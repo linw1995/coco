@@ -42,15 +42,21 @@ fn is_prompt_job_queue(queue: &str) -> bool {
     queue == PROMPT_JOB_QUEUE || queue.starts_with(PROMPT_JOB_BRANCH_QUEUE_PREFIX)
 }
 
-fn list_prompt_job_queue_messages(store: &impl Store) -> Result<Vec<MessageQueueItem>> {
+async fn list_prompt_job_queue_messages(store: &impl Store) -> Result<Vec<MessageQueueItem>> {
     let mut items = Vec::new();
     for queue in store
         .list_message_queues()
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .filter(|queue| is_prompt_job_queue(queue))
     {
-        items.extend(store.list_queue_messages(&queue).context(StoreSnafu)?);
+        items.extend(
+            store
+                .list_queue_messages(&queue)
+                .await
+                .context(StoreSnafu)?,
+        );
     }
     items.sort_by_key(|item| item.created_at);
     Ok(items)
@@ -244,7 +250,8 @@ where
                     merge_parents: command.merge_parents,
                     session_patch,
                 },
-            )?;
+            )
+            .await?;
             let view = JobQueuedView {
                 job_id,
                 status: JobStatus::Queued,
@@ -359,10 +366,12 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let snapshot = match engine.get_job(&command.job) {
+    let snapshot = match engine.get_job(&command.job).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Some(view) = load_queued_prompt_request_status(shared_store, &command.job)? {
+            if let Some(view) =
+                load_queued_prompt_request_status(shared_store, &command.job).await?
+            {
                 return Ok(Some(if command.json {
                     render_json(view)
                 } else {
@@ -372,8 +381,9 @@ where
             return Err(error).context(CoreEngineSnafu);
         }
     };
-    let prompt_details =
-        load_prompt_anchor_details(shared_store, &command.job).context(CoreEngineSnafu)?;
+    let prompt_details = load_prompt_anchor_details(shared_store, &command.job)
+        .await
+        .context(CoreEngineSnafu)?;
     let view = build_job_status_view(snapshot, prompt_details);
     Ok(Some(if command.json {
         render_json(view)
@@ -391,19 +401,18 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let mut jobs = engine
+    let mut jobs = Vec::new();
+    for job_id in engine
         .list_jobs()
+        .await
         .context(CoreEngineSnafu)?
         .into_keys()
-        .map(|job_id| {
-            engine
-                .get_job(&job_id)
-                .map(job_list_item_from_snapshot)
-                .context(CoreEngineSnafu)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    {
+        let snapshot = engine.get_job(&job_id).await.context(CoreEngineSnafu)?;
+        jobs.push(job_list_item_from_snapshot(snapshot));
+    }
 
-    jobs.extend(load_queued_prompt_request_list(shared_store)?);
+    jobs.extend(load_queued_prompt_request_list(shared_store).await?);
     jobs.sort_by(|left, right| {
         right
             .created_at
@@ -454,13 +463,14 @@ where
     });
 }
 
-pub fn queue_prompt_job_request(
+pub async fn queue_prompt_job_request(
     store: &impl Store,
     request: QueuedPromptRequest,
 ) -> Result<MessageQueueItem> {
     let queue = prompt_job_queue_for_branch(&request.branch);
     store
         .enqueue_message(&queue, json!(request))
+        .await
         .context(StoreSnafu)
 }
 
@@ -499,12 +509,12 @@ fn build_job_status_view(
     }
 }
 
-fn load_prompt_anchor_details(
+async fn load_prompt_anchor_details(
     store: &(impl JobStore + NodeStore),
     job_id: &str,
 ) -> std::result::Result<PromptAnchorDetails, EngineError> {
-    let job = store.get_job(job_id)?;
-    let node = store.get_node(&job.base)?;
+    let job = store.get_job(job_id).await?;
+    let node = store.get_node(&job.base).await?;
     match node.kind {
         Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Prompt(prompt_anchor) => Ok(PromptAnchorDetails {
@@ -618,11 +628,11 @@ fn render_job_status_snapshot_text(snapshot: &JobStatusSnapshot) -> String {
     )
 }
 
-fn load_queued_prompt_request_status(
+async fn load_queued_prompt_request_status(
     store: &impl Store,
     job_id: &str,
 ) -> Result<Option<QueuedPromptRequestStatusView>> {
-    let items = list_prompt_job_queue_messages(store)?;
+    let items = list_prompt_job_queue_messages(store).await?;
     let Some((item, request)) = items.into_iter().find_map(|item| {
         serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
             .ok()
@@ -633,6 +643,7 @@ fn load_queued_prompt_request_status(
     };
     let head = store
         .get_branch_head(&request.branch)
+        .await
         .context(StoreSnafu)?
         .to_owned();
     Ok(Some(QueuedPromptRequestStatusView {
@@ -652,15 +663,15 @@ fn load_queued_prompt_request_status(
     }))
 }
 
-fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobListItemView>> {
-    let items = list_prompt_job_queue_messages(store)?;
+async fn load_queued_prompt_request_list(store: &impl Store) -> Result<Vec<JobListItemView>> {
+    let items = list_prompt_job_queue_messages(store).await?;
     let mut jobs = Vec::new();
     for item in items {
         let Ok(request) = serde_json::from_value::<QueuedPromptRequest>(item.payload.clone())
         else {
             continue;
         };
-        let head = match store.get_branch_head(&request.branch) {
+        let head = match store.get_branch_head(&request.branch).await {
             Ok(head) => head.to_owned(),
             Err(StoreError::BranchNotFound { .. }) => continue,
             Err(error) => return Err(error).context(StoreSnafu),

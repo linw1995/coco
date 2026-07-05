@@ -89,7 +89,7 @@ where
     start_console_server_with_cache(config, ConsoleGraphCache::new(store, publisher))
 }
 
-pub fn start_console_server_with_graph_store_path<S>(
+pub async fn start_console_server_with_graph_store_path<S>(
     config: ConsoleConfig,
     store: S,
     publisher: ConsolePublisher,
@@ -99,7 +99,8 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let cache =
-        ConsoleGraphCache::new_with_persistent_store_path(store, publisher, graph_store_path)?;
+        ConsoleGraphCache::new_with_persistent_store_path(store, publisher, graph_store_path)
+            .await?;
     start_console_server_with_cache(config, cache)
 }
 
@@ -497,6 +498,7 @@ where
         return match state
             .cache
             .materialized_fragment_current_ready_or_schedule(mode)
+            .await
         {
             Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
             Ok(None) => html_response(render_loading_fragment(
@@ -559,6 +561,7 @@ where
         return match state
             .cache
             .node_detail_current_ready_or_schedule(mode, target)
+            .await
         {
             Ok(Some(node)) => html_response(render_graph_node_detail_fragment(&node)),
             Ok(None) => html_response(render_node_detail_fragment(
@@ -601,11 +604,11 @@ where
         let target = query
             .get("target")
             .expect("target was checked before materialized provider context lookup");
-        return match state.cache.provider_context_current_ready_or_schedule(
-            mode,
-            target,
-            query.get("context"),
-        ) {
+        return match state
+            .cache
+            .provider_context_current_ready_or_schedule(mode, target, query.get("context"))
+            .await
+        {
             Ok(Some(items)) => html_response(render_provider_context_items_fragment(items)),
             Ok(None) => html_response(render_provider_context_missing_fragment(target)),
             Err(error) => plain_error(error.to_string()),
@@ -1032,12 +1035,15 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{Duration, timeout};
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn test_store() -> SqliteStore {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 
     fn test_config() -> ConsoleConfig {
@@ -1100,12 +1106,15 @@ mod tests {
     }
 
     fn temp_store_path() -> PathBuf {
+        static NEXT_TEMP_STORE: AtomicU64 = AtomicU64::new(0);
+
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "coco-console-server-test-{}-{nanos}",
+            "coco-console-server-test-{}-{nanos}-{sequence}",
             std::process::id()
         ))
     }
@@ -1128,9 +1137,12 @@ mod tests {
     }
 
     async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
-        let handle =
-            start_console_server(test_config(), test_store(), crate::ConsolePublisher::new())
-                .unwrap();
+        let handle = start_console_server(
+            test_config(),
+            test_store().await,
+            crate::ConsolePublisher::new(),
+        )
+        .unwrap();
         let mut client = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         client.write_all(bytes).await.unwrap();
         let mut response = Vec::new();
@@ -1147,9 +1159,12 @@ mod tests {
 
     #[tokio::test]
     async fn start_console_server_accepts_requests() {
-        let handle =
-            start_console_server(test_config(), test_store(), crate::ConsolePublisher::new())
-                .unwrap();
+        let handle = start_console_server(
+            test_config(),
+            test_store().await,
+            crate::ConsolePublisher::new(),
+        )
+        .unwrap();
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
             .write_all(get_request("/style.css").as_bytes())
@@ -1184,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn write_event_stream_writes_initial_and_changed_events() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let handle = start_console_server(test_config(), store.clone(), publisher.clone()).unwrap();
         let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         stream
@@ -1220,6 +1235,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("changed".to_owned()),
             })
+            .await
             .unwrap();
 
         let mut invalidated = Vec::new();
@@ -1235,9 +1251,9 @@ mod tests {
     #[tokio::test]
     async fn versioned_viewport_items_diff_waits_past_empty_known_diff() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
-        store.fork("main", &root).unwrap();
+        store.fork("main", &root).await.unwrap();
         let first = store
             .append(NewNode {
                 parent: root.clone(),
@@ -1245,8 +1261,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible".to_owned()),
             })
+            .await
             .unwrap();
-        store.set_branch_head("main", &root, &first).unwrap();
+        store.set_branch_head("main", &root, &first).await.unwrap();
         let viewport = GraphViewportRequest::default();
         let state = app_state(store.clone(), publisher.clone());
         let snapshot = state.cache.current_snapshot(GraphMode::All).await;
@@ -1272,8 +1289,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("next visible".to_owned()),
             })
+            .await
             .unwrap();
-        store.set_branch_head("main", &first, &next).unwrap();
+        store.set_branch_head("main", &first, &next).await.unwrap();
 
         let response = timeout(Duration::from_secs(1), task)
             .await
@@ -1285,7 +1303,7 @@ mod tests {
     #[tokio::test]
     async fn versioned_viewport_items_diff_returns_known_payload_changes() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
         let first = store
             .append(NewNode {
@@ -1294,6 +1312,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first".to_owned()),
             })
+            .await
             .unwrap();
         let second = store
             .append(NewNode {
@@ -1302,9 +1321,10 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second".to_owned()),
             })
+            .await
             .unwrap();
-        store.fork("main", &first).unwrap();
-        store.fork("draft", &second).unwrap();
+        store.fork("main", &first).await.unwrap();
+        store.fork("draft", &second).await.unwrap();
         let viewport = GraphViewportRequest::default();
         let state = app_state(store.clone(), publisher.clone());
         let snapshot = state.cache.current_snapshot(GraphMode::All).await;
@@ -1316,7 +1336,10 @@ mod tests {
             parse_query(&query),
         ));
 
-        store.set_branch_head("main", &first, &second).unwrap();
+        store
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
 
         let response = timeout(Duration::from_secs(1), task)
             .await
@@ -1328,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn versioned_viewport_items_diff_waits_for_newer_version() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let viewport = GraphViewportRequest::default();
         let state = app_state(store, publisher.clone());
         let snapshot = state.cache.current_snapshot(GraphMode::All).await;
@@ -1362,12 +1385,12 @@ mod tests {
     #[tokio::test]
     async fn viewport_diff_returns_immediate_patch_even_with_version_query() {
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store(), publisher.clone());
+        let store = ConsoleStore::new(test_store().await, publisher.clone());
         let root = store.root_id();
-        store.fork("main", &root).unwrap();
+        store.fork("main", &root).await.unwrap();
         let version = publisher.current_version();
         let viewport = GraphViewportRequest::default();
-        let snapshot = build_graph_snapshot(&store, version).unwrap();
+        let snapshot = build_graph_snapshot(&store, version).await.unwrap();
         let rendered = layout_graph_viewport(&snapshot, viewport);
         let query = known_viewport_query(version, viewport, &rendered);
         let state = app_state(store, publisher);
@@ -1466,7 +1489,8 @@ mod tests {
     #[tokio::test]
     async fn versioned_fragment_waits_for_newer_version() {
         let publisher = ConsolePublisher::new();
-        let handle = start_console_server(test_config(), test_store(), publisher.clone()).unwrap();
+        let handle =
+            start_console_server(test_config(), test_store().await, publisher.clone()).unwrap();
         let mut initial = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
         initial
             .write_all(b"GET /fragment HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
@@ -1643,16 +1667,17 @@ mod tests {
     #[tokio::test]
     async fn graph_json_schedules_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).unwrap();
+        writer.fork("main", &writer.root_id()).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -1671,10 +1696,10 @@ mod tests {
     #[tokio::test]
     async fn graph_json_ignores_cached_full_snapshot_in_materialized_mode() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -1682,15 +1707,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("cached full snapshot node".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         state.cache.current_snapshot(GraphMode::All).await;
@@ -1710,10 +1737,10 @@ mod tests {
     #[tokio::test]
     async fn index_page_uses_mode_specific_loading_version() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -1721,15 +1748,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("all mode only".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let all = state
@@ -1873,16 +1902,17 @@ mod tests {
     #[tokio::test]
     async fn fragment_schedules_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).unwrap();
+        writer.fork("main", &writer.root_id()).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -1900,7 +1930,7 @@ mod tests {
     #[tokio::test]
     async fn fragment_uses_materialized_shell_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -1910,8 +1940,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -1925,24 +1956,30 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         seed_cache.current_snapshot(GraphMode::Anchors).await;
         drop(seed_cache);
 
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -1987,10 +2024,10 @@ mod tests {
     #[tokio::test]
     async fn node_detail_uses_materialized_facts_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -1998,15 +2035,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("single node detail".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let query = format!("target={}&mode=all", node_target_id(&text));
@@ -2025,7 +2064,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_reads_hidden_context_node_incrementally() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2035,8 +2074,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2044,6 +2084,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden targeted materialized detail".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -2058,15 +2099,20 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         state.cache.current_snapshot(GraphMode::Anchors).await;
@@ -2089,7 +2135,7 @@ mod tests {
     #[tokio::test]
     async fn node_detail_ignores_hidden_node_outside_current_materialized_context() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2099,8 +2145,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2108,6 +2155,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("stale hidden materialized detail".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -2122,19 +2170,27 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher.clone(),
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let initial = state.cache.current_snapshot(GraphMode::Anchors).await;
-        writer.set_branch_head("main", &prompt, &session).unwrap();
+        writer
+            .set_branch_head("main", &prompt, &session)
+            .await
+            .unwrap();
         publisher.mark_changed();
         state
             .cache
@@ -2152,6 +2208,7 @@ mod tests {
                 GraphMode::Anchors,
                 &node_target_id(&hidden_text),
             )
+            .await
             .unwrap();
 
         assert!(detail.is_none());
@@ -2178,16 +2235,17 @@ mod tests {
     #[tokio::test]
     async fn provider_context_default_avoids_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).unwrap();
+        writer.fork("main", &writer.root_id()).await.unwrap();
         publisher.mark_changed();
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
 
@@ -2208,7 +2266,7 @@ mod tests {
     #[tokio::test]
     async fn provider_context_uses_materialized_facts_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let root = writer.root_id();
         let session = writer
@@ -2218,8 +2276,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2227,6 +2286,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden context item".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -2241,24 +2301,30 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         seed_cache.current_snapshot(GraphMode::Anchors).await;
         drop(seed_cache);
 
         let state = AppState {
             cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store(),
+                test_store().await,
                 publisher,
                 path.clone(),
             )
+            .await
             .unwrap(),
         };
         let visible_query = format!("mode=anchors&target={}", node_target_id(&prompt));

@@ -175,22 +175,22 @@ struct VisibleGraphCollector<'a, S: NodeStore> {
 }
 
 #[cfg(test)]
-pub fn build_graph_snapshot(
+pub async fn build_graph_snapshot(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
 ) -> Result<GraphSnapshot> {
-    build_graph_snapshot_with_mode(store, version, GraphMode::All)
+    build_graph_snapshot_with_mode(store, version, GraphMode::All).await
 }
 
-pub fn build_graph_snapshot_with_mode(
+pub async fn build_graph_snapshot_with_mode(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
     mode: GraphMode,
 ) -> Result<GraphSnapshot> {
-    build_graph_snapshot_with_mode_and_progress(store, version, mode, |_| {})
+    build_graph_snapshot_with_mode_and_progress(store, version, mode, |_| {}).await
 }
 
-pub fn build_graph_snapshot_with_mode_and_progress<F>(
+pub async fn build_graph_snapshot_with_mode_and_progress<F>(
     store: &(impl BranchStore + NodeStore + SessionStore),
     version: u64,
     mode: GraphMode,
@@ -199,9 +199,9 @@ pub fn build_graph_snapshot_with_mode_and_progress<F>(
 where
     F: FnMut(GraphBuildProgress),
 {
-    let mut state = collect_graph_state(store, mode, &mut progress)?;
-    let contexts = state.provider_contexts(store, &mut progress)?;
-    let entries = sorted_graph_entries(&mut state, store, &contexts, &mut progress)?;
+    let mut state = collect_graph_state(store, mode, &mut progress).await?;
+    let contexts = state.provider_contexts(store, &mut progress).await?;
+    let entries = sorted_graph_entries(&mut state, store, &contexts, &mut progress).await?;
     let (nodes, edges) = graph_items_from_entries(entries);
     progress(GraphBuildProgress {
         phase: GraphBuildPhase::Snapshot,
@@ -220,7 +220,7 @@ where
     })
 }
 
-fn collect_graph_state<F>(
+async fn collect_graph_state<F>(
     store: &(impl BranchStore + NodeStore + SessionStore),
     mode: GraphMode,
     progress: &mut F,
@@ -229,7 +229,7 @@ where
     F: FnMut(GraphBuildProgress),
 {
     let mut state = GraphBuildState::new(mode);
-    let session_states = sorted_session_states(store)?;
+    let session_states = sorted_session_states(store).await?;
     let total = session_states.len();
     (*progress)(GraphBuildProgress {
         phase: GraphBuildPhase::Branches,
@@ -237,7 +237,7 @@ where
         total,
     });
     for (index, (branch, session_state)) in session_states.into_iter().enumerate() {
-        state.collect_branch(store, branch, session_state)?;
+        state.collect_branch(store, branch, session_state).await?;
         (*progress)(GraphBuildProgress {
             phase: GraphBuildPhase::Branches,
             processed: index + 1,
@@ -247,7 +247,7 @@ where
     Ok(state)
 }
 
-fn sorted_graph_entries<F>(
+async fn sorted_graph_entries<F>(
     state: &mut GraphBuildState,
     store: &impl NodeStore,
     contexts: &[GraphProviderContext],
@@ -256,7 +256,7 @@ fn sorted_graph_entries<F>(
 where
     F: FnMut(GraphBuildProgress),
 {
-    let mut entries = state.node_entries(store, contexts, progress)?;
+    let mut entries = state.node_entries(store, contexts, progress).await?;
     entries.sort_by(graph_entry_order);
     Ok(entries)
 }
@@ -353,15 +353,17 @@ impl GraphBuildState {
         }
     }
 
-    fn collect_branch(
+    async fn collect_branch(
         &mut self,
         store: &(impl BranchStore + NodeStore),
         branch: String,
         state: SessionState,
     ) -> Result<()> {
-        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
-        let scope = self.collect_branch_scope(store, &head_id)?;
-        let visible_head_id = self.resolve_visible_parent(store, &scope.node_ids, &head_id)?;
+        let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
+        let scope = self.collect_branch_scope(store, &head_id).await?;
+        let visible_head_id = self
+            .resolve_visible_parent(store, &scope.node_ids, &head_id)
+            .await?;
         self.add_branch_label(&branch, &state, visible_head_id.as_deref());
         self.branches.push(GraphBranch {
             name: branch,
@@ -372,12 +374,12 @@ impl GraphBuildState {
         Ok(())
     }
 
-    fn collect_branch_scope(
+    async fn collect_branch_scope(
         &mut self,
         store: &impl NodeStore,
         head_id: &str,
     ) -> Result<BranchGraphScope> {
-        let mut scope_node_ids = initial_graph_scope(store, head_id, self.mode)?;
+        let mut scope_node_ids = initial_graph_scope(store, head_id, self.mode).await?;
         let mut branch_visible_node_ids = BTreeSet::new();
         collect_visible_graph_nodes(
             store,
@@ -387,7 +389,8 @@ impl GraphBuildState {
             &mut self.visible_node_ids,
             &mut self.visible_nodes,
             &mut branch_visible_node_ids,
-        )?;
+        )
+        .await?;
         self.merge_visible_node_scopes(&scope_node_ids, &branch_visible_node_ids);
         Ok(BranchGraphScope {
             node_ids: scope_node_ids,
@@ -425,7 +428,7 @@ impl GraphBuildState {
             });
     }
 
-    fn node_entries<F>(
+    async fn node_entries<F>(
         &mut self,
         store: &impl NodeStore,
         contexts: &[GraphProviderContext],
@@ -444,7 +447,7 @@ impl GraphBuildState {
         });
         let mut entries = Vec::with_capacity(total);
         for (index, node) in visible_nodes.into_values().enumerate() {
-            entries.push(self.node_entry(store, node, &context_ids_by_node)?);
+            entries.push(self.node_entry(store, node, &context_ids_by_node).await?);
             (*progress)(GraphBuildProgress {
                 phase: GraphBuildPhase::Entries,
                 processed: index + 1,
@@ -454,7 +457,7 @@ impl GraphBuildState {
         Ok(entries)
     }
 
-    fn node_entry(
+    async fn node_entry(
         &mut self,
         store: &impl NodeStore,
         node: Node,
@@ -464,9 +467,12 @@ impl GraphBuildState {
             .visible_node_scopes
             .remove(&node.id)
             .unwrap_or_default();
-        let primary_parent = self.resolve_visible_parent(store, &scope_node_ids, &node.parent)?;
-        let merge_parents =
-            self.visible_merge_parents(store, &node, &scope_node_ids, &primary_parent)?;
+        let primary_parent = self
+            .resolve_visible_parent(store, &scope_node_ids, &node.parent)
+            .await?;
+        let merge_parents = self
+            .visible_merge_parents(store, &node, &scope_node_ids, &primary_parent)
+            .await?;
         let labels = self.labels_by_node.remove(&node.id).unwrap_or_default();
         let provider_context_ids = context_ids_by_node
             .get(&node.id)
@@ -481,7 +487,7 @@ impl GraphBuildState {
         })
     }
 
-    fn provider_contexts<F>(
+    async fn provider_contexts<F>(
         &self,
         store: &impl NodeStore,
         progress: &mut F,
@@ -497,7 +503,7 @@ impl GraphBuildState {
             total,
         });
         for (index, branch) in self.branches.iter().enumerate() {
-            let ancestry = store.ancestry(&branch.head_id).context(StoreSnafu)?;
+            let ancestry = store.ancestry(&branch.head_id).await.context(StoreSnafu)?;
             for context_nodes in provider_contexts_from_head(ancestry) {
                 self.insert_provider_context(&mut contexts, &branch.name, context_nodes);
             }
@@ -539,7 +545,7 @@ impl GraphBuildState {
         });
     }
 
-    fn visible_merge_parents(
+    async fn visible_merge_parents(
         &self,
         store: &impl NodeStore,
         node: &Node,
@@ -558,12 +564,13 @@ impl GraphBuildState {
                 primary_parent,
                 merge_parent,
                 &mut parents,
-            )?;
+            )
+            .await?;
         }
         Ok(parents)
     }
 
-    fn push_visible_merge_parent(
+    async fn push_visible_merge_parent(
         &self,
         store: &impl NodeStore,
         scope_node_ids: &BTreeSet<String>,
@@ -571,8 +578,9 @@ impl GraphBuildState {
         merge_parent: &MergeParent,
         parents: &mut Vec<MergeParent>,
     ) -> Result<()> {
-        let Some(parent_id) =
-            self.resolve_visible_parent(store, scope_node_ids, merge_parent.node_id())?
+        let Some(parent_id) = self
+            .resolve_visible_parent(store, scope_node_ids, merge_parent.node_id())
+            .await?
         else {
             return Ok(());
         };
@@ -583,20 +591,20 @@ impl GraphBuildState {
         Ok(())
     }
 
-    fn resolve_visible_parent(
+    async fn resolve_visible_parent(
         &self,
         store: &impl NodeStore,
         scope_node_ids: &BTreeSet<String>,
         start_id: &str,
     ) -> Result<Option<String>> {
-        resolve_visible_parent(store, &self.visible_node_ids, scope_node_ids, start_id)
+        resolve_visible_parent(store, &self.visible_node_ids, scope_node_ids, start_id).await
     }
 }
 
 impl<S: NodeStore> VisibleGraphCollector<'_, S> {
-    fn collect(&mut self) -> Result<()> {
+    async fn collect(&mut self) -> Result<()> {
         while let Some(node_id) = self.next_node_id() {
-            self.visit(node_id)?;
+            self.visit(node_id).await?;
         }
         Ok(())
     }
@@ -616,20 +624,20 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
             && self.visited.insert(node_id.to_owned())
     }
 
-    fn visit(&mut self, node_id: String) -> Result<()> {
-        let node = self.store.get_node(&node_id).context(StoreSnafu)?;
+    async fn visit(&mut self, node_id: String) -> Result<()> {
+        let node = self.store.get_node(&node_id).await.context(StoreSnafu)?;
         if node.is_root() {
             return Ok(());
         }
-        self.enqueue_traversal_targets(&node)?;
+        self.enqueue_traversal_targets(&node).await?;
         self.record_if_visible(node);
         Ok(())
     }
 
-    fn enqueue_traversal_targets(&mut self, node: &Node) -> Result<()> {
+    async fn enqueue_traversal_targets(&mut self, node: &Node) -> Result<()> {
         self.enqueue_primary_parent(node);
         self.enqueue_merge_parents(node);
-        self.enqueue_skill_invocation_subtrees(node)
+        self.enqueue_skill_invocation_subtrees(node).await
     }
 
     fn enqueue_primary_parent(&mut self, node: &Node) {
@@ -647,7 +655,7 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
         }
     }
 
-    fn enqueue_skill_invocation_subtrees(&mut self, node: &Node) -> Result<()> {
+    async fn enqueue_skill_invocation_subtrees(&mut self, node: &Node) -> Result<()> {
         if node.kind.as_tool_uses().is_none() {
             return Ok(());
         }
@@ -657,6 +665,7 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
             self.scope_node_ids,
             &mut self.pending,
         )
+        .await
     }
 
     fn record_if_visible(&mut self, node: Node) {
@@ -673,9 +682,10 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
     }
 }
 
-fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, SessionState)>> {
+async fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, SessionState)>> {
     let mut branches = store
         .list_session_states()
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .collect::<Vec<_>>();
@@ -683,15 +693,18 @@ fn sorted_session_states(store: &impl SessionStore) -> Result<Vec<(String, Sessi
     Ok(branches)
 }
 
-pub(crate) fn provider_context_for_node(
+pub(crate) async fn provider_context_for_node(
     store: &(impl BranchStore + NodeStore + SessionStore),
     target_node_id: &str,
     context_id: Option<&str>,
 ) -> Result<Option<GraphProviderContextSelection>> {
     let mut contexts = HashMap::<String, GraphProviderContext>::new();
-    for (branch_name, _) in sorted_session_states(store)? {
-        let head_id = store.get_branch_head(&branch_name).context(StoreSnafu)?;
-        let ancestry = store.ancestry(&head_id).context(StoreSnafu)?;
+    for (branch_name, _) in sorted_session_states(store).await? {
+        let head_id = store
+            .get_branch_head(&branch_name)
+            .await
+            .context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head_id).await.context(StoreSnafu)?;
         for context_nodes in provider_contexts_from_head(ancestry) {
             let Some(id) = provider_context_id(&branch_name, &context_nodes) else {
                 continue;
@@ -749,7 +762,7 @@ fn is_duplicate_visible_merge_parent(
             .any(|existing| existing.node_id() == parent_id)
 }
 
-fn collect_visible_graph_nodes<S: NodeStore>(
+async fn collect_visible_graph_nodes<S: NodeStore>(
     store: &S,
     head_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
@@ -769,15 +782,16 @@ fn collect_visible_graph_nodes<S: NodeStore>(
         visited: BTreeSet::new(),
     }
     .collect()
+    .await
 }
 
-fn initial_graph_scope(
+async fn initial_graph_scope(
     store: &impl NodeStore,
     head_id: &str,
     mode: GraphMode,
 ) -> Result<BTreeSet<String>> {
     match mode {
-        GraphMode::Anchors => collect_provider_context_node_ids(store, head_id),
+        GraphMode::Anchors => collect_provider_context_node_ids(store, head_id).await,
         GraphMode::All => Ok(BTreeSet::from([head_id.to_owned()])),
     }
 }
@@ -795,11 +809,11 @@ fn push_scoped_graph_node(
     pending.push(node_id);
 }
 
-fn collect_provider_context_node_ids(
+async fn collect_provider_context_node_ids(
     store: &impl NodeStore,
     head_id: &str,
 ) -> Result<BTreeSet<String>> {
-    let ancestry = store.ancestry(head_id).context(StoreSnafu)?;
+    let ancestry = store.ancestry(head_id).await.context(StoreSnafu)?;
     Ok(provider_context_node_ids(ancestry))
 }
 
@@ -972,25 +986,27 @@ pub(crate) fn initial_visible_graph_lane_nodes(
     Ok(nodes)
 }
 
-pub(crate) fn visible_skill_invocation_subtree_nodes(
+#[cfg(test)]
+pub(crate) async fn visible_skill_invocation_subtree_nodes(
     store: &impl NodeStore,
     mode: GraphMode,
     parent_id: &str,
 ) -> Result<Vec<Node>> {
     let mut nodes = Vec::new();
     let mut seen = BTreeSet::new();
-    push_initial_skill_invocation_subtrees(store, mode, parent_id, &mut seen, &mut nodes)?;
+    push_initial_skill_invocation_subtrees(store, mode, parent_id, &mut seen, &mut nodes).await?;
     Ok(nodes)
 }
 
-fn push_initial_skill_invocation_subtrees(
-    store: &impl NodeStore,
+pub(crate) fn visible_skill_invocation_subtree_nodes_with_lookup(
     mode: GraphMode,
     parent_id: &str,
-    seen: &mut BTreeSet<String>,
-    nodes: &mut Vec<Node>,
-) -> Result<()> {
-    let mut pending = skill_invocation_children(store, parent_id)?;
+    mut get_node: impl FnMut(&str) -> Result<Node>,
+    mut get_children: impl FnMut(&str) -> Result<Vec<Node>>,
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = skill_invocation_children_with_lookup(parent_id, &mut get_children)?;
     pending.reverse();
     let mut visited = BTreeSet::new();
 
@@ -998,8 +1014,33 @@ fn push_initial_skill_invocation_subtrees(
         if node_id.is_empty() || !visited.insert(node_id.clone()) {
             continue;
         }
-        let node = store.get_node(&node_id).context(StoreSnafu)?;
-        let mut children = child_ids(store, &node.id)?;
+        let node = get_node(&node_id)?;
+        let mut children = child_ids_with_lookup(&node.id, &mut get_children)?;
+        children.reverse();
+        pending.extend(children);
+        push_initial_lane_node(mode, node, &mut seen, &mut nodes);
+    }
+    Ok(nodes)
+}
+
+#[cfg(test)]
+async fn push_initial_skill_invocation_subtrees(
+    store: &impl NodeStore,
+    mode: GraphMode,
+    parent_id: &str,
+    seen: &mut BTreeSet<String>,
+    nodes: &mut Vec<Node>,
+) -> Result<()> {
+    let mut pending = skill_invocation_children(store, parent_id).await?;
+    pending.reverse();
+    let mut visited = BTreeSet::new();
+
+    while let Some(node_id) = pending.pop() {
+        if node_id.is_empty() || !visited.insert(node_id.clone()) {
+            continue;
+        }
+        let node = store.get_node(&node_id).await.context(StoreSnafu)?;
+        let mut children = child_ids(store, &node.id).await?;
         children.reverse();
         pending.extend(children);
         push_initial_lane_node(mode, node, seen, nodes);
@@ -1018,27 +1059,38 @@ fn push_initial_lane_node(
     }
 }
 
-fn collect_visible_skill_invocation_subtrees(
+async fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
     pending: &mut Vec<String>,
 ) -> Result<()> {
-    let mut descendants = skill_invocation_children(store, parent_id)?;
+    let mut descendants = skill_invocation_children(store, parent_id).await?;
     let mut visited = BTreeSet::new();
 
     while let Some(node_id) = next_unvisited_descendant(&mut descendants, &mut visited) {
         push_scoped_graph_node(scope_node_ids, pending, node_id.clone());
-        descendants.extend(child_ids(store, &node_id)?);
+        descendants.extend(child_ids(store, &node_id).await?);
     }
 
     Ok(())
 }
 
-fn skill_invocation_children(store: &impl NodeStore, parent_id: &str) -> Result<Vec<String>> {
+async fn skill_invocation_children(store: &impl NodeStore, parent_id: &str) -> Result<Vec<String>> {
     Ok(store
         .list_children(parent_id)
+        .await
         .context(StoreSnafu)?
+        .into_iter()
+        .filter_map(skill_invocation_child_id)
+        .collect())
+}
+
+fn skill_invocation_children_with_lookup(
+    parent_id: &str,
+    get_children: &mut impl FnMut(&str) -> Result<Vec<Node>>,
+) -> Result<Vec<String>> {
+    Ok(get_children(parent_id)?
         .into_iter()
         .filter_map(skill_invocation_child_id)
         .collect())
@@ -1063,16 +1115,27 @@ fn next_unvisited_descendant(
     None
 }
 
-fn child_ids(store: &impl NodeStore, node_id: &str) -> Result<Vec<String>> {
+async fn child_ids(store: &impl NodeStore, node_id: &str) -> Result<Vec<String>> {
     Ok(store
         .list_children(node_id)
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .map(|child| child.id)
         .collect())
 }
 
-fn resolve_visible_parent(
+fn child_ids_with_lookup(
+    node_id: &str,
+    get_children: &mut impl FnMut(&str) -> Result<Vec<Node>>,
+) -> Result<Vec<String>> {
+    Ok(get_children(node_id)?
+        .into_iter()
+        .map(|child| child.id)
+        .collect())
+}
+
+async fn resolve_visible_parent(
     store: &impl NodeStore,
     visible_node_ids: &BTreeSet<String>,
     scope_node_ids: &BTreeSet<String>,
@@ -1082,7 +1145,7 @@ fn resolve_visible_parent(
         return Ok(None);
     };
 
-    let ancestry = store.ancestry(start_id).context(StoreSnafu)?;
+    let ancestry = store.ancestry(start_id).await.context(StoreSnafu)?;
     Ok(visible_parent_in_ancestry(
         ancestry,
         visible_node_ids,

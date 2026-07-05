@@ -57,7 +57,11 @@ where
                 conversation_id: message.conversation_id().to_owned(),
             })?;
 
-        let supports_load_image = match self.engine.session_supports_tool(&branch, "load_image") {
+        let supports_load_image = match self
+            .engine
+            .session_supports_tool(&branch, "load_image")
+            .await
+        {
             Ok(supports_load_image) => supports_load_image,
             Err(source) => {
                 return Err(error_from_engine_failure(branch, EngineError::from(source)));

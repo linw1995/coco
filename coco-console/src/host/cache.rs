@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::snapshot_store::ConsoleGraphSnapshotStore;
@@ -20,6 +21,7 @@ use crate::publisher::ConsolePublisher;
 use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
+#[cfg(test)]
 use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -49,6 +51,7 @@ pub struct ConsoleGraphCache<S> {
     ready: ConsolePublisher,
     progress: ConsolePublisher,
     snapshots: Option<ConsoleGraphSnapshotStore>,
+    #[cfg(test)]
     compute_permits: Arc<Semaphore>,
     publish_lock: Arc<Mutex<()>>,
     state: Arc<Mutex<CacheState>>,
@@ -58,7 +61,7 @@ pub struct ConsoleGraphCache<S> {
 enum ConsoleGraphSource<S> {
     #[allow(dead_code)]
     Store(S),
-    PersistentStorePath(PathBuf),
+    PersistentStore(PathBuf),
 }
 
 #[derive(Default)]
@@ -136,19 +139,22 @@ where
             ready: ConsolePublisher::new(),
             progress: ConsolePublisher::new(),
             snapshots: None,
+            #[cfg(test)]
             compute_permits: Arc::new(Semaphore::new(1)),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
         }
     }
 
-    pub fn new_with_persistent_store_path(
+    pub async fn new_with_persistent_store_path(
         _store: S,
         invalidations: ConsolePublisher,
         path: PathBuf,
     ) -> crate::Result<Self> {
-        SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-        let snapshots = ConsoleGraphSnapshotStore::open(&path)?;
+        SqliteGraphStore::open_read_only(&path)
+            .await
+            .context(crate::error::StoreSnafu)?;
+        let snapshots = ConsoleGraphSnapshotStore::open(&path).await?;
         let persisted_version = latest_persistent_materialization_version(&snapshots)?;
         let ready = ConsolePublisher::new();
         if let Some(version) = persisted_version {
@@ -160,11 +166,12 @@ where
                 .unwrap_or(1),
         );
         Ok(Self {
-            source: ConsoleGraphSource::PersistentStorePath(path),
+            source: ConsoleGraphSource::PersistentStore(path),
             invalidations,
             ready,
             progress: ConsolePublisher::new(),
             snapshots: Some(snapshots),
+            #[cfg(test)]
             compute_permits: Arc::new(Semaphore::new(1)),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
@@ -209,6 +216,7 @@ where
         self.invalidations.subscribe()
     }
 
+    #[cfg(test)]
     pub async fn run_blocking_graph_compute<T, F>(&self, compute: F) -> crate::Result<T>
     where
         T: Send + 'static,
@@ -218,6 +226,7 @@ where
             .await
     }
 
+    #[cfg(test)]
     pub async fn run_blocking_graph_compute_with<T, I, P, F>(
         &self,
         prepare: P,
@@ -272,24 +281,22 @@ where
             )
         );
         let progress_cache = self.clone();
-        let snapshot = self
-            .run_blocking_graph_compute(move || {
-                source.build_snapshot_with_progress(mode, graph_version, |progress| {
-                    set_rebuild_status!(
-                        progress_cache,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Building,
-                            Some(progress.phase),
-                            progress.processed,
-                            progress.total,
-                            progress.phase.label(),
-                        )
-                    );
-                })
+        let snapshot = source
+            .build_snapshot_with_progress(mode, graph_version, |progress| {
+                set_rebuild_status!(
+                    progress_cache,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Building,
+                        Some(progress.phase),
+                        progress.processed,
+                        progress.total,
+                        progress.phase.label(),
+                    )
+                );
             })
-            .await??;
+            .await?;
         let snapshot = Arc::new(snapshot);
         self.store_cached_snapshot(mode, source_version, snapshot.clone());
         self.publish_ready_version(source_version);
@@ -329,7 +336,7 @@ where
         self.snapshots.is_some()
     }
 
-    pub fn node_detail_current_ready_or_schedule(
+    pub async fn node_detail_current_ready_or_schedule(
         &self,
         mode: GraphMode,
         target: &str,
@@ -365,20 +372,22 @@ where
                     return Ok(None);
                 };
                 if snapshots.has_materialization(mode)?
-                    && !self.node_is_in_materialized_provider_context(snapshots, mode, &node_id)?
+                    && !self
+                        .node_is_in_materialized_provider_context(snapshots, mode, &node_id)
+                        .await?
                 {
                     return Ok(None);
                 }
                 (node_id, Vec::new())
             }
         };
-        match self.source.clone().get_node(&node_id) {
+        match self.source.clone().get_node(&node_id).await {
             Ok(node) => Ok(Some(graph_node_from_node(node, labels, Vec::new()))),
             Err(_) => Ok(None),
         }
     }
 
-    fn node_is_in_materialized_provider_context(
+    async fn node_is_in_materialized_provider_context(
         &self,
         snapshots: &ConsoleGraphSnapshotStore,
         mode: GraphMode,
@@ -387,7 +396,8 @@ where
         let Some(selection) = self
             .source
             .clone()
-            .provider_context_for_node(node_id, None)?
+            .provider_context_for_node(node_id, None)
+            .await?
         else {
             return Ok(false);
         };
@@ -402,7 +412,7 @@ where
             .is_empty())
     }
 
-    pub(crate) fn provider_context_current_ready_or_schedule(
+    pub(crate) async fn provider_context_current_ready_or_schedule(
         &self,
         mode: GraphMode,
         target: &str,
@@ -423,7 +433,8 @@ where
         let Some(selection) = self
             .source
             .clone()
-            .provider_context_for_node(&target_node_id, context)?
+            .provider_context_for_node(&target_node_id, context)
+            .await?
         else {
             return Ok(target_was_materialized.then(Vec::new));
         };
@@ -458,7 +469,7 @@ where
         Ok(Some(items))
     }
 
-    pub(crate) fn materialized_fragment_current_ready_or_schedule(
+    pub(crate) async fn materialized_fragment_current_ready_or_schedule(
         &self,
         mode: GraphMode,
     ) -> crate::Result<Option<MaterializedGraphShell>> {
@@ -472,10 +483,11 @@ where
         let branches = self
             .source
             .clone()
-            .materialized_shell_branches(&facts.lanes)?;
+            .materialized_shell_branches(&facts.lanes)
+            .await?;
         let mut time_ticks = Vec::with_capacity(facts.nodes.len());
         for node in &facts.nodes {
-            let store_node = self.source.clone().get_node(&node.node_id)?;
+            let store_node = self.source.clone().get_node(&node.node_id).await?;
             time_ticks.push(MaterializedGraphShellTick {
                 time_ns: store_node.created_at.as_nanosecond(),
                 label: store_node.created_at.to_string(),
@@ -791,13 +803,11 @@ where
         if let Some(snapshots) = self.snapshots.clone() {
             let has_non_empty_materialization = snapshots.has_non_empty_materialization(mode);
             let source = self.source.clone();
-            let incremental_result = self
-                .run_blocking_graph_compute(move || {
-                    source.try_append_linear_materialization(snapshots, mode, source_version)
-                })
+            let incremental_result = source
+                .try_append_linear_materialization(snapshots, mode, source_version)
                 .await;
             let fallback_message = match incremental_result {
-                Ok(Ok(true)) => {
+                Ok(true) => {
                     self.publish_ready_version(source_version);
                     set_rebuild_status!(
                         self,
@@ -813,7 +823,7 @@ where
                     );
                     return;
                 }
-                Ok(Ok(false)) => match has_non_empty_materialization {
+                Ok(false) => match has_non_empty_materialization {
                     Ok(true) => {
                         set_rebuild_status!(
                             self,
@@ -848,21 +858,6 @@ where
                         return;
                     }
                 },
-                Ok(Err(error)) => {
-                    set_rebuild_status!(
-                        self,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Failed,
-                            None,
-                            0,
-                            0,
-                            error.to_string(),
-                        )
-                    );
-                    return;
-                }
                 Err(error) => {
                     set_rebuild_status!(
                         self,
@@ -895,36 +890,36 @@ where
         let source = self.source.clone();
         let progress_cache = self.clone();
         let snapshots = self.snapshots.clone();
-        let result = self
-            .run_blocking_graph_compute(move || {
-                let snapshot =
-                    source.build_snapshot_with_progress(mode, source_version, |progress| {
-                        set_rebuild_status!(
-                            progress_cache,
-                            rebuild_status(
-                                mode,
-                                source_version,
-                                ConsoleGraphRebuildState::Building,
-                                Some(progress.phase),
-                                progress.processed,
-                                progress.total,
-                                progress.phase.label(),
-                            )
-                        );
-                    })?;
-                if let Some(snapshots) = snapshots {
-                    let branch_labels = visible_full_layout_branch_labels(&snapshot);
-                    snapshots.replace_materialization_from_viewport(
-                        mode,
-                        materialize_graph_viewport(&snapshot),
-                        branch_labels,
-                    )?;
-                }
-                crate::Result::Ok(snapshot)
-            })
-            .await;
+        let result = async move {
+            let snapshot = source
+                .build_snapshot_with_progress(mode, source_version, |progress| {
+                    set_rebuild_status!(
+                        progress_cache,
+                        rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Building,
+                            Some(progress.phase),
+                            progress.processed,
+                            progress.total,
+                            progress.phase.label(),
+                        )
+                    );
+                })
+                .await?;
+            if let Some(snapshots) = snapshots {
+                let branch_labels = visible_full_layout_branch_labels(&snapshot);
+                snapshots.replace_materialization_from_viewport(
+                    mode,
+                    materialize_graph_viewport(&snapshot),
+                    branch_labels,
+                )?;
+            }
+            crate::Result::Ok(snapshot)
+        }
+        .await;
         match result {
-            Ok(Ok(snapshot)) => {
+            Ok(snapshot) => {
                 self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
                 self.publish_ready_version(source_version);
                 set_rebuild_status!(
@@ -937,20 +932,6 @@ where
                         1,
                         1,
                         "Graph snapshot ready",
-                    )
-                );
-            }
-            Ok(Err(error)) => {
-                set_rebuild_status!(
-                    self,
-                    rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
                     )
                 );
             }
@@ -1178,11 +1159,50 @@ fn node_id_from_graph_target(target: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+async fn open_persistent_graph_store(path: &Path) -> crate::Result<SqliteGraphStore> {
+    SqliteGraphStore::open_read_only(path)
+        .await
+        .context(crate::error::StoreSnafu)
+}
+
+async fn run_sqlite_graph_read_transaction<T, Fut>(
+    store: &SqliteGraphStore,
+    operation: Fut,
+) -> crate::Result<T>
+where
+    Fut: Future<Output = crate::Result<T>>,
+{
+    store
+        .begin_read_transaction()
+        .await
+        .context(crate::error::StoreSnafu)?;
+
+    let result = operation.await;
+    match result {
+        Ok(value) => {
+            store
+                .commit_read_transaction()
+                .await
+                .context(crate::error::StoreSnafu)?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = store.rollback_read_transaction().await {
+                tracing::warn!(
+                    error = %rollback_error,
+                    "failed to roll back SQLite graph read transaction after console graph read error"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 impl<S> ConsoleGraphSource<S>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    fn build_snapshot_with_progress<F>(
+    async fn build_snapshot_with_progress<F>(
         self,
         mode: GraphMode,
         version: u64,
@@ -1193,100 +1213,107 @@ where
     {
         match self {
             Self::Store(store) => {
-                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
+                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress).await
             }
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                run_sqlite_graph_read_transaction(&store, || {
-                    build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress)
-                })
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
+                run_sqlite_graph_read_transaction(
+                    &store,
+                    build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress),
+                )
+                .await
             }
         }
     }
 
-    fn try_append_linear_materialization(
+    async fn try_append_linear_materialization(
         self,
         snapshots: ConsoleGraphSnapshotStore,
         mode: GraphMode,
         source_version: u64,
     ) -> crate::Result<bool> {
         match self {
-            Self::Store(store) => snapshots.try_append_linear_branch(source_version, mode, &store),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                run_sqlite_graph_read_transaction(&store, || {
-                    snapshots.try_append_linear_branch(source_version, mode, &store)
-                })
+            Self::Store(store) => {
+                snapshots
+                    .try_append_linear_branch(source_version, mode, &store)
+                    .await
+            }
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
+                run_sqlite_graph_read_transaction(
+                    &store,
+                    snapshots.try_append_linear_branch(source_version, mode, &store),
+                )
+                .await
             }
         }
     }
 
-    fn get_node(self, node_id: &str) -> crate::Result<coco_mem::Node> {
+    #[cfg(test)]
+    async fn hold_persistent_read_transaction_until(
+        self,
+        started: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> crate::Result<()> {
+        let Self::PersistentStore(path) = self else {
+            let _ = started.send(());
+            let _ = release.await;
+            return Ok(());
+        };
+        let store = open_persistent_graph_store(&path).await?;
+        run_sqlite_graph_read_transaction(&store, async move {
+            let _ = started.send(());
+            let _ = release.await;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_node(self, node_id: &str) -> crate::Result<coco_mem::Node> {
         match self {
-            Self::Store(store) => store.get_node(node_id).context(crate::error::StoreSnafu),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                store.get_node(node_id).context(crate::error::StoreSnafu)
+            Self::Store(store) => store
+                .get_node(node_id)
+                .await
+                .context(crate::error::StoreSnafu),
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
+                store
+                    .get_node(node_id)
+                    .await
+                    .context(crate::error::StoreSnafu)
             }
         }
     }
 
-    fn provider_context_for_node(
+    async fn provider_context_for_node(
         self,
         target_node_id: &str,
         context: Option<&str>,
     ) -> crate::Result<Option<crate::graph::GraphProviderContextSelection>> {
         match self {
-            Self::Store(store) => provider_context_for_node(&store, target_node_id, context),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                provider_context_for_node(&store, target_node_id, context)
+            Self::Store(store) => provider_context_for_node(&store, target_node_id, context).await,
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
+                provider_context_for_node(&store, target_node_id, context).await
             }
         }
     }
 
-    fn materialized_shell_branches(
+    async fn materialized_shell_branches(
         self,
         lanes: &[crate::api::GraphViewportLane],
     ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
         match self {
-            Self::Store(store) => materialized_shell_branches(&store, lanes),
-            Self::PersistentStorePath(path) => {
-                let store =
-                    SqliteGraphStore::open_read_only(&path).context(crate::error::StoreSnafu)?;
-                materialized_shell_branches(&store, lanes)
+            Self::Store(store) => materialized_shell_branches(&store, lanes).await,
+            Self::PersistentStore(path) => {
+                let store = open_persistent_graph_store(&path).await?;
+                materialized_shell_branches(&store, lanes).await
             }
         }
     }
 }
 
-fn run_sqlite_graph_read_transaction<T>(
-    store: &SqliteGraphStore,
-    operation: impl FnOnce() -> crate::Result<T>,
-) -> crate::Result<T> {
-    store
-        .begin_read_transaction()
-        .context(crate::error::StoreSnafu)?;
-    let result = operation();
-    match result {
-        Ok(value) => {
-            store
-                .commit_read_transaction()
-                .context(crate::error::StoreSnafu)?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = store.rollback_read_transaction();
-            Err(error)
-        }
-    }
-}
-
-fn materialized_shell_branches(
+async fn materialized_shell_branches(
     store: &(impl BranchStore + SessionStore),
     lanes: &[crate::api::GraphViewportLane],
 ) -> crate::Result<Vec<MaterializedGraphShellBranch>> {
@@ -1296,6 +1323,7 @@ fn materialized_shell_branches(
         .collect::<BTreeMap<_, _>>();
     let mut states = store
         .list_session_states()
+        .await
         .context(crate::error::StoreSnafu)?
         .into_iter()
         .collect::<Vec<(String, SessionState)>>();
@@ -1315,25 +1343,25 @@ fn materialized_shell_branches(
             .then_with(|| left_branch.cmp(right_branch))
     });
 
-    states
-        .into_iter()
-        .map(|(branch, state)| {
-            let branch_key = lane_key(&branch);
-            let lane = lane_by_key.get(branch_key.as_str());
-            let head_id = store
-                .get_branch_head(&branch)
-                .context(crate::error::StoreSnafu)?;
-            Ok(MaterializedGraphShellBranch {
-                name: branch,
-                key: lane
-                    .map(|lane| lane.key.clone())
-                    .unwrap_or_else(|| branch_key.clone()),
-                lane_y: lane.map(|lane| lane.y),
-                head_short_id: crate::graph::shorten_id(&head_id),
-                state,
-            })
-        })
-        .collect()
+    let mut branches = Vec::new();
+    for (branch, state) in states {
+        let branch_key = lane_key(&branch);
+        let lane = lane_by_key.get(branch_key.as_str());
+        let head_id = store
+            .get_branch_head(&branch)
+            .await
+            .context(crate::error::StoreSnafu)?;
+        branches.push(MaterializedGraphShellBranch {
+            name: branch,
+            key: lane
+                .map(|lane| lane.key.clone())
+                .unwrap_or_else(|| branch_key.clone()),
+            lane_y: lane.map(|lane| lane.y),
+            head_short_id: crate::graph::shorten_id(&head_id),
+            state,
+        });
+    }
+    Ok(branches)
 }
 
 #[cfg(test)]
@@ -1352,10 +1380,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
     use tokio::time::{Duration, sleep};
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn test_store() -> SqliteStore {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 
     fn session_anchor() -> SessionAnchor {
@@ -1375,8 +1406,10 @@ mod tests {
         }
     }
 
-    fn graph_store(publisher: ConsolePublisher) -> (ConsoleStore<SqliteStore>, String, String) {
-        let store = ConsoleStore::new(test_store(), publisher);
+    async fn graph_store(
+        publisher: ConsolePublisher,
+    ) -> (ConsoleStore<SqliteStore>, String, String) {
+        let store = ConsoleStore::new(test_store().await, publisher);
         let root = store.root_id();
         let session = store
             .append(NewNode {
@@ -1385,8 +1418,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        store.fork("main", &session).unwrap();
+        store.fork("main", &session).await.unwrap();
         let text = store
             .append(NewNode {
                 parent: session.clone(),
@@ -1394,8 +1428,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible only in all mode".to_owned()),
             })
+            .await
             .unwrap();
-        store.set_branch_head("main", &session, &text).unwrap();
+        store
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
 
         (store, session, text)
     }
@@ -1414,9 +1452,9 @@ mod tests {
         path
     }
 
-    #[test]
-    fn materialized_shell_branches_use_branch_lane_keys() {
-        let store = test_store();
+    #[tokio::test]
+    async fn materialized_shell_branches_use_branch_lane_keys() {
+        let store = test_store().await;
         let root = store.root_id();
         let session = store
             .append(NewNode {
@@ -1425,9 +1463,10 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let branch = "orphan abc123";
-        store.fork(branch, &session).unwrap();
+        store.fork(branch, &session).await.unwrap();
         let branch_lane = crate::api::GraphViewportLane {
             key: lane_key(branch),
             label: branch.to_owned(),
@@ -1439,8 +1478,9 @@ mod tests {
             y: 20,
         };
 
-        let branches =
-            materialized_shell_branches(&store, &[branch_lane.clone(), derived_lane]).unwrap();
+        let branches = materialized_shell_branches(&store, &[branch_lane.clone(), derived_lane])
+            .await
+            .unwrap();
 
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].name, branch);
@@ -1448,13 +1488,13 @@ mod tests {
         assert_eq!(branches[0].lane_y, Some(branch_lane.y));
     }
 
-    #[test]
-    fn materialized_shell_branches_preserve_hidden_branches() {
-        let store = test_store();
+    #[tokio::test]
+    async fn materialized_shell_branches_preserve_hidden_branches() {
+        let store = test_store().await;
         let root = store.root_id();
-        store.fork("hidden", &root).unwrap();
+        store.fork("hidden", &root).await.unwrap();
 
-        let branches = materialized_shell_branches(&store, &[]).unwrap();
+        let branches = materialized_shell_branches(&store, &[]).await.unwrap();
 
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].name, "hidden");
@@ -1523,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn cache_builds_snapshots_per_mode_on_demand() {
         let publisher = ConsolePublisher::new();
-        let (store, session, text) = graph_store(publisher.clone());
+        let (store, session, text) = graph_store(publisher.clone()).await;
         let cache = ConsoleGraphCache::new(store, publisher);
 
         let all = cache.current_snapshot(GraphMode::All).await;
@@ -1540,7 +1580,7 @@ mod tests {
     #[tokio::test]
     async fn cache_reads_latest_store_state_without_background_rebuild() {
         let publisher = ConsolePublisher::new();
-        let (store, _, text) = graph_store(publisher.clone());
+        let (store, _, text) = graph_store(publisher.clone()).await;
         let cache = ConsoleGraphCache::new(store.clone(), publisher.clone());
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -1551,8 +1591,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("new all-mode node".to_owned()),
             })
+            .await
             .unwrap();
-        store.set_branch_head("main", &text, &next_text).unwrap();
+        store
+            .set_branch_head("main", &text, &next_text)
+            .await
+            .unwrap();
 
         let refreshed = cache.current_snapshot(GraphMode::All).await;
 
@@ -1563,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn cache_reuses_snapshot_for_same_source_version() {
         let publisher = ConsolePublisher::new();
-        let (store, _, text) = graph_store(publisher.clone());
+        let (store, _, text) = graph_store(publisher.clone()).await;
         let cache = ConsoleGraphCache::new(store.clone(), publisher);
 
         let first = cache.current_snapshot(GraphMode::All).await;
@@ -1578,8 +1622,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("new version".to_owned()),
             })
+            .await
             .unwrap();
-        store.set_branch_head("main", &text, &next_text).unwrap();
+        store
+            .set_branch_head("main", &text, &next_text)
+            .await
+            .unwrap();
         let third = cache.current_snapshot(GraphMode::All).await;
 
         assert!(!Arc::ptr_eq(&first, &third));
@@ -1589,7 +1637,7 @@ mod tests {
     #[tokio::test]
     async fn cache_publishes_ready_version_after_snapshot_build() {
         let publisher = ConsolePublisher::new();
-        let (store, _, _) = graph_store(publisher.clone());
+        let (store, _, _) = graph_store(publisher.clone()).await;
         let cache = ConsoleGraphCache::new(store, publisher);
         assert_eq!(cache.current_version(), 0);
 
@@ -1605,13 +1653,14 @@ mod tests {
     #[tokio::test]
     async fn cache_reports_viewport_version_per_materialized_mode() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -1621,8 +1670,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -1649,7 +1699,7 @@ mod tests {
     #[tokio::test]
     async fn cache_schedules_snapshot_without_blocking_ready_reader() {
         let publisher = ConsolePublisher::new();
-        let (store, _, _) = graph_store(publisher.clone());
+        let (store, _, _) = graph_store(publisher.clone()).await;
         let cache = ConsoleGraphCache::new(store, publisher.clone());
         publisher.mark_changed();
         let source_version = publisher.current_version();
@@ -1671,13 +1721,14 @@ mod tests {
     #[tokio::test]
     async fn cache_reopens_persistent_store_path_for_latest_graph_state() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -1687,8 +1738,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -1696,8 +1748,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let snapshot = cache.current_snapshot(GraphMode::All).await;
@@ -1708,15 +1764,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_graph_source_uses_independent_read_transactions() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).await.unwrap();
+        let root = writer.root_id();
+        let session = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
+            })
+            .await
+            .unwrap();
+        writer.fork("main", &session).await.unwrap();
+        let text = writer
+            .append(NewNode {
+                parent: session.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("concurrent reader".to_owned()),
+            })
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
+
+        let source = ConsoleGraphSource::<ConsoleStore<SqliteStore>>::PersistentStore(path.clone());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let held_read = tokio::spawn(
+            source
+                .clone()
+                .hold_persistent_read_transaction_until(started_tx, release_rx),
+        );
+        started_rx
+            .await
+            .expect("held read transaction should start");
+
+        let concurrent_snapshot = source
+            .build_snapshot_with_progress(GraphMode::All, 1, |_| {})
+            .await;
+        release_tx
+            .send(())
+            .expect("held read transaction should be releasable");
+        held_read
+            .await
+            .expect("held read task should finish")
+            .expect("held read transaction should succeed");
+        let concurrent_snapshot =
+            concurrent_snapshot.expect("concurrent graph snapshot should build");
+
+        assert!(concurrent_snapshot.nodes.iter().any(|node| node.id == text));
+
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_persists_graph_locations_to_sqlite_graph_database() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -1726,8 +1843,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -1735,8 +1853,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -1751,6 +1873,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -1768,31 +1891,35 @@ mod tests {
         let materialized = materialized.expect("materialized viewport should be stored");
         let database_path = crate::host::snapshot_store::database_path(&path);
         assert_eq!(
-            sqlite_table_row_count(&database_path, "console_graph_materializations"),
+            sqlite_table_row_count(&database_path, "console_graph_materializations").await,
             1
         );
-        assert!(sqlite_table_row_count(&database_path, "console_graph_node_locations") > 0);
-        assert!(sqlite_table_row_count(&database_path, "console_graph_edge_routes") > 0);
-        assert!(!sqlite_table_has_column(
-            &database_path,
-            "console_graph_node_locations",
-            "source_version",
-        ));
-        assert!(!sqlite_table_has_column(
-            &database_path,
-            "console_graph_edge_routes",
-            "source_version",
-        ));
-        assert!(!sqlite_table_exists(
-            &database_path,
-            "console_graph_snapshots"
-        ));
+        assert!(sqlite_table_row_count(&database_path, "console_graph_node_locations").await > 0);
+        assert!(sqlite_table_row_count(&database_path, "console_graph_edge_routes").await > 0);
+        assert!(
+            !sqlite_table_has_column(
+                &database_path,
+                "console_graph_node_locations",
+                "source_version",
+            )
+            .await
+        );
+        assert!(
+            !sqlite_table_has_column(
+                &database_path,
+                "console_graph_edge_routes",
+                "source_version",
+            )
+            .await
+        );
+        assert!(!sqlite_table_exists(&database_path, "console_graph_snapshots").await);
         let reopened_publisher = ConsolePublisher::new();
         let reopened_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             reopened_publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let reopened = reopened_cache.snapshot_current_ready(GraphMode::All);
         assert_eq!(reopened_cache.current_version(), target_version);
@@ -1833,13 +1960,17 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn graph_materialization_preflight_read_does_not_block_store_writes() {
+    #[tokio::test]
+    async fn graph_materialization_preflight_read_does_not_block_store_writes() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
-        ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
+        ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let graph_database =
+            coco_mem::SqliteDatabase::open_unshared_file_path(&graph_database_path)
+                .await
+                .unwrap();
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
@@ -1847,7 +1978,7 @@ mod tests {
             use diesel::Connection;
             use diesel::prelude::*;
 
-            with_sqlite_test_connection(&graph_database_path, move |connection| {
+            with_sqlite_test_connection(graph_database, move |connection| {
                 connection
                     .transaction::<(), diesel::result::Error, _>(|connection| {
                         assert_eq!(
@@ -1869,8 +2000,8 @@ mod tests {
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();
-        let (write_tx, write_rx) = mpsc::channel();
-        let write = std::thread::spawn(move || {
+        let (write_tx, write_rx) = oneshot::channel();
+        let write = tokio::spawn(async move {
             let node = writer_for_thread
                 .append(NewNode {
                     parent: root,
@@ -1878,32 +2009,39 @@ mod tests {
                     metadata: None,
                     kind: Kind::Text("store write while graph db is locked".to_owned()),
                 })
+                .await
                 .unwrap();
             write_tx.send(node).unwrap();
         });
 
-        let written = write_rx.recv_timeout(Duration::from_secs(1));
+        let written = tokio::time::timeout(Duration::from_secs(1), write_rx).await;
         release_transaction_tx.send(()).unwrap();
         transaction.join().unwrap();
-        write.join().unwrap();
-        let written = written.expect("store write should not wait for graph transaction release");
-        assert_eq!(writer.get_node(&written).unwrap().id, written);
+        write.await.unwrap();
+        let written = written
+            .expect("store write should not wait for graph transaction release")
+            .unwrap();
+        assert_eq!(writer.get_node(&written).await.unwrap().id, written);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn graph_materialization_write_does_not_block_store_writes() {
+    #[tokio::test]
+    async fn graph_materialization_write_does_not_block_store_writes() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
-        ConsoleGraphSnapshotStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
+        ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let graph_database_path = crate::host::snapshot_store::database_path(&path);
+        let graph_database =
+            coco_mem::SqliteDatabase::open_unshared_file_path(&graph_database_path)
+                .await
+                .unwrap();
         let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
         let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
         let transaction = std::thread::spawn(move || {
-            with_sqlite_test_connection(&graph_database_path, move |connection| {
+            with_sqlite_test_connection(graph_database, move |connection| {
                 connection
                     .immediate_transaction::<(), diesel::result::Error, _>(|_| {
                         transaction_started_tx.send(()).unwrap();
@@ -1919,8 +2057,8 @@ mod tests {
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();
-        let (write_tx, write_rx) = mpsc::channel();
-        let write = std::thread::spawn(move || {
+        let (write_tx, write_rx) = oneshot::channel();
+        let write = tokio::spawn(async move {
             let node = writer_for_thread
                 .append(NewNode {
                     parent: root,
@@ -1928,17 +2066,19 @@ mod tests {
                     metadata: None,
                     kind: Kind::Text("store write while graph db is locked".to_owned()),
                 })
+                .await
                 .unwrap();
             write_tx.send(node).unwrap();
         });
 
-        let written = write_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("store write should not wait for graph transaction release");
+        let written = tokio::time::timeout(Duration::from_secs(1), write_rx)
+            .await
+            .expect("store write should not wait for graph transaction release")
+            .unwrap();
         release_transaction_tx.send(()).unwrap();
         transaction.join().unwrap();
-        write.join().unwrap();
-        assert_eq!(writer.get_node(&written).unwrap().id, written);
+        write.await.unwrap();
+        assert_eq!(writer.get_node(&written).await.unwrap().id, written);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -1947,13 +2087,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_initial_materialization_with_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -1963,8 +2104,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -1976,8 +2118,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -1991,6 +2137,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2005,6 +2152,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2020,6 +2168,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -2075,13 +2224,14 @@ mod tests {
     #[tokio::test]
     async fn cache_falls_back_when_unchanged_head_gains_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2091,8 +2241,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2104,8 +2255,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial_version = publisher.current_version();
         let initial = cache
@@ -2131,6 +2286,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2145,6 +2301,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2203,13 +2360,14 @@ mod tests {
     #[tokio::test]
     async fn cache_falls_back_when_appended_tool_use_has_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2219,8 +2377,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -2241,8 +2400,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2256,6 +2419,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2270,6 +2434,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2328,13 +2493,14 @@ mod tests {
     #[tokio::test]
     async fn cache_adopts_skill_lane_when_branch_forks_at_skill_result() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2344,8 +2510,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2357,8 +2524,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2372,6 +2543,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2386,6 +2558,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -2399,7 +2572,7 @@ mod tests {
         let skill_lane = format!("skill {}", crate::graph::shorten_id(&result));
         assert!(initial.lanes.iter().any(|lane| lane.label == skill_lane));
 
-        writer.fork("draft", &result).unwrap();
+        writer.fork("draft", &result).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -2456,13 +2629,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_missing_skill_result_to_derived_lane_when_branch_has_invocation() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2472,8 +2646,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2485,8 +2660,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2500,8 +2679,9 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.fork("draft", &invocation).unwrap();
+        writer.fork("draft", &invocation).await.unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -2525,6 +2705,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2581,13 +2762,14 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_skill_lane_when_tool_use_source_is_rewound() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2597,8 +2779,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2610,8 +2793,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2625,6 +2812,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -2639,6 +2827,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -2652,7 +2841,10 @@ mod tests {
         let skill_lane = format!("skill {}", crate::graph::shorten_id(&result));
         assert!(initial.lanes.iter().any(|lane| lane.label == skill_lane));
 
-        writer.set_branch_head("main", &tool_use, &session).unwrap();
+        writer
+            .set_branch_head("main", &tool_use, &session)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -2681,13 +2873,14 @@ mod tests {
     #[tokio::test]
     async fn cache_materializes_sibling_skill_invocation_subtrees() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2697,8 +2890,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2710,8 +2904,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let first_invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2725,6 +2923,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let first_result = writer
             .append(NewNode {
@@ -2739,6 +2938,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let second_invocation = writer
             .append(NewNode {
@@ -2753,6 +2953,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let second_result = writer
             .append(NewNode {
@@ -2767,6 +2968,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2841,13 +3043,14 @@ mod tests {
     #[tokio::test]
     async fn cache_materializes_branched_skill_invocation_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2857,8 +3060,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -2870,8 +3074,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -2885,6 +3093,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let first_result = writer
             .append(NewNode {
@@ -2899,6 +3108,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let second_result = writer
             .append(NewNode {
@@ -2913,6 +3123,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -2971,13 +3182,14 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_branch_suffix_when_rewound_tool_use_keeps_skill_subtree() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -2987,8 +3199,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3000,6 +3213,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         let child = writer
             .append(NewNode {
@@ -3014,8 +3228,12 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &child).unwrap();
+        writer
+            .set_branch_head("main", &session, &child)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -3029,6 +3247,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -3043,6 +3262,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3057,7 +3277,10 @@ mod tests {
         assert!(initial.nodes.iter().any(|node| node.id == invocation));
         assert!(initial.nodes.iter().any(|node| node.id == result));
 
-        writer.set_branch_head("main", &child, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &child, &tool_use)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -3091,13 +3314,14 @@ mod tests {
     #[tokio::test]
     async fn cache_refreshes_tail_tool_use_skill_subtree_before_branch_append() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3107,8 +3331,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3120,8 +3345,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -3144,6 +3373,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let next = writer
             .append(NewNode {
@@ -3152,8 +3382,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("branch continued after tool use".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &tool_use, &next).unwrap();
+        writer
+            .set_branch_head("main", &tool_use, &next)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3199,13 +3433,14 @@ mod tests {
     #[tokio::test]
     async fn cache_compacts_lanes_after_pruning_derived_skill_lane() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3215,8 +3450,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3228,9 +3464,11 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_tool_use)
+            .await
             .unwrap();
         let main_invocation = writer
             .append(NewNode {
@@ -3245,6 +3483,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let main_result = writer
             .append(NewNode {
@@ -3259,6 +3498,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let draft_tool_use = writer
             .append(NewNode {
@@ -3271,8 +3511,9 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.fork("draft", &draft_tool_use).unwrap();
+        writer.fork("draft", &draft_tool_use).await.unwrap();
         let draft_invocation = writer
             .append(NewNode {
                 parent: draft_tool_use.clone(),
@@ -3286,6 +3527,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let draft_result = writer
             .append(NewNode {
@@ -3300,6 +3542,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3328,6 +3571,7 @@ mod tests {
 
         writer
             .set_branch_head("main", &main_tool_use, &session)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -3367,13 +3611,14 @@ mod tests {
     #[tokio::test]
     async fn cache_trims_skill_prefix_when_branch_adopts_result_middle() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3383,8 +3628,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let tool_use = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3396,8 +3642,12 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &tool_use).unwrap();
+        writer
+            .set_branch_head("main", &session, &tool_use)
+            .await
+            .unwrap();
         let invocation = writer
             .append(NewNode {
                 parent: tool_use.clone(),
@@ -3411,6 +3661,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result_first = writer
             .append(NewNode {
@@ -3425,6 +3676,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result_second = writer
             .append(NewNode {
@@ -3439,6 +3691,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3452,7 +3705,7 @@ mod tests {
         let skill_lane = format!("skill {}", crate::graph::shorten_id(&result_second));
         assert!(initial.lanes.iter().any(|lane| lane.label == skill_lane));
 
-        writer.fork("draft", &result_first).unwrap();
+        writer.fork("draft", &result_first).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3528,13 +3781,14 @@ mod tests {
     #[tokio::test]
     async fn cache_reserves_new_branch_lane_when_seeding_merge_orphan() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3544,8 +3798,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -3568,8 +3823,9 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_merge = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3583,9 +3839,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_merge)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -3620,13 +3878,14 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_anchor_orphan_merge_parent_after_rewind_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3636,8 +3895,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let orphan_parent = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3651,6 +3911,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -3665,9 +3926,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache
@@ -3680,6 +3943,7 @@ mod tests {
             .unwrap();
         writer
             .set_branch_head("main", &merge_anchor, &session)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -3713,13 +3977,14 @@ mod tests {
     #[tokio::test]
     async fn cache_refreshes_graph_locations_incrementally() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3729,8 +3994,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3738,13 +4004,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("visible child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let next = writer
             .append(NewNode {
                 parent: text.clone(),
@@ -3752,14 +4022,16 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("next visible child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &text, &next).unwrap();
+        writer.set_branch_head("main", &text, &next).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -3783,10 +4055,10 @@ mod tests {
         assert_eq!(materialized.version, target_version);
         assert!(materialized.nodes.iter().any(|node| node.id == next));
 
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -3795,13 +4067,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_linear_graph_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3811,8 +4084,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3820,13 +4094,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -3834,8 +4112,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &first, &second).unwrap();
+        writer
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3855,10 +4137,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
         assert!(cache.rebuild_statuses().iter().any(|status| {
             status.mode == GraphMode::All
                 && status.source_version == target_version
@@ -3872,13 +4154,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_single_branch_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3888,8 +4171,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3897,8 +4181,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial materialized seed".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -3913,6 +4201,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -3945,13 +4234,14 @@ mod tests {
     #[tokio::test]
     async fn cache_replaces_materialization_from_full_snapshot_layout() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -3961,8 +4251,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -3970,6 +4261,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("full materialization fallback".to_owned()),
             })
+            .await
             .unwrap();
         let orphan = writer
             .append(NewNode {
@@ -3978,9 +4270,10 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("full materialization orphan".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan));
-        writer.fork(&orphan_lane, &root).unwrap();
+        writer.fork(&orphan_lane, &root).await.unwrap();
         let merge_anchor = writer
             .append(NewNode {
                 parent: text.clone(),
@@ -3994,11 +4287,13 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
+            .await
             .unwrap();
-        writer.fork("orphan branch", &session).unwrap();
+        writer.fork("orphan branch", &session).await.unwrap();
         let reserved_label_branch_head = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4006,9 +4301,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("reserved label branch".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("orphan branch", &session, &reserved_label_branch_head)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4017,10 +4314,12 @@ mod tests {
         let branch_labels = visible_full_layout_branch_labels(&snapshot);
         let viewport = materialize_graph_viewport(&snapshot);
         ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .replace_materialization_from_viewport(GraphMode::All, viewport, branch_labels)
             .unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -4060,13 +4359,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_multiple_branch_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4076,8 +4376,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4085,9 +4386,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial shared node".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
-        writer.fork("feature", &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
+        writer.fork("feature", &shared).await.unwrap();
         let main_head = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4095,8 +4400,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial main head".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &shared, &main_head).unwrap();
+        writer
+            .set_branch_head("main", &shared, &main_head)
+            .await
+            .unwrap();
         let feature_head = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4104,9 +4413,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("initial feature head".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("feature", &shared, &feature_head)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4122,6 +4433,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -4166,13 +4478,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_initial_materialization_rebalances_derived_route_slots() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4182,8 +4495,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4191,8 +4505,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
         let orphan_parent = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4200,6 +4518,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan parent".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -4214,11 +4533,13 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &shared, &merge_anchor)
+            .await
             .unwrap();
-        writer.fork("beta", &shared).unwrap();
+        writer.fork("beta", &shared).await.unwrap();
         let beta_first = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -4226,9 +4547,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("beta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("beta", &shared, &beta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4244,6 +4567,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -4294,13 +4618,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4310,8 +4635,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let hidden = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4319,6 +4645,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden anchor seed context".to_owned()),
             })
+            .await
             .unwrap();
         let prompt = writer
             .append(NewNode {
@@ -4333,8 +4660,12 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4349,6 +4680,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::Anchors,
@@ -4382,13 +4714,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_anchor_alias_labels_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4398,9 +4731,10 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
+        writer.fork("draft", &session).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4435,13 +4769,14 @@ mod tests {
     #[tokio::test]
     async fn cache_preserves_branches_named_like_derived_lanes() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4451,9 +4786,10 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("skill research", &session).unwrap();
-        writer.fork("orphan fix", &session).unwrap();
+        writer.fork("skill research", &session).await.unwrap();
+        writer.fork("orphan fix", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache
@@ -4479,9 +4815,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("next".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("skill research", &session, &next)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4520,13 +4858,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_branch_named_like_exact_orphan_lane_label() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4536,8 +4875,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4545,9 +4885,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -4559,6 +4901,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -4573,9 +4916,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merged = cache
@@ -4589,7 +4934,7 @@ mod tests {
         let orphan_lane = format!("orphan {}", crate::graph::shorten_id(&orphan_tail));
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork(&orphan_lane, &session).unwrap();
+        writer.fork(&orphan_lane, &session).await.unwrap();
         publisher.mark_changed();
         let branch_created_version = publisher.current_version();
         let branch_created = cache
@@ -4609,9 +4954,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("branch next".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head(&orphan_lane, &session, &branch_next)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -4645,16 +4992,17 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_empty_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4669,6 +5017,7 @@ mod tests {
         let mut materialized = None;
         for _ in 0..50 {
             materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -4691,6 +5040,7 @@ mod tests {
         assert!(materialized.lanes.is_empty());
         assert!(
             !ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .has_non_empty_materialization(GraphMode::All)
                 .unwrap()
@@ -4707,6 +5057,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let text = writer
             .append(NewNode {
@@ -4715,8 +5066,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first non-empty node".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &root, &text).unwrap();
+        writer.set_branch_head("main", &root, &text).await.unwrap();
         publisher.mark_changed();
         let non_empty_version = publisher.current_version();
         let non_empty = cache
@@ -4734,12 +5086,13 @@ mod tests {
         assert!(non_empty.lanes.iter().any(|lane| lane.label == "main"));
         assert!(
             ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .has_non_empty_materialization(GraphMode::All)
                 .unwrap()
         );
 
-        writer.delete_branch("main").unwrap();
+        writer.delete_branch("main").await.unwrap();
         publisher.mark_changed();
         let empty_again_version = publisher.current_version();
         let empty_again = cache
@@ -4764,16 +5117,17 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_root_only_leading_branch_when_seeding_materialization() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
+        writer.fork("main", &root).await.unwrap();
         let session = writer
             .append(NewNode {
                 parent: root,
@@ -4781,6 +5135,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let text = writer
             .append(NewNode {
@@ -4789,8 +5144,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft history".to_owned()),
             })
+            .await
             .unwrap();
-        writer.fork("draft", &text).unwrap();
+        writer.fork("draft", &text).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4822,13 +5178,14 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_root_only_trailing_branch_when_seeding_materialization() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4838,8 +5195,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4847,9 +5205,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main history".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
-        writer.fork("empty", &root).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
+        writer.fork("empty", &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -4881,13 +5243,14 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_root_only_new_branch_when_appending_materialization() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4897,8 +5260,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4906,8 +5270,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main history".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -4918,7 +5286,7 @@ mod tests {
             .await
             .unwrap();
 
-        writer.fork("empty", &root).unwrap();
+        writer.fork("empty", &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -4949,13 +5317,14 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_branch_lane_rewound_to_root_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -4965,8 +5334,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let text = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -4974,8 +5344,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main history".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let initial = cache
             .viewport_after(
@@ -4986,7 +5360,7 @@ mod tests {
             .await
             .unwrap();
 
-        writer.set_branch_head("main", &text, &root).unwrap();
+        writer.set_branch_head("main", &text, &root).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
         let viewport = cache
@@ -5016,13 +5390,14 @@ mod tests {
     #[tokio::test]
     async fn pending_viewport_after_refreshes_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5032,8 +5407,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5058,8 +5434,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("pending viewport update".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -5080,13 +5460,14 @@ mod tests {
     #[tokio::test]
     async fn pending_viewport_diff_after_refreshes_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5096,8 +5477,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5126,8 +5508,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("pending viewport diff update".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -5148,13 +5534,14 @@ mod tests {
     #[tokio::test]
     async fn cache_does_not_full_rebuild_when_incremental_materialization_cannot_apply() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5164,8 +5551,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5173,8 +5561,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first materialized head".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5185,8 +5577,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("sibling head cannot append incrementally".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &first, &sibling).unwrap();
+        writer
+            .set_branch_head("main", &first, &sibling)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -5207,6 +5603,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -5301,13 +5698,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_linear_graph_merge_route_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5317,8 +5715,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5332,6 +5731,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let main_hidden = writer
             .append(NewNode {
@@ -5340,11 +5740,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_hidden)
+            .await
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_hidden = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5352,15 +5754,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_hidden)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_hidden.clone(),
@@ -5374,9 +5778,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_hidden, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5412,10 +5818,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -5424,13 +5830,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_merge_after_farther_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5440,8 +5847,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5449,11 +5857,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5461,9 +5871,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_first)
+            .await
             .unwrap();
         let draft_second = writer
             .append(NewNode {
@@ -5472,15 +5884,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -5494,9 +5908,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5511,6 +5927,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_merge = viewport
@@ -5536,10 +5953,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -5548,13 +5965,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_orphan_merge_parent_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5564,8 +5982,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5573,15 +5992,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let orphan_parent = writer
             .append(NewNode {
                 parent: root,
@@ -5589,6 +6010,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan feedback".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -5603,9 +6025,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5633,10 +6057,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -5645,13 +6069,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_orphan_tool_use_skill_subtree_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5661,8 +6086,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5670,9 +6096,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5688,6 +6116,7 @@ mod tests {
                     input: json!({}),
                 }),
             })
+            .await
             .unwrap();
         let invocation = writer
             .append(NewNode {
@@ -5702,6 +6131,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let result = writer
             .append(NewNode {
@@ -5716,6 +6146,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -5730,9 +6161,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -5795,13 +6228,14 @@ mod tests {
     #[tokio::test]
     async fn cache_drops_orphan_lane_when_branch_adopts_merge_parent() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5811,8 +6245,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5820,9 +6255,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -5834,6 +6271,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan feedback".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -5848,9 +6286,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -5867,7 +6307,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_parent).unwrap();
+        writer.fork("draft", &orphan_parent).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -5912,13 +6352,14 @@ mod tests {
     #[tokio::test]
     async fn cache_preserves_orphan_ancestry_when_branch_adopts_chain_tail() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -5928,8 +6369,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -5937,8 +6379,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
@@ -5949,6 +6395,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_tail = writer
             .append(NewNode {
@@ -5957,6 +6404,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -5971,9 +6419,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &shared, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -5990,7 +6440,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_tail).unwrap();
+        writer.fork("draft", &orphan_tail).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -6055,13 +6505,14 @@ mod tests {
     #[tokio::test]
     async fn cache_trims_orphan_prefix_when_branch_adopts_chain_middle() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6071,8 +6522,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6080,9 +6532,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6094,6 +6548,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_middle = writer
             .append(NewNode {
@@ -6102,6 +6557,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan middle".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_tail = writer
             .append(NewNode {
@@ -6110,6 +6566,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6124,9 +6581,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6143,7 +6602,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_middle).unwrap();
+        writer.fork("draft", &orphan_middle).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -6225,13 +6684,14 @@ mod tests {
     #[tokio::test]
     async fn cache_adopts_root_started_orphan_chain_tail_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6241,8 +6701,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6250,9 +6711,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6264,6 +6727,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_tail = writer
             .append(NewNode {
@@ -6272,6 +6736,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan tail".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6286,9 +6751,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6305,7 +6772,7 @@ mod tests {
         assert_eq!(merged.version, merge_version);
         assert!(merged.lanes.iter().any(|lane| lane.label == orphan_lane));
 
-        writer.fork("draft", &orphan_tail).unwrap();
+        writer.fork("draft", &orphan_tail).await.unwrap();
         publisher.mark_changed();
         let adopt_version = publisher.current_version();
         let adopted = cache
@@ -6357,13 +6824,14 @@ mod tests {
     #[tokio::test]
     async fn cache_prunes_orphan_merge_parent_after_rewind_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6373,8 +6841,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6382,9 +6851,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6396,6 +6867,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan feedback".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6410,9 +6882,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let merge_version = publisher.current_version();
@@ -6433,6 +6907,7 @@ mod tests {
 
         writer
             .set_branch_head("main", &merge_anchor, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let rewind_version = publisher.current_version();
@@ -6468,13 +6943,14 @@ mod tests {
     #[tokio::test]
     async fn cache_seeds_initial_merge_after_orphan_parent_column_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6484,8 +6960,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6493,6 +6970,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_first = writer
             .append(NewNode {
@@ -6501,6 +6979,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan first".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_second = writer
             .append(NewNode {
@@ -6509,6 +6988,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan second".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_third = writer
             .append(NewNode {
@@ -6517,6 +6997,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan third".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_parent = writer
             .append(NewNode {
@@ -6525,6 +7006,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan parent".to_owned()),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6539,9 +7021,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -6556,6 +7040,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_merge = viewport
@@ -6603,13 +7088,14 @@ mod tests {
     #[tokio::test]
     async fn cache_applies_merge_constraints_to_orphan_lane_nodes() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6619,8 +7105,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6628,6 +7115,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -6636,9 +7124,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
@@ -6650,6 +7140,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan base".to_owned()),
             })
+            .await
             .unwrap();
         let orphan_parent = writer
             .append(NewNode {
@@ -6664,6 +7155,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let merge_anchor = writer
             .append(NewNode {
@@ -6678,9 +7170,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_second, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -6695,6 +7189,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_orphan = viewport
@@ -6728,13 +7223,14 @@ mod tests {
     #[tokio::test]
     async fn cache_updates_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6744,8 +7240,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6753,13 +7250,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -6767,8 +7268,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &first, &second).unwrap();
+        writer
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -6795,10 +7300,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6807,13 +7312,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6823,13 +7329,14 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6843,8 +7350,12 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("main", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -6880,10 +7391,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6892,13 +7403,14 @@ mod tests {
     #[tokio::test]
     async fn cache_rewinds_anchor_materialization_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -6908,8 +7420,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first_prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -6923,9 +7436,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &first_prompt)
+            .await
             .unwrap();
         let second_prompt = writer
             .append(NewNode {
@@ -6940,17 +7455,20 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &first_prompt, &second_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer
             .set_branch_head("main", &second_prompt, &first_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -6977,10 +7495,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -6989,13 +7507,14 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_anchor_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7005,8 +7524,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7020,11 +7540,13 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7038,16 +7560,18 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("draft").unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -7073,10 +7597,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7085,13 +7609,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_anchor_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7101,8 +7626,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7116,9 +7642,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
         let main_followup = writer
             .append(NewNode {
@@ -7133,16 +7661,18 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_anchor, &main_followup)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("draft", &session).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7156,9 +7686,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7176,6 +7708,7 @@ mod tests {
             target_version,
             GraphMode::Anchors,
         )
+        .await
         .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_draft = viewport
@@ -7207,10 +7740,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7219,13 +7752,14 @@ mod tests {
     #[tokio::test]
     async fn cache_scopes_new_anchor_branch_lane_to_current_context_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let old_session = writer
@@ -7235,8 +7769,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &old_session).unwrap();
+        writer.fork("main", &old_session).await.unwrap();
         let old_prompt = writer
             .append(NewNode {
                 parent: old_session.clone(),
@@ -7250,9 +7785,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_session, &old_prompt)
+            .await
             .unwrap();
         let current_session = writer
             .append(NewNode {
@@ -7261,9 +7798,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_prompt, &current_session)
+            .await
             .unwrap();
         let main_anchor = writer
             .append(NewNode {
@@ -7278,16 +7817,18 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &main_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("draft", &current_session).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("draft", &current_session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: current_session.clone(),
@@ -7301,9 +7842,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &current_session, &draft_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7332,8 +7875,8 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
 
         drop(cache);
         drop(writer);
@@ -7343,13 +7886,14 @@ mod tests {
     #[tokio::test]
     async fn cache_scopes_existing_anchor_branch_append_to_current_context_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let old_session = writer
@@ -7359,8 +7903,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &old_session).unwrap();
+        writer.fork("main", &old_session).await.unwrap();
         let old_prompt = writer
             .append(NewNode {
                 parent: old_session.clone(),
@@ -7374,15 +7919,17 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_session, &old_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let current_session = writer
             .append(NewNode {
                 parent: old_prompt.clone(),
@@ -7390,9 +7937,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &old_prompt, &current_session)
+            .await
             .unwrap();
         let current_prompt = writer
             .append(NewNode {
@@ -7407,9 +7956,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &current_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7438,8 +7989,8 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
 
         drop(cache);
         drop(writer);
@@ -7449,13 +8000,14 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_hidden_new_anchor_branch_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7465,8 +8017,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7480,14 +8033,16 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        writer.fork("hidden", &root).unwrap();
+        writer.fork("hidden", &root).await.unwrap();
         let hidden_text = writer
             .append(NewNode {
                 parent: root.clone(),
@@ -7495,9 +8050,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("hidden branch text".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("hidden", &root, &hidden_text)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7536,13 +8093,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_anchor_branch_alias_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7552,8 +8110,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7567,16 +8126,18 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("draft", &main_anchor).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("draft", &main_anchor).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -7607,10 +8168,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7619,13 +8180,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_anchor_merge_route_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7635,8 +8197,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7650,6 +8213,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let main_hidden = writer
             .append(NewNode {
@@ -7658,11 +8222,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_hidden)
+            .await
             .unwrap();
-        writer.fork("draft", &session).unwrap();
+        writer.fork("draft", &session).await.unwrap();
         let draft_anchor = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7676,6 +8242,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let draft_hidden = writer
             .append(NewNode {
@@ -7684,9 +8251,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft hidden".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &session, &draft_hidden)
+            .await
             .unwrap();
         let draft_second = writer
             .append(NewNode {
@@ -7701,15 +8270,17 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_hidden, &draft_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let merge_anchor = writer
             .append(NewNode {
                 parent: main_hidden.clone(),
@@ -7723,9 +8294,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_hidden, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7743,6 +8316,7 @@ mod tests {
             target_version,
             GraphMode::Anchors,
         )
+        .await
         .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_merge = viewport
@@ -7780,10 +8354,10 @@ mod tests {
                 .cached_snapshot(GraphMode::Anchors, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7792,13 +8366,14 @@ mod tests {
     #[tokio::test]
     async fn cache_skips_anchor_merge_parent_outside_current_context_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let old_session = writer
@@ -7808,6 +8383,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
         let old_prompt = writer
             .append(NewNode {
@@ -7822,6 +8398,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let current_session = writer
             .append(NewNode {
@@ -7830,8 +8407,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &current_session).unwrap();
+        writer.fork("main", &current_session).await.unwrap();
         let current_prompt = writer
             .append(NewNode {
                 parent: current_session.clone(),
@@ -7845,9 +8423,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_session, &current_prompt)
+            .await
             .unwrap();
         publisher.mark_changed();
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
@@ -7864,9 +8444,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &current_prompt, &merge_anchor)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -7907,13 +8489,14 @@ mod tests {
     #[tokio::test]
     async fn cache_rewinds_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7923,8 +8506,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -7932,8 +8516,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("first child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &first).unwrap();
+        writer
+            .set_branch_head("main", &session, &first)
+            .await
+            .unwrap();
         let second = writer
             .append(NewNode {
                 parent: first.clone(),
@@ -7941,14 +8529,21 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("second child".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &first, &second).unwrap();
+        writer
+            .set_branch_head("main", &first, &second)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.set_branch_head("main", &second, &first).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer
+            .set_branch_head("main", &second, &first)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -7970,10 +8565,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -7982,13 +8577,14 @@ mod tests {
     #[tokio::test]
     async fn cache_rejects_branch_rewind_that_orphans_dependent_lane() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -7998,8 +8594,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8007,9 +8604,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -8018,11 +8617,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
-        writer.fork("draft", &main_second).unwrap();
+        writer.fork("draft", &main_second).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_second.clone(),
@@ -8030,17 +8631,20 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_second, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         writer
             .set_branch_head("main", &main_second, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8062,6 +8666,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -8079,10 +8684,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
         let viewport_error = tokio::time::timeout(
             Duration::from_millis(200),
             cache.viewport_after(
@@ -8111,13 +8716,14 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_branch_with_orphan_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8127,8 +8733,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8136,11 +8743,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8148,9 +8757,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         let orphan_parent = writer
             .append(NewNode {
@@ -8159,6 +8770,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("orphan parent".to_owned()),
             })
+            .await
             .unwrap();
         let draft_merge = writer
             .append(NewNode {
@@ -8173,16 +8785,18 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_merge)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("draft").unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8206,8 +8820,8 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert!(audit.row_count(&database_path, "node_delete") >= 3);
-        assert!(audit.row_count(&database_path, "edge_delete") >= 3);
+        assert!(audit.row_count(&database_path, "node_delete").await >= 3);
+        assert!(audit.row_count(&database_path, "edge_delete").await >= 3);
 
         drop(cache);
         drop(writer);
@@ -8217,13 +8831,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_multiple_linear_graph_materializations_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8233,8 +8848,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8242,11 +8858,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8254,15 +8872,17 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let main_second = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8270,9 +8890,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         let draft_second = writer
             .append(NewNode {
@@ -8281,9 +8903,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &draft_first, &draft_second)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8305,10 +8929,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8317,13 +8941,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8333,8 +8958,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8342,9 +8968,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -8353,16 +8981,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("draft", &main_first).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8370,9 +9000,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8387,6 +9019,7 @@ mod tests {
             .unwrap();
         let full_snapshot =
             crate::graph::build_graph_snapshot_with_mode(&writer, target_version, GraphMode::All)
+                .await
                 .unwrap();
         let full_viewport = crate::layout::materialize_graph_viewport(&full_snapshot);
         let incremental_draft = viewport
@@ -8408,10 +9041,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8420,13 +9053,14 @@ mod tests {
     #[tokio::test]
     async fn cache_inserts_sorted_new_branch_from_earlier_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8436,8 +9070,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("zeta", &session).unwrap();
+        writer.fork("zeta", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8445,12 +9080,16 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("zeta", &session, &shared).unwrap();
+        writer
+            .set_branch_head("zeta", &session, &shared)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
-        writer.fork("alpha", &shared).unwrap();
+        writer.fork("alpha", &shared).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8531,13 +9170,14 @@ mod tests {
     #[tokio::test]
     async fn cache_trims_lower_anchor_lane_after_earlier_branch_insert() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8547,8 +9187,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("zeta", &session).unwrap();
+        writer.fork("zeta", &session).await.unwrap();
         let prompt = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8562,12 +9203,16 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("zeta", &session, &prompt).unwrap();
+        writer
+            .set_branch_head("zeta", &session, &prompt)
+            .await
+            .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::Anchors).await;
-        writer.fork("alpha", &prompt).unwrap();
+        writer.fork("alpha", &prompt).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8626,13 +9271,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_branch_merge_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8642,8 +9288,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8651,9 +9298,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -8662,16 +9311,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("draft", &main_first).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_merge = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -8685,9 +9336,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_merge)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -8725,10 +9378,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8737,13 +9390,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_new_branch_alias_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8753,8 +9407,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8762,16 +9417,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("draft", &main_first).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("draft", &main_first).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8810,10 +9467,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         publisher.mark_changed();
         let refresh_version = publisher.current_version();
@@ -8835,7 +9492,7 @@ mod tests {
 
         assert_eq!(refreshed.version, refresh_version);
         assert_eq!(refreshed_alias_nodes, 2);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8844,13 +9501,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_first_visible_branch_alias_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8860,14 +9518,15 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("draft", &session).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("draft", &session).await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8887,6 +9546,7 @@ mod tests {
             })
             .count();
         let reference = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .materialized_node_reference(GraphMode::All, &crate::graph::node_target_id(&session))
             .unwrap()
@@ -8903,10 +9563,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -8915,13 +9575,14 @@ mod tests {
     #[tokio::test]
     async fn cache_appends_from_duplicated_branch_tail_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -8931,8 +9592,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let shared = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -8940,14 +9602,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("shared tail".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &shared).unwrap();
-        writer.fork("draft", &shared).unwrap();
+        writer
+            .set_branch_head("main", &session, &shared)
+            .await
+            .unwrap();
+        writer.fork("draft", &shared).await.unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
         let main_next = writer
             .append(NewNode {
                 parent: shared.clone(),
@@ -8955,8 +9621,12 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main next".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &shared, &main_next).unwrap();
+        writer
+            .set_branch_head("main", &shared, &main_next)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -8992,10 +9662,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9004,13 +9674,14 @@ mod tests {
     #[tokio::test]
     async fn cache_inserts_middle_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9020,8 +9691,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9029,11 +9701,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
-        writer.fork("zeta", &main_first).unwrap();
+        writer.fork("zeta", &main_first).await.unwrap();
         let zeta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9041,16 +9715,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("zeta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("zeta", &main_first, &zeta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.fork("beta", &main_first).unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.fork("beta", &main_first).await.unwrap();
         let beta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9058,9 +9734,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("beta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("beta", &main_first, &beta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
@@ -9118,10 +9796,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9130,13 +9808,14 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_trailing_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9146,8 +9825,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9155,11 +9835,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
-        writer.fork("draft", &main_first).unwrap();
+        writer.fork("draft", &main_first).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9167,16 +9849,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_first, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("draft").unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.delete_branch("draft").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9196,10 +9880,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 1);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 1);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -9208,13 +9892,14 @@ mod tests {
     #[tokio::test]
     async fn cache_rejects_branch_delete_that_orphans_dependent_lane() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9224,8 +9909,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9233,9 +9919,11 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
         let main_second = writer
             .append(NewNode {
@@ -9244,11 +9932,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main second".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &main_first, &main_second)
+            .await
             .unwrap();
-        writer.fork("draft", &main_second).unwrap();
+        writer.fork("draft", &main_second).await.unwrap();
         let draft_first = writer
             .append(NewNode {
                 parent: main_second.clone(),
@@ -9256,16 +9946,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("draft first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("draft", &main_second, &draft_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("main").unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.delete_branch("main").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9286,6 +9978,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -9303,10 +9996,10 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 0);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 0);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
         let viewport_error = tokio::time::timeout(
             Duration::from_millis(200),
             cache.viewport_after(
@@ -9335,13 +10028,14 @@ mod tests {
     #[tokio::test]
     async fn cache_deletes_middle_branch_lane_without_full_snapshot() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9351,8 +10045,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         let main_first = writer
             .append(NewNode {
                 parent: session.clone(),
@@ -9360,11 +10055,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("main first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("main", &session, &main_first)
+            .await
             .unwrap();
-        writer.fork("beta", &main_first).unwrap();
+        writer.fork("beta", &main_first).await.unwrap();
         let beta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9372,11 +10069,13 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("beta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("beta", &main_first, &beta_first)
+            .await
             .unwrap();
-        writer.fork("zeta", &main_first).unwrap();
+        writer.fork("zeta", &main_first).await.unwrap();
         let zeta_first = writer
             .append(NewNode {
                 parent: main_first.clone(),
@@ -9384,16 +10083,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("zeta first".to_owned()),
             })
+            .await
             .unwrap();
         writer
             .set_branch_head("zeta", &main_first, &zeta_first)
+            .await
             .unwrap();
         publisher.mark_changed();
 
         let initial = cache.current_snapshot(GraphMode::All).await;
         let database_path = crate::host::snapshot_store::database_path(&path);
-        let audit = GraphFactAuditSnapshot::capture(&database_path);
-        writer.delete_branch("beta").unwrap();
+        let audit = GraphFactAuditSnapshot::capture(&database_path).await;
+        writer.delete_branch("beta").await.unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
@@ -9432,23 +10133,23 @@ mod tests {
                 .cached_snapshot(GraphMode::All, target_version)
                 .is_none()
         );
-        assert_eq!(audit.row_count(&database_path, "node_delete"), 2);
-        assert_eq!(audit.row_count(&database_path, "edge_delete"), 2);
-        assert_eq!(audit.row_count(&database_path, "node_update"), 0);
-        assert_eq!(audit.row_count(&database_path, "edge_update"), 0);
+        assert_eq!(audit.row_count(&database_path, "node_delete").await, 2);
+        assert_eq!(audit.row_count(&database_path, "edge_delete").await, 2);
+        assert_eq!(audit.row_count(&database_path, "node_update").await, 0);
+        assert_eq!(audit.row_count(&database_path, "edge_update").await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn cache_uses_snapshot_materialization_database() {
+    #[tokio::test]
+    async fn cache_uses_snapshot_materialization_database() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let main_database_path = path.join("store.sqlite3");
         let graph_database_path = path.join("console-graph.sqlite3");
 
-        ConsoleGraphSnapshotStore::open(&path).unwrap();
+        ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         assert_eq!(
             crate::host::snapshot_store::database_path(&path),
@@ -9459,21 +10160,21 @@ mod tests {
             "console_graph_node_locations",
             "console_graph_edge_routes",
         ] {
-            assert!(sqlite_table_exists(&graph_database_path, table));
-            assert!(!sqlite_table_exists(&main_database_path, table));
+            assert!(sqlite_table_exists(&graph_database_path, table).await);
+            assert!(!sqlite_table_exists(&main_database_path, table).await);
         }
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }
 
-    #[test]
-    fn snapshot_write_transaction_allows_store_write_after_short_lock() {
+    #[tokio::test]
+    async fn snapshot_write_transaction_allows_store_write_after_short_lock() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let root = writer.root_id();
-        writer.fork("main", &root).unwrap();
-        let snapshot = ConsoleGraphSnapshotStore::open(&path).unwrap();
+        writer.fork("main", &root).await.unwrap();
+        let snapshot = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
         let base = root.clone();
 
         let (started_tx, started_rx) = mpsc::channel();
@@ -9493,7 +10194,7 @@ mod tests {
         });
         started_rx.recv().unwrap();
 
-        writer.submit_job("main", &base).unwrap();
+        writer.submit_job("main", &base).await.unwrap();
         transaction.join().unwrap();
 
         drop(writer);
@@ -9508,13 +10209,12 @@ mod tests {
         }
     }
 
-    fn with_sqlite_test_connection<T, F>(database_path: &std::path::Path, operation: F) -> T
+    fn with_sqlite_test_connection<T, F>(database: coco_mem::SqliteDatabase, operation: F) -> T
     where
         T: Send + 'static,
         F: FnOnce(&mut diesel::sqlite::SqliteConnection) -> T + Send + 'static,
     {
-        coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
-            .unwrap()
+        database
             .with_sync_connection(
                 |connection| Ok(operation(connection)),
                 |source| panic!("{source}"),
@@ -9565,11 +10265,14 @@ mod tests {
     }
 
     impl GraphFactAuditSnapshot {
-        fn capture(database_path: &std::path::Path) -> Self {
+        async fn capture(database_path: &std::path::Path) -> Self {
             use crate::schema::{console_graph_edge_routes, console_graph_node_locations};
             use diesel::prelude::*;
 
-            with_sqlite_test_connection(database_path, |connection| {
+            let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+                .await
+                .unwrap();
+            with_sqlite_test_connection(database, |connection| {
                 let nodes = console_graph_node_locations::table
                     .select((
                         console_graph_node_locations::mode,
@@ -9734,8 +10437,8 @@ mod tests {
             })
         }
 
-        fn row_count(&self, database_path: &std::path::Path, kind: &str) -> i64 {
-            let next = Self::capture(database_path);
+        async fn row_count(&self, database_path: &std::path::Path, kind: &str) -> i64 {
+            let next = Self::capture(database_path).await;
             match kind {
                 "node_delete" => deleted_count(&self.nodes, &next.nodes),
                 "edge_delete" => deleted_count(&self.edges, &next.edges),
@@ -9766,11 +10469,14 @@ mod tests {
             .count() as i64
     }
 
-    fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
+    async fn sqlite_table_exists(database_path: &std::path::Path, table: &str) -> bool {
         use diesel::prelude::*;
 
         let table = table.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| {
+        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+            .await
+            .unwrap();
+        with_sqlite_test_connection(database, move |connection| {
             sqlite_master::table
                 .filter(sqlite_master::object_type.eq("table"))
                 .filter(sqlite_master::name.eq(table))
@@ -9781,7 +10487,11 @@ mod tests {
         })
     }
 
-    fn sqlite_table_has_column(database_path: &std::path::Path, table: &str, column: &str) -> bool {
+    async fn sqlite_table_has_column(
+        database_path: &std::path::Path,
+        table: &str,
+        column: &str,
+    ) -> bool {
         use crate::schema::{
             console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
         };
@@ -9789,7 +10499,10 @@ mod tests {
 
         let table = table.to_owned();
         let column = column.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| {
+        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+            .await
+            .unwrap();
+        with_sqlite_test_connection(database, move |connection| {
             match (table.as_str(), column.as_str()) {
                 ("console_graph_materializations", "source_version") => {
                     console_graph_materializations::table
@@ -9815,14 +10528,17 @@ mod tests {
         })
     }
 
-    fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
+    async fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
         use crate::schema::{
             console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
         };
         use diesel::prelude::*;
 
         let table = table.to_owned();
-        with_sqlite_test_connection(database_path, move |connection| match table.as_str() {
+        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
+            .await
+            .unwrap();
+        with_sqlite_test_connection(database, move |connection| match table.as_str() {
             "console_graph_materializations" => console_graph_materializations::table
                 .count()
                 .get_result(connection)
@@ -9842,13 +10558,14 @@ mod tests {
     #[tokio::test]
     async fn cache_current_snapshot_does_not_rewrite_materialized_facts() {
         let path = temp_store_path();
-        let writer = PersistentStore::open(&path).unwrap();
+        let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store(),
+            test_store().await,
             publisher.clone(),
             path.clone(),
         )
+        .await
         .unwrap();
         let root = writer.root_id();
         let session = writer
@@ -9858,8 +10575,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
             })
+            .await
             .unwrap();
-        writer.fork("main", &session).unwrap();
+        writer.fork("main", &session).await.unwrap();
         publisher.mark_changed();
         let first_version = publisher.current_version();
         assert!(
@@ -9873,6 +10591,7 @@ mod tests {
         let mut first_materialized = None;
         for _ in 0..50 {
             first_materialized = ConsoleGraphSnapshotStore::open(&path)
+                .await
                 .unwrap()
                 .latest_viewport(
                     GraphMode::All,
@@ -9896,13 +10615,18 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("new node should roll back".to_owned()),
             })
+            .await
             .unwrap();
-        writer.set_branch_head("main", &session, &text).unwrap();
+        writer
+            .set_branch_head("main", &session, &text)
+            .await
+            .unwrap();
         publisher.mark_changed();
         let target_version = publisher.current_version();
 
         let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
+            .await
             .unwrap()
             .latest_viewport(
                 GraphMode::All,
@@ -9923,7 +10647,7 @@ mod tests {
     #[tokio::test]
     async fn graph_compute_permit_serializes_blocking_work() {
         let publisher = ConsolePublisher::new();
-        let (store, _, _) = graph_store(publisher.clone());
+        let (store, _, _) = graph_store(publisher.clone()).await;
         let cache = Arc::new(ConsoleGraphCache::new(store, publisher));
         let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
         let (release_first_tx, release_first_rx) = mpsc::channel();

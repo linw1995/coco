@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
+use async_trait::async_trait;
 use coco_mem::{
     Anchor, BranchStore, Kind, MergeParent, MessageQueueStore, NewNode, Node, NodeStore,
     PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
@@ -26,8 +27,10 @@ use crate::render::{
 };
 use crate::{ConsolePublisher, ConsoleStore};
 
-fn test_store() -> SqliteStore {
-    SqliteStore::open_temporary().expect("temporary SQLite store should open")
+async fn test_store() -> SqliteStore {
+    SqliteStore::open_temporary()
+        .await
+        .expect("temporary SQLite store should open")
 }
 
 #[derive(Default)]
@@ -48,24 +51,25 @@ impl DeepChainStore {
     }
 }
 
+#[async_trait]
 impl NodeStore for DeepChainStore {
     fn root_id(&self) -> String {
         panic!("deep chain test does not read root id")
     }
 
-    fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
+    async fn append(&self, _node: NewNode) -> coco_mem::StoreResult<String> {
         panic!("deep chain test inserts nodes directly")
     }
 
-    fn ancestry(&self, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+    async fn ancestry(&self, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
         panic!("deep chain test does not read ancestry")
     }
 
-    fn log(&self, _base_ref: &str, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
+    async fn log(&self, _base_ref: &str, _head_ref: &str) -> coco_mem::StoreResult<Vec<Node>> {
         panic!("deep chain test does not read logs")
     }
 
-    fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
+    async fn get_node(&self, id: &str) -> coco_mem::StoreResult<Node> {
         Ok(self
             .nodes
             .get(id)
@@ -73,7 +77,7 @@ impl NodeStore for DeepChainStore {
             .clone())
     }
 
-    fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
+    async fn list_children(&self, node_id: &str) -> coco_mem::StoreResult<Vec<Node>> {
         Ok(self
             .children
             .get(node_id)
@@ -254,9 +258,9 @@ fn apply_diff_node_keys(
     rendered
 }
 
-#[test]
-fn graph_snapshot_contains_primary_and_merge_edges() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_contains_primary_and_merge_edges() {
+    let store = test_store().await;
     let root = store.root_id();
     let left = store
         .append(NewNode {
@@ -265,8 +269,9 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &left).unwrap();
+    store.fork("main", &left).await.unwrap();
     let right = store
         .append(NewNode {
             parent: root,
@@ -274,6 +279,7 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
             metadata: None,
             kind: Kind::Text("feedback".to_owned()),
         })
+        .await
         .unwrap();
     let merged = store
         .append(NewNode {
@@ -285,9 +291,10 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
                 session_anchor(),
             )),
         })
+        .await
         .unwrap();
-    store.set_branch_head("main", &left, &merged).unwrap();
-    store.fork("draft", &left).unwrap();
+    store.set_branch_head("main", &left, &merged).await.unwrap();
+    store.fork("draft", &left).await.unwrap();
     let draft = store
         .append(NewNode {
             parent: left.clone(),
@@ -295,10 +302,11 @@ fn graph_snapshot_contains_primary_and_merge_edges() {
             metadata: None,
             kind: Kind::Text("draft work".to_owned()),
         })
+        .await
         .unwrap();
-    store.set_branch_head("draft", &left, &draft).unwrap();
+    store.set_branch_head("draft", &left, &draft).await.unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 7).unwrap();
+    let snapshot = build_graph_snapshot(&store, 7).await.unwrap();
 
     assert_eq!(snapshot.version, 7);
     assert_eq!(snapshot.nodes.len(), 4);
@@ -467,9 +475,9 @@ fn provider_context_fragment_renders_default_or_missing_selection() {
     assert!(missing_context.contains("detail-missing"));
 }
 
-#[test]
-fn graph_snapshot_contains_shadow_parent_edges() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_contains_shadow_parent_edges() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -478,8 +486,9 @@ fn graph_snapshot_contains_shadow_parent_edges() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let shadow_parent = store
         .append(NewNode {
             parent: root,
@@ -487,6 +496,7 @@ fn graph_snapshot_contains_shadow_parent_edges() {
             metadata: None,
             kind: Kind::Text("shadow".to_owned()),
         })
+        .await
         .unwrap();
     let prompt = store
         .append(NewNode {
@@ -501,10 +511,14 @@ fn graph_snapshot_contains_shadow_parent_edges() {
                 },
             )),
         })
+        .await
         .unwrap();
-    store.set_branch_head("main", &session, &prompt).unwrap();
+    store
+        .set_branch_head("main", &session, &prompt)
+        .await
+        .unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 8).unwrap();
+    let snapshot = build_graph_snapshot(&store, 8).await.unwrap();
 
     assert!(snapshot.edges.contains(&GraphEdge {
         source: shadow_parent,
@@ -513,9 +527,9 @@ fn graph_snapshot_contains_shadow_parent_edges() {
     }));
 }
 
-#[test]
-fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -524,9 +538,10 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &session).unwrap();
-    store.fork("draft", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
+    store.fork("draft", &session).await.unwrap();
 
     let main_anchor = store
         .append(NewNode {
@@ -541,6 +556,7 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
                 },
             )),
         })
+        .await
         .unwrap();
     let main_hidden = store
         .append(NewNode {
@@ -549,6 +565,7 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
             metadata: None,
             kind: Kind::Text("main hidden".to_owned()),
         })
+        .await
         .unwrap();
     let draft_anchor = store
         .append(NewNode {
@@ -563,6 +580,7 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
                 },
             )),
         })
+        .await
         .unwrap();
     let draft_hidden = store
         .append(NewNode {
@@ -571,6 +589,7 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
             metadata: None,
             kind: Kind::Text("draft hidden".to_owned()),
         })
+        .await
         .unwrap();
     let merge_anchor = store
         .append(NewNode {
@@ -585,15 +604,20 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session, &merge_anchor)
+        .await
         .unwrap();
     store
         .set_branch_head("draft", &session, &draft_hidden)
+        .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 11, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 11, GraphMode::Anchors)
+        .await
+        .unwrap();
     let node_ids = snapshot
         .nodes
         .iter()
@@ -628,9 +652,9 @@ fn graph_snapshot_anchor_mode_reconnects_edges_through_hidden_nodes() {
     );
 }
 
-#[test]
-fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -639,8 +663,9 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let tool_use = store
         .append(NewNode {
             parent: session.clone(),
@@ -652,8 +677,12 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
                 input: json!({}),
             }),
         })
+        .await
         .unwrap();
-    store.set_branch_head("main", &session, &tool_use).unwrap();
+    store
+        .set_branch_head("main", &session, &tool_use)
+        .await
+        .unwrap();
     let ignored_child = store
         .append(NewNode {
             parent: tool_use.clone(),
@@ -661,6 +690,7 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
             metadata: None,
             kind: Kind::Text("not a skill subtree".to_owned()),
         })
+        .await
         .unwrap();
     let invocation = store
         .append(NewNode {
@@ -675,6 +705,7 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
                 },
             )),
         })
+        .await
         .unwrap();
     let invocation_child = store
         .append(NewNode {
@@ -683,9 +714,10 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
             metadata: None,
             kind: Kind::Text("delegated context".to_owned()),
         })
+        .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 9).unwrap();
+    let snapshot = build_graph_snapshot(&store, 9).await.unwrap();
     let node_ids = snapshot
         .nodes
         .iter()
@@ -714,8 +746,8 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(invocation_context.contains("No provider context nodes."));
     assert!(!invocation_context.contains("The selected node is no longer available."));
 
-    store.fork("skill", &invocation_child).unwrap();
-    let skill_snapshot = build_graph_snapshot(&store, 10).unwrap();
+    store.fork("skill", &invocation_child).await.unwrap();
+    let skill_snapshot = build_graph_snapshot(&store, 10).await.unwrap();
     let skill_context = skill_snapshot
         .provider_contexts
         .iter()
@@ -738,8 +770,8 @@ fn graph_snapshot_includes_skill_invocation_subtree_after_tool_use() {
     assert!(!skill_context.nodes.iter().any(|node| node.id == tool_use));
 }
 
-#[test]
-fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
+#[tokio::test]
+async fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
     let mut store = DeepChainStore::default();
     let created_at = "1970-01-01T00:00:00Z".parse().unwrap();
     let session = Node::new(
@@ -792,8 +824,9 @@ fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
         store.insert(node);
     }
 
-    let nodes =
-        visible_skill_invocation_subtree_nodes(&store, GraphMode::All, &tool_use_id).unwrap();
+    let nodes = visible_skill_invocation_subtree_nodes(&store, GraphMode::All, &tool_use_id)
+        .await
+        .unwrap();
 
     assert_eq!(nodes.len(), depth + 1);
     assert_eq!(
@@ -806,9 +839,9 @@ fn visible_skill_invocation_subtree_nodes_handles_deep_all_mode_chain() {
     );
 }
 
-#[test]
-fn node_details_include_nodes_from_same_provider_context() {
-    let store = test_store();
+#[tokio::test]
+async fn node_details_include_nodes_from_same_provider_context() {
+    let store = test_store().await;
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -817,8 +850,9 @@ fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &first_session).unwrap();
+    store.fork("main", &first_session).await.unwrap();
     let previous_text = store
         .append(NewNode {
             parent: first_session.clone(),
@@ -826,6 +860,7 @@ fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Text("previous provider context".to_owned()),
         })
+        .await
         .unwrap();
     let next_session = store
         .append(NewNode {
@@ -834,6 +869,7 @@ fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     let hidden_text = store
         .append(NewNode {
@@ -842,6 +878,7 @@ fn node_details_include_nodes_from_same_provider_context() {
             metadata: None,
             kind: Kind::Text("hidden node inside current provider context".to_owned()),
         })
+        .await
         .unwrap();
     let prompt = store
         .append(NewNode {
@@ -856,12 +893,16 @@ fn node_details_include_nodes_from_same_provider_context() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &first_session, &prompt)
+        .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 32, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 32, GraphMode::Anchors)
+        .await
+        .unwrap();
     let context = snapshot
         .provider_contexts
         .iter()
@@ -920,9 +961,9 @@ fn node_details_include_nodes_from_same_provider_context() {
     assert!(hidden_context.contains("class=\"provider-context-node selected\""));
 }
 
-#[test]
-fn provider_context_list_uses_one_head_to_context_start_path() {
-    let store = test_store();
+#[tokio::test]
+async fn provider_context_list_uses_one_head_to_context_start_path() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -931,8 +972,9 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let shared_hidden = store
         .append(NewNode {
             parent: session.clone(),
@@ -940,6 +982,7 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Text("shared hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let shared_prompt = store
         .append(NewNode {
@@ -954,6 +997,7 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
                 },
             )),
         })
+        .await
         .unwrap();
     let main_hidden = store
         .append(NewNode {
@@ -962,6 +1006,7 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Text("main hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let main_prompt = store
         .append(NewNode {
@@ -976,12 +1021,14 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session, &main_prompt)
+        .await
         .unwrap();
 
-    store.fork("review", &shared_prompt).unwrap();
+    store.fork("review", &shared_prompt).await.unwrap();
     let review_hidden = store
         .append(NewNode {
             parent: shared_prompt.clone(),
@@ -989,6 +1036,7 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
             metadata: None,
             kind: Kind::Text("review hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let review_prompt = store
         .append(NewNode {
@@ -1003,12 +1051,16 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("review", &shared_prompt, &review_prompt)
+        .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 33, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 33, GraphMode::Anchors)
+        .await
+        .unwrap();
     let review_context = snapshot
         .provider_contexts
         .iter()
@@ -1056,9 +1108,9 @@ fn provider_context_list_uses_one_head_to_context_start_path() {
     assert!(!shared_hidden_context_from_review.contains("main hidden context"));
 }
 
-#[test]
-fn provider_context_id_stays_stable_when_branch_head_moves() {
-    let store = test_store();
+#[tokio::test]
+async fn provider_context_id_stays_stable_when_branch_head_moves() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1067,8 +1119,9 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &session).unwrap();
+    store.fork("main", &session).await.unwrap();
     let first_prompt = store
         .append(NewNode {
             parent: session.clone(),
@@ -1082,12 +1135,16 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session, &first_prompt)
+        .await
         .unwrap();
 
-    let first_snapshot = build_graph_snapshot_with_mode(&store, 35, GraphMode::Anchors).unwrap();
+    let first_snapshot = build_graph_snapshot_with_mode(&store, 35, GraphMode::Anchors)
+        .await
+        .unwrap();
     let first_context = first_snapshot
         .provider_contexts
         .iter()
@@ -1108,12 +1165,16 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &first_prompt, &next_prompt)
+        .await
         .unwrap();
 
-    let next_snapshot = build_graph_snapshot_with_mode(&store, 36, GraphMode::Anchors).unwrap();
+    let next_snapshot = build_graph_snapshot_with_mode(&store, 36, GraphMode::Anchors)
+        .await
+        .unwrap();
     let next_context = next_snapshot
         .provider_contexts
         .iter()
@@ -1125,9 +1186,9 @@ fn provider_context_id_stays_stable_when_branch_head_moves() {
     assert!(next_context.nodes.iter().any(|node| node.id == next_prompt));
 }
 
-#[test]
-fn provider_context_ids_preserve_unique_branch_names() {
-    let store = test_store();
+#[tokio::test]
+async fn provider_context_ids_preserve_unique_branch_names() {
+    let store = test_store().await;
     let root = store.root_id();
     let session = store
         .append(NewNode {
@@ -1136,9 +1197,10 @@ fn provider_context_ids_preserve_unique_branch_names() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
 
-    store.fork("draft/review", &session).unwrap();
+    store.fork("draft/review", &session).await.unwrap();
     let slash_hidden = store
         .append(NewNode {
             parent: session.clone(),
@@ -1146,6 +1208,7 @@ fn provider_context_ids_preserve_unique_branch_names() {
             metadata: None,
             kind: Kind::Text("slash branch context".to_owned()),
         })
+        .await
         .unwrap();
     let slash_prompt = store
         .append(NewNode {
@@ -1160,12 +1223,14 @@ fn provider_context_ids_preserve_unique_branch_names() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("draft/review", &session, &slash_prompt)
+        .await
         .unwrap();
 
-    store.fork("draft-review", &session).unwrap();
+    store.fork("draft-review", &session).await.unwrap();
     let dash_hidden = store
         .append(NewNode {
             parent: session.clone(),
@@ -1173,6 +1238,7 @@ fn provider_context_ids_preserve_unique_branch_names() {
             metadata: None,
             kind: Kind::Text("dash branch context".to_owned()),
         })
+        .await
         .unwrap();
     let dash_prompt = store
         .append(NewNode {
@@ -1187,12 +1253,16 @@ fn provider_context_ids_preserve_unique_branch_names() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("draft-review", &session, &dash_prompt)
+        .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 37, GraphMode::Anchors).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 37, GraphMode::Anchors)
+        .await
+        .unwrap();
     let slash_context_id = provider_context_target(&session, "draft/review");
     let dash_context_id = provider_context_target(&session, "draft-review");
     let slash_context = snapshot
@@ -1228,9 +1298,9 @@ fn provider_context_ids_preserve_unique_branch_names() {
     );
 }
 
-#[test]
-fn all_mode_provider_contexts_cover_older_visible_segments() {
-    let store = test_store();
+#[tokio::test]
+async fn all_mode_provider_contexts_cover_older_visible_segments() {
+    let store = test_store().await;
     let root = store.root_id();
     let first_session = store
         .append(NewNode {
@@ -1239,8 +1309,9 @@ fn all_mode_provider_contexts_cover_older_visible_segments() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
-    store.fork("main", &first_session).unwrap();
+    store.fork("main", &first_session).await.unwrap();
     let old_hidden = store
         .append(NewNode {
             parent: first_session.clone(),
@@ -1248,6 +1319,7 @@ fn all_mode_provider_contexts_cover_older_visible_segments() {
             metadata: None,
             kind: Kind::Text("old hidden context".to_owned()),
         })
+        .await
         .unwrap();
     let old_prompt = store
         .append(NewNode {
@@ -1262,6 +1334,7 @@ fn all_mode_provider_contexts_cover_older_visible_segments() {
                 },
             )),
         })
+        .await
         .unwrap();
     let next_session = store
         .append(NewNode {
@@ -1270,6 +1343,7 @@ fn all_mode_provider_contexts_cover_older_visible_segments() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), session_anchor())),
         })
+        .await
         .unwrap();
     let new_prompt = store
         .append(NewNode {
@@ -1284,12 +1358,16 @@ fn all_mode_provider_contexts_cover_older_visible_segments() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &first_session, &new_prompt)
+        .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot_with_mode(&store, 34, GraphMode::All).unwrap();
+    let snapshot = build_graph_snapshot_with_mode(&store, 34, GraphMode::All)
+        .await
+        .unwrap();
     let old_context = snapshot
         .provider_contexts
         .iter()
@@ -1331,9 +1409,9 @@ fn snapshot_content<'a>(snapshot: &'a GraphSnapshot, node_id: &str) -> &'a str {
         .expect("node should be visible")
 }
 
-#[test]
-fn graph_snapshot_renders_content_for_visible_node_kinds() {
-    let store = test_store();
+#[tokio::test]
+async fn graph_snapshot_renders_content_for_visible_node_kinds() {
+    let store = test_store().await;
     let root = store.root_id();
     let mut empty_prompt_session_anchor = session_anchor();
     empty_prompt_session_anchor.prompt.clear();
@@ -1345,8 +1423,9 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), empty_prompt_session_anchor)),
         })
+        .await
         .unwrap();
-    store.fork("main", &empty_prompt_session).unwrap();
+    store.fork("main", &empty_prompt_session).await.unwrap();
 
     let mut prompted_session_anchor = session_anchor();
     prompted_session_anchor.prompt = "session prompt".to_owned();
@@ -1357,6 +1436,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session(Vec::new(), prompted_session_anchor)),
         })
+        .await
         .unwrap();
 
     let session_patch = SessionAnchorPatch {
@@ -1370,6 +1450,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Anchor(Anchor::session_patch(Vec::new(), session_patch.clone())),
         })
+        .await
         .unwrap();
     let prompt = store
         .append(NewNode {
@@ -1384,6 +1465,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 },
             )),
         })
+        .await
         .unwrap();
     let invocation = store
         .append(NewNode {
@@ -1398,6 +1480,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 },
             )),
         })
+        .await
         .unwrap();
     let skill_result = store
         .append(NewNode {
@@ -1412,6 +1495,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 },
             )),
         })
+        .await
         .unwrap();
     let tool_use = store
         .append(NewNode {
@@ -1424,6 +1508,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 input: json!({"cmd": "cargo test"}),
             }),
         })
+        .await
         .unwrap();
     let empty_tool_use = store
         .append(NewNode {
@@ -1432,6 +1517,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::tool_use_items(Vec::new()),
         })
+        .await
         .unwrap();
     let tool_result = store
         .append(NewNode {
@@ -1443,6 +1529,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
                 output: "tool output".to_owned(),
             }),
         })
+        .await
         .unwrap();
     let empty_tool_result = store
         .append(NewNode {
@@ -1451,6 +1538,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::tool_result_items(Vec::new()),
         })
+        .await
         .unwrap();
     let text = store
         .append(NewNode {
@@ -1459,6 +1547,7 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Text("plain text".to_owned()),
         })
+        .await
         .unwrap();
     let failure = store
         .append(NewNode {
@@ -1467,12 +1556,14 @@ fn graph_snapshot_renders_content_for_visible_node_kinds() {
             metadata: None,
             kind: Kind::Failure("failure message".to_owned()),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &empty_prompt_session, &failure)
+        .await
         .unwrap();
 
-    let snapshot = build_graph_snapshot(&store, 10).unwrap();
+    let snapshot = build_graph_snapshot(&store, 10).await.unwrap();
 
     assert_eq!(
         snapshot_content(&snapshot, &empty_prompt_session),
@@ -2402,10 +2493,10 @@ fn streamed_graph_markup_escapes_dynamic_values() {
     assert!(!html.contains("<img src=x onerror=alert(1)>"));
 }
 
-#[test]
-fn console_store_notifies_after_successful_writes() {
+#[tokio::test]
+async fn console_store_notifies_after_successful_writes() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(test_store(), publisher.clone());
+    let store = ConsoleStore::new(test_store().await, publisher.clone());
     let root = store.root_id();
 
     store
@@ -2419,40 +2510,43 @@ fn console_store_notifies_after_successful_writes() {
                 input: json!({}),
             }),
         })
+        .await
         .unwrap();
 
     assert_eq!(publisher.current_version(), 1);
 }
 
-#[test]
-fn console_store_notifies_only_when_dequeue_removes_message() {
+#[tokio::test]
+async fn console_store_notifies_only_when_dequeue_removes_message() {
     let publisher = ConsolePublisher::new();
-    let store = ConsoleStore::new(test_store(), publisher.clone());
+    let store = ConsoleStore::new(test_store().await, publisher.clone());
 
-    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(store.dequeue_message("system").await.unwrap(), None);
     assert_eq!(publisher.current_version(), 0);
 
     let item = store
         .enqueue_message("system", json!({"ok": true}))
+        .await
         .unwrap();
     assert_eq!(publisher.current_version(), 1);
 
-    assert_eq!(store.dequeue_message("system").unwrap(), Some(item));
+    assert_eq!(store.dequeue_message("system").await.unwrap(), Some(item));
     assert_eq!(publisher.current_version(), 2);
 
-    assert_eq!(store.dequeue_message("system").unwrap(), None);
+    assert_eq!(store.dequeue_message("system").await.unwrap(), None);
     assert_eq!(publisher.current_version(), 2);
 }
 
-#[test]
-fn console_store_lists_message_queues() {
-    let store = ConsoleStore::new(test_store(), ConsolePublisher::new());
+#[tokio::test]
+async fn console_store_lists_message_queues() {
+    let store = ConsoleStore::new(test_store().await, ConsolePublisher::new());
 
     store
         .enqueue_message("system", json!({"ok": true}))
+        .await
         .unwrap();
 
-    assert_eq!(store.list_message_queues().unwrap(), vec!["system"]);
+    assert_eq!(store.list_message_queues().await.unwrap(), vec!["system"]);
 }
 
 #[test]

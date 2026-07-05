@@ -520,6 +520,7 @@ name = "coco-console"
 version = "0.1.0"
 dependencies = [
  "askama",
+ "async-trait",
  "axum",
  "coco-mem",
  "diesel",
@@ -584,6 +585,7 @@ dependencies = [
 name = "coco-mem"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "diesel",
  "diesel-async",
  "diesel_migrations",

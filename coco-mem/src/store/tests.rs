@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use super::sqlite::SqliteStore;
 use crate::{
-    Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueItem,
-    MessageQueueStore, NewNode, NodeStore, PauseReason, Preset, PresetStore, PromptAnchor, Role,
-    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillScript,
-    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError as Error,
+    Anchor, BranchAppendSessionState, BranchSessionStateUpdate, BranchStore, JobStatus, JobStore,
+    Kind, MergeParent, MessageQueueItem, MessageQueueStore, NewNode, NewNodeContent, NodeStore,
+    PauseReason, Preset, PresetStore, PromptAnchor, Role, SessionAnchor, SessionAnchorPatch,
+    SessionRole, SessionState, SessionStore, SkillScript, SkillStore, SkillUpdatePatch,
+    SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
 
@@ -58,8 +59,11 @@ fn make_preset(model: &str, role: SessionRole) -> Preset {
     }
 }
 
-fn current_preset(store: &impl PresetStore, name: &str) -> std::result::Result<Preset, Error> {
-    let record = store.get_preset_record(name)?;
+async fn current_preset(
+    store: &impl PresetStore,
+    name: &str,
+) -> std::result::Result<Preset, Error> {
+    let record = store.get_preset_record(name).await?;
     record
         .current_preset()
         .ok_or_else(|| Error::PresetVersionNotFound {
@@ -111,26 +115,22 @@ fn make_prompt_anchor_node(parent: &str, merge_parents: &[&str]) -> NewNode {
     }
 }
 
-fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::Job
+async fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> crate::Job
 where
     S: BranchStore + JobStore + NodeStore,
 {
-    let parent = store.get_branch_head(branch).unwrap();
-    let prompt_anchor_id = store
-        .append(NewNode {
-            parent,
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::prompt(
-                vec![],
-                PromptAnchor {
-                    prompt: prompt.to_owned(),
-                    attachments: vec![],
-                },
-            )),
-        })
-        .unwrap();
-    store.submit_job(branch, &prompt_anchor_id).unwrap()
+    store
+        .submit_job_with_prompt_base(
+            branch,
+            PromptAnchor {
+                prompt: prompt.to_owned(),
+                attachments: vec![],
+            },
+            vec![],
+            None,
+        )
+        .await
+        .unwrap()
 }
 
 trait TestStoreFactory {
@@ -142,7 +142,7 @@ trait TestStoreFactory {
         + SessionStore
         + SkillStore;
 
-    fn create() -> Self::Backend;
+    async fn create() -> Self::Backend;
 }
 
 struct SqliteFactory;
@@ -150,17 +150,19 @@ struct SqliteFactory;
 impl TestStoreFactory for SqliteFactory {
     type Backend = SqliteStore;
 
-    fn create() -> Self::Backend {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn create() -> Self::Backend {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 }
 
-fn assert_new_store_exposes_root_text_node<F>()
+async fn assert_new_store_exposes_root_text_node<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
-    let root = store.get_node(&store.root_id()).unwrap();
+    let store = F::create().await;
+    let root = store.get_node(&store.root_id()).await.unwrap();
 
     let Kind::Text(text) = &root.kind else {
         panic!("expected text root node");
@@ -169,52 +171,65 @@ where
     assert!(root.is_root());
 }
 
-fn assert_append_inserts_node_and_updates_children_index<F>()
+async fn assert_append_inserts_node_and_updates_children_index<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
 
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
 
-    let stored = store.get_node(&child_id).unwrap();
+    let stored = store.get_node(&child_id).await.unwrap();
     assert_eq!(stored.parent, session_id);
-    let children = store.list_children(&stored.parent).unwrap();
+    let children = store.list_children(&stored.parent).await.unwrap();
     assert!(children.iter().any(|node| node.id == child_id));
 }
 
-fn assert_append_rejects_missing_parent<F>()
+async fn assert_append_rejects_missing_parent<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let err = store
         .append(make_text_node("missing", "child"))
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
 }
 
-fn assert_append_prompt_anchor_indexes_merge_parents_as_children<F>()
+async fn assert_append_prompt_anchor_indexes_merge_parents_as_children<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_parent_id = store
         .append(make_text_node(&session_id, "merge-parent"))
+        .await
         .unwrap();
 
     let anchor_id = store
         .append(make_prompt_anchor_node(&session_id, &[&merge_parent_id]))
+        .await
         .unwrap();
 
     assert!(
         store
             .list_children(&session_id)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == anchor_id)
@@ -222,20 +237,22 @@ where
     assert!(
         store
             .list_children(&merge_parent_id)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == anchor_id)
     );
 }
 
-fn assert_append_session_anchor_indexes_merge_parents_as_children<F>()
+async fn assert_append_session_anchor_indexes_merge_parents_as_children<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
     let merge_parent_id = store
         .append(make_text_node(&root_id, "merge-parent"))
+        .await
         .unwrap();
 
     let anchor_id = store
@@ -243,46 +260,57 @@ where
             &root_id,
             &merge_parent_id,
         ))
+        .await
         .unwrap();
 
     assert!(
         store
             .list_children(&merge_parent_id)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == anchor_id)
     );
 }
 
-fn assert_append_prompt_anchor_rejects_missing_merge_parent<F>()
+async fn assert_append_prompt_anchor_rejects_missing_merge_parent<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let err = store
         .append(make_prompt_anchor_node(&session_id, &["missing"]))
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
 }
 
-fn assert_append_prompt_anchor_rejects_duplicate_merge_parents<F>()
+async fn assert_append_prompt_anchor_rejects_duplicate_merge_parents<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_parent_id = store
         .append(make_text_node(&session_id, "merge-parent"))
+        .await
         .unwrap();
     let err = store
         .append(make_prompt_anchor_node(
             &session_id,
             &[&merge_parent_id, &merge_parent_id],
         ))
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -291,18 +319,23 @@ where
     ));
 }
 
-fn assert_append_prompt_anchor_rejects_multiple_shadow_parents<F>()
+async fn assert_append_prompt_anchor_rejects_multiple_shadow_parents<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let left_shadow = store
         .append(make_text_node(&session_id, "left-shadow"))
+        .await
         .unwrap();
     let right_shadow = store
         .append(make_text_node(&session_id, "right-shadow"))
+        .await
         .unwrap();
     let err = store
         .append(NewNode {
@@ -320,6 +353,7 @@ where
                 },
             )),
         })
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -329,15 +363,19 @@ where
     ));
 }
 
-fn assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent<F>()
+async fn assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let err = store
         .append(make_prompt_anchor_node(&session_id, &[&session_id]))
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -346,148 +384,192 @@ where
     ));
 }
 
-fn assert_append_prompt_anchor_allows_merge_parent_from_other_session_root<F>()
+async fn assert_append_prompt_anchor_allows_merge_parent_from_other_session_root<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let left_root = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let right_root = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let left_leaf = store.append(make_text_node(&left_root, "left")).unwrap();
-    let right_leaf = store.append(make_text_node(&right_root, "right")).unwrap();
+    let left_root = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let right_root = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let left_leaf = store
+        .append(make_text_node(&left_root, "left"))
+        .await
+        .unwrap();
+    let right_leaf = store
+        .append(make_text_node(&right_root, "right"))
+        .await
+        .unwrap();
 
     let merge_id = store
         .append(make_prompt_anchor_node(&left_leaf, &[&right_leaf]))
+        .await
         .unwrap();
 
     assert!(
         store
             .list_children(&right_leaf)
+            .await
             .unwrap()
             .iter()
             .any(|node| node.id == merge_id)
     );
 }
 
-fn assert_ancestry_returns_nodes_back_to_root<F>()
+async fn assert_ancestry_returns_nodes_back_to_root<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let a_id = store.append(make_text_node(&session_id, "a")).unwrap();
-    let b_id = store.append(make_text_node(&a_id, "b")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let a_id = store
+        .append(make_text_node(&session_id, "a"))
+        .await
+        .unwrap();
+    let b_id = store.append(make_text_node(&a_id, "b")).await.unwrap();
 
-    let ancestry = store.ancestry(&b_id).unwrap();
+    let ancestry = store.ancestry(&b_id).await.unwrap();
     let ids: Vec<_> = ancestry.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![b_id, a_id, session_id, root_id]);
 }
 
-fn assert_list_children_returns_primary_and_merge_children_in_stable_order<F>()
+async fn assert_list_children_returns_primary_and_merge_children_in_stable_order<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let left_id = store.append(make_text_node(&session_id, "left")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let left_id = store
+        .append(make_text_node(&session_id, "left"))
+        .await
+        .unwrap();
     let right_id = store
         .append(make_prompt_anchor_node(&left_id, &[&session_id]))
+        .await
         .unwrap();
 
-    let nodes = store.list_children(&session_id).unwrap();
+    let nodes = store.list_children(&session_id).await.unwrap();
     let ids = nodes.into_iter().map(|node| node.id).collect::<Vec<_>>();
 
     assert_eq!(ids, vec![left_id, right_id]);
 }
 
-fn assert_list_children_returns_empty_for_leaf_node<F>()
+async fn assert_list_children_returns_empty_for_leaf_node<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let leaf_id = store.append(make_text_node(&session_id, "leaf")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let leaf_id = store
+        .append(make_text_node(&session_id, "leaf"))
+        .await
+        .unwrap();
 
-    let children = store.list_children(&leaf_id).unwrap();
+    let children = store.list_children(&leaf_id).await.unwrap();
 
     assert!(children.is_empty());
 }
 
-fn assert_list_children_returns_not_found_for_missing_node<F>()
+async fn assert_list_children_returns_not_found_for_missing_node<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    let err = store.list_children(missing_id).unwrap_err();
+    let err = store.list_children(missing_id).await.unwrap_err();
 
     assert!(matches!(err, Error::NotFound { id } if id == missing_id));
 }
 
-fn assert_log_returns_nodes_from_head_back_to_base_inclusive<F>()
+async fn assert_log_returns_nodes_from_head_back_to_base_inclusive<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let a_id = store.append(make_text_node(&session_id, "a")).unwrap();
-    let b_id = store.append(make_text_node(&a_id, "b")).unwrap();
-    let c_id = store.append(make_text_node(&b_id, "c")).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let a_id = store
+        .append(make_text_node(&session_id, "a"))
+        .await
+        .unwrap();
+    let b_id = store.append(make_text_node(&a_id, "b")).await.unwrap();
+    let c_id = store.append(make_text_node(&b_id, "c")).await.unwrap();
 
-    let log = store.log(&a_id, &c_id).unwrap();
+    let log = store.log(&a_id, &c_id).await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![c_id, b_id, a_id]);
 }
 
-fn assert_log_returns_single_node_when_base_equals_head<F>()
+async fn assert_log_returns_single_node_when_base_equals_head<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
 
-    let log = store.log(&root_id, &root_id).unwrap();
+    let log = store.log(&root_id, &root_id).await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![root_id]);
 }
 
-fn assert_log_returns_not_found_when_head_is_missing<F>()
+async fn assert_log_returns_not_found_when_head_is_missing<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
     let missing_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    let err = store.log(&root_id, missing_id).unwrap_err();
+    let err = store.log(&root_id, missing_id).await.unwrap_err();
 
     assert!(matches!(err, Error::NotFound { id } if id == missing_id));
 }
 
-fn assert_log_ignores_prompt_anchor_parents<F>()
+async fn assert_log_ignores_prompt_anchor_parents<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_parent_id = store
         .append(make_text_node(&session_id, "merge-parent"))
+        .await
         .unwrap();
     let anchor_id = store
         .append(make_prompt_anchor_node(&session_id, &[&merge_parent_id]))
+        .await
         .unwrap();
 
-    let err = store.log(&merge_parent_id, &anchor_id).unwrap_err();
+    let err = store.log(&merge_parent_id, &anchor_id).await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -498,98 +580,107 @@ where
     ));
 }
 
-fn assert_branch_creation_resolves_refs<F>()
+async fn assert_branch_creation_resolves_refs<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
 
-    let head_id = store.fork("main", &root_id).unwrap();
+    let head_id = store.fork("main", &root_id).await.unwrap();
 
     assert_eq!(head_id, root_id);
-    assert_eq!(store.get_branch_head("main").unwrap(), root_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), root_id);
 }
 
-fn assert_fork_rejects_duplicates<F>()
+async fn assert_fork_rejects_duplicates<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
-    let err = store.fork("main", &root_id).unwrap_err();
+    let err = store.fork("main", &root_id).await.unwrap_err();
 
     assert!(matches!(err, Error::BranchExists { name } if name == "main"));
 }
 
-fn assert_fork_initializes_session_state<F>()
+async fn assert_fork_initializes_session_state<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    let state = store.get_session_state("main").unwrap();
+    store.fork("main", &root_id).await.unwrap();
+    let state = store.get_session_state("main").await.unwrap();
 
     assert_eq!(state, SessionState::Active);
 }
 
-fn assert_set_branch_head_keeps_session_state_untouched<F>()
+async fn assert_set_branch_head_keeps_session_state_untouched<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
-    store.fork("main", &child_id).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let next_id = store
+        .append(make_text_node(&child_id, "next"))
+        .await
+        .unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
-    store.set_branch_head("main", &child_id, &next_id).unwrap();
-    let state = store.get_session_state("main").unwrap();
+    store
+        .set_branch_head("main", &child_id, &next_id)
+        .await
+        .unwrap();
+    let state = store.get_session_state("main").await.unwrap();
 
-    assert_eq!(store.get_branch_head("main").unwrap(), next_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), next_id);
     assert_eq!(state, SessionState::Active);
 }
 
-fn assert_delete_branch_removes_branch_and_session_state<F>()
+async fn assert_delete_branch_removes_branch_and_session_state<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let branch_head = store.fork("main", &root_id).unwrap();
+    let branch_head = store.fork("main", &root_id).await.unwrap();
 
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
 
-    let err = store.get_branch_head("main").unwrap_err();
+    let err = store.get_branch_head("main").await.unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
-    let err = store.get_session_state("main").unwrap_err();
+    let err = store.get_session_state("main").await.unwrap_err();
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
-    assert_eq!(store.get_node(&branch_head).unwrap().id, branch_head);
+    assert_eq!(store.get_node(&branch_head).await.unwrap().id, branch_head);
 }
 
-fn assert_delete_branch_rejects_missing_branch<F>()
+async fn assert_delete_branch_rejects_missing_branch<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
 
-    let err = store.delete_branch("missing").unwrap_err();
+    let err = store.delete_branch("missing").await.unwrap_err();
 
     assert!(matches!(err, Error::BranchNotFound { name } if name == "missing"));
 }
 
-fn assert_set_session_state_updates_value<F>()
+async fn assert_set_session_state_updates_value<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let state = store
         .set_session_state(
@@ -600,6 +691,7 @@ where
                 base_head_id: root_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -611,14 +703,14 @@ where
     );
 }
 
-fn assert_set_session_state_requires_matching_expected<F>()
+async fn assert_set_session_state_requires_matching_expected<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
     store
         .set_session_state(
             "main",
@@ -628,6 +720,7 @@ where
                 reason: PauseReason::Closed,
             },
         )
+        .await
         .unwrap();
 
     let err = store
@@ -639,6 +732,7 @@ where
                 base_head_id: root_id,
             },
         )
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -651,15 +745,18 @@ where
     ));
 }
 
-fn assert_set_branch_head_preserves_attached_state<F>()
+async fn assert_set_branch_head_preserves_attached_state<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     store
         .set_session_state(
@@ -670,33 +767,171 @@ where
                 base_head_id: base_anchor_id,
             },
         )
+        .await
         .unwrap();
 
-    let feedback_id = store.append(make_text_node(&root_id, "feedback")).unwrap();
+    let feedback_id = store
+        .append(make_text_node(&root_id, "feedback"))
+        .await
+        .unwrap();
     store
         .set_branch_head("main", &root_id, &feedback_id)
+        .await
         .unwrap();
 
-    let state = store.get_session_state("main").unwrap();
-    assert_eq!(store.get_branch_head("main").unwrap(), feedback_id);
+    let state = store.get_session_state("main").await.unwrap();
+    assert_eq!(store.get_branch_head("main").await.unwrap(), feedback_id);
     assert_eq!(
         state,
         SessionState::Attached {
             target_branch: "base".to_owned(),
-            base_head_id: store.get_branch_head("base").unwrap(),
+            base_head_id: store.get_branch_head("base").await.unwrap(),
         }
     );
 }
 
-fn assert_set_session_state_accepts_merged_anchor_on_target_branch<F>()
+async fn assert_append_nodes_and_set_branch_head_rolls_back_on_append_failure<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+    let children_before = store.list_children(&session_id).await.unwrap();
+
+    let err = store
+        .append_nodes_and_set_branch_head(
+            "main",
+            &session_id,
+            &session_id,
+            vec![
+                NewNodeContent {
+                    role: Role::LLM,
+                    metadata: None,
+                    kind: Kind::Text("partial".to_owned()),
+                },
+                NewNodeContent {
+                    role: Role::System,
+                    metadata: None,
+                    kind: Kind::Anchor(Anchor::prompt(
+                        vec![MergeParent::merge("missing")],
+                        PromptAnchor {
+                            prompt: "invalid".to_owned(),
+                            attachments: vec![],
+                        },
+                    )),
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
+    assert_eq!(
+        store.list_children(&session_id).await.unwrap(),
+        children_before
+    );
+}
+
+async fn assert_append_nodes_and_set_branch_head_to_rolls_back_on_head_failure<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+    let children_before = store.list_children(&session_id).await.unwrap();
+
+    let err = store
+        .append_nodes_and_set_branch_head_to(
+            "main",
+            &session_id,
+            &session_id,
+            "missing",
+            vec![NewNodeContent {
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("partial".to_owned()),
+            }],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::NotFound { id } if id == "missing"));
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
+    assert_eq!(
+        store.list_children(&session_id).await.unwrap(),
+        children_before
+    );
+}
+
+async fn assert_append_nodes_and_set_branch_head_with_session_state_rolls_back_on_state_failure<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+    let children_before = store.list_children(&session_id).await.unwrap();
+
+    let err = store
+        .append_nodes_and_set_branch_head_with_session_state(BranchAppendSessionState {
+            branch: "main".to_owned(),
+            expected_old_head: session_id.clone(),
+            parent: session_id.clone(),
+            new_head: None,
+            nodes: vec![NewNodeContent {
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("partial".to_owned()),
+            }],
+            session_branch: "main".to_owned(),
+            expected_session: None,
+            next_session: BranchSessionStateUpdate::Set(SessionState::Attached {
+                target_branch: "missing".to_owned(),
+                base_head_id: session_id.clone(),
+            }),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::BranchNotFound { name } if name == "missing"));
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
+    assert_eq!(
+        store.list_children(&session_id).await.unwrap(),
+        children_before
+    );
+    assert_eq!(
+        store.get_session_state("main").await.unwrap(),
+        SessionState::Active
+    );
+}
+
+async fn assert_set_session_state_accepts_merged_anchor_on_target_branch<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let state = store
         .set_session_state(
@@ -709,6 +944,7 @@ where
                 },
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -722,17 +958,23 @@ where
     );
 }
 
-fn assert_set_session_state_rejects_merged_anchor_outside_target_branch<F>()
+async fn assert_set_session_state_rejects_merged_anchor_outside_target_branch<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let other_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("other", &other_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let other_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("other", &other_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .set_session_state(
@@ -745,6 +987,7 @@ where
                 },
             },
         )
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -754,15 +997,18 @@ where
     ));
 }
 
-fn assert_set_session_state_rejects_non_anchor_merged_node<F>()
+async fn assert_set_session_state_rejects_non_anchor_merged_node<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let base_text_id = store.append(make_text_node(&root_id, "base text")).unwrap();
-    store.fork("base", &base_text_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    let base_text_id = store
+        .append(make_text_node(&root_id, "base text"))
+        .await
+        .unwrap();
+    store.fork("base", &base_text_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .set_session_state(
@@ -775,20 +1021,24 @@ where
                 },
             },
         )
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::InvalidAnchor { id } if id == base_text_id));
 }
 
-fn assert_paused_merged_state_can_resume_as_attached<F>()
+async fn assert_paused_merged_state_can_resume_as_attached<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     store
         .set_session_state(
@@ -801,13 +1051,16 @@ where
                 },
             },
         )
+        .await
         .unwrap();
 
     let next_base_anchor_id = store
         .append(make_prompt_anchor_node(&base_anchor_id, &[]))
+        .await
         .unwrap();
     store
         .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
+        .await
         .unwrap();
     let state = store
         .set_session_state(
@@ -823,6 +1076,7 @@ where
                 base_head_id: next_base_anchor_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -834,15 +1088,18 @@ where
     );
 }
 
-fn assert_paused_closed_state_can_resume_as_attached<F>()
+async fn assert_paused_closed_state_can_resume_as_attached<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let base_anchor_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    store.fork("base", &base_anchor_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    let base_anchor_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("base", &base_anchor_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     store
         .set_session_state(
@@ -853,13 +1110,16 @@ where
                 reason: PauseReason::Closed,
             },
         )
+        .await
         .unwrap();
 
     let next_base_anchor_id = store
         .append(make_prompt_anchor_node(&base_anchor_id, &[]))
+        .await
         .unwrap();
     store
         .set_branch_head("base", &base_anchor_id, &next_base_anchor_id)
+        .await
         .unwrap();
     let state = store
         .set_session_state(
@@ -873,6 +1133,7 @@ where
                 base_head_id: next_base_anchor_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -884,14 +1145,14 @@ where
     );
 }
 
-fn assert_list_session_states_returns_branch_state_map<F>()
+async fn assert_list_session_states_returns_branch_state_map<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("base", &root_id).unwrap();
-    store.fork("main", &root_id).unwrap();
+    store.fork("base", &root_id).await.unwrap();
+    store.fork("main", &root_id).await.unwrap();
     store
         .set_session_state(
             "main",
@@ -901,9 +1162,10 @@ where
                 base_head_id: root_id.clone(),
             },
         )
+        .await
         .unwrap();
 
-    let states = store.list_session_states().unwrap();
+    let states = store.list_session_states().await.unwrap();
 
     assert_eq!(states.get("base"), Some(&SessionState::Active));
     assert_eq!(
@@ -915,23 +1177,24 @@ where
     );
 }
 
-fn assert_preset_round_trip<F>()
+async fn assert_preset_round_trip<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let preset_name = "coding";
     let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
 
-    let stored = store.set_preset(preset_name, config.clone()).unwrap();
+    let stored = store.set_preset(preset_name, config.clone()).await.unwrap();
 
     assert_eq!(stored.current_version, 1);
     assert_eq!(stored.current_preset(), Some(config.clone()));
     assert_eq!(stored.versions.keys().copied().collect::<Vec<_>>(), vec![1]);
-    assert_eq!(current_preset(&store, preset_name).unwrap(), config);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), config);
     assert_eq!(
         store
             .get_preset_record(preset_name)
+            .await
             .unwrap()
             .current_version,
         1
@@ -939,6 +1202,7 @@ where
     assert_eq!(
         store
             .list_preset_records()
+            .await
             .unwrap()
             .get(preset_name)
             .unwrap()
@@ -947,21 +1211,25 @@ where
     );
 }
 
-fn assert_preset_replaces_existing_value<F>()
+async fn assert_preset_replaces_existing_value<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let preset_name = "coding";
     store
         .set_preset(
             preset_name,
             make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
+        .await
         .unwrap();
     let updated = make_preset("claude-sonnet-4-20250514", SessionRole::Runner);
 
-    let stored = store.set_preset(preset_name, updated.clone()).unwrap();
+    let stored = store
+        .set_preset(preset_name, updated.clone())
+        .await
+        .unwrap();
 
     assert_eq!(stored.current_version, 2);
     assert_eq!(stored.current_preset(), Some(updated.clone()));
@@ -974,21 +1242,27 @@ where
         make_preset("gpt-5.4", SessionRole::Orchestrator)
     );
     assert_eq!(stored.versions.get(&2).unwrap().to_preset(), updated);
-    assert_eq!(current_preset(&store, preset_name).unwrap(), updated);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), updated);
 }
 
-fn assert_rollback_preset_creates_new_current_version<F>()
+async fn assert_rollback_preset_creates_new_current_version<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let preset_name = "coding";
     let original = make_preset("gpt-5.4", SessionRole::Orchestrator);
     let updated = make_preset("claude-sonnet-4-20250514", SessionRole::Runner);
-    store.set_preset(preset_name, original.clone()).unwrap();
-    store.set_preset(preset_name, updated.clone()).unwrap();
+    store
+        .set_preset(preset_name, original.clone())
+        .await
+        .unwrap();
+    store
+        .set_preset(preset_name, updated.clone())
+        .await
+        .unwrap();
 
-    let rolled_back = store.rollback_preset(preset_name, 1).unwrap();
+    let rolled_back = store.rollback_preset(preset_name, 1).await.unwrap();
 
     assert_eq!(rolled_back.current_version, 3);
     assert_eq!(
@@ -997,61 +1271,62 @@ where
     );
     assert_eq!(rolled_back.current_preset(), Some(original.clone()));
     assert_eq!(rolled_back.versions.get(&2).unwrap().to_preset(), updated);
-    assert_eq!(current_preset(&store, preset_name).unwrap(), original);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), original);
 }
 
-fn assert_delete_preset_removes_only_config<F>()
+async fn assert_delete_preset_removes_only_config<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
     let preset_name = "coding";
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
     store
         .set_preset(
             preset_name,
             make_preset("gpt-5.4", SessionRole::Orchestrator),
         )
+        .await
         .unwrap();
 
-    store.delete_preset(preset_name).unwrap();
+    store.delete_preset(preset_name).await.unwrap();
 
-    assert!(store.list_preset_records().unwrap().is_empty());
+    assert!(store.list_preset_records().await.unwrap().is_empty());
     assert!(matches!(
-        store.get_preset_record(preset_name),
+        store.get_preset_record(preset_name).await,
         Err(Error::PresetNotFound { name }) if name == preset_name
     ));
-    assert_eq!(store.get_branch_head("main").unwrap(), root_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), root_id);
 }
 
-fn assert_delete_branch_preserves_preset<F>()
+async fn assert_delete_branch_preserves_preset<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
     let preset_name = "coding";
     let config = make_preset("gpt-5.4", SessionRole::Orchestrator);
-    store.fork("main", &root_id).unwrap();
-    store.set_preset(preset_name, config.clone()).unwrap();
+    store.fork("main", &root_id).await.unwrap();
+    store.set_preset(preset_name, config.clone()).await.unwrap();
 
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
 
     assert!(matches!(
-        store.get_branch_head("main"),
+        store.get_branch_head("main").await,
         Err(Error::BranchNotFound { name }) if name == "main"
     ));
-    assert_eq!(current_preset(&store, preset_name).unwrap(), config);
+    assert_eq!(current_preset(&store, preset_name).await.unwrap(), config);
 }
 
-fn assert_get_preset_rejects_missing_config<F>()
+async fn assert_get_preset_rejects_missing_config<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
 
-    let err = store.get_preset_record("missing-preset").unwrap_err();
+    let err = store.get_preset_record("missing-preset").await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -1059,13 +1334,13 @@ where
     ));
 }
 
-fn assert_delete_preset_rejects_missing_config<F>()
+async fn assert_delete_preset_rejects_missing_config<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
 
-    let err = store.delete_preset("missing-preset").unwrap_err();
+    let err = store.delete_preset("missing-preset").await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -1073,51 +1348,54 @@ where
     ));
 }
 
-fn assert_get_node_supports_branch_name<F>()
+async fn assert_get_node_supports_branch_name<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let branch_head = store.fork("draft", &root_id).unwrap();
+    let branch_head = store.fork("draft", &root_id).await.unwrap();
 
-    let node = store.get_node("draft").unwrap();
+    let node = store.get_node("draft").await.unwrap();
 
     assert_eq!(node.id, branch_head);
 }
 
-fn assert_get_node_supports_prefix_after_branch_delete<F>()
+async fn assert_get_node_supports_prefix_after_branch_delete<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("draft", &root_id).unwrap();
+    store.fork("draft", &root_id).await.unwrap();
     let draft_node = store
         .append(make_text_node(&root_id, "draft only"))
+        .await
         .unwrap();
     store
         .set_branch_head("draft", &root_id, &draft_node)
+        .await
         .unwrap();
-    store.delete_branch("draft").unwrap();
+    store.delete_branch("draft").await.unwrap();
 
     let prefix = &draft_node[..8];
-    let node = store.get_node(prefix).unwrap();
+    let node = store.get_node(prefix).await.unwrap();
 
     assert_eq!(node.id, draft_node);
 }
 
-fn assert_get_node_rejects_ambiguous_prefix<F>()
+async fn assert_get_node_rejects_ambiguous_prefix<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
     let mut ids = vec![root_id.clone()];
     for index in 0..32 {
         ids.push(
             store
                 .append(make_text_node(&root_id, &format!("node-{index}")))
+                .await
                 .unwrap(),
         );
     }
@@ -1132,7 +1410,7 @@ where
         .find_map(|(prefix, matches)| (matches.len() > 1).then_some((prefix, matches)))
         .expect("expected at least one ambiguous one-character prefix");
 
-    let err = store.get_node(&ambiguous.0).unwrap_err();
+    let err = store.get_node(&ambiguous.0).await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -1141,18 +1419,25 @@ where
     ));
 }
 
-fn assert_set_branch_head_requires_matching_expected_head<F>()
+async fn assert_set_branch_head_requires_matching_expected_head<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let next_id = store.append(make_text_node(&child_id, "next")).unwrap();
-    store.fork("main", &child_id).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let next_id = store
+        .append(make_text_node(&child_id, "next"))
+        .await
+        .unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let err = store
         .set_branch_head("main", &root_id, &next_id)
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1165,77 +1450,98 @@ where
     ));
 }
 
-fn assert_log_supports_branch_name_on_head_ref<F>()
+async fn assert_log_supports_branch_name_on_head_ref<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    store.fork("main", &child_id).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
-    let log = store.log(&root_id, "main").unwrap();
+    let log = store.log(&root_id, "main").await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![child_id, root_id]);
 }
 
-fn assert_log_supports_branch_name_on_base_ref<F>()
+async fn assert_log_supports_branch_name_on_base_ref<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let leaf_id = store.append(make_text_node(&child_id, "leaf")).unwrap();
-    store.fork("base", &child_id).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let leaf_id = store
+        .append(make_text_node(&child_id, "leaf"))
+        .await
+        .unwrap();
+    store.fork("base", &child_id).await.unwrap();
 
-    let log = store.log("base", &leaf_id).unwrap();
+    let log = store.log("base", &leaf_id).await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![leaf_id, child_id]);
 }
 
-fn assert_log_supports_branch_name_on_both_sides<F>()
+async fn assert_log_supports_branch_name_on_both_sides<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let child_id = store.append(make_text_node(&root_id, "child")).unwrap();
-    let leaf_id = store.append(make_text_node(&child_id, "leaf")).unwrap();
-    store.fork("base", &child_id).unwrap();
-    store.fork("main", &leaf_id).unwrap();
+    let child_id = store
+        .append(make_text_node(&root_id, "child"))
+        .await
+        .unwrap();
+    let leaf_id = store
+        .append(make_text_node(&child_id, "leaf"))
+        .await
+        .unwrap();
+    store.fork("base", &child_id).await.unwrap();
+    store.fork("main", &leaf_id).await.unwrap();
 
-    let log = store.log("base", "main").unwrap();
+    let log = store.log("base", "main").await.unwrap();
     let ids: Vec<_> = log.into_iter().map(|node| node.id).collect();
 
     assert_eq!(ids, vec![leaf_id, child_id]);
 }
 
-fn assert_log_returns_branch_not_found_when_branch_is_missing<F>()
+async fn assert_log_returns_branch_not_found_when_branch_is_missing<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
 
-    let err = store.log(&root_id, "main").unwrap_err();
+    let err = store.log(&root_id, "main").await.unwrap_err();
 
     assert!(matches!(err, Error::BranchNotFound { name } if name == "main"));
 }
 
-fn assert_rebase_session_rewrites_branch_chain_with_updated_config<F>()
+async fn assert_rebase_session_rewrites_branch_chain_with_updated_config<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
-    let old_child = store.get_node(&child_id).unwrap();
-    let old_session = store.get_node(&session_id).unwrap();
-    store.fork("main", &child_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
+    let old_child = store.get_node(&child_id).await.unwrap();
+    let old_session = store.get_node(&session_id).await.unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
         .rebase_session(
@@ -1247,10 +1553,11 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     assert_ne!(new_head, child_id);
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, new_head);
     assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "child"));
     assert_ne!(ancestry[0].id, child_id);
@@ -1275,16 +1582,22 @@ where
     );
 }
 
-fn assert_rebase_session_patch_system_prompt_rebuilds_branch_chain<F>()
+async fn assert_rebase_session_patch_system_prompt_rebuilds_branch_chain<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
-    let old_session = store.get_node(&session_id).unwrap();
-    store.fork("main", &child_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
+    let old_session = store.get_node(&session_id).await.unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
         .rebase_session(
@@ -1295,9 +1608,10 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, new_head);
     assert_ne!(ancestry[1].id, session_id);
     let Kind::Anchor(anchor) = &ancestry[1].kind else {
@@ -1313,20 +1627,25 @@ where
     assert_eq!(old_anchor.as_session().unwrap().system_prompt, "system");
 }
 
-fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
+async fn assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
     let merge_source_id = store
         .append(make_text_node(&session_id, "merge-source"))
+        .await
         .unwrap();
     let anchor_id = store
         .append(make_prompt_anchor_node(&merge_source_id, &[&session_id]))
+        .await
         .unwrap();
-    store.fork("main", &anchor_id).unwrap();
+    store.fork("main", &anchor_id).await.unwrap();
 
     store
         .rebase_session(
@@ -1336,9 +1655,10 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let rebased_prompt = &ancestry[0];
     let rebased_merge_source = &ancestry[1];
     let rebased_session = &ancestry[2];
@@ -1350,16 +1670,22 @@ where
     assert_eq!(anchor.merge_parent_node_ids(), [session_id.as_str()]);
 }
 
-fn assert_rebase_session_keeps_other_branches_on_old_chain<F>()
+async fn assert_rebase_session_keeps_other_branches_on_old_chain<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
-    store.fork("main", &child_id).unwrap();
-    store.fork("draft", &child_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
+    store.fork("main", &child_id).await.unwrap();
+    store.fork("draft", &child_id).await.unwrap();
 
     let new_head = store
         .rebase_session(
@@ -1369,11 +1695,12 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
-    assert_eq!(store.get_branch_head("draft").unwrap(), child_id);
-    assert_eq!(store.get_branch_head("main").unwrap(), new_head);
-    let draft_ancestry = store.ancestry("draft").unwrap();
+    assert_eq!(store.get_branch_head("draft").await.unwrap(), child_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), new_head);
+    let draft_ancestry = store.ancestry("draft").await.unwrap();
     let Kind::Anchor(anchor) = &draft_ancestry[1].kind else {
         panic!("expected session anchor");
     };
@@ -1384,16 +1711,17 @@ where
     assert_eq!(draft_ancestry[1].id, session_id);
 }
 
-fn assert_rebase_session_requires_visible_session_anchor<F>()
+async fn assert_rebase_session_requires_visible_session_anchor<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .rebase_session("main", &SessionAnchorPatch::default())
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1402,17 +1730,23 @@ where
     ));
 }
 
-fn assert_rebase_session_preserves_created_at_across_rewritten_chain<F>()
+async fn assert_rebase_session_preserves_created_at_across_rewritten_chain<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
-    let session_created_at = store.get_node(&session_id).unwrap().created_at;
-    let child_created_at = store.get_node(&child_id).unwrap().created_at;
-    store.fork("main", &child_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
+    let session_created_at = store.get_node(&session_id).await.unwrap().created_at;
+    let child_created_at = store.get_node(&child_id).await.unwrap().created_at;
+    store.fork("main", &child_id).await.unwrap();
 
     store
         .rebase_session(
@@ -1422,30 +1756,38 @@ where
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].created_at, child_created_at);
     assert_eq!(ancestry[1].created_at, session_created_at);
     assert_eq!(ancestry[2].id, root_id);
 }
 
-fn assert_handoff_session_appends_session_anchor_after_current_head<F>()
+async fn assert_handoff_session_appends_session_anchor_after_current_head<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    let child_id = store.append(make_text_node(&session_id, "child")).unwrap();
-    store.fork("main", &child_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    let child_id = store
+        .append(make_text_node(&session_id, "child"))
+        .await
+        .unwrap();
+    store.fork("main", &child_id).await.unwrap();
 
     let new_head = store
         .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
+        .await
         .unwrap();
 
     assert_ne!(new_head, child_id);
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, new_head);
     assert_eq!(ancestry[0].parent, child_id);
     let Kind::Anchor(anchor) = &ancestry[0].kind else {
@@ -1461,16 +1803,17 @@ where
     assert_eq!(ancestry[3].id, root_id);
 }
 
-fn assert_handoff_session_requires_visible_session_anchor<F>()
+async fn assert_handoff_session_requires_visible_session_anchor<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
+    store.fork("main", &root_id).await.unwrap();
 
     let err = store
         .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1479,31 +1822,38 @@ where
     ));
 }
 
-fn assert_handoff_session_rejects_empty_prompt<F>()
+async fn assert_handoff_session_rejects_empty_prompt<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    store.fork("main", &session_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
 
     let err = store
         .handoff_session("main", &SessionAnchorPatch::default(), "  ")
+        .await
         .unwrap_err();
 
     assert!(matches!(err, Error::InvalidSessionHandoffPrompt));
-    assert_eq!(store.get_branch_head("main").unwrap(), session_id);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
 }
 
-fn assert_handoff_session_applies_session_patch<F>()
+async fn assert_handoff_session_applies_session_patch<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    let session_id = store.append(make_session_anchor_node(&root_id)).unwrap();
-    store.fork("main", &session_id).unwrap();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
 
     let new_head = store
         .handoff_session(
@@ -1516,9 +1866,10 @@ where
             },
             "handoff prompt",
         )
+        .await
         .unwrap();
 
-    let node = store.get_node(&new_head).unwrap();
+    let node = store.get_node(&new_head).await.unwrap();
     let Kind::Anchor(anchor) = &node.kind else {
         panic!("expected session anchor");
     };
@@ -1530,86 +1881,93 @@ where
     assert_eq!(session.max_tokens, Some(256));
 }
 
-fn assert_job_round_trip<F>()
+async fn assert_job_round_trip<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    store.fork("main", &root_id).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
-    assert_eq!(store.get_job(&job.job_id).unwrap(), job);
+    assert_eq!(store.get_job(&job.job_id).await.unwrap(), job);
 }
 
-fn assert_create_job_generates_unique_ids<F>()
+async fn assert_create_job_generates_unique_ids<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("draft", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
-    let second = submit_prompt_job(&store, "draft", "world");
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("draft", &root_id).await.unwrap();
+    let first = submit_prompt_job(&store, "main", "hello").await;
+    let second = submit_prompt_job(&store, "draft", "world").await;
 
     assert!(!first.job_id.is_empty());
     assert!(!second.job_id.is_empty());
     assert_ne!(first.job_id, second.job_id);
 }
 
-fn assert_finished_job_round_trip<F>()
+async fn assert_finished_job_round_trip<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    store.fork("main", &root_id).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "hello").await;
     let running = store
         .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .await
         .unwrap();
     assert!(running.finished_at.is_none());
     let finished = store
         .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .await
         .unwrap();
 
     assert!(finished.finished_at.is_some());
-    assert_eq!(store.get_job(&job.job_id).unwrap(), finished);
+    assert_eq!(store.get_job(&job.job_id).await.unwrap(), finished);
 }
 
-fn assert_job_work_branch_round_trip<F>()
+async fn assert_job_work_branch_round_trip<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("recovery", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("recovery", &root_id).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     assert_eq!(job.work_branch, "main");
     let updated = store
         .set_job_work_branch(&job.job_id, "main", "recovery")
+        .await
         .unwrap();
 
     assert_eq!(updated.branch, "main");
     assert_eq!(updated.work_branch, "recovery");
-    assert_eq!(store.get_job(&job.job_id).unwrap().work_branch, "recovery");
+    assert_eq!(
+        store.get_job(&job.job_id).await.unwrap().work_branch,
+        "recovery"
+    );
 }
 
-fn assert_set_job_work_branch_rejects_stale_expected_branch<F>()
+async fn assert_set_job_work_branch_rejects_stale_expected_branch<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("recovery", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("recovery", &root_id).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     let err = store
         .set_job_work_branch(&job.job_id, "stale", "recovery")
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1619,20 +1977,21 @@ where
     ));
 }
 
-fn assert_submit_job_rejects_active_work_branch<F>()
+async fn assert_submit_job_rejects_active_work_branch<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    store.fork("recovery", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
+    store.fork("main", &root_id).await.unwrap();
+    store.fork("recovery", &root_id).await.unwrap();
+    let first = submit_prompt_job(&store, "main", "hello").await;
     store
         .set_job_work_branch(&first.job_id, "main", "recovery")
+        .await
         .unwrap();
 
-    let err = store.submit_job("recovery", &root_id).unwrap_err();
+    let err = store.submit_job("recovery", &root_id).await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -1641,17 +2000,18 @@ where
     ));
 }
 
-fn assert_set_job_status_rejects_invalid_transition<F>()
+async fn assert_set_job_status_rejects_invalid_transition<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    store.fork("main", &root_id).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     let err = store
         .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Finished)
+        .await
         .unwrap_err();
 
     assert!(matches!(
@@ -1661,16 +2021,16 @@ where
     ));
 }
 
-fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
+async fn assert_submit_job_rejects_second_active_job_on_same_branch<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
+    store.fork("main", &root_id).await.unwrap();
+    let first = submit_prompt_job(&store, "main", "hello").await;
 
-    let second_parent = store.get_branch_head("main").unwrap();
+    let second_parent = store.get_branch_head("main").await.unwrap();
     let second_anchor_id = store
         .append(NewNode {
             parent: second_parent,
@@ -1684,8 +2044,12 @@ where
                 },
             )),
         })
+        .await
         .unwrap();
-    let err = store.submit_job("main", &second_anchor_id).unwrap_err();
+    let err = store
+        .submit_job("main", &second_anchor_id)
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         err,
@@ -1694,92 +2058,139 @@ where
     ));
 }
 
-fn assert_submit_job_allows_new_job_after_previous_job_finishes<F>()
+async fn assert_submit_job_with_prompt_base_rolls_back_nodes_on_failure<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let root_id = store.root_id();
-    store.fork("main", &root_id).unwrap();
-    let first = submit_prompt_job(&store, "main", "hello");
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+
+    let err = store
+        .submit_job_with_prompt_base(
+            "main",
+            PromptAnchor {
+                prompt: "hello".to_owned(),
+                attachments: vec![],
+            },
+            vec![MergeParent::merge("missing")],
+            Some(SessionAnchorPatch::default()),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+    assert!(store.list_jobs().await.unwrap().is_empty());
+    assert!(store.list_children(&session_id).await.unwrap().is_empty());
+}
+
+async fn assert_submit_job_allows_new_job_after_previous_job_finishes<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    store.fork("main", &root_id).await.unwrap();
+    let first = submit_prompt_job(&store, "main", "hello").await;
     store
         .set_job_status(&first.job_id, JobStatus::Queued, JobStatus::Running)
+        .await
         .unwrap();
     store
         .set_job_status(&first.job_id, JobStatus::Running, JobStatus::Finished)
+        .await
         .unwrap();
 
-    let second = submit_prompt_job(&store, "main", "world");
+    let second = submit_prompt_job(&store, "main", "world").await;
 
     assert_ne!(first.job_id, second.job_id);
     assert_eq!(second.status, JobStatus::Queued);
 }
 
-fn assert_message_queue_round_trip<F>()
+async fn assert_message_queue_round_trip<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let first = store
         .enqueue_message("hooks", json!({"text": "first"}))
+        .await
         .unwrap();
     let second = store
         .enqueue_message("hooks", json!({"text": "second"}))
+        .await
         .unwrap();
 
     assert_eq!(
-        store.list_queue_messages("hooks").unwrap(),
+        store.list_queue_messages("hooks").await.unwrap(),
         vec![first.clone(), second.clone(),]
     );
-    assert_eq!(store.peek_message("hooks").unwrap(), Some(first.clone()));
-    assert_eq!(store.peek_message("missing").unwrap(), None);
-    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(first));
-    assert_eq!(store.peek_message("hooks").unwrap(), Some(second.clone()));
-    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(second));
-    assert_eq!(store.dequeue_message("hooks").unwrap(), None);
-    assert_eq!(store.peek_message("hooks").unwrap(), None);
-    assert!(store.list_queue_messages("hooks").unwrap().is_empty());
-    assert!(store.list_message_queues().unwrap().is_empty());
+    assert_eq!(
+        store.peek_message("hooks").await.unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(store.peek_message("missing").await.unwrap(), None);
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), Some(first));
+    assert_eq!(
+        store.peek_message("hooks").await.unwrap(),
+        Some(second.clone())
+    );
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), Some(second));
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), None);
+    assert_eq!(store.peek_message("hooks").await.unwrap(), None);
+    assert!(store.list_queue_messages("hooks").await.unwrap().is_empty());
+    assert!(store.list_message_queues().await.unwrap().is_empty());
 }
 
-fn assert_message_queue_isolates_named_queues<F>()
+async fn assert_message_queue_isolates_named_queues<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let hook = store
         .enqueue_message("hooks", json!({"text": "hook"}))
+        .await
         .unwrap();
     let scheduler = store
         .enqueue_message("scheduler", json!({"text": "scheduler"}))
+        .await
         .unwrap();
 
     assert_eq!(
-        store.list_queue_messages("hooks").unwrap(),
+        store.list_queue_messages("hooks").await.unwrap(),
         vec![hook.clone()]
     );
     assert_eq!(
-        store.list_queue_messages("scheduler").unwrap(),
+        store.list_queue_messages("scheduler").await.unwrap(),
         vec![scheduler.clone()]
     );
     assert_eq!(
-        store.list_message_queues().unwrap(),
+        store.list_message_queues().await.unwrap(),
         vec!["hooks".to_owned(), "scheduler".to_owned()]
     );
-    assert_eq!(store.dequeue_message("hooks").unwrap(), Some(hook));
-    assert_eq!(store.dequeue_message("scheduler").unwrap(), Some(scheduler));
+    assert_eq!(store.dequeue_message("hooks").await.unwrap(), Some(hook));
+    assert_eq!(
+        store.dequeue_message("scheduler").await.unwrap(),
+        Some(scheduler)
+    );
 }
 
-fn assert_message_queue_ids_are_content_derived<F>()
+async fn assert_message_queue_ids_are_content_derived<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let first = store
         .enqueue_message("hooks", json!({"text": "same"}))
+        .await
         .unwrap();
     let second = store
         .enqueue_message("hooks", json!({"text": "same"}))
+        .await
         .unwrap();
 
     assert_ne!(first.message_id, second.message_id);
@@ -1804,11 +2215,11 @@ where
     assert_ne!(different_payload.message_id, first.message_id);
 }
 
-fn assert_add_skill_starts_at_version_one<F>()
+async fn assert_add_skill_starts_at_version_one<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let record = store
         .add_skill(
             SessionRole::Orchestrator,
@@ -1820,6 +2231,7 @@ where
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(record.current_version, 1);
@@ -1827,11 +2239,11 @@ where
     assert_eq!(record.current().unwrap().description, "first");
 }
 
-fn assert_update_skill_creates_new_version<F>()
+async fn assert_update_skill_creates_new_version<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let first_script = SkillScript {
         path: "scripts/inspect.py".to_owned(),
         content: "print('v1')".to_owned(),
@@ -1851,6 +2263,7 @@ where
                 enable_coco_shim: false,
             },
         )
+        .await
         .unwrap();
 
     let updated = store
@@ -1864,6 +2277,7 @@ where
                 enable_coco_shim: Some(true),
             },
         )
+        .await
         .unwrap();
 
     assert_eq!(updated.current_version, 2);
@@ -1883,11 +2297,11 @@ where
     assert!(current.enable_coco_shim);
 }
 
-fn assert_rollback_skill_creates_new_current_version<F>()
+async fn assert_rollback_skill_creates_new_current_version<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
     let first_script = SkillScript {
         path: "scripts/rollback.py".to_owned(),
         content: "print('v1')".to_owned(),
@@ -1903,6 +2317,7 @@ where
                 enable_coco_shim: false,
             },
         )
+        .await
         .unwrap();
     store
         .update_skill(
@@ -1918,10 +2333,12 @@ where
                 enable_coco_shim: Some(true),
             },
         )
+        .await
         .unwrap();
 
     let rolled_back = store
         .rollback_skill(SessionRole::Orchestrator, "custom-orchestrator", 1)
+        .await
         .unwrap();
 
     assert_eq!(rolled_back.current_version, 3);
@@ -1936,29 +2353,40 @@ where
     assert!(!current.enable_coco_shim);
 }
 
-fn assert_new_store_seeds_default_skills<F>()
+async fn assert_new_store_seeds_default_skills<F>()
 where
     F: TestStoreFactory,
 {
-    let store = F::create();
+    let store = F::create().await;
 
     let orchestrator = store
         .get_skill(SessionRole::Orchestrator, "coco-orchestrator")
+        .await
         .unwrap();
     let new_skill = store
         .get_skill(SessionRole::Orchestrator, "new-skill")
+        .await
         .unwrap();
     let cronjob = store
         .get_skill(SessionRole::Orchestrator, "cronjob")
+        .await
         .unwrap();
     let recovery = store
         .get_skill(SessionRole::Orchestrator, "recovery")
+        .await
         .unwrap();
     let compact = store
         .get_skill(SessionRole::Orchestrator, "compact")
+        .await
         .unwrap();
-    let runner = store.get_skill(SessionRole::Runner, "coco-runner").unwrap();
-    let telegram = store.get_skill(SessionRole::Runner, "telegram").unwrap();
+    let runner = store
+        .get_skill(SessionRole::Runner, "coco-runner")
+        .await
+        .unwrap();
+    let telegram = store
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
 
     assert_eq!(orchestrator.current_version, 1);
     assert_eq!(new_skill.current_version, 1);
@@ -2107,374 +2535,394 @@ macro_rules! define_common_store_tests {
         mod $module {
             use super::*;
 
-            #[test]
-            fn new_store_exposes_root_text_node() {
-                assert_new_store_exposes_root_text_node::<$factory>();
+            #[tokio::test]
+            async fn new_store_exposes_root_text_node() {
+                assert_new_store_exposes_root_text_node::<$factory>().await;
             }
 
-            #[test]
-            fn append_inserts_node_and_updates_children_index() {
-                assert_append_inserts_node_and_updates_children_index::<$factory>();
+            #[tokio::test]
+            async fn append_inserts_node_and_updates_children_index() {
+                assert_append_inserts_node_and_updates_children_index::<$factory>().await;
             }
 
-            #[test]
-            fn append_rejects_missing_parent() {
-                assert_append_rejects_missing_parent::<$factory>();
+            #[tokio::test]
+            async fn append_rejects_missing_parent() {
+                assert_append_rejects_missing_parent::<$factory>().await;
             }
 
-            #[test]
-            fn append_prompt_anchor_indexes_merge_parents_as_children() {
-                assert_append_prompt_anchor_indexes_merge_parents_as_children::<$factory>();
+            #[tokio::test]
+            async fn append_prompt_anchor_indexes_merge_parents_as_children() {
+                assert_append_prompt_anchor_indexes_merge_parents_as_children::<$factory>().await;
             }
 
-            #[test]
-            fn append_session_anchor_indexes_merge_parents_as_children() {
-                assert_append_session_anchor_indexes_merge_parents_as_children::<$factory>();
+            #[tokio::test]
+            async fn append_session_anchor_indexes_merge_parents_as_children() {
+                assert_append_session_anchor_indexes_merge_parents_as_children::<$factory>().await;
             }
 
-            #[test]
-            fn append_prompt_anchor_rejects_missing_merge_parent() {
-                assert_append_prompt_anchor_rejects_missing_merge_parent::<$factory>();
+            #[tokio::test]
+            async fn append_prompt_anchor_rejects_missing_merge_parent() {
+                assert_append_prompt_anchor_rejects_missing_merge_parent::<$factory>().await;
             }
 
-            #[test]
-            fn append_prompt_anchor_rejects_duplicate_merge_parents() {
-                assert_append_prompt_anchor_rejects_duplicate_merge_parents::<$factory>();
+            #[tokio::test]
+            async fn append_prompt_anchor_rejects_duplicate_merge_parents() {
+                assert_append_prompt_anchor_rejects_duplicate_merge_parents::<$factory>().await;
             }
 
-            #[test]
-            fn append_prompt_anchor_rejects_multiple_shadow_parents() {
-                assert_append_prompt_anchor_rejects_multiple_shadow_parents::<$factory>();
+            #[tokio::test]
+            async fn append_prompt_anchor_rejects_multiple_shadow_parents() {
+                assert_append_prompt_anchor_rejects_multiple_shadow_parents::<$factory>().await;
             }
 
-            #[test]
-            fn append_prompt_anchor_rejects_merge_parent_matching_primary_parent() {
-                assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent::<$factory>();
+            #[tokio::test]
+            async fn append_prompt_anchor_rejects_merge_parent_matching_primary_parent() {
+                assert_append_prompt_anchor_rejects_merge_parent_matching_primary_parent::<$factory>().await;
             }
 
-            #[test]
-            fn append_prompt_anchor_allows_merge_parent_from_other_session_root() {
-                assert_append_prompt_anchor_allows_merge_parent_from_other_session_root::<$factory>();
+            #[tokio::test]
+            async fn append_prompt_anchor_allows_merge_parent_from_other_session_root() {
+                assert_append_prompt_anchor_allows_merge_parent_from_other_session_root::<$factory>().await;
             }
 
-            #[test]
-            fn ancestry_returns_nodes_back_to_root() {
-                assert_ancestry_returns_nodes_back_to_root::<$factory>();
+            #[tokio::test]
+            async fn ancestry_returns_nodes_back_to_root() {
+                assert_ancestry_returns_nodes_back_to_root::<$factory>().await;
             }
 
-            #[test]
-            fn list_children_returns_primary_and_merge_children_in_stable_order() {
-                assert_list_children_returns_primary_and_merge_children_in_stable_order::<$factory>();
+            #[tokio::test]
+            async fn list_children_returns_primary_and_merge_children_in_stable_order() {
+                assert_list_children_returns_primary_and_merge_children_in_stable_order::<$factory>().await;
             }
 
-            #[test]
-            fn list_children_returns_empty_for_leaf_node() {
-                assert_list_children_returns_empty_for_leaf_node::<$factory>();
+            #[tokio::test]
+            async fn list_children_returns_empty_for_leaf_node() {
+                assert_list_children_returns_empty_for_leaf_node::<$factory>().await;
             }
 
-            #[test]
-            fn list_children_returns_not_found_for_missing_node() {
-                assert_list_children_returns_not_found_for_missing_node::<$factory>();
+            #[tokio::test]
+            async fn list_children_returns_not_found_for_missing_node() {
+                assert_list_children_returns_not_found_for_missing_node::<$factory>().await;
             }
 
-            #[test]
-            fn log_returns_nodes_from_head_back_to_base_inclusive() {
-                assert_log_returns_nodes_from_head_back_to_base_inclusive::<$factory>();
+            #[tokio::test]
+            async fn log_returns_nodes_from_head_back_to_base_inclusive() {
+                assert_log_returns_nodes_from_head_back_to_base_inclusive::<$factory>().await;
             }
 
-            #[test]
-            fn log_returns_single_node_when_base_equals_head() {
-                assert_log_returns_single_node_when_base_equals_head::<$factory>();
+            #[tokio::test]
+            async fn log_returns_single_node_when_base_equals_head() {
+                assert_log_returns_single_node_when_base_equals_head::<$factory>().await;
             }
 
-            #[test]
-            fn log_returns_not_found_when_head_is_missing() {
-                assert_log_returns_not_found_when_head_is_missing::<$factory>();
+            #[tokio::test]
+            async fn log_returns_not_found_when_head_is_missing() {
+                assert_log_returns_not_found_when_head_is_missing::<$factory>().await;
             }
 
-            #[test]
-            fn log_ignores_prompt_anchor_parents() {
-                assert_log_ignores_prompt_anchor_parents::<$factory>();
+            #[tokio::test]
+            async fn log_ignores_prompt_anchor_parents() {
+                assert_log_ignores_prompt_anchor_parents::<$factory>().await;
             }
 
-            #[test]
-            fn branch_creation_resolves_refs() {
-                assert_branch_creation_resolves_refs::<$factory>();
+            #[tokio::test]
+            async fn branch_creation_resolves_refs() {
+                assert_branch_creation_resolves_refs::<$factory>().await;
             }
 
-            #[test]
-            fn fork_rejects_duplicates() {
-                assert_fork_rejects_duplicates::<$factory>();
+            #[tokio::test]
+            async fn fork_rejects_duplicates() {
+                assert_fork_rejects_duplicates::<$factory>().await;
             }
 
-            #[test]
-            fn fork_initializes_session_state() {
-                assert_fork_initializes_session_state::<$factory>();
+            #[tokio::test]
+            async fn fork_initializes_session_state() {
+                assert_fork_initializes_session_state::<$factory>().await;
             }
 
-            #[test]
-            fn set_branch_head_requires_matching_expected_head() {
-                assert_set_branch_head_requires_matching_expected_head::<$factory>();
+            #[tokio::test]
+            async fn set_branch_head_requires_matching_expected_head() {
+                assert_set_branch_head_requires_matching_expected_head::<$factory>().await;
             }
 
-            #[test]
-            fn set_branch_head_keeps_session_state_untouched() {
-                assert_set_branch_head_keeps_session_state_untouched::<$factory>();
+            #[tokio::test]
+            async fn set_branch_head_keeps_session_state_untouched() {
+                assert_set_branch_head_keeps_session_state_untouched::<$factory>().await;
             }
 
-            #[test]
-            fn delete_branch_removes_branch_and_session_state() {
-                assert_delete_branch_removes_branch_and_session_state::<$factory>();
+            #[tokio::test]
+            async fn delete_branch_removes_branch_and_session_state() {
+                assert_delete_branch_removes_branch_and_session_state::<$factory>().await;
             }
 
-            #[test]
-            fn delete_branch_rejects_missing_branch() {
-                assert_delete_branch_rejects_missing_branch::<$factory>();
+            #[tokio::test]
+            async fn delete_branch_rejects_missing_branch() {
+                assert_delete_branch_rejects_missing_branch::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_updates_value() {
-                assert_set_session_state_updates_value::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_updates_value() {
+                assert_set_session_state_updates_value::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_requires_matching_expected() {
-                assert_set_session_state_requires_matching_expected::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_requires_matching_expected() {
+                assert_set_session_state_requires_matching_expected::<$factory>().await;
             }
 
-            #[test]
-            fn set_branch_head_preserves_attached_state() {
-                assert_set_branch_head_preserves_attached_state::<$factory>();
+            #[tokio::test]
+            async fn set_branch_head_preserves_attached_state() {
+                assert_set_branch_head_preserves_attached_state::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_accepts_merged_anchor_on_target_branch() {
-                assert_set_session_state_accepts_merged_anchor_on_target_branch::<$factory>();
+            #[tokio::test]
+            async fn append_nodes_and_set_branch_head_rolls_back_on_append_failure() {
+                assert_append_nodes_and_set_branch_head_rolls_back_on_append_failure::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_rejects_merged_anchor_outside_target_branch() {
-                assert_set_session_state_rejects_merged_anchor_outside_target_branch::<$factory>();
+            #[tokio::test]
+            async fn append_nodes_and_set_branch_head_to_rolls_back_on_head_failure() {
+                assert_append_nodes_and_set_branch_head_to_rolls_back_on_head_failure::<$factory>().await;
             }
 
-            #[test]
-            fn set_session_state_rejects_non_anchor_merged_node() {
-                assert_set_session_state_rejects_non_anchor_merged_node::<$factory>();
+            #[tokio::test]
+            async fn append_nodes_and_set_branch_head_with_session_state_rolls_back_on_state_failure() {
+                assert_append_nodes_and_set_branch_head_with_session_state_rolls_back_on_state_failure::<$factory>().await;
             }
 
-            #[test]
-            fn paused_merged_state_can_resume_as_attached() {
-                assert_paused_merged_state_can_resume_as_attached::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_accepts_merged_anchor_on_target_branch() {
+                assert_set_session_state_accepts_merged_anchor_on_target_branch::<$factory>().await;
             }
 
-            #[test]
-            fn paused_closed_state_can_resume_as_attached() {
-                assert_paused_closed_state_can_resume_as_attached::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_rejects_merged_anchor_outside_target_branch() {
+                assert_set_session_state_rejects_merged_anchor_outside_target_branch::<$factory>().await;
             }
 
-            #[test]
-            fn list_session_states_returns_branch_state_map() {
-                assert_list_session_states_returns_branch_state_map::<$factory>();
+            #[tokio::test]
+            async fn set_session_state_rejects_non_anchor_merged_node() {
+                assert_set_session_state_rejects_non_anchor_merged_node::<$factory>().await;
             }
 
-            #[test]
-            fn preset_round_trip() {
-                assert_preset_round_trip::<$factory>();
+            #[tokio::test]
+            async fn paused_merged_state_can_resume_as_attached() {
+                assert_paused_merged_state_can_resume_as_attached::<$factory>().await;
             }
 
-            #[test]
-            fn preset_replaces_existing_value() {
-                assert_preset_replaces_existing_value::<$factory>();
+            #[tokio::test]
+            async fn paused_closed_state_can_resume_as_attached() {
+                assert_paused_closed_state_can_resume_as_attached::<$factory>().await;
             }
 
-            #[test]
-            fn rollback_preset_creates_new_current_version() {
-                assert_rollback_preset_creates_new_current_version::<$factory>();
+            #[tokio::test]
+            async fn list_session_states_returns_branch_state_map() {
+                assert_list_session_states_returns_branch_state_map::<$factory>().await;
             }
 
-            #[test]
-            fn delete_preset_removes_only_config() {
-                assert_delete_preset_removes_only_config::<$factory>();
+            #[tokio::test]
+            async fn preset_round_trip() {
+                assert_preset_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn delete_branch_preserves_preset() {
-                assert_delete_branch_preserves_preset::<$factory>();
+            #[tokio::test]
+            async fn preset_replaces_existing_value() {
+                assert_preset_replaces_existing_value::<$factory>().await;
             }
 
-            #[test]
-            fn get_preset_rejects_missing_config() {
-                assert_get_preset_rejects_missing_config::<$factory>();
+            #[tokio::test]
+            async fn rollback_preset_creates_new_current_version() {
+                assert_rollback_preset_creates_new_current_version::<$factory>().await;
             }
 
-            #[test]
-            fn delete_preset_rejects_missing_config() {
-                assert_delete_preset_rejects_missing_config::<$factory>();
+            #[tokio::test]
+            async fn delete_preset_removes_only_config() {
+                assert_delete_preset_removes_only_config::<$factory>().await;
             }
 
-            #[test]
-            fn get_node_supports_branch_name() {
-                assert_get_node_supports_branch_name::<$factory>();
+            #[tokio::test]
+            async fn delete_branch_preserves_preset() {
+                assert_delete_branch_preserves_preset::<$factory>().await;
             }
 
-            #[test]
-            fn get_node_supports_prefix_after_branch_delete() {
-                assert_get_node_supports_prefix_after_branch_delete::<$factory>();
+            #[tokio::test]
+            async fn get_preset_rejects_missing_config() {
+                assert_get_preset_rejects_missing_config::<$factory>().await;
             }
 
-            #[test]
-            fn get_node_rejects_ambiguous_prefix() {
-                assert_get_node_rejects_ambiguous_prefix::<$factory>();
+            #[tokio::test]
+            async fn delete_preset_rejects_missing_config() {
+                assert_delete_preset_rejects_missing_config::<$factory>().await;
             }
 
-            #[test]
-            fn log_supports_branch_name_on_head_ref() {
-                assert_log_supports_branch_name_on_head_ref::<$factory>();
+            #[tokio::test]
+            async fn get_node_supports_branch_name() {
+                assert_get_node_supports_branch_name::<$factory>().await;
             }
 
-            #[test]
-            fn log_supports_branch_name_on_base_ref() {
-                assert_log_supports_branch_name_on_base_ref::<$factory>();
+            #[tokio::test]
+            async fn get_node_supports_prefix_after_branch_delete() {
+                assert_get_node_supports_prefix_after_branch_delete::<$factory>().await;
             }
 
-            #[test]
-            fn log_supports_branch_name_on_both_sides() {
-                assert_log_supports_branch_name_on_both_sides::<$factory>();
+            #[tokio::test]
+            async fn get_node_rejects_ambiguous_prefix() {
+                assert_get_node_rejects_ambiguous_prefix::<$factory>().await;
             }
 
-            #[test]
-            fn log_returns_branch_not_found_when_branch_is_missing() {
-                assert_log_returns_branch_not_found_when_branch_is_missing::<$factory>();
+            #[tokio::test]
+            async fn log_supports_branch_name_on_head_ref() {
+                assert_log_supports_branch_name_on_head_ref::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_rewrites_branch_chain_with_updated_config() {
-                assert_rebase_session_rewrites_branch_chain_with_updated_config::<$factory>();
+            #[tokio::test]
+            async fn log_supports_branch_name_on_base_ref() {
+                assert_log_supports_branch_name_on_base_ref::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_patch_system_prompt_rebuilds_branch_chain() {
-                assert_rebase_session_patch_system_prompt_rebuilds_branch_chain::<$factory>();
+            #[tokio::test]
+            async fn log_supports_branch_name_on_both_sides() {
+                assert_log_supports_branch_name_on_both_sides::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_keeps_merge_parents_pointing_to_original_nodes() {
-                assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes::<$factory>();
+            #[tokio::test]
+            async fn log_returns_branch_not_found_when_branch_is_missing() {
+                assert_log_returns_branch_not_found_when_branch_is_missing::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_keeps_other_branches_on_old_chain() {
-                assert_rebase_session_keeps_other_branches_on_old_chain::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_rewrites_branch_chain_with_updated_config() {
+                assert_rebase_session_rewrites_branch_chain_with_updated_config::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_requires_visible_session_anchor() {
-                assert_rebase_session_requires_visible_session_anchor::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_patch_system_prompt_rebuilds_branch_chain() {
+                assert_rebase_session_patch_system_prompt_rebuilds_branch_chain::<$factory>().await;
             }
 
-            #[test]
-            fn rebase_session_preserves_created_at_across_rewritten_chain() {
-                assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_keeps_merge_parents_pointing_to_original_nodes() {
+                assert_rebase_session_keeps_merge_parents_pointing_to_original_nodes::<$factory>().await;
             }
 
-            #[test]
-            fn handoff_session_appends_session_anchor_after_current_head() {
-                assert_handoff_session_appends_session_anchor_after_current_head::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_keeps_other_branches_on_old_chain() {
+                assert_rebase_session_keeps_other_branches_on_old_chain::<$factory>().await;
             }
 
-            #[test]
-            fn handoff_session_requires_visible_session_anchor() {
-                assert_handoff_session_requires_visible_session_anchor::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_requires_visible_session_anchor() {
+                assert_rebase_session_requires_visible_session_anchor::<$factory>().await;
             }
 
-            #[test]
-            fn handoff_session_rejects_empty_prompt() {
-                assert_handoff_session_rejects_empty_prompt::<$factory>();
+            #[tokio::test]
+            async fn rebase_session_preserves_created_at_across_rewritten_chain() {
+                assert_rebase_session_preserves_created_at_across_rewritten_chain::<$factory>().await;
             }
 
-            #[test]
-            fn handoff_session_applies_session_patch() {
-                assert_handoff_session_applies_session_patch::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_appends_session_anchor_after_current_head() {
+                assert_handoff_session_appends_session_anchor_after_current_head::<$factory>().await;
             }
 
-            #[test]
-            fn job_round_trip() {
-                assert_job_round_trip::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_requires_visible_session_anchor() {
+                assert_handoff_session_requires_visible_session_anchor::<$factory>().await;
             }
 
-            #[test]
-            fn create_job_generates_unique_ids() {
-                assert_create_job_generates_unique_ids::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_rejects_empty_prompt() {
+                assert_handoff_session_rejects_empty_prompt::<$factory>().await;
             }
 
-            #[test]
-            fn add_skill_starts_at_version_one() {
-                assert_add_skill_starts_at_version_one::<$factory>();
+            #[tokio::test]
+            async fn handoff_session_applies_session_patch() {
+                assert_handoff_session_applies_session_patch::<$factory>().await;
             }
 
-            #[test]
-            fn new_store_seeds_default_skills() {
-                assert_new_store_seeds_default_skills::<$factory>();
+            #[tokio::test]
+            async fn job_round_trip() {
+                assert_job_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn update_skill_creates_new_version() {
-                assert_update_skill_creates_new_version::<$factory>();
+            #[tokio::test]
+            async fn create_job_generates_unique_ids() {
+                assert_create_job_generates_unique_ids::<$factory>().await;
             }
 
-            #[test]
-            fn rollback_skill_creates_new_current_version() {
-                assert_rollback_skill_creates_new_current_version::<$factory>();
+            #[tokio::test]
+            async fn add_skill_starts_at_version_one() {
+                assert_add_skill_starts_at_version_one::<$factory>().await;
             }
 
-            #[test]
-            fn finished_job_round_trip() {
-                assert_finished_job_round_trip::<$factory>();
+            #[tokio::test]
+            async fn new_store_seeds_default_skills() {
+                assert_new_store_seeds_default_skills::<$factory>().await;
             }
 
-            #[test]
-            fn job_work_branch_round_trip() {
-                assert_job_work_branch_round_trip::<$factory>();
+            #[tokio::test]
+            async fn update_skill_creates_new_version() {
+                assert_update_skill_creates_new_version::<$factory>().await;
             }
 
-            #[test]
-            fn set_job_work_branch_rejects_stale_expected_branch() {
-                assert_set_job_work_branch_rejects_stale_expected_branch::<$factory>();
+            #[tokio::test]
+            async fn rollback_skill_creates_new_current_version() {
+                assert_rollback_skill_creates_new_current_version::<$factory>().await;
             }
 
-            #[test]
-            fn submit_job_rejects_active_work_branch() {
-                assert_submit_job_rejects_active_work_branch::<$factory>();
+            #[tokio::test]
+            async fn finished_job_round_trip() {
+                assert_finished_job_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn set_job_status_rejects_invalid_transition() {
-                assert_set_job_status_rejects_invalid_transition::<$factory>();
+            #[tokio::test]
+            async fn job_work_branch_round_trip() {
+                assert_job_work_branch_round_trip::<$factory>().await;
             }
 
-            #[test]
-            fn submit_job_rejects_second_active_job_on_same_branch() {
-                assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>();
+            #[tokio::test]
+            async fn set_job_work_branch_rejects_stale_expected_branch() {
+                assert_set_job_work_branch_rejects_stale_expected_branch::<$factory>().await;
             }
 
-            #[test]
-            fn submit_job_allows_new_job_after_previous_job_finishes() {
-                assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>();
+            #[tokio::test]
+            async fn submit_job_rejects_active_work_branch() {
+                assert_submit_job_rejects_active_work_branch::<$factory>().await;
             }
 
-            #[test]
-            fn message_queue_round_trip() {
-                assert_message_queue_round_trip::<$factory>();
+            #[tokio::test]
+            async fn set_job_status_rejects_invalid_transition() {
+                assert_set_job_status_rejects_invalid_transition::<$factory>().await;
             }
 
-            #[test]
-            fn message_queue_isolates_named_queues() {
-                assert_message_queue_isolates_named_queues::<$factory>();
+            #[tokio::test]
+            async fn submit_job_rejects_second_active_job_on_same_branch() {
+                assert_submit_job_rejects_second_active_job_on_same_branch::<$factory>().await;
             }
 
-            #[test]
-            fn message_queue_ids_are_content_derived() {
-                assert_message_queue_ids_are_content_derived::<$factory>();
+            #[tokio::test]
+            async fn submit_job_with_prompt_base_rolls_back_nodes_on_failure() {
+                assert_submit_job_with_prompt_base_rolls_back_nodes_on_failure::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn submit_job_allows_new_job_after_previous_job_finishes() {
+                assert_submit_job_allows_new_job_after_previous_job_finishes::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn message_queue_round_trip() {
+                assert_message_queue_round_trip::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn message_queue_isolates_named_queues() {
+                assert_message_queue_isolates_named_queues::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn message_queue_ids_are_content_derived() {
+                assert_message_queue_ids_are_content_derived::<$factory>().await;
             }
 
         }

@@ -51,6 +51,10 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
+async fn node_created_at(store: &impl NodeStore, id: &str) -> String {
+    store.get_node(id).await.unwrap().created_at.to_string()
+}
+
 fn prompt_job_queue_for_branch(branch: &str) -> String {
     format!("prompt.job/{branch}")
 }
@@ -89,11 +93,11 @@ fn cli_help_uses_coco_command_name() {
     assert!(!help.contains("Usage: coco-cli"));
 }
 
-fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job
+async fn submit_prompt_job<S>(store: &S, branch: &str, prompt: &str) -> coco_mem::Job
 where
     S: BranchStore + JobStore + NodeStore,
 {
-    let parent = store.get_branch_head(branch).unwrap();
+    let parent = store.get_branch_head(branch).await.unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
             parent,
@@ -107,8 +111,9 @@ where
                 },
             )),
         })
+        .await
         .unwrap();
-    store.submit_job(branch, &prompt_anchor_id).unwrap()
+    store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -679,7 +684,7 @@ where
     B: CompletionBackend + 'static,
     R: std::io::Read,
 {
-    let store = open_store(&cli.store_path)?;
+    let store = open_store(&cli.store_path).await?;
     let provider_configs = HashMap::from_iter(
         provider_profiles
             .list_provider_profiles()
@@ -719,7 +724,7 @@ where
     .await
 }
 
-fn append_prompt_anchor(
+async fn append_prompt_anchor(
     store: &impl NodeStore,
     parent: &str,
     prompt: &str,
@@ -741,10 +746,11 @@ fn append_prompt_anchor(
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
-fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> String {
+async fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -768,10 +774,16 @@ fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> 
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
-fn append_tool_use_node(store: &impl NodeStore, parent: &str, id: &str, name: &str) -> String {
+async fn append_tool_use_node(
+    store: &impl NodeStore,
+    parent: &str,
+    id: &str,
+    name: &str,
+) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -787,10 +799,16 @@ fn append_tool_use_node(store: &impl NodeStore, parent: &str, id: &str, name: &s
                 }),
             }),
         })
+        .await
         .unwrap()
 }
 
-fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, output: &str) -> String {
+async fn append_tool_result_node(
+    store: &impl NodeStore,
+    parent: &str,
+    id: &str,
+    output: &str,
+) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -803,10 +821,11 @@ fn append_tool_result_node(store: &impl NodeStore, parent: &str, id: &str, outpu
                 output: output.to_owned(),
             }),
         })
+        .await
         .unwrap()
 }
 
-fn append_text_node(store: &impl NodeStore, parent: &str, text: &str) -> String {
+async fn append_text_node(store: &impl NodeStore, parent: &str, text: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -814,10 +833,11 @@ fn append_text_node(store: &impl NodeStore, parent: &str, text: &str) -> String 
             metadata: None,
             kind: Kind::Text(text.to_owned()),
         })
+        .await
         .unwrap()
 }
 
-fn append_failure_node(store: &impl NodeStore, parent: &str, message: &str) -> String {
+async fn append_failure_node(store: &impl NodeStore, parent: &str, message: &str) -> String {
     store
         .append(NewNode {
             parent: parent.to_owned(),
@@ -825,10 +845,11 @@ fn append_failure_node(store: &impl NodeStore, parent: &str, message: &str) -> S
             metadata: None,
             kind: Kind::Failure(message.to_owned()),
         })
+        .await
         .unwrap()
 }
 
-fn append_skill_result_anchor(
+async fn append_skill_result_anchor(
     store: &impl NodeStore,
     parent: &str,
     merge_parent: &str,
@@ -848,10 +869,11 @@ fn append_skill_result_anchor(
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
-fn append_skill_invocation_anchor(
+async fn append_skill_invocation_anchor(
     store: &impl NodeStore,
     parent: &str,
     skill_name: &str,
@@ -869,6 +891,7 @@ fn append_skill_invocation_anchor(
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
@@ -1006,8 +1029,10 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     )
     .await;
     let original_main_head = open_store(&store_path)
+        .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
     run_with_backend(
         session_fork_cli(store_path.clone(), "runner", Some("main")),
@@ -1040,8 +1065,8 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     .unwrap();
 
     assert_eq!(output, Some("runner done".to_owned()));
-    let store = open_store(&store_path).unwrap();
-    let ancestry = store.ancestry("runner").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let ancestry = store.ancestry("runner").await.unwrap();
     assert!(matches!(
         &ancestry[0].kind,
         Kind::Text(text) if text == "runner done"
@@ -1104,8 +1129,8 @@ async fn prompt_enable_all_tools_appends_all_tool_patch() {
     .await
     .unwrap();
 
-    let store = open_store(&store_path).unwrap();
-    let ancestry = store.ancestry("runner").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let ancestry = store.ancestry("runner").await.unwrap();
     let Kind::Anchor(anchor) = &ancestry[2].kind else {
         panic!("expected session patch anchor");
     };
@@ -1191,7 +1216,12 @@ async fn prompt_persists_single_job_even_without_async() {
 
     assert_eq!(output, "done");
 
-    let jobs = open_store(&store_path).unwrap().list_jobs().unwrap();
+    let jobs = open_store(&store_path)
+        .await
+        .unwrap()
+        .list_jobs()
+        .await
+        .unwrap();
     assert_eq!(jobs.len(), 1);
     let job_id = jobs.keys().next().unwrap().clone();
     let status_text_output = run_with_backend(
@@ -1272,7 +1302,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("async done")]), ("json", &[Ok("json done")])]),
@@ -1309,10 +1339,11 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert!(text_output.contains("branch: main"));
     let queued_messages = store
         .list_queue_messages(&prompt_job_queue_for_branch("main"))
+        .await
         .unwrap();
     assert_eq!(queued_messages.len(), 1);
     let text_job_id = queued_messages[0].payload["job_id"].as_str().unwrap();
-    assert!(store.get_job(text_job_id).is_err());
+    assert!(store.get_job(text_job_id).await.is_err());
     assert_eq!(queued_messages[0].payload["branch"], "main");
     assert_eq!(queued_messages[0].payload["prompt"], "hello");
 
@@ -1355,6 +1386,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
                 "session_patch": null,
             }),
         )
+        .await
         .unwrap();
 
     let pending_list_output = crate::app::runtime::run_with_services(
@@ -1411,6 +1443,7 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(
         store
             .list_queue_messages(&prompt_job_queue_for_branch("main"))
+            .await
             .unwrap()
             .len(),
         1
@@ -1418,11 +1451,18 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     assert_eq!(
         store
             .list_queue_messages(&prompt_job_queue_for_branch("json"))
+            .await
             .unwrap()
             .len(),
         1
     );
-    assert!(store.list_queue_messages("prompt.job").unwrap().is_empty());
+    assert!(
+        store
+            .list_queue_messages("prompt.job")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1442,7 +1482,7 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("async done")])]),
@@ -1479,6 +1519,7 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
     assert!(
         store
             .list_queue_messages(&prompt_job_queue_for_branch("main"))
+            .await
             .unwrap()
             .is_empty()
     );
@@ -1487,6 +1528,7 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
         loop {
             if store
                 .get_job(job_id)
+                .await
                 .is_ok_and(|job| job.status == coco_mem::JobStatus::Finished)
             {
                 break;
@@ -1515,8 +1557,8 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello");
+    let store = open_store(&store_path).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "hello").await;
 
     run_with_backend(
         prompt_worker_cli(store_path.clone(), &job.job_id),
@@ -1562,9 +1604,10 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
-    let shadow_parent = append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+    let store = open_store(&store_path).await.unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
+    let shadow_parent =
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let prompt_anchor_id = store
         .append(NewNode {
             parent: session_head,
@@ -1578,8 +1621,9 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
                 },
             )),
         })
+        .await
         .unwrap();
-    let job = store.submit_job("main", &prompt_anchor_id).unwrap();
+    let job = store.submit_job("main", &prompt_anchor_id).await.unwrap();
 
     let status_output = run_with_backend(
         prompt_status_cli(store_path, &job.job_id),
@@ -1614,8 +1658,8 @@ async fn prompt_status_reports_running_task_progress() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let job = submit_prompt_job(&store, "main", "hello progress");
+    let store = open_store(&store_path).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "hello progress").await;
 
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
@@ -1687,8 +1731,8 @@ async fn session_create_persists_branch_for_future_prompt_calls() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    assert_eq!(store.get_branch_head("main").unwrap().len(), 64);
+    let store = open_store(&store_path).await.unwrap();
+    assert_eq!(store.get_branch_head("main").await.unwrap().len(), 64);
 
     let output = run_with_backend(
         prompt_cli(store_path, Some("main"), &["hello"]),
@@ -1719,8 +1763,10 @@ async fn session_fork_creates_active_branch_from_reference() {
     .await;
 
     let source_head_id = open_store(&store_path)
+        .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
 
     let text_output = run_with_backend(
@@ -1766,11 +1812,17 @@ async fn session_fork_creates_active_branch_from_reference() {
         })
     );
 
-    let store = open_store(&store_path).unwrap();
-    assert_eq!(store.get_branch_head("draft").unwrap(), source_head_id);
-    assert_eq!(store.get_branch_head("json-draft").unwrap(), source_head_id);
+    let store = open_store(&store_path).await.unwrap();
     assert_eq!(
-        store.get_session_state("draft").unwrap(),
+        store.get_branch_head("draft").await.unwrap(),
+        source_head_id
+    );
+    assert_eq!(
+        store.get_branch_head("json-draft").await.unwrap(),
+        source_head_id
+    );
+    assert_eq!(
+        store.get_session_state("draft").await.unwrap(),
         SessionState::Active
     );
 }
@@ -1799,8 +1851,8 @@ async fn session_list_returns_sorted_branches_with_states() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let base_head_id = store.get_branch_head("main").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let base_head_id = store.get_branch_head("main").await.unwrap();
 
     run_with_backend(
         session_pr_cli(store_path.clone(), Some("draft"), "main"),
@@ -1845,7 +1897,7 @@ async fn session_list_returns_sorted_branches_with_states() {
         json!([
             {
                 "branch": "draft",
-                "head_id": store.get_branch_head("draft").unwrap(),
+                "head_id": store.get_branch_head("draft").await.unwrap(),
                 "role": "orchestrator",
                 "state": {
                     "Attached": {
@@ -1856,7 +1908,7 @@ async fn session_list_returns_sorted_branches_with_states() {
             },
             {
                 "branch": "main",
-                "head_id": store.get_branch_head("main").unwrap(),
+                "head_id": store.get_branch_head("main").await.unwrap(),
                 "role": "orchestrator",
                 "state": "Active"
             }
@@ -1926,10 +1978,10 @@ async fn session_get_returns_state_and_visible_anchor() {
     assert_eq!(value["anchor"]["max_tokens"], json!(64));
     assert_eq!(value["anchor"]["tools"], json!([]));
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     assert_eq!(
         value["head_id"],
-        json!(store.get_branch_head("main").unwrap())
+        json!(store.get_branch_head("main").await.unwrap())
     );
 }
 
@@ -2194,12 +2246,12 @@ async fn session_delete_removes_branch_and_session_state() {
         json!({"branch": "json-draft"})
     );
 
-    let store = open_store(&store_path).unwrap();
-    let err = store.get_branch_head("draft").unwrap_err();
+    let store = open_store(&store_path).await.unwrap();
+    let err = store.get_branch_head("draft").await.unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
-    let err = store.get_session_state("draft").unwrap_err();
+    let err = store.get_session_state("draft").await.unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "draft"));
-    let err = store.get_branch_head("json-draft").unwrap_err();
+    let err = store.get_branch_head("json-draft").await.unwrap_err();
     assert!(matches!(err, coco_mem::StoreError::BranchNotFound { name } if name == "json-draft"));
 }
 
@@ -2221,8 +2273,10 @@ async fn session_rebase_updates_visible_session_config() {
     .await;
 
     let original_head = open_store(&store_path)
+        .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
 
     let rebase_text_output = run_with_backend(
@@ -2348,8 +2402,10 @@ async fn session_handoff_appends_inherited_session_anchor() {
     .await
     .unwrap();
     let original_head = open_store(&store_path)
+        .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
 
     let text_output = run_with_backend(
@@ -2387,8 +2443,8 @@ async fn session_handoff_appends_inherited_session_anchor() {
     let head = value["head"].as_str().unwrap();
     assert_ne!(value["head"], json!(original_head));
 
-    let store = open_store(&store_path).unwrap();
-    let ancestry = store.ancestry("main").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     assert_eq!(ancestry[0].id, head);
     let Kind::Anchor(anchor) = &ancestry[0].kind else {
         panic!("expected session anchor");
@@ -2422,6 +2478,7 @@ async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default
 
     let stale_tool = stale_exec_command_tool();
     open_store(&store_path)
+        .await
         .unwrap()
         .rebase_session(
             "main",
@@ -2430,6 +2487,7 @@ async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     run_with_backend(
@@ -2451,8 +2509,8 @@ async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default
     .await
     .unwrap();
 
-    let store = open_store(&store_path).unwrap();
-    let ancestry = store.ancestry("main").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let Kind::Anchor(anchor) = &ancestry[0].kind else {
         panic!("expected session anchor");
     };
@@ -2480,6 +2538,7 @@ async fn session_handoff_can_preserve_inherited_tool_definitions() {
 
     let stale_tool = stale_exec_command_tool();
     open_store(&store_path)
+        .await
         .unwrap()
         .rebase_session(
             "main",
@@ -2488,6 +2547,7 @@ async fn session_handoff_can_preserve_inherited_tool_definitions() {
                 ..SessionAnchorPatch::default()
             },
         )
+        .await
         .unwrap();
 
     run_with_backend(
@@ -2510,8 +2570,8 @@ async fn session_handoff_can_preserve_inherited_tool_definitions() {
     .await
     .unwrap();
 
-    let store = open_store(&store_path).unwrap();
-    let ancestry = store.ancestry("main").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let Kind::Anchor(anchor) = &ancestry[0].kind else {
         panic!("expected session anchor");
     };
@@ -2543,7 +2603,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
 
     let pr_text_output = run_with_backend(
         Cli::try_parse_from([
@@ -2569,7 +2629,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
     assert!(pr_text_output.contains("branch: main"));
     assert!(pr_text_output.contains("state: attached target=main"));
 
-    let json_base_head_id = store.get_branch_head("main").unwrap();
+    let json_base_head_id = store.get_branch_head("main").await.unwrap();
     let pr_output = run_with_backend(
         session_pr_cli(store_path.clone(), Some("json"), "main"),
         &mut Cursor::new(""),
@@ -2622,8 +2682,10 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
 
     assert_eq!(
         open_store(&store_path)
+            .await
             .unwrap()
             .get_session_state("main")
+            .await
             .unwrap(),
         SessionState::Active
     );
@@ -2736,8 +2798,8 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     .await
     .unwrap();
 
-    let store = open_store(&store_path).unwrap();
-    let source_head_id = store.get_branch_head("main").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let source_head_id = store.get_branch_head("main").await.unwrap();
 
     let merge_text_output = run_with_backend(
         Cli::try_parse_from([
@@ -2764,8 +2826,10 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     assert!(merge_text_output.contains("state: paused target=base reason=merged"));
 
     let base_head_id = open_store(&store_path)
+        .await
         .unwrap()
         .get_branch_head("base")
+        .await
         .unwrap();
 
     let merge_output = run_with_backend(
@@ -2795,8 +2859,8 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         })
     );
 
-    let store = open_store(&store_path).unwrap();
-    let merged_anchor = store.get_node(&merged_anchor_id).unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let merged_anchor = store.get_node(&merged_anchor_id).await.unwrap();
     let Kind::Anchor(anchor) = merged_anchor.kind else {
         panic!("expected merged prompt anchor");
     };
@@ -2808,9 +2872,10 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     );
 
     let merged_feedback_source_id =
-        append_prompt_anchor(&store, &merged_anchor_id, "review note", &[]);
+        append_prompt_anchor(&store, &merged_anchor_id, "review note", &[]).await;
     store
         .set_branch_head("base", &merged_anchor_id, &merged_feedback_source_id)
+        .await
         .unwrap();
     store
         .set_session_state(
@@ -2821,9 +2886,10 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
                 base_head_id: merged_anchor_id.clone(),
             },
         )
+        .await
         .unwrap();
 
-    let main_head_before_feedback = store.get_branch_head("main").unwrap();
+    let main_head_before_feedback = store.get_branch_head("main").await.unwrap();
     let feedback_output = run_with_backend(
         session_feedback_cli(
             store_path.clone(),
@@ -2861,8 +2927,8 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         })
     );
 
-    let store = open_store(&store_path).unwrap();
-    let feedback_anchor = store.get_node(&feedback_anchor_id).unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let feedback_anchor = store.get_node(&feedback_anchor_id).await.unwrap();
     let Kind::Anchor(anchor) = feedback_anchor.kind else {
         panic!("expected feedback prompt anchor");
     };
@@ -2877,13 +2943,14 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     );
 
     let second_feedback_source_id =
-        append_prompt_anchor(&store, &merged_feedback_source_id, "second review", &[]);
+        append_prompt_anchor(&store, &merged_feedback_source_id, "second review", &[]).await;
     store
         .set_branch_head(
             "base",
             &merged_feedback_source_id,
             &second_feedback_source_id,
         )
+        .await
         .unwrap();
     store
         .set_session_state(
@@ -2894,6 +2961,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
                 base_head_id: merged_feedback_source_id.clone(),
             },
         )
+        .await
         .unwrap();
 
     let feedback_text_output = run_with_backend(
@@ -3010,19 +3078,21 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let draft_head = append_prompt_anchor(
         &store,
-        &store.get_branch_head("draft").unwrap(),
+        &store.get_branch_head("draft").await.unwrap(),
         "draft merge parent",
         &[],
-    );
+    )
+    .await;
     store
         .set_branch_head(
             "draft",
-            &store.get_branch_head("draft").unwrap(),
+            &store.get_branch_head("draft").await.unwrap(),
             &draft_head,
         )
+        .await
         .unwrap();
 
     run_with_backend(
@@ -3033,12 +3103,13 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
     .await
     .unwrap();
 
-    let store = open_store(&store_path).unwrap();
-    let main_head = store.get_branch_head("main").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let main_head = store.get_branch_head("main").await.unwrap();
     let merged_head =
-        append_prompt_anchor(&store, &main_head, "merge after delete", &[&draft_head]);
+        append_prompt_anchor(&store, &main_head, "merge after delete", &[&draft_head]).await;
     store
         .set_branch_head("main", &main_head, &merged_head)
+        .await
         .unwrap();
 
     let output = run_with_backend(
@@ -3072,19 +3143,22 @@ async fn session_graph_shows_tool_and_failure_nodes() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
+    let store = open_store(&store_path).await.unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
+        .await
         .unwrap();
-    let tool_result_id = append_tool_result_node(&store, &tool_use_id, "tool-1", "hello");
+    let tool_result_id = append_tool_result_node(&store, &tool_use_id, "tool-1", "hello").await;
     store
         .set_branch_head("main", &tool_use_id, &tool_result_id)
+        .await
         .unwrap();
-    let failure_id = append_failure_node(&store, &tool_result_id, "command failed");
+    let failure_id = append_failure_node(&store, &tool_result_id, "command failed").await;
     store
         .set_branch_head("main", &tool_result_id, &failure_id)
+        .await
         .unwrap();
 
     let output = run_with_backend(
@@ -3174,16 +3248,17 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let original_session_id = store.get_branch_head("main").unwrap();
-    let old_prompt_id = append_prompt_anchor(&store, &original_session_id, "old prompt", &[]);
-    let old_text_id = append_text_node(&store, &old_prompt_id, "old text");
+    let store = open_store(&store_path).await.unwrap();
+    let original_session_id = store.get_branch_head("main").await.unwrap();
+    let old_prompt_id = append_prompt_anchor(&store, &original_session_id, "old prompt", &[]).await;
+    let old_text_id = append_text_node(&store, &old_prompt_id, "old text").await;
     let new_session_id =
-        append_session_anchor(&store, &old_text_id, "You are executing the skill `docs`.");
-    let new_prompt_id = append_prompt_anchor(&store, &new_session_id, "new prompt", &[]);
-    let new_text_id = append_text_node(&store, &new_prompt_id, "new text");
+        append_session_anchor(&store, &old_text_id, "You are executing the skill `docs`.").await;
+    let new_prompt_id = append_prompt_anchor(&store, &new_session_id, "new prompt", &[]).await;
+    let new_text_id = append_text_node(&store, &new_prompt_id, "new text").await;
     store
         .set_branch_head("main", &original_session_id, &new_text_id)
+        .await
         .unwrap();
 
     let output = run_with_backend(
@@ -3196,16 +3271,15 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
     let expected_output = formatdoc!(
         "
         * {new_prompt_id} prompt {new_prompt_created_at} [main] new prompt
         * {new_session_id} session {new_session_created_at} You are executing the skill `docs`.
         ",
         new_prompt_id = short_id(&new_prompt_id),
-        new_prompt_created_at = created_at(&new_prompt_id),
+        new_prompt_created_at = node_created_at(&store, &new_prompt_id).await,
         new_session_id = short_id(&new_session_id),
-        new_session_created_at = created_at(&new_session_id),
+        new_session_created_at = node_created_at(&store, &new_session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -3231,17 +3305,17 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
         * {original_session_id} session {original_session_created_at} You are helpful.
         ",
         new_text_id = short_id(&new_text_id),
-        new_text_created_at = created_at(&new_text_id),
+        new_text_created_at = node_created_at(&store, &new_text_id).await,
         new_prompt_id = short_id(&new_prompt_id),
-        new_prompt_created_at = created_at(&new_prompt_id),
+        new_prompt_created_at = node_created_at(&store, &new_prompt_id).await,
         new_session_id = short_id(&new_session_id),
-        new_session_created_at = created_at(&new_session_id),
+        new_session_created_at = node_created_at(&store, &new_session_id).await,
         old_text_id = short_id(&old_text_id),
-        old_text_created_at = created_at(&old_text_id),
+        old_text_created_at = node_created_at(&store, &old_text_id).await,
         old_prompt_id = short_id(&old_prompt_id),
-        old_prompt_created_at = created_at(&old_prompt_id),
+        old_prompt_created_at = node_created_at(&store, &old_prompt_id).await,
         original_session_id = short_id(&original_session_id),
-        original_session_created_at = created_at(&original_session_id),
+        original_session_created_at = node_created_at(&store, &original_session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -3299,22 +3373,25 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
-    let main_anchor_id = append_prompt_anchor(&store, &session_id, "main anchor", &[]);
-    let main_hidden_id = append_text_node(&store, &main_anchor_id, "main hidden text");
+    let store = open_store(&store_path).await.unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
+    let main_anchor_id = append_prompt_anchor(&store, &session_id, "main anchor", &[]).await;
+    let main_hidden_id = append_text_node(&store, &main_anchor_id, "main hidden text").await;
     store
         .set_branch_head("main", &session_id, &main_hidden_id)
+        .await
         .unwrap();
-    let draft_anchor_id = append_prompt_anchor(&store, &session_id, "draft anchor", &[]);
-    let draft_hidden_id = append_text_node(&store, &draft_anchor_id, "draft hidden text");
+    let draft_anchor_id = append_prompt_anchor(&store, &session_id, "draft anchor", &[]).await;
+    let draft_hidden_id = append_text_node(&store, &draft_anchor_id, "draft hidden text").await;
     store
         .set_branch_head("draft", &session_id, &draft_hidden_id)
+        .await
         .unwrap();
     let merge_anchor_id =
-        append_prompt_anchor(&store, &main_hidden_id, "merge anchor", &[&draft_hidden_id]);
+        append_prompt_anchor(&store, &main_hidden_id, "merge anchor", &[&draft_hidden_id]).await;
     store
         .set_branch_head("main", &main_hidden_id, &merge_anchor_id)
+        .await
         .unwrap();
 
     let output = run_with_backend(
@@ -3327,7 +3404,6 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
     let expected_output = formatdoc!(
         "
         * {merge_id} prompt {merge_created_at} [main] merge anchor merge=[{draft_id}]
@@ -3338,13 +3414,13 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
         * {session_id} session {session_created_at} You are helpful.
         ",
         merge_id = short_id(&merge_anchor_id),
-        merge_created_at = created_at(&merge_anchor_id),
+        merge_created_at = node_created_at(&store, &merge_anchor_id).await,
         draft_id = short_id(&draft_anchor_id),
-        draft_created_at = created_at(&draft_anchor_id),
+        draft_created_at = node_created_at(&store, &draft_anchor_id).await,
         main_id = short_id(&main_anchor_id),
-        main_created_at = created_at(&main_anchor_id),
+        main_created_at = node_created_at(&store, &main_anchor_id).await,
         session_id = short_id(&session_id),
-        session_created_at = created_at(&session_id),
+        session_created_at = node_created_at(&store, &session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -3401,27 +3477,32 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
-    let shared_anchor_id = append_prompt_anchor(&store, &session_id, "shared anchor", &[]);
-    let shared_hidden_id = append_text_node(&store, &shared_anchor_id, "shared hidden text");
+    let store = open_store(&store_path).await.unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
+    let shared_anchor_id = append_prompt_anchor(&store, &session_id, "shared anchor", &[]).await;
+    let shared_hidden_id = append_text_node(&store, &shared_anchor_id, "shared hidden text").await;
 
-    let alpha_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "alpha anchor", &[]);
-    let alpha_hidden_id = append_text_node(&store, &alpha_anchor_id, "alpha hidden text");
+    let alpha_anchor_id =
+        append_prompt_anchor(&store, &shared_hidden_id, "alpha anchor", &[]).await;
+    let alpha_hidden_id = append_text_node(&store, &alpha_anchor_id, "alpha hidden text").await;
     store
         .set_branch_head("alpha", &session_id, &alpha_hidden_id)
+        .await
         .unwrap();
 
-    let beta_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "beta anchor", &[]);
-    let beta_hidden_id = append_text_node(&store, &beta_anchor_id, "beta hidden text");
+    let beta_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "beta anchor", &[]).await;
+    let beta_hidden_id = append_text_node(&store, &beta_anchor_id, "beta hidden text").await;
     store
         .set_branch_head("beta", &session_id, &beta_hidden_id)
+        .await
         .unwrap();
 
-    let gamma_anchor_id = append_prompt_anchor(&store, &shared_hidden_id, "gamma anchor", &[]);
-    let gamma_hidden_id = append_text_node(&store, &gamma_anchor_id, "gamma hidden text");
+    let gamma_anchor_id =
+        append_prompt_anchor(&store, &shared_hidden_id, "gamma anchor", &[]).await;
+    let gamma_hidden_id = append_text_node(&store, &gamma_anchor_id, "gamma hidden text").await;
     store
         .set_branch_head("gamma", &session_id, &gamma_hidden_id)
+        .await
         .unwrap();
 
     let merge_anchor_id = append_prompt_anchor(
@@ -3429,9 +3510,11 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
         &alpha_hidden_id,
         "merge fanin anchor",
         &[&beta_hidden_id, &gamma_hidden_id],
-    );
+    )
+    .await;
     store
         .set_branch_head("main", &session_id, &merge_anchor_id)
+        .await
         .unwrap();
 
     let output = run_with_backend(
@@ -3444,7 +3527,6 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
     .unwrap();
 
     let short_id = |id: &str| id.chars().take(8).collect::<String>();
-    let created_at = |id: &str| store.get_node(id).unwrap().created_at.to_string();
     let expected_output = formatdoc!(
         "
         * {merge_id} prompt {merge_created_at} [main] merge fanin anchor merge=[{beta_id},{gamma_id}]
@@ -3458,17 +3540,17 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
         * {session_id} session {session_created_at} You are helpful.
         ",
         merge_id = short_id(&merge_anchor_id),
-        merge_created_at = created_at(&merge_anchor_id),
+        merge_created_at = node_created_at(&store, &merge_anchor_id).await,
         beta_id = short_id(&beta_anchor_id),
-        beta_created_at = created_at(&beta_anchor_id),
+        beta_created_at = node_created_at(&store, &beta_anchor_id).await,
         gamma_id = short_id(&gamma_anchor_id),
-        gamma_created_at = created_at(&gamma_anchor_id),
+        gamma_created_at = node_created_at(&store, &gamma_anchor_id).await,
         alpha_id = short_id(&alpha_anchor_id),
-        alpha_created_at = created_at(&alpha_anchor_id),
+        alpha_created_at = node_created_at(&store, &alpha_anchor_id).await,
         shared_id = short_id(&shared_anchor_id),
-        shared_created_at = created_at(&shared_anchor_id),
+        shared_created_at = node_created_at(&store, &shared_anchor_id).await,
         session_id = short_id(&session_id),
-        session_created_at = created_at(&session_id),
+        session_created_at = node_created_at(&store, &session_id).await,
     )
     .strip_suffix('\n')
     .expect("formatdoc output should end with one newline")
@@ -3526,11 +3608,12 @@ async fn session_graph_and_show_render_skill_result_anchor() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
+    let store = open_store(&store_path).await.unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
+        .await
         .unwrap();
     let skill_result_id = append_skill_result_anchor(
         &store,
@@ -3538,9 +3621,11 @@ async fn session_graph_and_show_render_skill_result_anchor() {
         &session_head,
         "find-skills",
         "Delegated result",
-    );
+    )
+    .await;
     store
         .set_branch_head("main", &tool_use_id, &skill_result_id)
+        .await
         .unwrap();
 
     let graph_output = run_with_backend(
@@ -3593,30 +3678,34 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
-    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command");
+    let store = open_store(&store_path).await.unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
+    let tool_use_id = append_tool_use_node(&store, &session_head, "tool-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &tool_use_id)
+        .await
         .unwrap();
-    let invocation_id = append_skill_invocation_anchor(&store, &tool_use_id, "fast-rust");
+    let invocation_id = append_skill_invocation_anchor(&store, &tool_use_id, "fast-rust").await;
     let child_session_id = append_session_anchor(
         &store,
         &invocation_id,
         "You are executing the skill `fast-rust` on an isolated branch.",
-    );
-    let child_output_id = append_text_node(&store, &child_session_id, "Delegated result");
+    )
+    .await;
+    let child_output_id = append_text_node(&store, &child_session_id, "Delegated result").await;
     let tool_result_id =
-        append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result");
+        append_tool_result_node(&store, &tool_use_id, "tool-1", "Delegated result").await;
     let skill_result_id = append_skill_result_anchor(
         &store,
         &tool_result_id,
         &child_output_id,
         "fast-rust",
         "Delegated result",
-    );
+    )
+    .await;
     store
         .set_branch_head("main", &tool_use_id, &skill_result_id)
+        .await
         .unwrap();
 
     let graph_output = run_with_backend(
@@ -3666,8 +3755,10 @@ async fn session_show_resolves_branch_to_head_node_text_output() {
     .unwrap();
 
     let head_id = open_store(&store_path)
+        .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
     let output = run_with_backend(
         session_show_cli(store_path, "main", false),
@@ -3703,8 +3794,10 @@ async fn session_show_outputs_json_for_node_id_reference() {
     .await;
 
     let head_id = open_store(&store_path)
+        .await
         .unwrap()
         .get_branch_head("main")
+        .await
         .unwrap();
     let prefix = &head_id[..12];
     let output = run_with_backend(
@@ -3741,11 +3834,11 @@ async fn session_show_outputs_children_ids_for_primary_and_merge_edges() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
-    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]);
+    let store = open_store(&store_path).await.unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
+    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]).await;
     let merge_child_id =
-        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]);
+        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
 
     let output = run_with_backend(
         session_show_cli(store_path, &session_id, false),
@@ -3776,11 +3869,11 @@ async fn session_show_json_includes_children_ids() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
-    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]);
+    let store = open_store(&store_path).await.unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
+    let primary_child_id = append_prompt_anchor(&store, &session_id, "primary child", &[]).await;
     let merge_child_id =
-        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]);
+        append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
 
     let output = run_with_backend(
         session_show_cli(store_path, &session_id[..12], true),
@@ -3812,9 +3905,10 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_id = store.get_branch_head("main").unwrap();
-    let shadow_parent = append_tool_use_node(&store, &session_id, "tool-call-1", "exec_command");
+    let store = open_store(&store_path).await.unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
+    let shadow_parent =
+        append_tool_use_node(&store, &session_id, "tool-call-1", "exec_command").await;
     let shadow_anchor_id = store
         .append(NewNode {
             parent: session_id.clone(),
@@ -3828,9 +3922,11 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
                 },
             )),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &session_id, &shadow_anchor_id)
+        .await
         .unwrap();
 
     let show_text = run_with_backend(
@@ -3939,11 +4035,12 @@ async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let draft_head = store.get_branch_head("draft").unwrap();
-    let draft_node_id = append_prompt_anchor(&store, &draft_head, "deleted branch node", &[]);
+    let store = open_store(&store_path).await.unwrap();
+    let draft_head = store.get_branch_head("draft").await.unwrap();
+    let draft_node_id = append_prompt_anchor(&store, &draft_head, "deleted branch node", &[]).await;
     store
         .set_branch_head("draft", &draft_head, &draft_node_id)
+        .await
         .unwrap();
 
     run_with_backend(
@@ -4001,17 +4098,20 @@ async fn session_show_reports_ambiguous_short_node_prefix() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let root_id = store.root_id();
-    let session_id = store.get_branch_head("main").unwrap();
+    let session_id = store.get_branch_head("main").await.unwrap();
     let mut ids = vec![root_id, session_id];
     for index in 0..32 {
-        ids.push(append_prompt_anchor(
-            &store,
-            &store.get_branch_head("main").unwrap(),
-            &format!("node-{index}"),
-            &[],
-        ));
+        ids.push(
+            append_prompt_anchor(
+                &store,
+                &store.get_branch_head("main").await.unwrap(),
+                &format!("node-{index}"),
+                &[],
+            )
+            .await,
+        );
     }
     let (prefix, matches) = ids
         .into_iter()
@@ -5047,8 +5147,10 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(second_json["config"]["additional_params"], json!(null));
     assert_eq!(second_json["config"]["enable_coco_shim"], false);
     let persisted = open_store(&store_path)
+        .await
         .unwrap()
         .get_preset_record(preset_name)
+        .await
         .unwrap()
         .current_preset()
         .unwrap();
@@ -5214,8 +5316,10 @@ async fn preset_commands_manage_versions_in_store() {
     );
     assert!(
         open_store(&store_path)
+            .await
             .unwrap()
             .list_preset_records()
+            .await
             .unwrap()
             .is_empty()
     );
@@ -5448,7 +5552,7 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
@@ -5494,10 +5598,10 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_head = store.get_branch_head("draft").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let session_head = store.get_branch_head("draft").await.unwrap();
     let parent_tool_use =
-        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
@@ -5525,7 +5629,7 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
     assert_eq!(response.stdout, "world\n");
     assert!(response.stderr.is_empty());
 
-    let ancestry = store.ancestry("draft").unwrap();
+    let ancestry = store.ancestry("draft").await.unwrap();
     let prompt_anchor = ancestry
         .iter()
         .find_map(|node| match &node.kind {
@@ -5562,7 +5666,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     store
         .add_skill(
             SessionRole::Runner,
@@ -5574,10 +5678,11 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let parent_tool_use =
-        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
     let llm = llm_with_test_provider_config(store.clone(), SkillRunBackend);
 
     let response = run_forwarded_with_services(
@@ -5612,7 +5717,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
     assert_eq!(output["skill_name"], "fast-rust");
     assert_eq!(output["text"], "delegated output");
 
-    let children = store.list_children(&parent_tool_use).unwrap();
+    let children = store.list_children(&parent_tool_use).await.unwrap();
     let invocation_node = children
         .iter()
         .find_map(|node| match &node.kind {
@@ -5631,7 +5736,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
         }
     );
 
-    let invocation_children = store.list_children(&invocation_node.0.id).unwrap();
+    let invocation_children = store.list_children(&invocation_node.0.id).await.unwrap();
     let child_session_anchor = invocation_children
         .iter()
         .find_map(|node| match &node.kind {
@@ -5684,7 +5789,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     store
         .add_skill(
             SessionRole::Orchestrator,
@@ -5696,6 +5801,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
     store
         .add_skill(
@@ -5708,9 +5814,10 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
-    let session_head = store.get_branch_head("main").unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let patch_id = store
         .append(NewNode {
             parent: session_head.clone(),
@@ -5724,13 +5831,17 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
                 },
             )),
         })
+        .await
         .unwrap();
-    let parent_tool_use = append_tool_use_node(&store, &patch_id, "tool-call-1", "exec_command");
+    let parent_tool_use =
+        append_tool_use_node(&store, &patch_id, "tool-call-1", "exec_command").await;
     store
         .set_branch_head("main", &session_head, &patch_id)
+        .await
         .unwrap();
     store
         .set_branch_head("main", &patch_id, &parent_tool_use)
+        .await
         .unwrap();
 
     let llm = llm_with_test_provider_config(store.clone(), SkillRunBackend);
@@ -5765,7 +5876,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
     assert_eq!(output["text"], "delegated output");
 
     let invocation_node_id = output["invocation_node_id"].as_str().unwrap();
-    let invocation_children = store.list_children(invocation_node_id).unwrap();
+    let invocation_children = store.list_children(invocation_node_id).await.unwrap();
     let child_session = invocation_children
         .iter()
         .find_map(|node| match &node.kind {
@@ -5793,7 +5904,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("main-response")])]),
@@ -5844,11 +5955,11 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let session_head = store.get_branch_head("main").unwrap();
+    let store = open_store(&store_path).await.unwrap();
+    let session_head = store.get_branch_head("main").await.unwrap();
     let parent_tool_use =
-        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command");
-    let job = submit_prompt_job(&store, "main", "hello");
+        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
+    let job = submit_prompt_job(&store, "main", "hello").await;
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("done")])]),
@@ -5881,7 +5992,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     assert!(response.stdout.is_empty());
     assert!(response.stderr.is_empty());
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let shadow_anchor = ancestry
         .iter()
         .find_map(|node| match &node.kind {
@@ -5905,7 +6016,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
 #[tokio::test]
 async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
     let (_tempdir, store_path) = temp_store_path();
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
@@ -5939,7 +6050,7 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
 #[tokio::test]
 async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
     let (_tempdir, store_path) = temp_store_path();
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
@@ -5975,7 +6086,7 @@ async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
 #[tokio::test]
 async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
     let (_tempdir, store_path) = temp_store_path();
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
@@ -6005,7 +6116,7 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
 #[tokio::test]
 async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
     let (_tempdir, store_path) = temp_store_path();
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let prompt_response = run_forwarded_with_services(
@@ -6122,7 +6233,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
 #[tokio::test]
 async fn forwarded_runtime_rejects_store_path_override() {
     let (_tempdir, store_path) = temp_store_path();
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     let response = run_forwarded_with_services(
@@ -6175,7 +6286,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         .tempdir_in("/tmp")
         .unwrap();
     let socket_path = socket_dir.path().join("coco.sock");
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(
         store.clone(),
         FakeBackend::with_responses(&[("main", &[Ok("daemon-response")])]),
@@ -6189,9 +6300,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         &engine,
         DaemonServerOptions {
             channel_configs: &ChannelConfigs::default(),
-            console_config: None,
-            console_publisher: None,
-            console_graph_store_path: store_path.clone(),
+            console: None,
         },
     ) {
         Ok(server) => server,
@@ -6231,19 +6340,19 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
 #[tokio::test]
 async fn daemon_startup_creates_default_session_when_store_is_empty() {
     let (_tempdir, store_path) = temp_store_path();
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
 
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
 
-    let states = store.list_session_states().unwrap();
+    let states = store.list_session_states().await.unwrap();
     assert_eq!(states.get("main"), Some(&SessionState::Active));
     assert_eq!(states.get("day"), Some(&SessionState::Active));
 
-    let head = store.get_branch_head("main").unwrap();
-    let node = store.get_node(&head).unwrap();
+    let head = store.get_branch_head("main").await.unwrap();
+    let node = store.get_node(&head).await.unwrap();
     let Kind::Anchor(anchor) = node.kind else {
         panic!("expected default session anchor");
     };
@@ -6267,8 +6376,8 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
         vec!["exec_command", "write_stdin", "search_skill", "load_image"]
     );
 
-    let day_head = store.get_branch_head("day").unwrap();
-    let day_node = store.get_node(&day_head).unwrap();
+    let day_head = store.get_branch_head("day").await.unwrap();
+    let day_node = store.get_node(&day_head).await.unwrap();
     let Kind::Anchor(day_anchor) = day_node.kind else {
         panic!("expected day session anchor");
     };
@@ -6297,30 +6406,30 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
-    assert_eq!(store.get_branch_head("main").unwrap(), head);
-    assert_eq!(store.get_branch_head("day").unwrap(), day_head);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), head);
+    assert_eq!(store.get_branch_head("day").await.unwrap(), day_head);
 }
 
 #[tokio::test]
 async fn daemon_startup_replaces_invalid_builtin_day_branch() {
     let (_tempdir, store_path) = temp_store_path();
-    let store = open_store(&store_path).unwrap();
+    let store = open_store(&store_path).await.unwrap();
     let llm = llm_with_test_provider_config(store.clone(), FakeBackend::with_responses(&[]));
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
-    let main_head = store.get_branch_head("main").unwrap();
-    store.delete_branch("day").unwrap();
-    store.fork("day", &main_head).unwrap();
-    assert_eq!(store.get_branch_head("day").unwrap(), main_head);
+    let main_head = store.get_branch_head("main").await.unwrap();
+    store.delete_branch("day").await.unwrap();
+    store.fork("day", &main_head).await.unwrap();
+    assert_eq!(store.get_branch_head("day").await.unwrap(), main_head);
 
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await
         .unwrap();
 
-    let day_head = store.get_branch_head("day").unwrap();
+    let day_head = store.get_branch_head("day").await.unwrap();
     assert_ne!(day_head, main_head);
-    let day_node = store.get_node(&day_head).unwrap();
+    let day_node = store.get_node(&day_head).await.unwrap();
     let Kind::Anchor(day_anchor) = day_node.kind else {
         panic!("expected day session anchor");
     };
@@ -6405,14 +6514,15 @@ async fn daemon_startup_resumes_incomplete_jobs() {
     )
     .await;
 
-    let store = open_store(&store_path).unwrap();
-    let job = submit_prompt_job(&store, "main", "resume me");
+    let store = open_store(&store_path).await.unwrap();
+    let job = submit_prompt_job(&store, "main", "resume me").await;
     store
         .set_job_status(
             &job.job_id,
             coco_mem::JobStatus::Queued,
             coco_mem::JobStatus::Running,
         )
+        .await
         .unwrap();
 
     let llm = llm_with_test_provider_config(
@@ -6423,118 +6533,109 @@ async fn daemon_startup_resumes_incomplete_jobs() {
 
     resume_incomplete_jobs(&engine).await.unwrap();
 
-    let resumed_job = store.get_job(&job.job_id).unwrap();
+    let resumed_job = store.get_job(&job.job_id).await.unwrap();
     assert_eq!(resumed_job.status, coco_mem::JobStatus::Finished);
-    let head = store.get_branch_head("main").unwrap();
-    let node = store.get_node(&head).unwrap();
+    let head = store.get_branch_head("main").await.unwrap();
+    let node = store.get_node(&head).await.unwrap();
     match node.kind {
         Kind::Text(text) => assert_eq!(text, "recovered after daemon start"),
         other => panic!("expected text node at branch head, got {other:?}"),
     }
 }
 
-#[test]
-fn resolve_session_config_reads_coco_prefixed_env_only() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[
-                ("COCO_PROVIDER", "anthropic"),
-                ("COCO_MODEL", "claude-sonnet-4-20250514"),
-            ],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: None,
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_reads_coco_prefixed_env_only() {
+    let config = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "anthropic"),
+            ("COCO_MODEL", "claude-sonnet-4-20250514"),
+        ],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: None,
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(config.provider, Provider::ChatGpt);
     assert_eq!(config.model, "gpt-5.4");
     assert_eq!(config.role, SessionRole::Orchestrator);
 }
 
-#[test]
-fn resolve_session_config_accepts_chatgpt_provider() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[
-                ("COCO_PROVIDER", "chatgpt"),
-                ("COCO_MODEL", "gpt-5.3-codex"),
-            ],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: None,
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_accepts_chatgpt_provider() {
+    let config = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "chatgpt"),
+            ("COCO_MODEL", "gpt-5.3-codex"),
+        ],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: None,
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(config.provider, Provider::ChatGpt);
     assert_eq!(config.model, "gpt-5.4");
 }
 
-#[test]
-fn resolve_session_config_reads_tools_from_env() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[
-                ("COCO_PROVIDER", "openai"),
-                ("COCO_MODEL", "gpt-4.1-mini"),
-                (
-                    "COCO_TOOLS",
-                    "exec_command,write_stdin,search_skill,load_image",
-                ),
-            ],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: None,
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: true,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_reads_tools_from_env() {
+    let config = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "openai"),
+            ("COCO_MODEL", "gpt-4.1-mini"),
+            (
+                "COCO_TOOLS",
+                "exec_command,write_stdin,search_skill,load_image",
+            ),
+        ],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: None,
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: true,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(
         config
@@ -6547,68 +6648,62 @@ fn resolve_session_config_reads_tools_from_env() {
     assert!(config.enable_coco_shim);
 }
 
-#[test]
-fn resolve_session_config_enable_all_tools_overrides_env_tools() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[
-                ("COCO_PROVIDER", "openai"),
-                ("COCO_MODEL", "gpt-4.1-mini"),
-                ("COCO_TOOLS", "exec_command"),
-            ],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: None,
-                    tools: vec![],
-                    enable_all_tools: true,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_enable_all_tools_overrides_env_tools() {
+    let config = with_coco_env_async(
+        &[
+            ("COCO_PROVIDER", "openai"),
+            ("COCO_MODEL", "gpt-4.1-mini"),
+            ("COCO_TOOLS", "exec_command"),
+        ],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: None,
+                tools: vec![],
+                enable_all_tools: true,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(tool_names(&config.tools), all_builtin_tool_names());
 }
 
-#[test]
-fn resolve_session_config_parses_additional_params_json_object() {
-    let config = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: Some(
-                        "{\"service_tier\":\"priority\",\"reasoning_effort\":\"low\"}".to_owned(),
-                    ),
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_parses_additional_params_json_object() {
+    let config = with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: Some(
+                    "{\"service_tier\":\"priority\",\"reasoning_effort\":\"low\"}".to_owned(),
+                ),
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap()
+        },
+    )
+    .await;
 
     assert_eq!(
         config.additional_params,
@@ -6658,32 +6753,29 @@ fn resolve_session_config_persists_only_explicit_additional_params() {
     );
 }
 
-#[test]
-fn resolve_session_config_rejects_non_object_additional_params() {
-    let error = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(with_coco_env_async(
-            &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
-            || async {
-                resolve_session_config(SessionCreateCommand {
-                    branch: "main".to_owned(),
-                    role: crate::cli::CliSessionRole::Orchestrator,
-                    provider_profile: None,
-                    system_prompt: "You are helpful.".to_owned(),
-                    prompt: "".to_owned(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(64),
-                    additional_params: Some("[1,2,3]".to_owned()),
-                    tools: vec![],
-                    enable_all_tools: false,
-                    enable_coco_shim: false,
-                    disable_coco_shim: false,
-                })
-                .unwrap_err()
-            },
-        ));
+#[tokio::test]
+async fn resolve_session_config_rejects_non_object_additional_params() {
+    let error = with_coco_env_async(
+        &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
+        || async {
+            resolve_session_config(SessionCreateCommand {
+                branch: "main".to_owned(),
+                role: crate::cli::CliSessionRole::Orchestrator,
+                provider_profile: None,
+                system_prompt: "You are helpful.".to_owned(),
+                prompt: "".to_owned(),
+                temperature: Some(0.2),
+                max_tokens: Some(64),
+                additional_params: Some("[1,2,3]".to_owned()),
+                tools: vec![],
+                enable_all_tools: false,
+                enable_coco_shim: false,
+                disable_coco_shim: false,
+            })
+            .unwrap_err()
+        },
+    )
+    .await;
 
     assert!(matches!(
         error,

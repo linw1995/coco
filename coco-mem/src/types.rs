@@ -24,6 +24,13 @@ pub struct NewNode {
     pub kind: Kind,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NewNodeContent {
+    pub role: Role,
+    pub metadata: Option<NodeMetadata>,
+    pub kind: Kind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Role {
     User,

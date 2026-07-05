@@ -29,11 +29,13 @@ use crate::{
 type FakeResponseQueue =
     Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendTurn, BackendError>>>>>;
 
-fn test_store() -> SqliteStore {
-    SqliteStore::open_temporary().expect("temporary SQLite store should open")
+async fn test_store() -> SqliteStore {
+    SqliteStore::open_temporary()
+        .await
+        .expect("temporary SQLite store should open")
 }
 
-fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
+async fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
 where
     S: NodeStore,
 {
@@ -50,6 +52,7 @@ where
                 },
             )),
         })
+        .await
         .unwrap()
 }
 
@@ -272,8 +275,12 @@ fn session_config(branch: &str) -> SessionConfig {
     }
 }
 
-fn submit_prompt_job(store: &SqliteStore, branch: &str, prompt: &str) -> coco_llm::coco_mem::Job {
-    let parent = store.get_branch_head(branch).unwrap();
+async fn submit_prompt_job(
+    store: &SqliteStore,
+    branch: &str,
+    prompt: &str,
+) -> coco_llm::coco_mem::Job {
+    let parent = store.get_branch_head(branch).await.unwrap();
     let prompt_anchor_id = store
         .append(NewNode {
             parent,
@@ -287,13 +294,14 @@ fn submit_prompt_job(store: &SqliteStore, branch: &str, prompt: &str) -> coco_ll
                 },
             )),
         })
+        .await
         .unwrap();
-    store.submit_job(branch, &prompt_anchor_id).unwrap()
+    store.submit_job(branch, &prompt_anchor_id).await.unwrap()
 }
 
 #[tokio::test]
 async fn core_service_routes_message_to_engine() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -312,7 +320,7 @@ async fn core_service_routes_message_to_engine() {
 
 #[tokio::test]
 async fn core_service_telegram_prompt_requires_completing_request_before_reply() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -331,7 +339,7 @@ async fn core_service_telegram_prompt_requires_completing_request_before_reply()
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -352,7 +360,7 @@ async fn core_service_telegram_prompt_requires_completing_request_before_reply()
 
 #[tokio::test]
 async fn core_service_telegram_prompt_includes_image_attachments() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let mut config = session_config("main");
@@ -380,7 +388,7 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -405,7 +413,7 @@ async fn core_service_telegram_prompt_includes_image_attachments() {
 
 #[tokio::test]
 async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -427,7 +435,7 @@ async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable(
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -439,7 +447,7 @@ async fn core_service_telegram_prompt_omits_load_image_when_tool_is_unavailable(
 
 #[tokio::test]
 async fn core_service_telegram_prompt_includes_voice_attachments() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("Telegram reply sent.")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -466,7 +474,7 @@ async fn core_service_telegram_prompt_includes_voice_attachments() {
         .await
         .unwrap();
 
-    let ancestry = store.ancestry("main").unwrap();
+    let ancestry = store.ancestry("main").await.unwrap();
     let prompt = match &ancestry[1].kind {
         Kind::Anchor(anchor) => &anchor.as_prompt().expect("expected prompt anchor").prompt,
         _ => panic!("expected prompt anchor"),
@@ -483,7 +491,7 @@ async fn core_service_telegram_prompt_includes_voice_attachments() {
 
 #[tokio::test]
 async fn core_service_returns_missing_session() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let service = CoreService::new(
@@ -501,7 +509,7 @@ async fn core_service_returns_missing_session() {
 
 #[tokio::test]
 async fn core_service_returns_branch_resolution_error_context() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let service = CoreService::new(FailingResolver, ConversationEngine::new(llm));
@@ -523,7 +531,7 @@ async fn core_service_returns_branch_resolution_error_context() {
 
 #[tokio::test]
 async fn llm_engine_calls_prompt_and_returns_text() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -532,11 +540,11 @@ async fn llm_engine_calls_prompt_and_returns_text() {
     let response = engine.reply("main", "hello").await.unwrap();
 
     assert_eq!(response, "hello from llm");
-    let jobs = store.list_jobs().unwrap();
+    let jobs = store.list_jobs().await.unwrap();
     assert_eq!(jobs.len(), 1);
     let job_id = jobs.keys().next().unwrap();
     let persisted_job = jobs.get(job_id).unwrap();
-    let job = engine.get_job(job_id).unwrap();
+    let job = engine.get_job(job_id).await.unwrap();
     assert_eq!(job.status, JobStatus::Finished);
     assert_eq!(job.finished_at, persisted_job.finished_at);
     assert!(job.finished_at.is_some());
@@ -544,11 +552,11 @@ async fn llm_engine_calls_prompt_and_returns_text() {
 
 #[tokio::test]
 async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     let main_session = llm.create_session(session_config("main")).await.unwrap();
-    llm.fork("runner", &main_session.anchor_id).unwrap();
+    llm.fork("runner", &main_session.anchor_id).await.unwrap();
     let exec_tool = builtin_tool_definition("exec_command").unwrap();
     let engine = ConversationEngine::new(llm);
 
@@ -567,7 +575,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
         .unwrap();
 
     assert_eq!(response, "runner done");
-    let ancestry = store.ancestry("runner").unwrap();
+    let ancestry = store.ancestry("runner").await.unwrap();
     assert!(matches!(
         &ancestry[0].kind,
         Kind::Text(text) if text == "runner done"
@@ -586,7 +594,7 @@ async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
 
 #[tokio::test]
 async fn llm_engine_rejects_second_active_job_on_same_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -607,7 +615,7 @@ async fn llm_engine_rejects_second_active_job_on_same_branch() {
 
 #[tokio::test]
 async fn llm_engine_branch_lock_uses_service_lock() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let engine = ConversationEngine::new(llm.clone());
@@ -642,7 +650,7 @@ async fn llm_engine_branch_lock_uses_service_lock() {
 
 #[tokio::test]
 async fn llm_engine_coalesces_duplicate_drive_job_calls() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -685,7 +693,7 @@ async fn llm_engine_coalesces_duplicate_drive_job_calls() {
 
 #[tokio::test]
 async fn llm_engine_join_job_waits_for_idle_job_without_starting_it() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -703,14 +711,14 @@ async fn llm_engine_join_job_waits_for_idle_job_without_starting_it() {
     assert!(result.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        store.get_job(&job.job_id).unwrap().status,
+        store.get_job(&job.job_id).await.unwrap().status,
         JobStatus::Queued
     );
 }
 
 #[tokio::test]
 async fn llm_engine_join_job_waits_for_later_driver_notification() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -751,7 +759,7 @@ async fn llm_engine_join_job_waits_for_later_driver_notification() {
 
 #[tokio::test]
 async fn llm_engine_join_job_observes_driver_from_another_engine_instance() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -795,7 +803,7 @@ async fn llm_engine_join_job_observes_driver_from_another_engine_instance() {
 
 #[tokio::test]
 async fn llm_engine_join_job_waits_for_inflight_job() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = BlockingBackend {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
@@ -837,7 +845,7 @@ async fn llm_engine_join_job_waits_for_inflight_job() {
 
 #[tokio::test]
 async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[(
         "main",
         &[Err(BackendError::Failed {
@@ -854,7 +862,7 @@ async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
     assert_eq!(snapshot.status, JobStatus::Running);
     assert_eq!(snapshot.branch, "main");
     assert_eq!(snapshot.work_branch, "main");
-    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].queue, SYSTEM_EVENT_QUEUE);
     let payload = &events[0].payload;
@@ -874,13 +882,13 @@ async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
 
 #[tokio::test]
 async fn llm_engine_retries_job_from_before_failure_node() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("recovered")])]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
-    let current_head = store.get_branch_head("main").unwrap();
+    let current_head = store.get_branch_head("main").await.unwrap();
     let failure_id = store
         .append(NewNode {
             parent: job.base.clone(),
@@ -888,9 +896,11 @@ async fn llm_engine_retries_job_from_before_failure_node() {
             metadata: BackendMetadata::builder().build(),
             kind: Kind::Failure("transient backend outage".to_owned()),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &current_head, &failure_id)
+        .await
         .unwrap();
 
     let recovered = engine.drive_job(&job.job_id).await.unwrap();
@@ -898,14 +908,14 @@ async fn llm_engine_retries_job_from_before_failure_node() {
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(recovered.work_branch, "main");
     assert_eq!(
-        store.get_node(&recovered.head).unwrap().kind,
+        store.get_node(&recovered.head).await.unwrap().kind,
         Kind::Text("recovered".to_owned())
     );
 }
 
 #[tokio::test]
 async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = ModelGateBackend::new("good-model");
     let calls = backend.calls.clone();
     let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -933,7 +943,7 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
 
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(
-        store.get_node(&recovered.head).unwrap().kind,
+        store.get_node(&recovered.head).await.unwrap().kind,
         Kind::Text("recovered".to_owned())
     );
     assert_eq!(
@@ -943,8 +953,8 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
 }
 
 #[tokio::test]
-async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_event() {
-    let store = test_store();
+async fn llm_engine_retrying_failure_node_requeues_missing_recovery_event() {
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[(
         "main",
         &[Err(BackendError::Failed {
@@ -955,7 +965,7 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
-    let current_head = store.get_branch_head("main").unwrap();
+    let current_head = store.get_branch_head("main").await.unwrap();
     let failure_id = store
         .append(NewNode {
             parent: job.base.clone(),
@@ -963,25 +973,83 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
             metadata: BackendMetadata::builder().build(),
             kind: Kind::Failure("transient backend outage".to_owned()),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &current_head, &failure_id)
+        .await
         .unwrap();
 
     let snapshot = engine.drive_job(&job.job_id).await.unwrap();
 
     assert_eq!(snapshot.status, JobStatus::Running);
-    assert!(
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["data"]["retry_from_node_id"], job.base);
+}
+
+#[tokio::test]
+async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_event() {
+    let store = test_store().await;
+    let backend = FakeBackend::with_responses(&[(
+        "main",
+        &[Err(BackendError::Failed {
+            message: "backend still failed".to_owned(),
+        })],
+    )]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+    let current_head = store.get_branch_head("main").await.unwrap();
+    let failure_id = store
+        .append(NewNode {
+            parent: job.base.clone(),
+            role: Role::System,
+            metadata: BackendMetadata::builder().build(),
+            kind: Kind::Failure("transient backend outage".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .set_branch_head("main", &current_head, &failure_id)
+        .await
+        .unwrap();
+    let dedupe_key = format!(
+        "llm.backend_failure:{}:{}:{}",
+        job.job_id, job.work_branch, job.base
+    );
+    store
+        .enqueue_message(
+            SYSTEM_EVENT_QUEUE,
+            serde_json::json!({
+                "type": "llm.backend_failure.recovery_requested",
+                "version": 1,
+                "dedupe_key": dedupe_key,
+                "data": {
+                    "retry_from_node_id": job.base,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    let snapshot = engine.drive_job(&job.job_id).await.unwrap();
+
+    assert_eq!(snapshot.status, JobStatus::Running);
+    assert_eq!(
         store
             .list_queue_messages(SYSTEM_EVENT_QUEUE)
+            .await
             .unwrap()
-            .is_empty()
+            .len(),
+        1
     );
 }
 
 #[tokio::test]
 async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -989,17 +1057,26 @@ async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
     let job_id = job.job_id.clone();
 
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
     let error = engine.drive_job(&job_id).await.unwrap_err();
 
     assert!(matches!(error, EngineError::SessionMissing { branch } if branch == "main"));
-    assert_eq!(store.get_job(&job_id).unwrap().status, JobStatus::Finished);
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert_eq!(
+        store.get_job(&job_id).await.unwrap().status,
+        JobStatus::Finished
+    );
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[
         (
             "main",
@@ -1026,6 +1103,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     assert_eq!(failed_a.work_branch, "main");
     let first_event = store
         .list_queue_messages(SYSTEM_EVENT_QUEUE)
+        .await
         .unwrap()
         .pop()
         .expect("first recovery event should exist");
@@ -1034,9 +1112,14 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
         .expect("first event should include retry node")
         .to_owned();
 
-    engine.service().fork("recovery-b", &retry_from_a).unwrap();
+    engine
+        .service()
+        .fork("recovery-b", &retry_from_a)
+        .await
+        .unwrap();
     let on_b = engine
         .set_job_work_branch(&job.job_id, "main", "recovery-b")
+        .await
         .unwrap();
     assert_eq!(on_b.status, JobStatus::Running);
     assert_eq!(on_b.branch, "main");
@@ -1045,7 +1128,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     let failed_b = engine.drive_job(&job.job_id).await.unwrap();
     assert_eq!(failed_b.status, JobStatus::Running);
     assert_eq!(failed_b.work_branch, "recovery-b");
-    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
     assert_eq!(events.len(), 2);
     let second_event = events.last().unwrap();
     assert_eq!(second_event.payload["data"]["root_branch"], "main");
@@ -1057,9 +1140,14 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
         .expect("second event should include retry node")
         .to_owned();
 
-    engine.service().fork("recovery-c", &retry_from_b).unwrap();
+    engine
+        .service()
+        .fork("recovery-c", &retry_from_b)
+        .await
+        .unwrap();
     let on_c = engine
         .set_job_work_branch(&job.job_id, "recovery-b", "recovery-c")
+        .await
         .unwrap();
     assert_eq!(on_c.status, JobStatus::Running);
     assert_eq!(on_c.work_branch, "recovery-c");
@@ -1069,21 +1157,29 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(recovered.branch, "main");
     assert_eq!(recovered.work_branch, "main");
-    assert_eq!(store.get_branch_head("main").unwrap(), recovered.head);
+    assert_eq!(store.get_branch_head("main").await.unwrap(), recovered.head);
     assert_eq!(
-        store.get_node(&recovered.head).unwrap().kind,
+        store.get_node(&recovered.head).await.unwrap().kind,
         Kind::Text("recovered by c".to_owned())
     );
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         engine
             .active_branch_prompt_job("recovery-b")
+            .await
             .unwrap()
             .is_none()
     );
     assert!(
         engine
             .active_branch_prompt_job("recovery-c")
+            .await
             .unwrap()
             .is_none()
     );
@@ -1091,7 +1187,7 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
 
 #[tokio::test]
 async fn llm_engine_finishes_job_when_recovery_restore_fails() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[
         (
             "main",
@@ -1108,6 +1204,7 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
     let failed = engine.drive_job(&job.job_id).await.unwrap();
     let event = store
         .list_queue_messages(SYSTEM_EVENT_QUEUE)
+        .await
         .unwrap()
         .pop()
         .expect("recovery event should exist");
@@ -1115,21 +1212,33 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
         .as_str()
         .expect("event should include retry node");
 
-    engine.service().fork("recovery-b", retry_from).unwrap();
+    engine
+        .service()
+        .fork("recovery-b", retry_from)
+        .await
+        .unwrap();
     engine
         .set_job_work_branch(&job.job_id, &failed.work_branch, "recovery-b")
+        .await
         .unwrap();
-    store.delete_branch("main").unwrap();
+    store.delete_branch("main").await.unwrap();
 
     let recovered = engine.drive_job(&job.job_id).await.unwrap();
 
     assert_eq!(recovered.status, JobStatus::Finished);
     assert_eq!(recovered.branch, "main");
     assert_eq!(recovered.work_branch, "recovery-b");
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         engine
             .active_branch_prompt_job("recovery-b")
+            .await
             .unwrap()
             .is_none()
     );
@@ -1137,7 +1246,7 @@ async fn llm_engine_finishes_job_when_recovery_restore_fails() {
 
 #[tokio::test]
 async fn llm_engine_maps_missing_session_error() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let engine = ConversationEngine::new(llm);
@@ -1149,7 +1258,7 @@ async fn llm_engine_maps_missing_session_error() {
 
 #[tokio::test]
 async fn llm_engine_reply_surfaces_backend_failure_message() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = AlwaysFailBackend::new();
     let llm = Arc::new(LlmService::new(store.clone(), backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -1165,18 +1274,24 @@ async fn llm_engine_reply_surfaces_backend_failure_message() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).unwrap();
+    let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].payload["type"],
         "llm.backend_failure.recovery_requested"
     );
-    assert!(engine.active_branch_prompt_job("main").unwrap().is_none());
+    assert!(
+        engine
+            .active_branch_prompt_job("main")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = MissingFinalTextBackend::new();
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -1196,7 +1311,7 @@ async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() 
 
 #[tokio::test]
 async fn core_service_rejects_empty_message_content() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let service = CoreService::new(
@@ -1216,7 +1331,7 @@ async fn core_service_rejects_empty_message_content() {
 
 #[tokio::test]
 async fn core_service_handles_batch_prompt_across_multiple_branches() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[
         ("main", &[Ok("main done")]),
         ("draft", &[Ok("draft done")]),
@@ -1257,14 +1372,14 @@ async fn core_service_handles_batch_prompt_across_multiple_branches() {
     assert_eq!(result.outcomes[1].branch, "draft");
     assert_eq!(result.outcomes[1].status(), BranchPromptStatus::Succeeded);
     assert_eq!(result.outcomes[1].text(), Some("draft done"));
-    let jobs = store.list_jobs().unwrap();
+    let jobs = store.list_jobs().await.unwrap();
     assert_eq!(jobs.len(), 2);
     assert!(jobs.values().all(|job| job.status == JobStatus::Finished));
 }
 
 #[tokio::test]
 async fn core_service_batch_prompt_reports_per_branch_failures() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("main", &[Ok("main done")])]);
     let llm = Arc::new(LlmService::new(store, backend));
     llm.create_session(session_config("main")).await.unwrap();
@@ -1305,7 +1420,7 @@ async fn core_service_batch_prompt_reports_per_branch_failures() {
 
 #[tokio::test]
 async fn core_service_batch_prompt_rejects_duplicate_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store, backend));
     let service = CoreService::new(
@@ -1341,32 +1456,33 @@ async fn core_service_batch_prompt_rejects_duplicate_branch() {
 
 #[tokio::test]
 async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
-    let store = test_store();
+    let store = test_store().await;
     let setup_backend = FakeBackend::with_responses(&[]);
     let setup_llm = Arc::new(LlmService::new(store.clone(), setup_backend));
     setup_llm
         .create_session(session_config("main"))
         .await
         .unwrap();
-    let original_head = store.get_branch_head("main").unwrap();
-    submit_prompt_job(&store, "main", "keep going");
+    let original_head = store.get_branch_head("main").await.unwrap();
+    submit_prompt_job(&store, "main", "keep going").await;
+    let job_id = store
+        .list_jobs()
+        .await
+        .unwrap()
+        .keys()
+        .next()
+        .expect("job should exist")
+        .clone();
     store
-        .set_job_status(
-            store
-                .list_jobs()
-                .unwrap()
-                .keys()
-                .next()
-                .expect("job should exist"),
-            JobStatus::Queued,
-            JobStatus::Running,
-        )
+        .set_job_status(&job_id, JobStatus::Queued, JobStatus::Running)
+        .await
         .unwrap();
 
-    let job = store.list_jobs().unwrap();
+    let job = store.list_jobs().await.unwrap();
     let job = job.values().next().unwrap().clone();
     store
         .set_branch_head("main", &original_head, &job.base)
+        .await
         .unwrap();
     let tool_use_id = store
         .append(NewNode {
@@ -1382,9 +1498,11 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 input: serde_json::json!({"cmd": "printf 'hello' > trace.txt"}),
             }),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &job.base, &tool_use_id)
+        .await
         .unwrap();
     let tool_result_id = store
         .append(NewNode {
@@ -1399,9 +1517,11 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
                 output: "exit_status: 0\nstdout:\n\nstderr:\n".to_owned(),
             }),
         })
+        .await
         .unwrap();
     store
         .set_branch_head("main", &tool_use_id, &tool_result_id)
+        .await
         .unwrap();
 
     let resumed_backend = FakeBackend::with_responses(&[("main", &[Ok("recovered")])]);
@@ -1410,14 +1530,17 @@ async fn llm_engine_resumes_running_job_from_nodes_after_restart() {
 
     resumed_engine.resume_incomplete_jobs().await.unwrap();
 
-    let stored_job = resumed_engine.get_job(&job.job_id).unwrap();
+    let stored_job = resumed_engine.get_job(&job.job_id).await.unwrap();
     assert_eq!(stored_job.status, JobStatus::Finished);
-    assert_eq!(store.get_branch_head("main").unwrap(), stored_job.head);
+    assert_eq!(
+        store.get_branch_head("main").await.unwrap(),
+        stored_job.head
+    );
 }
 
 #[tokio::test]
 async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = AnyBranchBackend::new("child result");
     let calls = backend.calls.clone();
     let provider_contexts = backend.provider_contexts.clone();
@@ -1435,6 +1558,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
     let caller_task = "Review the inherited task from the parent prompt.";
     let caller_prompt_id = store
@@ -1450,8 +1574,9 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
                 },
             )),
         })
+        .await
         .unwrap();
-    let invocation_id = append_skill_invocation_node(&store, &caller_prompt_id, "fast-rust");
+    let invocation_id = append_skill_invocation_node(&store, &caller_prompt_id, "fast-rust").await;
 
     let result = engine
         .execute_skill_invocation(
@@ -1466,7 +1591,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         .unwrap();
 
     assert_eq!(result.text, "child result");
-    let response_node = store.get_node(&result.response_node_id).unwrap();
+    let response_node = store.get_node(&result.response_node_id).await.unwrap();
     assert!(matches!(
         response_node.kind,
         Kind::Text(ref text) if text == "child result"
@@ -1477,19 +1602,19 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
     let child_branch = calls[0].clone();
     drop(calls);
 
-    let branch_error = store.get_branch_head(&child_branch).unwrap_err();
+    let branch_error = store.get_branch_head(&child_branch).await.unwrap_err();
     assert!(matches!(
         branch_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch
     ));
-    let state_error = store.get_session_state(&child_branch).unwrap_err();
+    let state_error = store.get_session_state(&child_branch).await.unwrap_err();
     assert!(matches!(
         state_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch
     ));
-    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(store.list_jobs().await.unwrap().is_empty());
 
-    let children = store.list_children(&invocation_id).unwrap();
+    let children = store.list_children(&invocation_id).await.unwrap();
     let child_session_anchor = children
         .iter()
         .find_map(|node| match &node.kind {
@@ -1512,7 +1637,10 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
             .prompt
             .contains("Additional task from caller:")
     );
-    let child_session_children = store.list_children(&child_session_anchor.0.id).unwrap();
+    let child_session_children = store
+        .list_children(&child_session_anchor.0.id)
+        .await
+        .unwrap();
     assert!(!child_session_children.iter().any(|node| matches!(
         &node.kind,
         Kind::Anchor(anchor) if anchor.as_prompt().is_some()
@@ -1526,7 +1654,7 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
 
 #[tokio::test]
 async fn llm_engine_materializes_store_skill_scripts() {
-    let store = test_store();
+    let store = test_store().await;
     store
         .add_skill(
             SessionRole::Orchestrator,
@@ -1541,6 +1669,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
     let backend = AnyBranchBackend::new("script result");
@@ -1548,7 +1677,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let invocation_id =
-        append_skill_invocation_node(&store, &base_session.anchor_id, "scripted-skill");
+        append_skill_invocation_node(&store, &base_session.anchor_id, "scripted-skill").await;
 
     engine
         .execute_skill_invocation(
@@ -1562,7 +1691,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
         .await
         .unwrap();
 
-    let children = store.list_children(&invocation_id).unwrap();
+    let children = store.list_children(&invocation_id).await.unwrap();
     let child_session_anchor = children
         .iter()
         .find_map(|node| match &node.kind {
@@ -1602,7 +1731,7 @@ async fn llm_engine_materializes_store_skill_scripts() {
 async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
     let runtime_root = std::env::temp_dir().join("coco").join("skill-sessions");
     let body = format!("# Bad Scripted Skill {}", nanoid::nanoid!());
-    let store = test_store();
+    let store = test_store().await;
     store
         .add_skill(
             SessionRole::Orchestrator,
@@ -1617,6 +1746,7 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
                 enable_coco_shim: true,
             },
         )
+        .await
         .unwrap();
 
     let backend = AnyBranchBackend::new("should not run");
@@ -1624,7 +1754,7 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let invocation_id =
-        append_skill_invocation_node(&store, &base_session.anchor_id, "bad-scripted-skill");
+        append_skill_invocation_node(&store, &base_session.anchor_id, "bad-scripted-skill").await;
 
     let error = engine
         .execute_skill_invocation(
@@ -1644,7 +1774,7 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
 
 #[tokio::test]
 async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
-    let store = test_store();
+    let store = test_store().await;
     let backend = AlwaysFailBackend::new();
     let calls = backend.calls.clone();
     let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -1661,8 +1791,10 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
                 enable_coco_shim: false,
             },
         )
+        .await
         .unwrap();
-    let invocation_id = append_skill_invocation_node(&store, &base_session.anchor_id, "fast-rust");
+    let invocation_id =
+        append_skill_invocation_node(&store, &base_session.anchor_id, "fast-rust").await;
 
     let error = engine
         .execute_skill_invocation(
@@ -1682,10 +1814,10 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
     let child_branch = calls[0].clone();
     drop(calls);
 
-    let branch_error = store.get_branch_head(&child_branch).unwrap_err();
+    let branch_error = store.get_branch_head(&child_branch).await.unwrap_err();
     assert!(matches!(
         branch_error,
         coco_llm::coco_mem::StoreError::BranchNotFound { name } if name == child_branch
     ));
-    assert!(store.list_jobs().unwrap().is_empty());
+    assert!(store.list_jobs().await.unwrap().is_empty());
 }

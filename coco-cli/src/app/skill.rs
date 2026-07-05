@@ -79,7 +79,7 @@ where
     match command.command {
         SkillSubcommand::Add(command) => {
             let json = command.json;
-            let skill = run_skill_add(command, store)?;
+            let skill = run_skill_add(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -88,7 +88,7 @@ where
         }
         SkillSubcommand::Update(command) => {
             let json = command.json;
-            let skill = run_skill_update(command, store)?;
+            let skill = run_skill_update(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -97,7 +97,7 @@ where
         }
         SkillSubcommand::Rollback(command) => {
             let json = command.json;
-            let skill = run_skill_rollback(command, store)?;
+            let skill = run_skill_rollback(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -106,7 +106,7 @@ where
         }
         SkillSubcommand::List(command) => {
             let json = command.json;
-            let skills = run_skill_list(command, store)?;
+            let skills = run_skill_list(command, store).await?;
             Ok(Some(if json {
                 render_json(skills)
             } else {
@@ -115,7 +115,7 @@ where
         }
         SkillSubcommand::Show(command) => {
             let json = command.json;
-            let skill = run_skill_show(command, store)?;
+            let skill = run_skill_show(command, store).await?;
             Ok(Some(if json {
                 render_json(skill)
             } else {
@@ -134,7 +134,10 @@ where
     }
 }
 
-fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<SkillSummaryView> {
+async fn run_skill_add(
+    command: SkillAddCommand,
+    store: &impl SkillStore,
+) -> Result<SkillSummaryView> {
     let body = read_skill_body(&command.file)?;
     let scripts = read_skill_scripts(command.scripts, command.script_dir)?;
     let record = store
@@ -148,11 +151,12 @@ fn run_skill_add(command: SkillAddCommand, store: &impl SkillStore) -> Result<Sk
                 enable_coco_shim: command.enable_coco_shim,
             },
         )
+        .await
         .context(StoreSnafu)?;
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_update(
+async fn run_skill_update(
     command: SkillUpdateCommand,
     store: &impl SkillStore,
 ) -> Result<SkillSummaryView> {
@@ -181,21 +185,23 @@ fn run_skill_update(
     };
     let record = store
         .update_skill(command.role.into(), &command.name, &patch)
+        .await
         .context(StoreSnafu)?;
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_rollback(
+async fn run_skill_rollback(
     command: SkillRollbackCommand,
     store: &impl SkillStore,
 ) -> Result<SkillSummaryView> {
     let record = store
         .rollback_skill(command.role.into(), &command.name, command.to_version)
+        .await
         .context(StoreSnafu)?;
     Ok(skill_summary_view(command.role.into(), &record))
 }
 
-fn run_skill_list(
+async fn run_skill_list(
     command: SkillListCommand,
     store: &impl SkillStore,
 ) -> Result<Vec<SkillSummaryView>> {
@@ -206,7 +212,7 @@ fn run_skill_list(
         .unwrap_or_else(|| vec![SessionRole::Orchestrator, SessionRole::Runner]);
     let mut skills = Vec::new();
     for role in roles {
-        let mut records = store.list_skills(role).context(StoreSnafu)?;
+        let mut records = store.list_skills(role).await.context(StoreSnafu)?;
         records.sort_by(|left, right| left.name.cmp(&right.name));
         skills.extend(
             records
@@ -217,9 +223,15 @@ fn run_skill_list(
     Ok(skills)
 }
 
-fn run_skill_show(command: SkillShowCommand, store: &impl SkillStore) -> Result<SkillShowView> {
+async fn run_skill_show(
+    command: SkillShowCommand,
+    store: &impl SkillStore,
+) -> Result<SkillShowView> {
     let role: SessionRole = command.role.into();
-    let record = store.get_skill(role, &command.name).context(StoreSnafu)?;
+    let record = store
+        .get_skill(role, &command.name)
+        .await
+        .context(StoreSnafu)?;
     let versions = record
         .versions
         .values()
@@ -251,7 +263,10 @@ where
         .branch
         .or_else(|| std::env::var(coco_llm::COCO_SESSION_BRANCH_ENV).ok())
         .context(MissingSkillRunBranchSnafu)?;
-    let parent = store.get_node(&parent_tool_use_id).context(StoreSnafu)?;
+    let parent = store
+        .get_node(&parent_tool_use_id)
+        .await
+        .context(StoreSnafu)?;
     ensure!(
         parent.kind.as_tool_uses().is_some(),
         InvalidSkillInvocationParentSnafu {
@@ -264,7 +279,7 @@ where
     let handoff = Some(prompt.clone());
     let mode = SkillInvocationMode::Handoff { prompt };
     let skill_name = command.name;
-    let session_role = resolve_parent_session_role(store, &parent_tool_use_id)?;
+    let session_role = resolve_parent_session_role(store, &parent_tool_use_id).await?;
     let invocation_node_id = store
         .append(NewNode {
             parent: parent_tool_use_id.clone(),
@@ -278,6 +293,7 @@ where
                 },
             )),
         })
+        .await
         .context(StoreSnafu)?;
     let workspace_root = std::env::current_dir().context(ResolveCurrentDirSnafu)?;
     let result = ConversationEngine::new(llm.clone())
@@ -302,8 +318,11 @@ where
     })
 }
 
-fn resolve_parent_session_role(store: &impl NodeStore, start_id: &str) -> Result<SessionRole> {
-    let mut node = store.get_node(start_id).context(StoreSnafu)?;
+async fn resolve_parent_session_role(
+    store: &impl NodeStore,
+    start_id: &str,
+) -> Result<SessionRole> {
+    let mut node = store.get_node(start_id).await.context(StoreSnafu)?;
     let mut patches = Vec::new();
     loop {
         if let Kind::Anchor(anchor) = &node.kind {
@@ -325,7 +344,7 @@ fn resolve_parent_session_role(store: &impl NodeStore, start_id: &str) -> Result
                 parent_tool_use_id: start_id.to_owned(),
             }
         );
-        node = store.get_node(&node.parent).context(StoreSnafu)?;
+        node = store.get_node(&node.parent).await.context(StoreSnafu)?;
     }
 }
 

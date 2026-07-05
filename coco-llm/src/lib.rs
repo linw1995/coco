@@ -16,11 +16,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+#[cfg(test)]
+use coco_mem::PauseReason;
 use coco_mem::{
-    Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MergeParent,
-    NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, PromptAttachment,
-    ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord,
-    SkillResultAnchor, SkillStore, SqliteStore, StoreError, Tool, ToolResult, ToolUse,
+    Anchor, AnchorPayload, BackendMetadata, BranchAppendSessionState, BranchSessionStateUpdate,
+    BranchStore, ExecutionMetadata, Kind, MergeParent, NewNode, NewNodeContent, NodeMetadata,
+    NodeStore, PromptAnchor, PromptAttachment, ProviderMetadata, Role, SessionAnchor, SessionRole,
+    SessionState, SessionStore, SkillRecord, SkillResultAnchor, SkillStore, SqliteStore,
+    StoreError, Tool, ToolResult, ToolUse,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -441,7 +444,7 @@ struct ToolInvocationContext {
 #[derive(Debug)]
 struct StoreNodeAppender<S> {
     store: S,
-    head_id: StdMutex<String>,
+    head_id: Mutex<String>,
 }
 
 #[derive(Clone)]
@@ -449,12 +452,13 @@ struct TraceNodeAppenderHandle {
     inner: Arc<dyn TraceNodeAppender>,
 }
 
+#[async_trait]
 trait TraceNodeAppender: Send + Sync {
     /// Returns the current trace tail.
-    fn head_id(&self) -> std::result::Result<String, BackendError>;
+    async fn head_id(&self) -> std::result::Result<String, BackendError>;
 
     /// Appends a store node to the current trace tail.
-    fn append(
+    async fn append(
         &self,
         role: Role,
         metadata: Option<NodeMetadata>,
@@ -467,17 +471,17 @@ impl TraceNodeAppenderHandle {
         Self { inner }
     }
 
-    fn append(
+    async fn append(
         &self,
         role: Role,
         metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
-        self.inner.append(role, metadata, kind)
+        self.inner.append(role, metadata, kind).await
     }
 
-    fn head_id(&self) -> std::result::Result<String, BackendError> {
-        self.inner.head_id()
+    async fn head_id(&self) -> std::result::Result<String, BackendError> {
+        self.inner.head_id().await
     }
 }
 
@@ -487,28 +491,22 @@ impl std::fmt::Debug for TraceNodeAppenderHandle {
     }
 }
 
+#[async_trait]
 impl<S> TraceNodeAppender for StoreNodeAppender<S>
 where
     S: NodeStore + Send + Sync,
 {
-    fn head_id(&self) -> std::result::Result<String, BackendError> {
-        Ok(self
-            .head_id
-            .lock()
-            .expect("trace node appender lock poisoned")
-            .clone())
+    async fn head_id(&self) -> std::result::Result<String, BackendError> {
+        Ok(self.head_id.lock().await.clone())
     }
 
-    fn append(
+    async fn append(
         &self,
         role: Role,
         metadata: Option<NodeMetadata>,
         kind: Kind,
     ) -> std::result::Result<String, BackendError> {
-        let mut head_id = self
-            .head_id
-            .lock()
-            .expect("trace node appender lock poisoned");
+        let mut head_id = self.head_id.lock().await;
         let node_id = self
             .store
             .append(NewNode {
@@ -517,6 +515,7 @@ where
                 metadata,
                 kind,
             })
+            .await
             .map_err(|source| BackendError::failed(source.to_string()))?;
         *head_id = node_id.clone();
         Ok(node_id)
@@ -1335,6 +1334,7 @@ where
         let anchor_id = self
             .store
             .rebase_session(branch, &patch)
+            .await
             .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
@@ -1358,6 +1358,7 @@ where
         let anchor_id = self
             .store
             .handoff_session(branch, &patch, prompt)
+            .await
             .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
@@ -1381,15 +1382,20 @@ where
         prompt: &str,
     ) -> Result<String> {
         let _guard = self.lock_branch(branch).await;
+        let inherited_tools = if patch.tools.is_none() {
+            Some(self.resolve_context(branch).await?.session_anchor.tools)
+        } else {
+            None
+        };
         refresh_handoff_tool_patch(&mut patch, || {
-            self.resolve_context(branch)
-                .map(|context| context.session_anchor.tools)
+            Ok(inherited_tools.expect("inherited tools should be preloaded when needed"))
         })?;
         let has_tool_patch = patch.tools.is_some();
         let has_model_patch = patch.model.is_some();
         let anchor_id = self
             .store
             .handoff_session(branch, &patch, prompt)
+            .await
             .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
@@ -1464,9 +1470,11 @@ where
                     },
                 )),
             })
+            .await
             .context(MemorySnafu)?;
         self.store
             .fork(&config.branch, &anchor_id)
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(
@@ -1486,9 +1494,13 @@ where
         })
     }
 
-    pub fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
+    pub async fn fork(&self, branch: impl Into<String>, from_ref: &str) -> Result<String> {
         let branch = branch.into();
-        let anchor_id = self.store.fork(&branch, from_ref).context(MemorySnafu)?;
+        let anchor_id = self
+            .store
+            .fork(&branch, from_ref)
+            .await
+            .context(MemorySnafu)?;
         tracing::info!(
             branch = %branch,
             from_ref = %from_ref,
@@ -1505,7 +1517,10 @@ where
 {
     pub async fn delete_session_branch(&self, branch: &str) -> Result<()> {
         let _guard = self.lock_branch(branch).await;
-        self.store.delete_branch(branch).context(MemorySnafu)?;
+        self.store
+            .delete_branch(branch)
+            .await
+            .context(MemorySnafu)?;
         let cleaned_session_count = self
             .runtime
             .unified_exec_sessions
@@ -1530,6 +1545,7 @@ where
         let base_head_id = self
             .store
             .get_branch_head(target_branch)
+            .await
             .context(MemorySnafu)?;
         self.store
             .set_session_state(
@@ -1540,6 +1556,7 @@ where
                     base_head_id: base_head_id.clone(),
                 },
             )
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(
@@ -1561,6 +1578,26 @@ struct PreparedCompletionRun {
     retry_from_node_id: String,
     session: ResolvedSession,
     resolved: ResolvedCompletionRequest,
+}
+
+struct SuccessfulBackendRunPersistence<'a> {
+    resolved: &'a ResolvedCompletionRequest,
+    original_head: &'a str,
+    retry_from_node_id: &'a str,
+    execution_id: &'a str,
+    head: Option<&'a str>,
+    text: &'a str,
+    steps: &'a [BackendStep],
+}
+
+struct FailedBackendRunPersistence<'a> {
+    resolved: &'a ResolvedCompletionRequest,
+    original_head: &'a str,
+    retry_from_node_id: &'a str,
+    execution_id: &'a str,
+    head: Option<&'a str>,
+    message: &'a str,
+    steps: &'a [BackendStep],
 }
 
 impl<B, S> LlmService<B, S>
@@ -1603,15 +1640,18 @@ where
     }
 
     async fn run_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
-        let prepared = self.prepare_completion_run(request)?;
+        let prepared = self.prepare_completion_run(request).await?;
         let completed = self
             .backend
             .complete(prepared.session.clone(), prepared.resolved.clone())
             .await;
-        self.finish_completion_run(prepared, completed)
+        self.finish_completion_run(prepared, completed).await
     }
 
-    fn prepare_completion_run(&self, request: CompletionRequest) -> Result<PreparedCompletionRun> {
+    async fn prepare_completion_run(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<PreparedCompletionRun> {
         let branch = request.branch.clone();
         let origin_kind = completion_origin_kind(&request.origin);
         let input_kind = completion_input_kind(&request.input);
@@ -1620,12 +1660,13 @@ where
         let original_head = self
             .store
             .get_branch_head(&request.branch)
+            .await
             .context(MemorySnafu)?;
         let reference_id = match &request.origin {
             CompletionOrigin::BranchHead => original_head.clone(),
             CompletionOrigin::Reference(reference)
             | CompletionOrigin::ReferenceWithBranchSession(reference) => {
-                self.resolve_reference_id(reference)?
+                self.resolve_reference_id(reference).await?
             }
         };
         let retry_from_node_id = match &request.input {
@@ -1635,23 +1676,29 @@ where
                 attachments,
                 merge_parents,
                 session_patch,
-            } => self.append_prompt_anchor_to_parent_with_session_patch(
-                &reference_id,
-                text,
-                attachments,
-                merge_parents,
-                session_patch.as_deref(),
-            )?,
+            } => {
+                self.append_prompt_anchor_to_parent_with_session_patch(
+                    &reference_id,
+                    text,
+                    attachments,
+                    merge_parents,
+                    session_patch.as_deref(),
+                )
+                .await?
+            }
         };
         let mut session = match &request.origin {
-            CompletionOrigin::ReferenceWithBranchSession(_) => self
-                .resolve_session_from_reference_with_branch_session(
+            CompletionOrigin::ReferenceWithBranchSession(_) => {
+                self.resolve_session_from_reference_with_branch_session(
                     &request.branch,
                     &retry_from_node_id,
                     &original_head,
-                )?,
+                )
+                .await?
+            }
             CompletionOrigin::BranchHead | CompletionOrigin::Reference(_) => {
-                self.resolve_session_from_reference(&request.branch, &retry_from_node_id)?
+                self.resolve_session_from_reference(&request.branch, &retry_from_node_id)
+                    .await?
             }
         };
         if request.active_skill_runtime.is_some() {
@@ -1674,7 +1721,7 @@ where
         );
         let trace_node_appender = TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
             store: self.store.clone(),
-            head_id: StdMutex::new(retry_from_node_id.clone()),
+            head_id: Mutex::new(retry_from_node_id.clone()),
         }));
         let trace_node_store: Arc<TraceNodeStore> = Arc::new(self.store.clone());
         let resolved = self.resolve_request(
@@ -1692,18 +1739,18 @@ where
         })
     }
 
-    fn finish_completion_run(
+    async fn finish_completion_run(
         &self,
         prepared: PreparedCompletionRun,
         completed: std::result::Result<BackendRun, BackendError>,
     ) -> Result<CompletionResult> {
         match completed {
-            Ok(run) => self.finish_backend_run(prepared, run),
-            Err(source) => self.finish_backend_error(prepared, source),
+            Ok(run) => self.finish_backend_run(prepared, run).await,
+            Err(source) => self.finish_backend_error(prepared, source).await,
         }
     }
 
-    fn finish_backend_run(
+    async fn finish_backend_run(
         &self,
         prepared: PreparedCompletionRun,
         run: BackendRun,
@@ -1716,14 +1763,16 @@ where
         match outcome {
             BackendOutcome::Succeeded { text } => {
                 self.finish_successful_backend_run(prepared, steps, head, text)
+                    .await
             }
             BackendOutcome::Failed { message } => {
                 self.finish_failed_backend_run(prepared, steps, head, message)
+                    .await
             }
         }
     }
 
-    fn finish_successful_backend_run(
+    async fn finish_successful_backend_run(
         &self,
         prepared: PreparedCompletionRun,
         steps: Vec<BackendStep>,
@@ -1738,15 +1787,17 @@ where
             ..
         } = prepared;
         let (last_execution_id, steps) = normalize_backend_steps(steps, Some(text.clone()));
-        let response_node_id = self.persist_successful_backend_run(
-            &resolved,
-            &retry_from_node_id,
-            &last_execution_id,
-            head.as_deref(),
-            &text,
-            &steps,
-        )?;
-        self.move_branch_head(&resolved.branch, &original_head, &response_node_id)?;
+        let response_node_id = self
+            .persist_successful_backend_run(SuccessfulBackendRunPersistence {
+                resolved: &resolved,
+                original_head: &original_head,
+                retry_from_node_id: &retry_from_node_id,
+                execution_id: &last_execution_id,
+                head: head.as_deref(),
+                text: &text,
+                steps: &steps,
+            })
+            .await?;
 
         tracing::info!(
             branch = %resolved.branch,
@@ -1766,37 +1817,55 @@ where
         })
     }
 
-    fn persist_successful_backend_run(
+    async fn persist_successful_backend_run(
         &self,
-        resolved: &ResolvedCompletionRequest,
-        retry_from_node_id: &str,
-        execution_id: &str,
-        head: Option<&str>,
-        text: &str,
-        steps: &[BackendStep],
+        run: SuccessfulBackendRunPersistence<'_>,
     ) -> Result<String> {
-        let trace_node_appender = resolved
-            .trace_node_appender
-            .as_ref()
-            .expect("completion runs should always persist through a trace node appender");
-        match head {
-            Some(head_id) => self.validate_terminal_text_with_trace_node_appender(
-                &resolved.branch,
-                execution_id,
-                head_id,
-                text,
-            ),
-            None => self.persist_backend_steps_with_trace_node_appender(
-                &resolved.branch,
-                retry_from_node_id,
-                trace_node_appender,
-                resolved.trace_node_store.as_deref(),
-                steps,
-            ),
+        match run.head {
+            Some(head_id) => {
+                let response_node_id = self
+                    .validate_terminal_text_with_trace_node_appender(
+                        &run.resolved.branch,
+                        run.execution_id,
+                        head_id,
+                        run.text,
+                    )
+                    .await?;
+                self.move_branch_head(&run.resolved.branch, run.original_head, &response_node_id)
+                    .await?;
+                Ok(response_node_id)
+            }
+            None => {
+                let nodes = backend_step_node_contents_with_skill_results(
+                    run.resolved.trace_node_store.as_deref(),
+                    run.retry_from_node_id,
+                    run.steps,
+                )
+                .await
+                .context(BackendSnafu {
+                    context: Box::new(BackendFailureContext {
+                        branch: run.resolved.branch.clone(),
+                        execution_id: run.execution_id.to_owned(),
+                        error_node_id: run.retry_from_node_id.to_owned(),
+                        retry_from_node_id: run.retry_from_node_id.to_owned(),
+                    }),
+                })?;
+                let response_node_id = self
+                    .store
+                    .append_nodes_and_set_branch_head(
+                        &run.resolved.branch,
+                        run.original_head,
+                        run.retry_from_node_id,
+                        nodes,
+                    )
+                    .await
+                    .context(MemorySnafu)?;
+                Ok(response_node_id)
+            }
         }
     }
 
-    fn finish_failed_backend_run(
+    async fn finish_failed_backend_run(
         &self,
         prepared: PreparedCompletionRun,
         steps: Vec<BackendStep>,
@@ -1810,15 +1879,17 @@ where
             ..
         } = prepared;
         let (execution_id, steps) = normalize_backend_steps(steps, None);
-        let error_node_id = self.persist_failed_backend_run(
-            &resolved,
-            &retry_from_node_id,
-            &execution_id,
-            head,
-            &message,
-            &steps,
-        )?;
-        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+        let error_node_id = self
+            .persist_failed_backend_run(FailedBackendRunPersistence {
+                resolved: &resolved,
+                original_head: &original_head,
+                retry_from_node_id: &retry_from_node_id,
+                execution_id: &execution_id,
+                head: head.as_deref(),
+                message: &message,
+                steps: &steps,
+            })
+            .await?;
         tracing::warn!(
             branch = %resolved.branch,
             execution_id = %execution_id,
@@ -1839,41 +1910,62 @@ where
         .into_error(BackendError::failed(message)))
     }
 
-    fn persist_failed_backend_run(
+    async fn persist_failed_backend_run(
         &self,
-        resolved: &ResolvedCompletionRequest,
-        retry_from_node_id: &str,
-        execution_id: &str,
-        head: Option<String>,
-        message: &str,
-        steps: &[BackendStep],
+        run: FailedBackendRunPersistence<'_>,
     ) -> Result<String> {
-        let trace_node_appender = resolved
+        if run.head.is_none() {
+            let mut nodes = backend_step_node_contents_with_skill_results(
+                run.resolved.trace_node_store.as_deref(),
+                run.retry_from_node_id,
+                run.steps,
+            )
+            .await
+            .context(BackendSnafu {
+                context: Box::new(BackendFailureContext {
+                    branch: run.resolved.branch.clone(),
+                    execution_id: run.execution_id.to_owned(),
+                    error_node_id: run.retry_from_node_id.to_owned(),
+                    retry_from_node_id: run.retry_from_node_id.to_owned(),
+                }),
+            })?;
+            nodes.push(failure_node_content(run.execution_id, run.message));
+            return self
+                .store
+                .append_nodes_and_set_branch_head_to(
+                    &run.resolved.branch,
+                    run.original_head,
+                    run.retry_from_node_id,
+                    run.retry_from_node_id,
+                    nodes,
+                )
+                .await
+                .context(MemorySnafu);
+        }
+        let trace_node_appender = run
+            .resolved
             .trace_node_appender
             .as_ref()
             .expect("completion runs should always persist through a trace node appender");
-        head.map_or_else(
-            || {
-                self.persist_backend_steps_with_trace_node_appender(
-                    &resolved.branch,
-                    retry_from_node_id,
-                    trace_node_appender,
-                    resolved.trace_node_store.as_deref(),
-                    steps,
-                )
-            },
-            Ok,
-        )?;
-        self.append_failure_with_trace_node_appender(
-            &resolved.branch,
-            retry_from_node_id,
-            trace_node_appender,
-            execution_id,
-            message,
+        let trace_parent_id = trace_node_appender.head_id().await.context(BackendSnafu {
+            context: Box::new(BackendFailureContext {
+                branch: run.resolved.branch.clone(),
+                execution_id: run.execution_id.to_owned(),
+                error_node_id: run.retry_from_node_id.to_owned(),
+                retry_from_node_id: run.retry_from_node_id.to_owned(),
+            }),
+        })?;
+        self.append_failure_and_reset_branch(
+            run.resolved,
+            run.original_head,
+            run.retry_from_node_id,
+            &trace_parent_id,
+            run.execution_id,
+            run.message,
         )
+        .await
     }
-
-    fn finish_backend_error(
+    async fn finish_backend_error(
         &self,
         prepared: PreparedCompletionRun,
         source: BackendError,
@@ -1885,9 +1977,15 @@ where
             ..
         } = prepared;
         let execution_id = format!("execution-{}", nanoid::nanoid!());
-        let error_node_id =
-            self.persist_backend_error(&resolved, &retry_from_node_id, &execution_id, &source)?;
-        self.move_branch_head(&resolved.branch, &original_head, &retry_from_node_id)?;
+        let error_node_id = self
+            .persist_backend_error(
+                &resolved,
+                &original_head,
+                &retry_from_node_id,
+                &execution_id,
+                &source,
+            )
+            .await?;
         tracing::error!(
             branch = %resolved.branch,
             execution_id = %execution_id,
@@ -1907,9 +2005,10 @@ where
         .into_error(source))
     }
 
-    fn persist_backend_error(
+    async fn persist_backend_error(
         &self,
         resolved: &ResolvedCompletionRequest,
+        original_head: &str,
         retry_from_node_id: &str,
         execution_id: &str,
         source: &BackendError,
@@ -1918,40 +2017,79 @@ where
             .trace_node_appender
             .as_ref()
             .expect("completion runs should always persist through a trace node appender");
-        self.append_failure_with_trace_node_appender(
-            &resolved.branch,
+        let trace_parent_id = trace_node_appender.head_id().await.context(BackendSnafu {
+            context: Box::new(BackendFailureContext {
+                branch: resolved.branch.clone(),
+                execution_id: execution_id.to_owned(),
+                error_node_id: retry_from_node_id.to_owned(),
+                retry_from_node_id: retry_from_node_id.to_owned(),
+            }),
+        })?;
+        self.append_failure_and_reset_branch(
+            resolved,
+            original_head,
             retry_from_node_id,
-            trace_node_appender,
+            &trace_parent_id,
             execution_id,
             &source.to_string(),
         )
+        .await
+    }
+
+    async fn append_failure_and_reset_branch(
+        &self,
+        resolved: &ResolvedCompletionRequest,
+        original_head: &str,
+        retry_from_node_id: &str,
+        parent: &str,
+        execution_id: &str,
+        message: &str,
+    ) -> Result<String> {
+        self.store
+            .append_nodes_and_set_branch_head_to(
+                &resolved.branch,
+                original_head,
+                parent,
+                retry_from_node_id,
+                vec![failure_node_content(execution_id, message)],
+            )
+            .await
+            .map_err(BackendError::from)
+            .context(BackendSnafu {
+                context: Box::new(BackendFailureContext {
+                    branch: resolved.branch.clone(),
+                    execution_id: execution_id.to_owned(),
+                    error_node_id: retry_from_node_id.to_owned(),
+                    retry_from_node_id: retry_from_node_id.to_owned(),
+                }),
+            })
     }
 }
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + SkillStore,
+    S: NodeStore + SkillStore + Sync,
 {
-    fn resolve_session_from_reference(
+    async fn resolve_session_from_reference(
         &self,
         branch: &str,
         reference: &str,
     ) -> Result<ResolvedSession> {
-        let context = self.resolve_context(reference)?;
-        self.session_from_context(branch, context)
+        let context = self.resolve_context(reference).await?;
+        self.session_from_context(branch, context).await
     }
 
-    fn resolve_session_from_reference_with_branch_session(
+    async fn resolve_session_from_reference_with_branch_session(
         &self,
         branch: &str,
         reference: &str,
         branch_head: &str,
     ) -> Result<ResolvedSession> {
-        let mut context = self.resolve_context(reference)?;
-        let branch_context = self.resolve_context(branch_head)?;
+        let mut context = self.resolve_context(reference).await?;
+        let branch_context = self.resolve_context(branch_head).await?;
         context.active_anchor_id = branch_context.active_anchor_id;
         context.session_anchor = branch_context.session_anchor;
-        self.session_from_context(branch, context)
+        self.session_from_context(branch, context).await
     }
 }
 
@@ -1986,7 +2124,7 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore + BranchStore,
 {
-    pub fn append_prompt_job_base(
+    pub async fn append_prompt_job_base(
         &self,
         branch: &str,
         prompt: &str,
@@ -1994,7 +2132,11 @@ where
         merge_parents: &[MergeParent],
         session_patch: Option<&SessionConfigPatch>,
     ) -> Result<String> {
-        let parent_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let parent_id = self
+            .store
+            .get_branch_head(branch)
+            .await
+            .context(MemorySnafu)?;
         self.append_prompt_anchor_to_parent_with_session_patch(
             &parent_id,
             prompt,
@@ -2002,27 +2144,7 @@ where
             merge_parents,
             session_patch,
         )
-    }
-}
-
-impl<B, S> LlmService<B, S>
-where
-    S: NodeStore + BranchStore,
-{
-    fn append_prompt_anchor_to_branch(
-        &self,
-        branch: &str,
-        prompt: &str,
-        merge_parents: &[MergeParent],
-    ) -> Result<String> {
-        let original_head = self.store.get_branch_head(branch).context(MemorySnafu)?;
-        let anchor_id =
-            self.append_prompt_anchor_to_parent(&original_head, prompt, &[], merge_parents)?;
-        self.store
-            .set_branch_head(branch, &original_head, &anchor_id)
-            .context(MemorySnafu)?;
-
-        Ok(anchor_id)
+        .await
     }
 }
 
@@ -2030,7 +2152,7 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
 {
-    fn append_prompt_anchor_to_parent_with_session_patch(
+    async fn append_prompt_anchor_to_parent_with_session_patch(
         &self,
         parent_id: &str,
         prompt: &str,
@@ -2040,7 +2162,7 @@ where
     ) -> Result<String> {
         let prompt_parent_id = match session_patch {
             Some(patch) => {
-                self.resolve_context(parent_id)?;
+                self.resolve_context(parent_id).await?;
                 self.store
                     .append(NewNode {
                         parent: parent_id.to_owned(),
@@ -2048,11 +2170,13 @@ where
                         metadata: None,
                         kind: Kind::Anchor(Anchor::session_patch(vec![], patch.clone())),
                     })
+                    .await
                     .context(MemorySnafu)?
             }
             None => parent_id.to_owned(),
         };
         self.append_prompt_anchor_to_parent(&prompt_parent_id, prompt, attachments, merge_parents)
+            .await
     }
 }
 
@@ -2060,7 +2184,7 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
 {
-    fn append_prompt_anchor_to_parent(
+    async fn append_prompt_anchor_to_parent(
         &self,
         parent_id: &str,
         prompt: &str,
@@ -2091,75 +2215,18 @@ where
                     },
                 )),
             })
+            .await
             .context(MemorySnafu)
     }
 
-    fn persist_backend_steps_with_trace_node_appender(
-        &self,
-        branch: &str,
-        retry_from_node_id: &str,
-        trace_node_appender: &TraceNodeAppenderHandle,
-        trace_node_store: Option<&TraceNodeStore>,
-        steps: &[BackendStep],
-    ) -> Result<String> {
-        let mut head_id = retry_from_node_id.to_owned();
-        for step in steps {
-            if step.events.is_empty() {
-                continue;
-            }
-            head_id = append_backend_events(
-                trace_node_appender,
-                trace_node_store,
-                &step.execution,
-                &step.events,
-            )
-            .context(BackendSnafu {
-                context: Box::new(BackendFailureContext {
-                    branch: branch.to_owned(),
-                    execution_id: step.execution.execution_id.clone(),
-                    error_node_id: retry_from_node_id.to_owned(),
-                    retry_from_node_id: retry_from_node_id.to_owned(),
-                }),
-            })?;
-        }
-
-        Ok(head_id)
-    }
-
-    fn append_failure_with_trace_node_appender(
-        &self,
-        branch: &str,
-        retry_from_node_id: &str,
-        trace_node_appender: &TraceNodeAppenderHandle,
-        execution_id: &str,
-        message: &str,
-    ) -> Result<String> {
-        trace_node_appender
-            .append(
-                Role::System,
-                BackendMetadata::builder()
-                    .execution(&ExecutionMetadata::new(execution_id.to_owned()))
-                    .build(),
-                Kind::Failure(message.to_owned()),
-            )
-            .context(BackendSnafu {
-                context: Box::new(BackendFailureContext {
-                    branch: branch.to_owned(),
-                    execution_id: execution_id.to_owned(),
-                    error_node_id: retry_from_node_id.to_owned(),
-                    retry_from_node_id: retry_from_node_id.to_owned(),
-                }),
-            })
-    }
-
-    fn validate_terminal_text_with_trace_node_appender(
+    async fn validate_terminal_text_with_trace_node_appender(
         &self,
         branch: &str,
         execution_id: &str,
         head: &str,
         text: &str,
     ) -> Result<String> {
-        let node = self.store.get_node(head).context(MemorySnafu)?;
+        let node = self.store.get_node(head).await.context(MemorySnafu)?;
         if matches!(&node.kind, Kind::Text(last_text) if last_text == text) {
             return Ok(head.to_owned());
         }
@@ -2182,13 +2249,19 @@ impl<B, S> LlmService<B, S>
 where
     S: BranchStore,
 {
-    fn move_branch_head(&self, branch: &str, current_head: &str, next_head: &str) -> Result<()> {
+    async fn move_branch_head(
+        &self,
+        branch: &str,
+        current_head: &str,
+        next_head: &str,
+    ) -> Result<()> {
         if current_head == next_head {
             return Ok(());
         }
 
         self.store
             .set_branch_head(branch, current_head, next_head)
+            .await
             .context(MemorySnafu)
     }
 }
@@ -2205,28 +2278,39 @@ where
     ) -> Result<SessionMerge> {
         let _workflow = self.lock_workflow().await;
         let _branch_guard = self.lock_branch(branch).await;
-        let resolved_target_branch = self.resolve_target_branch(branch, target_branch)?;
+        let resolved_target_branch = self.resolve_target_branch(branch, target_branch).await?;
         let _target_guard = if resolved_target_branch == branch {
             None
         } else {
             Some(self.lock_branch(&resolved_target_branch).await)
         };
 
-        let source_head_id = self.store.get_branch_head(branch).context(MemorySnafu)?;
+        let source_head_id = self
+            .store
+            .get_branch_head(branch)
+            .await
+            .context(MemorySnafu)?;
+        let target_head_id = self
+            .store
+            .get_branch_head(&resolved_target_branch)
+            .await
+            .context(MemorySnafu)?;
         let merge_parents = vec![MergeParent::merge(source_head_id.clone())];
-        let merged_anchor_id =
-            self.append_prompt_anchor_to_branch(&resolved_target_branch, prompt, &merge_parents)?;
-        self.store
-            .set_session_state(
-                branch,
-                None,
-                SessionState::Paused {
+        let merged_anchor_id = self
+            .store
+            .append_nodes_and_set_branch_head_with_session_state(BranchAppendSessionState {
+                branch: resolved_target_branch.clone(),
+                expected_old_head: target_head_id.clone(),
+                parent: target_head_id,
+                new_head: None,
+                nodes: vec![prompt_anchor_node_content(prompt, &merge_parents)],
+                session_branch: branch.to_owned(),
+                expected_session: None,
+                next_session: BranchSessionStateUpdate::PausedMergedToAppendedHead {
                     target_branch: resolved_target_branch.clone(),
-                    reason: PauseReason::Merged {
-                        merged_anchor_id: merged_anchor_id.clone(),
-                    },
                 },
-            )
+            })
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(
@@ -2252,17 +2336,20 @@ where
     ) -> Result<SessionFeedback> {
         let _workflow = self.lock_workflow().await;
         let _branch_guard = self.lock_branch(branch).await;
-        let (target_branch, base_head_id) = self.attached_state(branch)?;
+        let (target_branch, base_head_id) = self.attached_state(branch).await?;
         let _target_guard = if target_branch == branch {
             None
         } else {
             Some(self.lock_branch(&target_branch).await)
         };
 
-        let source_anchor_id = self.resolve_reference_id(from_ref.unwrap_or(&target_branch))?;
-        self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)?;
+        let source_anchor_id = self
+            .resolve_reference_id(from_ref.unwrap_or(&target_branch))
+            .await?;
+        self.ensure_ref_visible_on_branch(&target_branch, &source_anchor_id)
+            .await?;
         if source_anchor_id != base_head_id {
-            match self.store.log(&base_head_id, &source_anchor_id) {
+            match self.store.log(&base_head_id, &source_anchor_id).await {
                 Ok(_) => {}
                 Err(StoreError::RefsNotConnected { .. }) => {
                     return FeedbackSourceNotAheadSnafu {
@@ -2281,17 +2368,27 @@ where
         }
 
         let merge_parents = vec![MergeParent::merge(source_anchor_id.clone())];
-        let feedback_anchor_id =
-            self.append_prompt_anchor_to_branch(branch, prompt, &merge_parents)?;
-        self.store
-            .set_session_state(
-                branch,
-                None,
-                SessionState::Attached {
+        let branch_head_id = self
+            .store
+            .get_branch_head(branch)
+            .await
+            .context(MemorySnafu)?;
+        let feedback_anchor_id = self
+            .store
+            .append_nodes_and_set_branch_head_with_session_state(BranchAppendSessionState {
+                branch: branch.to_owned(),
+                expected_old_head: branch_head_id.clone(),
+                parent: branch_head_id,
+                new_head: None,
+                nodes: vec![prompt_anchor_node_content(prompt, &merge_parents)],
+                session_branch: branch.to_owned(),
+                expected_session: None,
+                next_session: BranchSessionStateUpdate::Set(SessionState::Attached {
                     target_branch: target_branch.clone(),
                     base_head_id: source_anchor_id.clone(),
-                },
-            )
+                }),
+            })
+            .await
             .context(MemorySnafu)?;
 
         tracing::info!(
@@ -2313,12 +2410,12 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore + SkillStore,
+    S: NodeStore + SkillStore + Sync,
 {
     #[cfg(test)]
-    fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
-        let context = self.resolve_context(branch)?;
-        self.session_from_context(branch, context)
+    async fn resolve_session(&self, branch: &str) -> Result<ResolvedSession> {
+        let context = self.resolve_context(branch).await?;
+        self.session_from_context(branch, context).await
     }
 }
 
@@ -2360,14 +2457,14 @@ fn skill_summaries_from_records(records: &[SkillRecord]) -> Vec<SessionSkillSumm
         .collect()
 }
 
-fn session_skill_summaries(
-    store: &impl SkillStore,
+async fn session_skill_summaries(
+    store: &(impl SkillStore + Sync),
     session_role: SessionRole,
 ) -> Result<Vec<SessionSkillSummary>> {
     let mut seen_names = HashSet::new();
     let mut skills = Vec::new();
     for role in accessible_skill_roles(session_role) {
-        let records = store.list_skills(*role).context(MemorySnafu)?;
+        let records = store.list_skills(*role).await.context(MemorySnafu)?;
         for skill in skill_summaries_from_records(&records) {
             if seen_names.insert(skill.name.clone()) {
                 skills.push(skill);
@@ -2403,9 +2500,9 @@ fn append_skills_to_system_prompt(system_prompt: &str, skills: &[SessionSkillSum
 
 impl<B, S> LlmService<B, S>
 where
-    S: SkillStore,
+    S: SkillStore + Sync,
 {
-    fn session_from_context(
+    async fn session_from_context(
         &self,
         branch: &str,
         context: ResolvedContext,
@@ -2433,7 +2530,8 @@ where
         let profile_additional_params =
             provider_config.and_then(|config| config.additional_params.clone());
 
-        let available_skills = session_skill_summaries(self.store(), context.session_anchor.role)?;
+        let available_skills =
+            session_skill_summaries(self.store(), context.session_anchor.role).await?;
 
         Ok(ResolvedSession {
             branch: branch.to_owned(),
@@ -2475,12 +2573,12 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
 {
-    pub fn session_supports_tool(
+    pub async fn session_supports_tool(
         &self,
         branch: &str,
         tool_name: &str,
     ) -> std::result::Result<bool, Error> {
-        let context = self.resolve_context(branch)?;
+        let context = self.resolve_context(branch).await?;
         Ok(context
             .session_anchor
             .tools
@@ -2488,9 +2586,9 @@ where
             .any(|tool| tool.name == tool_name))
     }
 
-    fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
+    async fn resolve_context(&self, reference: &str) -> Result<ResolvedContext> {
         let mut ordered = Vec::new();
-        for node in self.store.ancestry(reference).context(MemorySnafu)? {
+        for node in self.store.ancestry(reference).await.context(MemorySnafu)? {
             let is_context_start = is_provider_context_start(&node);
             ordered.push(node);
             if is_context_start {
@@ -2710,8 +2808,16 @@ impl<B, S> LlmService<B, S>
 where
     S: SessionStore,
 {
-    fn resolve_target_branch(&self, branch: &str, explicit_target: Option<&str>) -> Result<String> {
-        let state = self.store.get_session_state(branch).context(MemorySnafu)?;
+    async fn resolve_target_branch(
+        &self,
+        branch: &str,
+        explicit_target: Option<&str>,
+    ) -> Result<String> {
+        let state = self
+            .store
+            .get_session_state(branch)
+            .await
+            .context(MemorySnafu)?;
 
         if let Some(target_branch) = explicit_target {
             match state {
@@ -2750,8 +2856,13 @@ where
         }
     }
 
-    fn attached_state(&self, branch: &str) -> Result<(String, String)> {
-        match self.store.get_session_state(branch).context(MemorySnafu)? {
+    async fn attached_state(&self, branch: &str) -> Result<(String, String)> {
+        match self
+            .store
+            .get_session_state(branch)
+            .await
+            .context(MemorySnafu)?
+        {
             SessionState::Attached {
                 target_branch,
                 base_head_id,
@@ -2768,9 +2879,10 @@ impl<B, S> LlmService<B, S>
 where
     S: NodeStore,
 {
-    fn resolve_reference_id(&self, reference: &str) -> Result<String> {
+    async fn resolve_reference_id(&self, reference: &str) -> Result<String> {
         self.store
             .ancestry(reference)
+            .await
             .context(MemorySnafu)
             .map(|nodes| {
                 nodes
@@ -2781,9 +2893,10 @@ where
             })
     }
 
-    fn ensure_ref_visible_on_branch(&self, branch: &str, node_id: &str) -> Result<()> {
+    async fn ensure_ref_visible_on_branch(&self, branch: &str, node_id: &str) -> Result<()> {
         self.store
             .log(node_id, branch)
+            .await
             .context(MemorySnafu)
             .map(|_| ())
     }
@@ -3127,6 +3240,171 @@ fn persisted_nodes_from_backend_events(
     nodes
 }
 
+fn backend_step_node_contents(steps: &[BackendStep]) -> Vec<NewNodeContent> {
+    steps
+        .iter()
+        .flat_map(|step| persisted_nodes_from_backend_events(&step.events, &step.execution))
+        .map(|(role, metadata, kind)| NewNodeContent {
+            role,
+            metadata,
+            kind,
+        })
+        .collect()
+}
+
+async fn backend_step_node_contents_with_skill_results(
+    trace_node_store: Option<&TraceNodeStore>,
+    parent: &str,
+    steps: &[BackendStep],
+) -> std::result::Result<Vec<NewNodeContent>, BackendError> {
+    let Some(trace_node_store) = trace_node_store else {
+        return Ok(backend_step_node_contents(steps));
+    };
+
+    let mut ancestry = trace_node_store.ancestry(parent).await?;
+    let mut head = parent.to_owned();
+    let mut contents = Vec::new();
+    let virtual_created_at = ancestry
+        .first()
+        .expect("parent ancestry should include at least the parent node")
+        .created_at;
+
+    for step in steps {
+        for (role, metadata, kind) in
+            persisted_nodes_from_backend_events(&step.events, &step.execution)
+        {
+            let kind = normalize_kind_for_primary_parent(kind, &head);
+            let node = coco_mem::Node {
+                id: format!("virtual-{}", contents.len()),
+                parent: head.clone(),
+                created_at: virtual_created_at,
+                role: role.clone(),
+                metadata: metadata.clone(),
+                kind: kind.clone(),
+            };
+            head = node.id.clone();
+            ancestry.insert(0, node);
+            contents.push(NewNodeContent {
+                role,
+                metadata,
+                kind: kind.clone(),
+            });
+
+            if matches!(kind, Kind::ToolResult(_)) {
+                let skill_results = skill_result_node_contents_after_tool_result(
+                    trace_node_store,
+                    &ancestry,
+                    &head,
+                )
+                .await?;
+                for content in skill_results {
+                    let node = coco_mem::Node {
+                        id: format!("virtual-{}", contents.len()),
+                        parent: head.clone(),
+                        created_at: virtual_created_at,
+                        role: content.role.clone(),
+                        metadata: content.metadata.clone(),
+                        kind: content.kind.clone(),
+                    };
+                    head = node.id.clone();
+                    ancestry.insert(0, node);
+                    contents.push(content);
+                }
+            }
+        }
+    }
+
+    Ok(contents)
+}
+
+async fn skill_result_node_contents_after_tool_result(
+    trace_node_store: &TraceNodeStore,
+    ancestry: &[coco_mem::Node],
+    head: &str,
+) -> std::result::Result<Vec<NewNodeContent>, BackendError> {
+    let Some(tool_result_node) = ancestry.first() else {
+        return Ok(vec![]);
+    };
+    let Kind::ToolResult(tool_results) = &tool_result_node.kind else {
+        return Ok(vec![]);
+    };
+
+    let mut contents = Vec::new();
+    let mut fanned_in = HashSet::new();
+    for tool_result in tool_results.items() {
+        if !is_terminal_unified_exec_output(&tool_result.output) {
+            continue;
+        }
+        let Some(source_tool_use) = resolve_skill_source_tool_use(ancestry, tool_result) else {
+            continue;
+        };
+        let children = match trace_node_store.list_children(&source_tool_use.id).await {
+            Ok(children) => children,
+            Err(coco_mem::StoreError::NotFound { .. }) => continue,
+            Err(source) => return Err(source.into()),
+        };
+        for child in children {
+            let Kind::Anchor(anchor) = &child.kind else {
+                continue;
+            };
+            let Some(invocation) = anchor.as_skill_invocation() else {
+                continue;
+            };
+            let Some(response) =
+                newest_skill_response_descendant(trace_node_store, &child.id).await?
+            else {
+                continue;
+            };
+            let Kind::Text(output) = &response.kind else {
+                continue;
+            };
+            if !fanned_in.insert(response.id.clone()) {
+                continue;
+            }
+            let kind = normalize_kind_for_primary_parent(
+                Kind::Anchor(Anchor::skill_result(
+                    vec![MergeParent::merge(response.id.clone())],
+                    SkillResultAnchor {
+                        skill_name: invocation.skill_name.clone(),
+                        output: output.clone(),
+                    },
+                )),
+                head,
+            );
+            contents.push(NewNodeContent {
+                role: Role::System,
+                metadata: None,
+                kind,
+            });
+        }
+    }
+    Ok(contents)
+}
+
+fn failure_node_content(execution_id: &str, message: &str) -> NewNodeContent {
+    NewNodeContent {
+        role: Role::System,
+        metadata: BackendMetadata::builder()
+            .execution(&ExecutionMetadata::new(execution_id.to_owned()))
+            .build(),
+        kind: Kind::Failure(message.to_owned()),
+    }
+}
+
+fn prompt_anchor_node_content(prompt: &str, merge_parents: &[MergeParent]) -> NewNodeContent {
+    NewNodeContent {
+        role: Role::System,
+        metadata: None,
+        kind: Kind::Anchor(Anchor::prompt(
+            merge_parents.to_vec(),
+            PromptAnchor {
+                prompt: prompt.to_owned(),
+                attachments: vec![],
+            },
+        )),
+    }
+}
+
 fn normalize_kind_for_primary_parent(kind: Kind, primary_parent: &str) -> Kind {
     let Kind::Anchor(mut anchor) = kind else {
         return kind;
@@ -3141,18 +3419,20 @@ fn normalize_kind_for_primary_parent(kind: Kind, primary_parent: &str) -> Kind {
     Kind::Anchor(anchor)
 }
 
-fn append_backend_event(
+async fn append_backend_event(
     trace_node_appender: &TraceNodeAppenderHandle,
     execution: &ExecutionMetadata,
     event: BackendEvent,
 ) -> std::result::Result<String, BackendError> {
     let (role, metadata, kind) = persisted_node_from_backend_event(event, execution);
-    let primary_parent = trace_node_appender.head_id()?;
-    trace_node_appender.append(
-        role,
-        metadata,
-        normalize_kind_for_primary_parent(kind, &primary_parent),
-    )
+    let primary_parent = trace_node_appender.head_id().await?;
+    trace_node_appender
+        .append(
+            role,
+            metadata,
+            normalize_kind_for_primary_parent(kind, &primary_parent),
+        )
+        .await
 }
 
 fn is_terminal_unified_exec_output(output: &str) -> bool {
@@ -3228,11 +3508,11 @@ fn resolve_skill_source_tool_use<'a>(
     }
 }
 
-fn newest_skill_response_descendant(
+async fn newest_skill_response_descendant(
     trace_node_store: &TraceNodeStore,
     invocation_node_id: &str,
 ) -> std::result::Result<Option<coco_mem::Node>, BackendError> {
-    let mut stack = trace_node_store.list_children(invocation_node_id)?;
+    let mut stack = trace_node_store.list_children(invocation_node_id).await?;
     let mut visited = HashSet::new();
     let mut response = None::<coco_mem::Node>;
 
@@ -3248,18 +3528,18 @@ fn newest_skill_response_descendant(
         {
             response = Some(node.clone());
         }
-        stack.extend(trace_node_store.list_children(&node.id)?);
+        stack.extend(trace_node_store.list_children(&node.id).await?);
     }
 
     Ok(response)
 }
 
-fn has_fanned_in_skill_result(
+async fn has_fanned_in_skill_result(
     trace_node_store: &TraceNodeStore,
     tool_result_node_id: &str,
     response_node_id: &str,
 ) -> std::result::Result<bool, BackendError> {
-    let mut stack = trace_node_store.list_children(tool_result_node_id)?;
+    let mut stack = trace_node_store.list_children(tool_result_node_id).await?;
     let mut visited = HashSet::new();
 
     while let Some(node) = stack.pop() {
@@ -3275,22 +3555,22 @@ fn has_fanned_in_skill_result(
         {
             return Ok(true);
         }
-        stack.extend(trace_node_store.list_children(&node.id)?);
+        stack.extend(trace_node_store.list_children(&node.id).await?);
     }
 
     Ok(false)
 }
 
-fn append_skill_results_after_tool_result(
+async fn append_skill_results_after_tool_result(
     trace_node_appender: &TraceNodeAppenderHandle,
     trace_node_store: &TraceNodeStore,
     tool_result_node_id: &str,
 ) -> std::result::Result<Vec<String>, BackendError> {
-    let tool_result_node = trace_node_store.get_node(tool_result_node_id)?;
+    let tool_result_node = trace_node_store.get_node(tool_result_node_id).await?;
     let Kind::ToolResult(tool_results) = &tool_result_node.kind else {
         return Ok(vec![]);
     };
-    let ancestry = trace_node_store.ancestry(tool_result_node_id)?;
+    let ancestry = trace_node_store.ancestry(tool_result_node_id).await?;
     let mut appended = Vec::new();
     let mut fanned_in = HashSet::new();
 
@@ -3301,14 +3581,15 @@ fn append_skill_results_after_tool_result(
         let Some(source_tool_use) = resolve_skill_source_tool_use(&ancestry, tool_result) else {
             continue;
         };
-        for child in trace_node_store.list_children(&source_tool_use.id)? {
+        for child in trace_node_store.list_children(&source_tool_use.id).await? {
             let Kind::Anchor(anchor) = &child.kind else {
                 continue;
             };
             let Some(invocation) = anchor.as_skill_invocation() else {
                 continue;
             };
-            let Some(response) = newest_skill_response_descendant(trace_node_store, &child.id)?
+            let Some(response) =
+                newest_skill_response_descendant(trace_node_store, &child.id).await?
             else {
                 continue;
             };
@@ -3316,25 +3597,28 @@ fn append_skill_results_after_tool_result(
                 continue;
             };
             if !fanned_in.insert(response.id.clone())
-                || has_fanned_in_skill_result(trace_node_store, tool_result_node_id, &response.id)?
+                || has_fanned_in_skill_result(trace_node_store, tool_result_node_id, &response.id)
+                    .await?
             {
                 continue;
             }
-            let primary_parent = trace_node_appender.head_id()?;
-            let node_id = trace_node_appender.append(
-                Role::System,
-                None,
-                normalize_kind_for_primary_parent(
-                    Kind::Anchor(Anchor::skill_result(
-                        vec![MergeParent::merge(response.id.clone())],
-                        SkillResultAnchor {
-                            skill_name: invocation.skill_name.clone(),
-                            output: output.clone(),
-                        },
-                    )),
-                    &primary_parent,
-                ),
-            )?;
+            let primary_parent = trace_node_appender.head_id().await?;
+            let node_id = trace_node_appender
+                .append(
+                    Role::System,
+                    None,
+                    normalize_kind_for_primary_parent(
+                        Kind::Anchor(Anchor::skill_result(
+                            vec![MergeParent::merge(response.id.clone())],
+                            SkillResultAnchor {
+                                skill_name: invocation.skill_name.clone(),
+                                output: output.clone(),
+                            },
+                        )),
+                        &primary_parent,
+                    ),
+                )
+                .await?;
             appended.push(node_id);
         }
     }
@@ -3342,7 +3626,7 @@ fn append_skill_results_after_tool_result(
     Ok(appended)
 }
 
-fn append_backend_event_nodes(
+async fn append_backend_event_nodes(
     trace_node_appender: &TraceNodeAppenderHandle,
     trace_node_store: Option<&TraceNodeStore>,
     execution: &ExecutionMetadata,
@@ -3350,9 +3634,11 @@ fn append_backend_event_nodes(
 ) -> std::result::Result<Vec<(String, Kind)>, BackendError> {
     let mut appended = Vec::new();
     for (role, metadata, kind) in persisted_nodes_from_backend_events(events, execution) {
-        let primary_parent = trace_node_appender.head_id()?;
+        let primary_parent = trace_node_appender.head_id().await?;
         let kind = normalize_kind_for_primary_parent(kind, &primary_parent);
-        let node_id = trace_node_appender.append(role, metadata, kind.clone())?;
+        let node_id = trace_node_appender
+            .append(role, metadata, kind.clone())
+            .await?;
         appended.push((node_id.clone(), kind.clone()));
         if matches!(kind, Kind::ToolResult(_))
             && let Some(trace_node_store) = trace_node_store
@@ -3361,8 +3647,10 @@ fn append_backend_event_nodes(
                 trace_node_appender,
                 trace_node_store,
                 &node_id,
-            )? {
-                let skill_result = trace_node_store.get_node(&skill_result_node_id)?;
+            )
+            .await?
+            {
+                let skill_result = trace_node_store.get_node(&skill_result_node_id).await?;
                 appended.push((skill_result_node_id, skill_result.kind));
             }
         }
@@ -3371,13 +3659,15 @@ fn append_backend_event_nodes(
     Ok(appended)
 }
 
-fn append_backend_events(
+#[cfg(test)]
+async fn append_backend_events(
     trace_node_appender: &TraceNodeAppenderHandle,
     trace_node_store: Option<&TraceNodeStore>,
     execution: &ExecutionMetadata,
     events: &[BackendEvent],
 ) -> std::result::Result<String, BackendError> {
-    append_backend_event_nodes(trace_node_appender, trace_node_store, execution, events)?
+    append_backend_event_nodes(trace_node_appender, trace_node_store, execution, events)
+        .await?
         .last()
         .map(|(node_id, _)| node_id.clone())
         .ok_or_else(|| BackendError::failed("append_backend_events requires at least one event"))
@@ -3774,7 +4064,7 @@ impl CompletionRunner {
         backend.step(self.step_context()).await
     }
 
-    fn record_turn_events(
+    async fn record_turn_events(
         &mut self,
         execution: &ExecutionMetadata,
         step_events: &mut Vec<BackendEvent>,
@@ -3789,7 +4079,8 @@ impl CompletionRunner {
                 self.request.trace_node_store.as_deref(),
                 execution,
                 &turn.events,
-            )?;
+            )
+            .await?;
             for (node_id, kind) in &appended {
                 if let Kind::ToolUse(tool_uses) = kind {
                     for tool_use in tool_uses.iter() {
@@ -3813,7 +4104,7 @@ impl CompletionRunner {
             .with_head(self.head.take())
     }
 
-    fn complete_terminal_step(
+    async fn complete_terminal_step(
         &mut self,
         state: StepState,
         turn: BackendTurn,
@@ -3829,11 +4120,14 @@ impl CompletionRunner {
                     if matches!(&last_event.event, BackendEventPayload::AssistantText(last_text) if last_text == &text)
             )
         {
-            self.head = Some(append_backend_event(
-                trace_node_appender,
-                &state.execution,
-                BackendEventPayload::AssistantText(text.clone()).into(),
-            )?);
+            self.head = Some(
+                append_backend_event(
+                    trace_node_appender,
+                    &state.execution,
+                    BackendEventPayload::AssistantText(text.clone()).into(),
+                )
+                .await?,
+            );
         }
         self.steps.push(BackendStep {
             execution: state.execution,
@@ -3889,7 +4183,7 @@ impl CompletionRunner {
         })
     }
 
-    fn persist_tool_result_events(
+    async fn persist_tool_result_events(
         &mut self,
         execution: &ExecutionMetadata,
         events: &[BackendEvent],
@@ -3906,7 +4200,8 @@ impl CompletionRunner {
             self.request.trace_node_store.as_deref(),
             execution,
             events,
-        )?;
+        )
+        .await?;
         self.head = appended.last().map(|(node_id, _)| node_id.clone());
         Ok(())
     }
@@ -3945,7 +4240,8 @@ impl CompletionRunner {
                     self.persist_tool_result_events(
                         &next_execution,
                         std::slice::from_ref(&execution.event),
-                    )?;
+                    )
+                    .await?;
                     completed.push(execution);
                 }
                 Err(source) => {
@@ -3984,6 +4280,7 @@ impl CompletionRunner {
         if turn.tool_calls.is_empty() {
             return self
                 .complete_terminal_step(state, turn)
+                .await
                 .map(RunControl::Completed);
         }
 
@@ -4013,7 +4310,8 @@ impl CompletionRunner {
                 Err(source) => return Ok(self.fail_current_run(state, source)),
             };
 
-            self.record_turn_events(&state.execution, &mut state.step_events, &turn)?;
+            self.record_turn_events(&state.execution, &mut state.step_events, &turn)
+                .await?;
 
             match self.finish_step(state, turn).await? {
                 RunControl::Continue => {}
@@ -4366,8 +4664,10 @@ mod tests {
     type FakeRunQueue =
         Arc<Mutex<HashMap<String, VecDeque<std::result::Result<BackendRun, BackendError>>>>>;
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn test_store() -> SqliteStore {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 
     #[derive(Clone)]
@@ -4623,17 +4923,21 @@ mod tests {
                 trace_node_store,
                 &execution("execution-step-1"),
                 &step_one_events,
-            )?;
+            )
+            .await?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
             let step_two_text: BackendEvent =
                 BackendEventPayload::AssistantText("done".to_owned()).into();
-            let head = Some(append_backend_event(
-                &trace_node_appender,
-                &execution("execution-step-2"),
-                step_two_text.clone(),
-            )?);
+            let head = Some(
+                append_backend_event(
+                    &trace_node_appender,
+                    &execution("execution-step-2"),
+                    step_two_text.clone(),
+                )
+                .await?,
+            );
 
             Ok(BackendRun::succeeded_with_steps(
                 "done",
@@ -4682,7 +4986,8 @@ mod tests {
                 trace_node_store,
                 &execution("execution-step-1"),
                 &step_one_events,
-            )?;
+            )
+            .await?;
 
             tokio::time::sleep(Duration::from_millis(5)).await;
 
@@ -4702,7 +5007,8 @@ mod tests {
                 trace_node_store,
                 &execution("execution-step-2"),
                 &step_two_events,
-            )?;
+            )
+            .await?;
 
             Ok(BackendRun::failed_with_steps(
                 "MaxTurnError: (reached max turn limit: 8)",
@@ -4751,7 +5057,8 @@ mod tests {
                 trace_node_store,
                 &execution("execution-step-1"),
                 &step_one_events,
-            )?;
+            )
+            .await?;
 
             let step_two_events = vec![backend_event(
                 BackendEventPayload::ToolResult(ToolResult {
@@ -4766,7 +5073,8 @@ mod tests {
                 trace_node_store,
                 &execution("execution-step-2"),
                 &step_two_events,
-            )?;
+            )
+            .await?;
 
             Ok(BackendRun::succeeded_with_steps(
                 "done",
@@ -5156,14 +5464,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_session_appends_available_skills_to_system_prompt() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store, FakeBackend::with_responses(&[]));
         service
             .create_session(session_config("main"))
             .await
             .unwrap();
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
 
         assert!(session.config.system_prompt.starts_with("You are helpful."));
         assert!(session.config.system_prompt.contains("## Available Skills"));
@@ -5205,7 +5513,7 @@ mod tests {
             "main",
             vec![Ok(turn), Ok(BackendTurn::finished("done"))],
         )]);
-        let store = test_store();
+        let store = test_store().await;
         let first_done = Arc::new(Notify::new());
         let release_second = Arc::new(Notify::new());
         let service = LlmService::builder(store.clone(), backend)
@@ -5221,7 +5529,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let initial_head = store.get_branch_head("main").unwrap();
+        let initial_head = store.get_branch_head("main").await.unwrap();
 
         let prompt =
             tokio::spawn(
@@ -5231,7 +5539,7 @@ mod tests {
 
         let staged_nodes = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let nodes = tool_result_nodes(&store, &initial_head);
+                let nodes = tool_result_nodes(&store, &initial_head).await;
                 if !nodes.is_empty() {
                     return nodes;
                 }
@@ -5253,7 +5561,7 @@ mod tests {
         let result = prompt.await.unwrap().unwrap();
         assert_eq!(result.text, "done");
 
-        let final_result_nodes = tool_result_nodes(&store, &initial_head);
+        let final_result_nodes = tool_result_nodes(&store, &initial_head).await;
         assert_eq!(final_result_nodes.len(), 2);
     }
 
@@ -5283,7 +5591,7 @@ mod tests {
                 "main",
                 vec![Ok(turn), Ok(BackendTurn::finished("done"))],
             )]);
-            let store = SqliteStore::open(&store_path).unwrap();
+            let store = SqliteStore::open(&store_path).await.unwrap();
             let first_done = Arc::new(Notify::new());
             let release_second = Arc::new(Notify::new());
             let service = LlmService::builder(store, backend)
@@ -5308,9 +5616,9 @@ mod tests {
             assert_eq!(prompt.await.unwrap().unwrap().text, "done");
         }
 
-        let reopened = SqliteStore::open(&store_path).unwrap();
+        let reopened = SqliteStore::open(&store_path).await.unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         let tool_result_message = session
             .provider_history
             .iter()
@@ -5361,7 +5669,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let store_path = temp_dir.path().join("store");
         {
-            let store = SqliteStore::open(&store_path).unwrap();
+            let store = SqliteStore::open(&store_path).await.unwrap();
             let service = LlmService::new(store.clone(), FakeBackend::with_turns(vec![]));
             service
                 .create_session(SessionConfig {
@@ -5370,7 +5678,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let session_head = store.get_branch_head("main").unwrap();
+            let session_head = store.get_branch_head("main").await.unwrap();
             let tool_use_id = store
                 .append(NewNode {
                     parent: session_head.clone(),
@@ -5398,6 +5706,7 @@ mod tests {
                         },
                     ]),
                 })
+                .await
                 .unwrap();
             let tool_result_id = store
                 .append(NewNode {
@@ -5409,15 +5718,17 @@ mod tests {
                         output: r#"{"query":"present"}"#.to_owned(),
                     }),
                 })
+                .await
                 .unwrap();
             store
                 .set_branch_head("main", &session_head, &tool_result_id)
+                .await
                 .unwrap();
         }
 
-        let reopened = SqliteStore::open(&store_path).unwrap();
+        let reopened = SqliteStore::open(&store_path).await.unwrap();
         let service = LlmService::new(reopened, FakeBackend::with_turns(vec![]));
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         let tool_result_message = session
             .provider_history
             .iter()
@@ -5475,16 +5786,19 @@ mod tests {
     }
 
     fn context_node(role: Role, metadata: Option<NodeMetadata>, kind: Kind) -> coco_mem::Node {
-        let store = test_store();
-        let id = store
-            .append(NewNode {
-                parent: store.root_id(),
-                role,
-                metadata,
-                kind,
-            })
-            .expect("test node should be appended");
-        store.get_node(&id).expect("test node should exist")
+        static NODE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = format!(
+            "test-node-{}",
+            NODE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        coco_mem::Node {
+            id,
+            parent: "test-root".to_owned(),
+            created_at: "1970-01-01T00:00:00Z".parse().unwrap(),
+            role,
+            metadata,
+            kind,
+        }
     }
 
     fn node_execution_id(node: &coco_mem::Node) -> Option<&str> {
@@ -5501,15 +5815,17 @@ mod tests {
             .and_then(|metadata| metadata.call_id.as_deref())
     }
 
-    fn collect_descendants(store: &SqliteStore, node_id: &str) -> Vec<coco_mem::Node> {
+    async fn collect_descendants(store: &SqliteStore, node_id: &str) -> Vec<coco_mem::Node> {
         let mut descendants = Vec::new();
         let mut stack = store
             .list_children(node_id)
+            .await
             .expect("children should be listed");
         while let Some(node) = stack.pop() {
             stack.extend(
                 store
                     .list_children(&node.id)
+                    .await
                     .expect("children should be listed"),
             );
             descendants.push(node);
@@ -5517,8 +5833,9 @@ mod tests {
         descendants
     }
 
-    fn tool_result_nodes(store: &SqliteStore, root_id: &str) -> Vec<coco_mem::Node> {
+    async fn tool_result_nodes(store: &SqliteStore, root_id: &str) -> Vec<coco_mem::Node> {
         collect_descendants(store, root_id)
+            .await
             .into_iter()
             .filter(|node| matches!(node.kind, Kind::ToolResult(_)))
             .collect()
@@ -5559,18 +5876,18 @@ mod tests {
         assert_eq!(Provider::ChatGpt.as_str(), "chatgpt");
     }
 
-    #[test]
-    fn provider_auth_checks_are_enabled_only_for_rig_backend_by_default() {
-        let fake = LlmService::new(test_store(), FakeBackend::with_responses(&[]));
-        let rig = LlmService::new(test_store(), RigBackend::default());
+    #[tokio::test]
+    async fn provider_auth_checks_are_enabled_only_for_rig_backend_by_default() {
+        let fake = LlmService::new(test_store().await, FakeBackend::with_responses(&[]));
+        let rig = LlmService::new(test_store().await, RigBackend::default());
 
         assert!(!fake.enables_provider_auth_checks());
         assert!(rig.enables_provider_auth_checks());
     }
 
-    #[test]
-    fn chatgpt_auth_check_configs_include_only_chatgpt_profiles() {
-        let service = LlmService::builder(test_store(), FakeBackend::with_responses(&[]))
+    #[tokio::test]
+    async fn chatgpt_auth_check_configs_include_only_chatgpt_profiles() {
+        let service = LlmService::builder(test_store().await, FakeBackend::with_responses(&[]))
             .with_provider_configs(HashMap::from([
                 (
                     "openai".to_owned(),
@@ -6200,7 +6517,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_persists_execution_metadata_on_assistant_node() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -6212,7 +6529,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let prompt = &ancestry[1];
 
@@ -6231,7 +6548,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_profile_additional_params_apply_at_runtime() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let calls = backend.calls.clone();
         let service = LlmService::builder(store, backend)
@@ -6357,7 +6674,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_profile_additional_params_do_not_leak_to_provider_override() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello")])]);
         let calls = backend.calls.clone();
         let service = LlmService::builder(store, backend)
@@ -6402,14 +6719,14 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_resolves_session_anchor_merge_parents() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let main_session = service
             .create_session(session_config("main"))
             .await
             .unwrap();
-        let main_head = store.get_branch_head("main").unwrap();
+        let main_head = store.get_branch_head("main").await.unwrap();
 
         let draft_session = service
             .create_session(SessionConfig {
@@ -6430,7 +6747,7 @@ mod tests {
             .await
             .unwrap();
 
-        let anchor = store.get_node(&draft_session.anchor_id).unwrap();
+        let anchor = store.get_node(&draft_session.anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = anchor.kind else {
             panic!("expected anchor node");
         };
@@ -6443,7 +6760,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_with_provider_profile_persists_only_profile_name() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let mut config = session_config("main");
@@ -6451,7 +6768,7 @@ mod tests {
 
         let session = service.create_session(config).await.unwrap();
 
-        let anchor = store.get_node(&session.anchor_id).unwrap();
+        let anchor = store.get_node(&session.anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = anchor.kind else {
             panic!("expected anchor node");
         };
@@ -6465,7 +6782,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_turn_uses_previous_assistant_text_in_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("second")])]);
         let service = LlmService::new(store, backend);
         service
@@ -6483,7 +6800,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "second");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -6498,7 +6815,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_session_resets_provider_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("second")])]);
         let service = LlmService::new(store, backend);
         service
@@ -6520,7 +6837,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "second");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_ne!(session.anchor_id, anchor_id);
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
@@ -6534,7 +6851,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_session_prompt_seeds_empty_context() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("continued")])]);
         let service = LlmService::new(store, backend);
         let mut config = session_config("main");
@@ -6548,7 +6865,7 @@ mod tests {
         let result = service.run(request("main")).await.unwrap();
 
         assert_eq!(result.text, "continued");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -6560,7 +6877,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_session_refreshing_tools_refreshes_inherited_builtin_definitions() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let mut config = session_config("main");
@@ -6588,7 +6905,7 @@ mod tests {
             .await
             .unwrap();
 
-        let node = store.get_node(&anchor_id).unwrap();
+        let node = store.get_node(&anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = node.kind else {
             panic!("expected anchor node");
         };
@@ -6602,7 +6919,7 @@ mod tests {
     async fn skill_child_context_fixture(
         handoff: Option<String>,
     ) -> (LlmService<FakeBackend, SqliteStore>, String) {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let base_session = service
             .create_session(session_config("main"))
@@ -6621,6 +6938,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let tool_use_id = store
             .append(NewNode {
@@ -6633,6 +6951,7 @@ mod tests {
                     input: serde_json::json!({"cmd": "coco skill run fast-rust"}),
                 }),
             })
+            .await
             .unwrap();
         let invocation_id = store
             .append(NewNode {
@@ -6647,6 +6966,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let child_config = session_config("child");
         let child_prompt = "You are executing the skill `fast-rust` on an isolated child branch.";
@@ -6676,8 +6996,9 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
-        store.fork("child", &child_anchor_id).unwrap();
+        store.fork("child", &child_anchor_id).await.unwrap();
 
         (service, child_prompt.to_owned())
     }
@@ -6685,7 +7006,7 @@ mod tests {
     #[tokio::test]
     async fn context_reconstruction_orders_skill_prompt_after_inherited_history() {
         let (service, child_prompt) = skill_child_context_fixture(None).await;
-        let session = service.resolve_session("child").unwrap();
+        let session = service.resolve_session("child").await.unwrap();
 
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
@@ -6700,7 +7021,7 @@ mod tests {
     #[tokio::test]
     async fn context_reconstruction_skips_tool_use_that_created_skill_invocation() {
         let (service, _) = skill_child_context_fixture(None).await;
-        let session = service.resolve_session("child").unwrap();
+        let session = service.resolve_session("child").await.unwrap();
 
         assert_eq!(
             session
@@ -6725,7 +7046,7 @@ mod tests {
     async fn context_reconstruction_can_hide_parent_history_for_handoff_skill_child() {
         let (service, child_prompt) =
             skill_child_context_fixture(Some("Review the bounded diff.".to_owned())).await;
-        let session = service.resolve_session("child").unwrap();
+        let session = service.resolve_session("child").await.unwrap();
 
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
@@ -6735,7 +7056,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_completion_persists_failure_kind_but_not_prompt_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::failed("rate limited", vec![]))],
@@ -6763,13 +7084,16 @@ mod tests {
             other => panic!("expected backend error, got {other:?}"),
         };
 
-        let failure = store.get_node(&error_node_id).unwrap();
+        let failure = store.get_node(&error_node_id).await.unwrap();
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         assert_eq!(node_execution_id(&failure), Some(execution_id.as_str()));
-        assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
+        assert_eq!(
+            store.get_branch_head("main").await.unwrap(),
+            retry_from_node_id
+        );
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -6781,7 +7105,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_keeps_session_config_without_importing_merge_parent_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main answer"), Ok("merge answer")]),
             ("draft", &[Ok("draft answer")]),
@@ -6797,12 +7121,13 @@ mod tests {
             .unwrap();
         service
             .fork("draft", &main_result.response_node_id)
+            .await
             .unwrap();
         service
             .prompt(prompt_request("draft", "draft question"))
             .await
             .unwrap();
-        let draft_head = store.get_branch_head("draft").unwrap();
+        let draft_head = store.get_branch_head("draft").await.unwrap();
 
         let result = service
             .prompt(PromptRequest {
@@ -6814,7 +7139,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(result.text, "merge answer");
         assert_eq!(session.config.model, "gpt-4.1-mini");
         assert!(session.config.system_prompt.starts_with("You are helpful."));
@@ -6830,7 +7155,7 @@ mod tests {
             ]
         );
 
-        let ancestry = service.store().ancestry("main").unwrap();
+        let ancestry = service.store().ancestry("main").await.unwrap();
         assert!(matches!(
             &ancestry[0].kind,
             Kind::Text(text) if text == "merge answer"
@@ -6845,7 +7170,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_with_session_patch_appends_patch_anchor_without_truncating_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main answer")]),
             ("runner", &[Ok("runner answer")]),
@@ -6866,8 +7191,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let main_head = store.get_branch_head("main").unwrap();
-        service.fork("runner", &main_head).unwrap();
+        let main_head = store.get_branch_head("main").await.unwrap();
+        service.fork("runner", &main_head).await.unwrap();
         let exec_tool = builtin_tool_definition("exec_command").unwrap();
 
         let result = service
@@ -6900,7 +7225,7 @@ mod tests {
         );
         drop(calls);
 
-        let ancestry = store.ancestry("runner").unwrap();
+        let ancestry = store.ancestry("runner").await.unwrap();
         assert!(matches!(
             &ancestry[0].kind,
             Kind::Text(text) if text == "runner answer"
@@ -6923,7 +7248,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_advances_branch_head_to_completion_node() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("prompted")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -6937,11 +7262,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             result.response_node_id
         );
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         assert_eq!(ancestry[0].id, result.response_node_id);
         assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "prompted"));
         assert_eq!(ancestry[1].id, result.anchor_id);
@@ -6953,7 +7278,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_uses_prompt_anchor_history() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("prompted")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -6966,11 +7291,11 @@ mod tests {
             .unwrap();
         assert_eq!(prompt_result.text, "prompted");
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             prompt_result.response_node_id
         );
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         assert!(matches!(&ancestry[0].kind, Kind::Text(text) if text == "prompted"));
         assert!(matches!(
             &ancestry[1].kind,
@@ -6978,7 +7303,7 @@ mod tests {
         ));
         assert_ne!(ancestry[1].role, Role::User);
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -6991,7 +7316,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_can_retry_after_prompt_failure() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[
@@ -7019,13 +7344,16 @@ mod tests {
             } => (context.error_node_id, context.retry_from_node_id),
             other => panic!("expected backend error, got {other:?}"),
         };
-        let failure = store.get_node(&error_node_id).unwrap();
+        let failure = store.get_node(&error_node_id).await.unwrap();
         assert_eq!(failure.role, Role::System);
         assert!(matches!(&failure.kind, Kind::Failure(text) if text == "rate limited"));
         let prompt_anchor_id = retry_from_node_id.clone();
-        assert_eq!(store.get_branch_head("main").unwrap(), retry_from_node_id);
+        assert_eq!(
+            store.get_branch_head("main").await.unwrap(),
+            retry_from_node_id
+        );
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -7037,13 +7365,13 @@ mod tests {
         let recovered = service.run(request("main")).await.unwrap();
         assert_eq!(recovered.text, "recovered");
         assert_eq!(recovered.anchor_id, prompt_anchor_id);
-        let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
+        let recovered_node = store.get_node(&recovered.response_node_id).await.unwrap();
         assert_eq!(recovered_node.parent, prompt_anchor_id);
     }
 
     #[tokio::test]
     async fn run_can_continue_from_historical_reference() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("first"), Ok("resumed")])]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -7065,17 +7393,17 @@ mod tests {
 
         assert_eq!(resumed.text, "resumed");
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             resumed.response_node_id
         );
 
-        let resumed_node = store.get_node(&resumed.response_node_id).unwrap();
+        let resumed_node = store.get_node(&resumed.response_node_id).await.unwrap();
         assert_eq!(resumed_node.parent, first.response_node_id);
     }
 
     #[tokio::test]
     async fn run_can_retry_reference_with_latest_branch_session() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[(
             "main",
             &[Err(BackendError::failed("rate limited")), Ok("recovered")],
@@ -7118,7 +7446,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(recovered.text, "recovered");
-        let recovered_node = store.get_node(&recovered.response_node_id).unwrap();
+        let recovered_node = store.get_node(&recovered.response_node_id).await.unwrap();
         assert_eq!(recovered_node.parent, retry_from_node_id);
 
         let calls = calls.lock().await;
@@ -7137,7 +7465,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_can_start_from_historical_reference_with_prompt() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("old head"), Ok("new head")])]);
         let service = LlmService::new(store.clone(), backend);
         let session = service
@@ -7164,12 +7492,12 @@ mod tests {
 
         assert_eq!(resumed.text, "new head");
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             resumed.response_node_id
         );
         assert_ne!(old_head.response_node_id, resumed.response_node_id);
 
-        let prompt_anchor = store.get_node(&resumed.anchor_id).unwrap();
+        let prompt_anchor = store.get_node(&resumed.anchor_id).await.unwrap();
         assert_eq!(prompt_anchor.parent, session.anchor_id);
         assert!(matches!(
             &prompt_anchor.kind,
@@ -7183,7 +7511,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_branches_can_complete_concurrently() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_barrier(
             &[("main", "main"), ("draft", "draft")],
             Arc::new(Barrier::new(2)),
@@ -7193,7 +7521,10 @@ mod tests {
             .create_session(session_config("main"))
             .await
             .unwrap();
-        service.fork("draft", &main_session.anchor_id).unwrap();
+        service
+            .fork("draft", &main_session.anchor_id)
+            .await
+            .unwrap();
 
         let main_service = service.clone();
         let draft_service = service.clone();
@@ -7206,14 +7537,14 @@ mod tests {
         assert_eq!(main_result.text, "main");
         assert_eq!(draft_result.text, "draft");
         assert_ne!(
-            service.store().get_branch_head("main").unwrap(),
-            service.store().get_branch_head("draft").unwrap()
+            service.store().get_branch_head("main").await.unwrap(),
+            service.store().get_branch_head("draft").await.unwrap()
         );
     }
 
     #[tokio::test]
     async fn open_pull_request_uses_target_head_as_base() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let base_session = service
@@ -7237,9 +7568,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         store
             .set_branch_head("base", &base_session.anchor_id, &review_anchor_id)
+            .await
             .unwrap();
 
         let pr = service.open_pull_request("main", "base").await.unwrap();
@@ -7247,7 +7580,7 @@ mod tests {
         assert_eq!(pr.target_branch, "base");
         assert_eq!(pr.base_head_id, review_anchor_id);
         assert_eq!(
-            store.get_session_state("main").unwrap(),
+            store.get_session_state("main").await.unwrap(),
             SessionState::Attached {
                 target_branch: "base".to_owned(),
                 base_head_id: pr.base_head_id,
@@ -7257,7 +7590,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_session_appends_target_prompt_anchor_and_pauses_source() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         service
@@ -7269,7 +7602,7 @@ mod tests {
             .await
             .unwrap();
         let pr = service.open_pull_request("main", "base").await.unwrap();
-        let source_head_id = store.get_branch_head("main").unwrap();
+        let source_head_id = store.get_branch_head("main").await.unwrap();
 
         let merged = service
             .merge_session("main", None, "handoff to base")
@@ -7281,7 +7614,7 @@ mod tests {
         assert_eq!(merged.source_head_id, source_head_id);
         assert_ne!(merged.merged_anchor_id, pr.base_head_id);
 
-        let merged_anchor = store.get_node(&merged.merged_anchor_id).unwrap();
+        let merged_anchor = store.get_node(&merged.merged_anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = merged_anchor.kind else {
             panic!("expected anchor node");
         };
@@ -7290,11 +7623,11 @@ mod tests {
         assert_eq!(prompt_anchor.prompt, "handoff to base");
         assert_eq!(anchor.merge_parent_node_ids(), [source_head_id.as_str()]);
         assert_eq!(
-            store.get_branch_head("base").unwrap(),
+            store.get_branch_head("base").await.unwrap(),
             merged.merged_anchor_id
         );
         assert_eq!(
-            store.get_session_state("main").unwrap(),
+            store.get_session_state("main").await.unwrap(),
             SessionState::Paused {
                 target_branch: "base".to_owned(),
                 reason: PauseReason::Merged {
@@ -7306,7 +7639,7 @@ mod tests {
 
     #[tokio::test]
     async fn feedback_appends_session_prompt_anchor_and_advances_base_head() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let base_session = service
@@ -7332,9 +7665,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         store
             .set_branch_head("base", &base_session.anchor_id, &base_feedback_id)
+            .await
             .unwrap();
 
         let feedback = service
@@ -7345,7 +7680,7 @@ mod tests {
         assert_eq!(feedback.target_branch, "base");
         assert_eq!(feedback.base_head_id, base_feedback_id);
         assert_eq!(feedback.source_anchor_id, base_feedback_id);
-        let feedback_anchor = store.get_node(&feedback.feedback_anchor_id).unwrap();
+        let feedback_anchor = store.get_node(&feedback.feedback_anchor_id).await.unwrap();
         let Kind::Anchor(anchor) = feedback_anchor.kind else {
             panic!("expected anchor node");
         };
@@ -7354,11 +7689,11 @@ mod tests {
         assert_eq!(prompt_anchor.prompt, "address review comments");
         assert_eq!(anchor.merge_parent_node_ids(), [base_feedback_id.as_str()]);
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             feedback.feedback_anchor_id
         );
         assert_eq!(
-            store.get_session_state("main").unwrap(),
+            store.get_session_state("main").await.unwrap(),
             SessionState::Attached {
                 target_branch: "base".to_owned(),
                 base_head_id: base_feedback_id,
@@ -7368,7 +7703,7 @@ mod tests {
 
     #[tokio::test]
     async fn feedback_rejects_source_behind_attached_base_head() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
         let service = LlmService::new(store.clone(), backend);
         let base_session = service
@@ -7392,9 +7727,11 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         store
             .set_branch_head("base", &base_session.anchor_id, &newer_feedback_id)
+            .await
             .unwrap();
         service.open_pull_request("main", "base").await.unwrap();
 
@@ -7417,7 +7754,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_changes_defaults_for_future_turns() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("hello"), Ok("updated")])]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store, backend);
@@ -7451,7 +7788,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "updated");
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(session.config.provider, Provider::Anthropic);
         assert_eq!(session.config.model, "claude-sonnet-4-20250514");
         assert!(session.config.system_prompt.starts_with("You are helpful."));
@@ -7478,7 +7815,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_patch_system_prompt_rebuilds_session_anchor() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[("main", &[Ok("updated")])]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store.clone(), backend);
@@ -7499,7 +7836,7 @@ mod tests {
             .unwrap();
 
         assert_ne!(new_head, session.anchor_id);
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let Kind::Anchor(anchor) = &ancestry[0].kind else {
             panic!("expected rebuilt session anchor");
         };
@@ -7522,7 +7859,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_session_keeps_sibling_branch_defaults_unchanged() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_responses(&[
             ("main", &[Ok("main"), Ok("main updated")]),
             ("draft", &[Ok("draft")]),
@@ -7533,7 +7870,10 @@ mod tests {
             .create_session(session_config("main"))
             .await
             .unwrap();
-        service.fork("draft", &main_session.anchor_id).unwrap();
+        service
+            .fork("draft", &main_session.anchor_id)
+            .await
+            .unwrap();
         service
             .rebase_session(
                 "main",
@@ -7570,7 +7910,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_persists_tool_trace_before_final_assistant_text() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -7616,7 +7956,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];
@@ -7649,7 +7989,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_persists_sibling_tool_calls_as_single_nodes() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -7714,7 +8054,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];
@@ -7770,7 +8110,7 @@ mod tests {
                 .expect("assistant choice should be non-empty"),
         );
         let backend = FakeBackend::with_turns(vec![("main", vec![Ok(turn)])]);
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::builder(store.clone(), backend)
             .with_skill_search_executor(Arc::new(FakeSkillExecutor))
             .build();
@@ -7792,11 +8132,11 @@ mod tests {
         };
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             context.retry_from_node_id
         );
-        let failure = store.get_node(&context.error_node_id).unwrap();
-        let tool_result = store.get_node(&failure.parent).unwrap();
+        let failure = store.get_node(&context.error_node_id).await.unwrap();
+        let tool_result = store.get_node(&failure.parent).await.unwrap();
         assert!(
             tool_result
                 .kind
@@ -7810,7 +8150,7 @@ mod tests {
                 })
         );
 
-        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        let tool_use = store.get_node(&tool_result.parent).await.unwrap();
         assert!(tool_use.kind.as_tool_uses().is_some_and(|tool_uses| {
             let uses = tool_uses.iter().collect::<Vec<_>>();
             uses.len() == 2
@@ -7822,13 +8162,13 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_rejects_streamed_trace_head_without_terminal_text() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), StreamingInvalidTerminalTextBackend);
         service
             .create_session(session_config("main"))
             .await
             .unwrap();
-        let original_head = store.get_branch_head("main").unwrap();
+        let original_head = store.get_branch_head("main").await.unwrap();
 
         let error = service
             .prompt(prompt_request("main", "finish the streamed reply"))
@@ -7839,12 +8179,12 @@ mod tests {
                 .to_string()
                 .contains("without terminal assistant text")
         );
-        assert_eq!(store.get_branch_head("main").unwrap(), original_head);
+        assert_eq!(store.get_branch_head("main").await.unwrap(), original_head);
     }
 
     #[tokio::test]
     async fn streamed_tool_trace_preserves_event_timestamps() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), StreamingBackend::new());
         service
             .create_session(session_config("main"))
@@ -7856,7 +8196,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_use = &ancestry[1];
 
@@ -7872,7 +8212,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_exposes_load_image_tool_definition_to_backend() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = ToolDefinitionRecorder::default();
         let calls = backend.calls.clone();
         let service = LlmService::new(store.clone(), backend);
@@ -7891,7 +8231,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_session_keeps_tool_entries_but_text_history_stays_text_only() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -7936,7 +8276,7 @@ mod tests {
             .await
             .unwrap();
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -8326,7 +8666,7 @@ mod tests {
     fn test_trace_appender(store: SqliteStore, head_id: &str) -> TraceNodeAppenderHandle {
         TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
             store,
-            head_id: StdMutex::new(head_id.to_owned()),
+            head_id: Mutex::new(head_id.to_owned()),
         }))
     }
 
@@ -8334,7 +8674,7 @@ mod tests {
         Arc::new(store)
     }
 
-    fn append_skill_invocation_fixture(
+    async fn append_skill_invocation_fixture(
         store: &SqliteStore,
         parent_tool_use_id: &str,
         skill_name: &str,
@@ -8353,6 +8693,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let child_session_id = store
             .append(NewNode {
@@ -8377,6 +8718,7 @@ mod tests {
                     },
                 )),
             })
+            .await
             .unwrap();
         let response_id = store
             .append(NewNode {
@@ -8385,6 +8727,7 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text(response_text.to_owned()),
             })
+            .await
             .unwrap();
 
         (invocation_id, response_id)
@@ -8392,7 +8735,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_exec_tool_result_appends_skill_result_fan_in() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let session = service
             .create_session(session_config("main"))
@@ -8412,10 +8755,12 @@ mod tests {
             })
             .into()],
         )
+        .await
         .unwrap();
         let tool_use_id = appended[0].0.clone();
         let (_invocation_id, response_id) =
-            append_skill_invocation_fixture(&store, &tool_use_id, "fast-rust", "delegated done");
+            append_skill_invocation_fixture(&store, &tool_use_id, "fast-rust", "delegated done")
+                .await;
 
         let appended = append_backend_event_nodes(
             &trace,
@@ -8429,11 +8774,12 @@ mod tests {
             })
             .into()],
         )
+        .await
         .unwrap();
 
         assert_eq!(appended.len(), 2);
-        let tool_result = store.get_node(&appended[0].0).unwrap();
-        let skill_result = store.get_node(&appended[1].0).unwrap();
+        let tool_result = store.get_node(&appended[0].0).await.unwrap();
+        let skill_result = store.get_node(&appended[1].0).await.unwrap();
         assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
         assert_eq!(skill_result.parent, tool_result.id);
         let Kind::Anchor(anchor) = &skill_result.kind else {
@@ -8443,12 +8789,80 @@ mod tests {
         assert_eq!(result.skill_name, "fast-rust");
         assert_eq!(result.output, "delegated done");
         assert_eq!(anchor.merge_parent_node_ids(), [response_id.as_str()]);
-        assert_eq!(trace.head_id().unwrap(), skill_result.id);
+        assert_eq!(trace.head_id().await.unwrap(), skill_result.id);
+    }
+
+    #[tokio::test]
+    async fn headless_backend_run_preserves_skill_result_fan_in() {
+        let store = test_store().await;
+        let backend = FakeBackend::with_completions(&[(
+            "main",
+            &[Ok(BackendRun::succeeded_with_steps(
+                "done",
+                vec![BackendStep {
+                    execution: ExecutionMetadata::new("execution-step-2".to_owned()),
+                    events: vec![
+                        backend_event(
+                            BackendEventPayload::ToolResult(ToolResult {
+                                id: "tool-call-1".to_owned(),
+                                output: "Process exited with code 0\nexit_status: 0\nstdout:\ndelegated done\nstderr:\n".to_owned(),
+                            }),
+                            Some("execution-step-2"),
+                            Some("call-1"),
+                        ),
+                        BackendEventPayload::AssistantText("done".to_owned()).into(),
+                    ],
+                }],
+            ))],
+        )]);
+        let service = LlmService::new(store.clone(), backend);
+        let session = service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        let trace = test_trace_appender(store.clone(), &session.anchor_id);
+        let trace_store = test_trace_store(store.clone());
+        let execution = ExecutionMetadata::new("execution-step-1".to_owned());
+        let appended = append_backend_event_nodes(
+            &trace,
+            Some(trace_store.as_ref()),
+            &execution,
+            &[BackendEventPayload::ToolUse(ToolUse {
+                id: "tool-call-1".to_owned(),
+                name: "exec_command".to_owned(),
+                input: serde_json::json!({"cmd": "coco skill run fast-rust"}),
+            })
+            .into()],
+        )
+        .await
+        .unwrap();
+        let tool_use_id = appended[0].0.clone();
+        store
+            .set_branch_head("main", &session.anchor_id, &tool_use_id)
+            .await
+            .unwrap();
+        let (_invocation_id, response_id) =
+            append_skill_invocation_fixture(&store, &tool_use_id, "fast-rust", "delegated done")
+                .await;
+
+        let completed = service.run(request("main")).await.unwrap();
+
+        let assistant = store.get_node(&completed.response_node_id).await.unwrap();
+        let skill_result = store.get_node(&assistant.parent).await.unwrap();
+        let tool_result = store.get_node(&skill_result.parent).await.unwrap();
+        assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
+        let Kind::Anchor(anchor) = &skill_result.kind else {
+            panic!("expected skill result anchor");
+        };
+        let result = anchor.as_skill_result().unwrap();
+        assert_eq!(result.skill_name, "fast-rust");
+        assert_eq!(result.output, "delegated done");
+        assert_eq!(anchor.merge_parent_node_ids(), [response_id.as_str()]);
     }
 
     #[tokio::test]
     async fn terminal_write_stdin_tool_result_fans_in_original_exec_skill() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), FakeBackend::with_responses(&[]));
         let session = service
             .create_session(session_config("main"))
@@ -8468,6 +8882,7 @@ mod tests {
             })
             .into()],
         )
+        .await
         .unwrap();
         let exec_tool_use_id = appended[0].0.clone();
         let running = append_backend_event_nodes(
@@ -8480,7 +8895,7 @@ mod tests {
                     .to_owned(),
             })
             .into()],
-        )
+        ).await
         .unwrap();
         assert_eq!(running.len(), 1);
         let (_invocation_id, response_id) = append_skill_invocation_fixture(
@@ -8488,7 +8903,8 @@ mod tests {
             &exec_tool_use_id,
             "fast-rust",
             "delegated done",
-        );
+        )
+        .await;
         append_backend_event_nodes(
             &trace,
             Some(trace_store.as_ref()),
@@ -8500,6 +8916,7 @@ mod tests {
             })
             .into()],
         )
+        .await
         .unwrap();
 
         let appended = append_backend_event_nodes(
@@ -8514,11 +8931,12 @@ mod tests {
             })
             .into()],
         )
+        .await
         .unwrap();
 
         assert_eq!(appended.len(), 2);
-        let tool_result = store.get_node(&appended[0].0).unwrap();
-        let skill_result = store.get_node(&appended[1].0).unwrap();
+        let tool_result = store.get_node(&appended[0].0).await.unwrap();
+        let skill_result = store.get_node(&appended[1].0).await.unwrap();
         assert!(matches!(tool_result.kind, Kind::ToolResult(_)));
         assert_eq!(skill_result.parent, tool_result.id);
         let Kind::Anchor(anchor) = &skill_result.kind else {
@@ -8701,7 +9119,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_step_completion_uses_distinct_execution_ids_per_completion_call() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::succeeded_with_steps(
@@ -8747,7 +9165,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ancestry = store.ancestry("main").unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
         let assistant = &ancestry[0];
         let tool_result = &ancestry[1];
         let tool_use = &ancestry[2];
@@ -8757,7 +9175,7 @@ mod tests {
         assert_eq!(node_execution_id(tool_use), Some("execution-step-1"));
         assert_eq!(result.execution_id, "execution-step-2");
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(session.provider_history.len(), 5);
         assert!(matches!(
             &session.provider_history[2],
@@ -8789,7 +9207,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_completion_persists_partial_trace_as_orphan_chain() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FakeBackend::with_completions(&[(
             "main",
             &[Ok(BackendRun::failed_with_steps(
@@ -8840,27 +9258,27 @@ mod tests {
         };
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             context.retry_from_node_id
         );
 
-        let failure = store.get_node(&context.error_node_id).unwrap();
+        let failure = store.get_node(&context.error_node_id).await.unwrap();
         assert!(matches!(
             &failure.kind,
             Kind::Failure(text) if text == "MaxTurnError: (reached max turn limit: 8)"
         ));
 
-        let assistant = store.get_node(&failure.parent).unwrap();
+        let assistant = store.get_node(&failure.parent).await.unwrap();
         assert!(matches!(&assistant.kind, Kind::Text(text) if text == "trying again"));
 
-        let tool_result = store.get_node(&assistant.parent).unwrap();
+        let tool_result = store.get_node(&assistant.parent).await.unwrap();
         assert!(kind_has_tool_result(
             &tool_result.kind,
             "tool-call-1",
             "exit_status: 0\nstdout:\n\nstderr:\n"
         ));
 
-        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        let tool_use = store.get_node(&tool_result.parent).await.unwrap();
         assert!(kind_has_tool_use(
             &tool_use.kind,
             "tool-call-1",
@@ -8868,7 +9286,7 @@ mod tests {
         ));
         assert_eq!(tool_use.parent, context.retry_from_node_id);
 
-        let session = service.resolve_session("main").unwrap();
+        let session = service.resolve_session("main").await.unwrap();
         assert_eq!(
             text_messages_from_provider_history(&session.provider_history),
             vec![
@@ -8880,7 +9298,7 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_failure_keeps_branch_head_at_retry_point() {
-        let store = test_store();
+        let store = test_store().await;
         let service = LlmService::new(store.clone(), StreamingFailBackend);
         service
             .create_session(session_config("main"))
@@ -8897,14 +9315,14 @@ mod tests {
         };
 
         assert_eq!(
-            store.get_branch_head("main").unwrap(),
+            store.get_branch_head("main").await.unwrap(),
             context.retry_from_node_id
         );
 
-        let failure = store.get_node(&context.error_node_id).unwrap();
-        let assistant = store.get_node(&failure.parent).unwrap();
-        let tool_result = store.get_node(&assistant.parent).unwrap();
-        let tool_use = store.get_node(&tool_result.parent).unwrap();
+        let failure = store.get_node(&context.error_node_id).await.unwrap();
+        let assistant = store.get_node(&failure.parent).await.unwrap();
+        let tool_result = store.get_node(&assistant.parent).await.unwrap();
+        let tool_use = store.get_node(&tool_result.parent).await.unwrap();
 
         assert!(tool_use.created_at < tool_result.created_at);
         assert!(tool_result.created_at < assistant.created_at);

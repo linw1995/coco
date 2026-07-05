@@ -467,7 +467,8 @@ fn should_forward_runtime_stdin(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::future::Future;
+    use std::sync::OnceLock;
 
     use super::{
         DaemonSocketSource, ForwardSocketError, ForwardingTarget, build_forward_socket_request,
@@ -483,11 +484,37 @@ mod tests {
     };
     use coco_mem::SessionRole;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
-    fn with_env_vars<T>(entries: &[(&str, Option<&str>)], run: impl FnOnce() -> T) -> T {
+    fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_env_vars<T>(entries: &[(&str, Option<&str>)], run: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().blocking_lock();
+        let previous = set_env_vars(entries);
+        let output = run();
+        restore_env_vars(previous);
+
+        output
+    }
+
+    async fn with_env_vars_async<T, F, Fut>(entries: &[(&str, Option<&str>)], run: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let _guard = env_lock().lock().await;
+        let previous = set_env_vars(entries);
+        let output = run().await;
+        restore_env_vars(previous);
+
+        output
+    }
+
+    fn set_env_vars(entries: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
         let previous: Vec<_> = entries
             .iter()
             .map(|(name, _)| ((*name).to_owned(), std::env::var(name).ok()))
@@ -498,17 +525,16 @@ mod tests {
                 None => unsafe { std::env::remove_var(name) },
             }
         }
+        previous
+    }
 
-        let output = run();
-
+    fn restore_env_vars(previous: Vec<(String, Option<String>)>) {
         for (name, value) in previous {
             match value {
                 Some(value) => unsafe { std::env::set_var(name, value) },
                 None => unsafe { std::env::remove_var(name) },
             }
         }
-
-        output
     }
 
     #[test]
@@ -746,25 +772,20 @@ mod tests {
         assert!(!should_fallback_to_local(DaemonSocketSource::Env, &error));
     }
 
-    #[test]
-    fn forward_cli_command_reports_resolution_errors() {
-        let error = with_env_vars(
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_cli_command_reports_resolution_errors() {
+        let error = with_env_vars_async(
             &[
                 (COCO_CLI_RUNTIME_SOCKET_ENV, None),
                 (COCO_DAEMON_SOCKET_ENV, None),
             ],
-            || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-                        forward_cli_command(&["--daemon-socket".to_owned()])
-                            .await
-                            .unwrap_err()
-                    })
+            || async {
+                forward_cli_command(&["--daemon-socket".to_owned()])
+                    .await
+                    .unwrap_err()
             },
-        );
+        )
+        .await;
 
         assert_eq!(error, "coco command \"--daemon-socket\" requires a value");
     }

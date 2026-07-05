@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 # Storage.
+async-trait.workspace = true
 diesel.workspace = true
 diesel-async.workspace = true
 diesel_migrations.workspace = true

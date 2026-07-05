@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, Node, NodeStore,
-    PromptAttachment, SessionStore, SkillStore, SqliteStore,
+    PromptAnchor, PromptAttachment, SessionStore, SkillStore, SqliteStore,
 };
 use coco_llm::{
     BackendError, BackendFailureContext, CompletionBackend, CompletionInput, CompletionOrigin,
@@ -118,12 +118,12 @@ impl<B, S> ConversationEngine<B, S>
 where
     S: NodeStore,
 {
-    pub fn session_supports_tool(
+    pub async fn session_supports_tool(
         &self,
         branch: &str,
         tool_name: &str,
     ) -> std::result::Result<bool, LlmError> {
-        self.service.session_supports_tool(branch, tool_name)
+        self.service.session_supports_tool(branch, tool_name).await
     }
 }
 
@@ -275,14 +275,14 @@ where
             )
             .await?;
         let snapshot = self.drive_job_for_prompt(&job.job_id).await?;
-        let job = self.service.store().get_job(&job.job_id)?;
+        let job = self.service.store().get_job(&job.job_id).await?;
         if !matches!(snapshot.status, JobStatus::Finished) {
             self.finish_job(&job).await?;
             return Err(EngineError::EngineFailed {
                 message: format!("prompt job {:?} is waiting for recovery", job.job_id),
             });
         }
-        build_prompt_reply(self.service.store(), &job, &snapshot)
+        build_prompt_reply(self.service.store(), &job, &snapshot).await
     }
 
     pub async fn submit_job(
@@ -360,22 +360,37 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionConfigPatch>,
     ) -> std::result::Result<Job, EngineError> {
-        self.ensure_prompt_job_can_submit(job_id, branch)?;
+        self.ensure_prompt_job_can_submit(job_id, branch).await?;
         let merge_parent_count = merge_parents.len();
         let has_session_patch = session_patch.is_some();
-        let base = self.service.append_prompt_job_base(
-            branch,
-            prompt,
-            &attachments,
-            &merge_parents,
-            session_patch.as_ref(),
-        )?;
+        let prompt_anchor = PromptAnchor {
+            prompt: prompt.to_owned(),
+            attachments,
+        };
         let job = match job_id {
-            Some(job_id) => self
-                .service
-                .store()
-                .submit_job_with_id(job_id, branch, &base)?,
-            None => self.service.store().submit_job(branch, &base)?,
+            Some(job_id) => {
+                self.service
+                    .store()
+                    .submit_job_with_id_and_prompt_base(
+                        job_id,
+                        branch,
+                        prompt_anchor,
+                        merge_parents,
+                        session_patch,
+                    )
+                    .await?
+            }
+            None => {
+                self.service
+                    .store()
+                    .submit_job_with_prompt_base(
+                        branch,
+                        prompt_anchor,
+                        merge_parents,
+                        session_patch,
+                    )
+                    .await?
+            }
         };
         tracing::info!(
             job_id = %job.job_id,
@@ -388,13 +403,13 @@ where
         Ok(job)
     }
 
-    fn ensure_prompt_job_can_submit(
+    async fn ensure_prompt_job_can_submit(
         &self,
         job_id: Option<&str>,
         branch: &str,
     ) -> std::result::Result<(), EngineError> {
         if let Some(job_id) = job_id {
-            match self.service.store().get_job(job_id) {
+            match self.service.store().get_job(job_id).await {
                 Ok(_) => {
                     return Err(EngineError::EngineFailed {
                         message: format!("Prompt job {job_id:?} already exists"),
@@ -404,7 +419,7 @@ where
                 Err(error) => return Err(error.into()),
             }
         }
-        if let Some(active_job) = self.active_branch_prompt_job(branch)? {
+        if let Some(active_job) = self.active_branch_prompt_job(branch).await? {
             return Err(EngineError::EngineFailed {
                 message: format!(
                     "Branch {branch:?} already has an active prompt job {:?}",
@@ -415,41 +430,44 @@ where
         Ok(())
     }
 
-    pub fn get_job(&self, job_id: &str) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let job = self.service.store().get_job(job_id)?;
-        self.build_job_status_snapshot(&job)
+    pub async fn get_job(
+        &self,
+        job_id: &str,
+    ) -> std::result::Result<JobStatusSnapshot, EngineError> {
+        let job = self.service.store().get_job(job_id).await?;
+        self.build_job_status_snapshot(&job).await
     }
 
-    pub fn set_job_work_branch(
+    pub async fn set_job_work_branch(
         &self,
         job_id: &str,
         expected_work_branch: &str,
         next_work_branch: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let job = self.service.store().set_job_work_branch(
-            job_id,
-            expected_work_branch,
-            next_work_branch,
-        )?;
+        let job = self
+            .service
+            .store()
+            .set_job_work_branch(job_id, expected_work_branch, next_work_branch)
+            .await?;
         self.service.notify_job_status_changed(job_id);
-        self.build_job_status_snapshot(&job)
+        self.build_job_status_snapshot(&job).await
     }
 
-    pub fn active_branch_prompt_job(
+    pub async fn active_branch_prompt_job(
         &self,
         branch: &str,
     ) -> std::result::Result<Option<Job>, EngineError> {
-        self.active_branch_prompt_job_excluding(branch, None)
+        self.active_branch_prompt_job_excluding(branch, None).await
     }
 
-    pub fn list_jobs(
+    pub async fn list_jobs(
         &self,
     ) -> std::result::Result<std::collections::HashMap<String, Job>, EngineError> {
-        Ok(self.service.store().list_jobs()?)
+        Ok(self.service.store().list_jobs().await?)
     }
 
     pub async fn resume_incomplete_jobs(&self) -> std::result::Result<(), EngineError> {
-        let jobs = self.list_jobs()?;
+        let jobs = self.list_jobs().await?;
         let incomplete_count = jobs
             .values()
             .filter(|job| !matches!(job.status, JobStatus::Finished))
@@ -469,7 +487,7 @@ where
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let _ = self.drive_job_singleflight(job_id, vec![]).await;
-        self.get_job(job_id)
+        self.get_job(job_id).await
     }
 
     pub async fn join_job(
@@ -478,7 +496,7 @@ where
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let mut job_status = self.service.subscribe_job_status(job_id);
         loop {
-            let snapshot = self.get_job(job_id)?;
+            let snapshot = self.get_job(job_id).await?;
             if matches!(snapshot.status, JobStatus::Finished) {
                 self.service.clear_job_status_watch(job_id);
                 return Ok(snapshot);
@@ -490,7 +508,7 @@ where
                 "waiting for prompt job status notification"
             );
             if job_status.changed().await.is_err() {
-                return self.get_job(job_id);
+                return self.get_job(job_id).await;
             }
         }
     }
@@ -505,7 +523,7 @@ where
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         let _ = self.drive_job_singleflight(job_id, merge_parents).await;
-        self.get_job(job_id)
+        self.get_job(job_id).await
     }
 
     async fn drive_job_for_prompt(
@@ -513,7 +531,7 @@ where
         job_id: &str,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
         self.drive_job_singleflight(job_id, vec![]).await?;
-        self.get_job(job_id)
+        self.get_job(job_id).await
     }
 
     async fn drive_job_singleflight(
@@ -542,7 +560,7 @@ where
         job_id: &str,
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<String, EngineError> {
-        let mut job = self.service.store().get_job(job_id)?;
+        let mut job = self.service.store().get_job(job_id).await?;
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -554,11 +572,11 @@ where
         );
 
         if matches!(job.status, JobStatus::Queued) {
-            job = self.service.store().set_job_status(
-                job_id,
-                JobStatus::Queued,
-                JobStatus::Running,
-            )?;
+            job = self
+                .service
+                .store()
+                .set_job_status(job_id, JobStatus::Queued, JobStatus::Running)
+                .await?;
             self.service.notify_job_status_changed(job_id);
             tracing::info!(
                 job_id = %job.job_id,
@@ -569,10 +587,10 @@ where
         }
 
         if matches!(job.status, JobStatus::Running) {
-            self.ensure_job_has_exclusive_branch_access(&job)?;
+            self.ensure_job_has_exclusive_branch_access(&job).await?;
             match self.resume_or_run_job(&job, merge_parents).await {
                 Ok(JobRunOutcome::Completed) => {
-                    job = match self.restore_root_branch_after_recovery(&job) {
+                    job = match self.restore_root_branch_after_recovery(&job).await {
                         Ok(job) => job,
                         Err(error) => {
                             self.finish_job(&job).await?;
@@ -596,7 +614,7 @@ where
             }
         }
 
-        let head = self.job_head(&job)?;
+        let head = self.job_head(&job).await?;
         tracing::info!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -613,7 +631,7 @@ where
         merge_parents: Vec<MergeParent>,
     ) -> std::result::Result<JobRunOutcome, EngineError> {
         let store = self.service.store();
-        let last_node = find_job_last_node(store, job)?;
+        let last_node = find_job_last_node(store, job).await?;
 
         let retry_from_failure = if let Some(last_node) = last_node.as_ref() {
             match &last_node.kind {
@@ -690,11 +708,14 @@ where
 
         match self.service.run(request).await {
             Ok(_) => Ok(JobRunOutcome::Completed),
-            Err(source) => self.handle_completion_error(job, source, !is_retrying_failure),
+            Err(source) => {
+                self.handle_completion_error(job, source, !is_retrying_failure)
+                    .await
+            }
         }
     }
 
-    fn handle_completion_error(
+    async fn handle_completion_error(
         &self,
         job: &Job,
         source: LlmError,
@@ -706,8 +727,12 @@ where
         } = &source
         {
             if queue_recovery_event {
-                self.enqueue_backend_failure_recovery_event(job, backend_source, context)?;
-            } else {
+                self.enqueue_backend_failure_recovery_event(job, backend_source, context)
+                    .await?;
+            } else if self
+                .backend_failure_recovery_event_is_queued(job, backend_source, context)
+                .await?
+            {
                 tracing::warn!(
                     job_id = %job.job_id,
                     branch = %job.branch,
@@ -718,23 +743,56 @@ where
                     error = %backend_source,
                     "suppressed duplicate backend failure recovery request while retrying failed job"
                 );
+            } else {
+                tracing::warn!(
+                    job_id = %job.job_id,
+                    branch = %job.branch,
+                    work_branch = %job.work_branch,
+                    execution_id = %context.execution_id,
+                    error_node_id = %context.error_node_id,
+                    retry_from_node_id = %context.retry_from_node_id,
+                    error = %backend_source,
+                    "re-queueing missing backend failure recovery request while retrying failed job"
+                );
+                self.enqueue_backend_failure_recovery_event(job, backend_source, context)
+                    .await?;
             }
             return Ok(JobRunOutcome::RecoveryQueued);
         }
         Err(source.into())
     }
 
-    fn enqueue_backend_failure_recovery_event(
+    async fn backend_failure_recovery_event_is_queued(
+        &self,
+        job: &Job,
+        source: &BackendError,
+        context: &BackendFailureContext,
+    ) -> std::result::Result<bool, EngineError> {
+        let event = backend_failure_recovery_event(job, source, context);
+        Ok(self
+            .service
+            .store()
+            .list_queue_messages(SYSTEM_EVENT_QUEUE)
+            .await?
+            .into_iter()
+            .any(|item| item.payload["dedupe_key"] == event.dedupe_key))
+    }
+
+    async fn enqueue_backend_failure_recovery_event(
         &self,
         job: &Job,
         source: &BackendError,
         context: &BackendFailureContext,
     ) -> std::result::Result<(), EngineError> {
         let event = backend_failure_recovery_event(job, source, context);
-        let item = self.service.store().enqueue_message(
-            SYSTEM_EVENT_QUEUE,
-            serde_json::to_value(&event).expect("system event payload should serialize"),
-        )?;
+        let item = self
+            .service
+            .store()
+            .enqueue_message(
+                SYSTEM_EVENT_QUEUE,
+                serde_json::to_value(&event).expect("system event payload should serialize"),
+            )
+            .await?;
         tracing::warn!(
             job_id = %job.job_id,
             branch = %job.branch,
@@ -751,7 +809,7 @@ where
         Ok(())
     }
 
-    fn restore_root_branch_after_recovery(
+    async fn restore_root_branch_after_recovery(
         &self,
         job: &Job,
     ) -> std::result::Result<Job, EngineError> {
@@ -760,15 +818,17 @@ where
         }
 
         let restored_from_work_branch = job.work_branch.clone();
-        let response_head = self.job_head(job)?;
-        let root_head = self.service.store().get_branch_head(&job.branch)?;
+        let response_head = self.job_head(job).await?;
+        let root_head = self.service.store().get_branch_head(&job.branch).await?;
         self.service
             .store()
-            .set_branch_head(&job.branch, &root_head, &response_head)?;
-        let job =
-            self.service
-                .store()
-                .set_job_work_branch(&job.job_id, &job.work_branch, &job.branch)?;
+            .set_branch_head(&job.branch, &root_head, &response_head)
+            .await?;
+        let job = self
+            .service
+            .store()
+            .set_job_work_branch(&job.job_id, &job.work_branch, &job.branch)
+            .await?;
         self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,
@@ -784,11 +844,10 @@ where
         if matches!(job.status, JobStatus::Finished) {
             return Ok(());
         }
-        self.service.store().set_job_status(
-            &job.job_id,
-            JobStatus::Running,
-            JobStatus::Finished,
-        )?;
+        self.service
+            .store()
+            .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+            .await?;
         self.service.notify_job_status_changed(&job.job_id);
         tracing::info!(
             job_id = %job.job_id,
@@ -798,11 +857,11 @@ where
         Ok(())
     }
 
-    fn build_job_status_snapshot(
+    async fn build_job_status_snapshot(
         &self,
         job: &Job,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let head = self.job_head(job)?;
+        let head = self.job_head(job).await?;
 
         Ok(JobStatusSnapshot {
             job_id: job.job_id.clone(),
@@ -816,17 +875,19 @@ where
         })
     }
 
-    fn job_head(&self, job: &Job) -> std::result::Result<String, EngineError> {
-        find_job_last_node(self.service.store(), job)?
+    async fn job_head(&self, job: &Job) -> std::result::Result<String, EngineError> {
+        find_job_last_node(self.service.store(), job)
+            .await?
             .map_or_else(|| Ok(job.base.clone()), |last_node| Ok(last_node.id))
     }
 
-    fn ensure_job_has_exclusive_branch_access(
+    async fn ensure_job_has_exclusive_branch_access(
         &self,
         job: &Job,
     ) -> std::result::Result<(), EngineError> {
-        if let Some(active_job) =
-            self.active_branch_prompt_job_excluding(&job.work_branch, Some(&job.job_id))?
+        if let Some(active_job) = self
+            .active_branch_prompt_job_excluding(&job.work_branch, Some(&job.job_id))
+            .await?
         {
             tracing::warn!(
                 branch = %job.branch,
@@ -845,7 +906,7 @@ where
         Ok(())
     }
 
-    fn active_branch_prompt_job_excluding(
+    async fn active_branch_prompt_job_excluding(
         &self,
         branch: &str,
         excluded_job_id: Option<&str>,
@@ -853,7 +914,8 @@ where
         Ok(self
             .service
             .store()
-            .list_jobs()?
+            .list_jobs()
+            .await?
             .into_values()
             .filter(|job| {
                 (job.branch == branch || job.work_branch == branch)
@@ -921,11 +983,14 @@ fn backend_failure_recovery_event(
     }
 }
 
-fn find_job_last_node<S>(store: &S, job: &Job) -> std::result::Result<Option<Node>, EngineError>
+async fn find_job_last_node<S>(
+    store: &S,
+    job: &Job,
+) -> std::result::Result<Option<Node>, EngineError>
 where
     S: NodeStore,
 {
-    let path = match store.log(&job.base, &job.work_branch) {
+    let path = match store.log(&job.base, &job.work_branch).await {
         Ok(path) => path,
         Err(coco_llm::coco_mem::StoreError::RefsNotConnected { .. }) => return Ok(None),
         Err(source) => return Err(source.into()),
@@ -942,7 +1007,7 @@ where
     Ok(Some(last_node))
 }
 
-fn build_prompt_reply<S>(
+async fn build_prompt_reply<S>(
     store: &S,
     job: &Job,
     snapshot: &JobStatusSnapshot,
@@ -956,7 +1021,7 @@ where
         });
     }
 
-    let response_node = store.get_node(&snapshot.head)?;
+    let response_node = store.get_node(&snapshot.head).await?;
     let execution_id = response_node
         .metadata
         .as_ref()

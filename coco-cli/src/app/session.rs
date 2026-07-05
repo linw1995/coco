@@ -7,7 +7,7 @@ use coco_llm::{
 };
 use coco_mem::{
     AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason, PresetStore,
-    SessionAnchor, SessionState, SessionStore, Store, StoreError, Tool,
+    SessionAnchor, SessionAnchorPatch, SessionState, SessionStore, Store, StoreError, Tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -178,16 +178,17 @@ where
         }
         SessionSubcommand::Fork(command) => {
             run_session_fork_command(command.branch, command.from_ref, command.json, store, llm)
+                .await
         }
-        SessionSubcommand::List(command) => run_session_list_command(command.json, store),
+        SessionSubcommand::List(command) => run_session_list_command(command.json, store).await,
         SessionSubcommand::Get(command) => {
-            run_session_get_command(command.branch, command.json, store)
+            run_session_get_command(command.branch, command.json, store).await
         }
         SessionSubcommand::Graph(command) => {
-            run_session_graph_command(command.json, command.all, store)
+            run_session_graph_command(command.json, command.all, store).await
         }
         SessionSubcommand::Show(command) => {
-            run_session_show_command(command.reference, command.json, store)
+            run_session_show_command(command.reference, command.json, store).await
         }
         SessionSubcommand::Delete(command) => {
             run_session_delete_command(command.branch, command.json, llm).await
@@ -199,7 +200,7 @@ where
             run_session_handoff_command(command, store, llm, provider_profiles).await
         }
         SessionSubcommand::Reopen(command) => {
-            run_session_reopen_command(command.branch, command.json, store)
+            run_session_reopen_command(command.branch, command.json, store).await
         }
         SessionSubcommand::Pr(command) => {
             run_session_pr_command(
@@ -213,6 +214,7 @@ where
         }
         SessionSubcommand::Close(command) => {
             run_session_close_command(command.branch, command.target_branch, command.json, store)
+                .await
         }
         SessionSubcommand::Merge(command) => {
             run_session_merge_command(
@@ -253,7 +255,7 @@ where
     Ok(None)
 }
 
-fn run_session_fork_command<B, S>(
+async fn run_session_fork_command<B, S>(
     branch: String,
     from_ref: String,
     json: bool,
@@ -264,10 +266,13 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    let head_id = llm.fork(branch.clone(), &from_ref).context(LlmSnafu)?;
-    let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
+    let head_id = llm
+        .fork(branch.clone(), &from_ref)
+        .await
+        .context(LlmSnafu)?;
+    let (_, anchor) = resolve_visible_session_anchor(store, &branch).await?;
     let result = SessionForkResult {
-        state: store.get_session_state(&branch).context(StoreSnafu)?,
+        state: store.get_session_state(&branch).await.context(StoreSnafu)?,
         role: anchor.role,
         branch,
         head_id,
@@ -279,22 +284,22 @@ where
     )))
 }
 
-fn run_session_list_command(
+async fn run_session_list_command(
     json: bool,
     store: &(impl BranchStore + NodeStore + SessionStore),
 ) -> Result<Option<String>> {
-    let sessions = list_sessions(store)?;
+    let sessions = list_sessions(store).await?;
     Ok(Some(render_session_result(sessions, json, |sessions| {
         render_session_list_text(sessions)
     })))
 }
 
-fn run_session_get_command(
+async fn run_session_get_command(
     branch: String,
     json: bool,
     store: &(impl BranchStore + NodeStore + SessionStore),
 ) -> Result<Option<String>> {
-    let details = read_session_details(store, &branch)?;
+    let details = read_session_details(store, &branch).await?;
     Ok(Some(render_session_result(
         details,
         json,
@@ -302,7 +307,7 @@ fn run_session_get_command(
     )))
 }
 
-fn run_session_graph_command(
+async fn run_session_graph_command(
     json: bool,
     all: bool,
     store: &(impl BranchStore + NodeStore + SessionStore),
@@ -312,18 +317,18 @@ fn run_session_graph_command(
     } else {
         SessionGraphMode::Anchors
     };
-    let entries = build_session_graph_entries(store, mode)?;
+    let entries = build_session_graph_entries(store, mode).await?;
     Ok(Some(render_session_result(entries, json, |entries| {
         render_session_graph_text(entries)
     })))
 }
 
-fn run_session_show_command(
+async fn run_session_show_command(
     reference: String,
     json: bool,
     store: &(impl BranchStore + NodeStore),
 ) -> Result<Option<String>> {
-    Ok(Some(render_session_show(store, &reference, json)?))
+    Ok(Some(render_session_show(store, &reference, json).await?))
 }
 
 async fn run_session_delete_command<B, S>(
@@ -356,7 +361,7 @@ where
 {
     let branch = command.branch.clone();
     let json = command.json;
-    let rebase = resolve_session_rebase(command, store, provider_profiles)?;
+    let rebase = resolve_session_rebase(command, store, provider_profiles).await?;
     let head_id = llm
         .rebase_session(&branch, rebase.patch)
         .await
@@ -388,7 +393,7 @@ where
     let json = rebase_command.json;
     let prompt = prompt.trim().to_owned();
     ensure!(!prompt.is_empty(), EmptyPromptSnafu);
-    let handoff = resolve_session_rebase(rebase_command, store, provider_profiles)?;
+    let handoff = resolve_session_rebase(rebase_command, store, provider_profiles).await?;
     let head = if refresh_tools {
         llm.handoff_session_refreshing_tools(&branch, handoff.patch, &prompt)
             .await
@@ -404,7 +409,7 @@ where
     )))
 }
 
-fn run_session_reopen_command(
+async fn run_session_reopen_command(
     branch: String,
     json: bool,
     store: &impl SessionStore,
@@ -413,6 +418,7 @@ fn run_session_reopen_command(
         branch: branch.clone(),
         state: store
             .set_session_state(&branch, None, SessionState::Active)
+            .await
             .context(StoreSnafu)?,
     };
     Ok(Some(render_session_result(
@@ -437,7 +443,7 @@ where
         .open_pull_request(&branch, &target_branch)
         .await
         .context(LlmSnafu)?;
-    let result = build_pull_request_result(store, pr)?;
+    let result = build_pull_request_result(store, pr).await?;
     Ok(Some(render_session_result(
         result,
         json,
@@ -445,7 +451,7 @@ where
     )))
 }
 
-fn run_session_close_command(
+async fn run_session_close_command(
     branch: String,
     target_branch: String,
     json: bool,
@@ -462,6 +468,7 @@ fn run_session_close_command(
                     reason: PauseReason::Closed,
                 },
             )
+            .await
             .context(StoreSnafu)?,
     };
     Ok(Some(render_session_result(
@@ -487,7 +494,7 @@ where
         .merge_session(&branch, target_branch.as_deref(), &prompt)
         .await
         .context(LlmSnafu)?;
-    let result = build_session_merge_result(store, merged)?;
+    let result = build_session_merge_result(store, merged).await?;
     Ok(Some(render_session_result(
         result,
         json,
@@ -511,7 +518,7 @@ where
         .apply_feedback(&branch, &prompt, from_ref.as_deref())
         .await
         .context(LlmSnafu)?;
-    let result = build_session_feedback_result(store, feedback)?;
+    let result = build_session_feedback_result(store, feedback).await?;
     Ok(Some(render_session_result(
         result,
         json,
@@ -592,34 +599,33 @@ fn resolve_create_provider_profile(
     Err(crate::Error::MissingProviderProfileSelection { available })
 }
 
-fn list_sessions(
+async fn list_sessions(
     store: &(impl BranchStore + NodeStore + SessionStore),
 ) -> Result<Vec<SessionSummary>> {
-    let states = store.list_session_states().context(StoreSnafu)?;
+    let states = store.list_session_states().await.context(StoreSnafu)?;
     let mut branches = states.into_iter().collect::<Vec<_>>();
     branches.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    branches
-        .into_iter()
-        .map(|(branch, state)| {
-            let (_, anchor) = resolve_visible_session_anchor(store, &branch)?;
-            Ok(SessionSummary {
-                head_id: store.get_branch_head(&branch).context(StoreSnafu)?,
-                role: anchor.role,
-                branch,
-                state,
-            })
-        })
-        .collect()
+    let mut summaries = Vec::new();
+    for (branch, state) in branches {
+        let (_, anchor) = resolve_visible_session_anchor(store, &branch).await?;
+        summaries.push(SessionSummary {
+            head_id: store.get_branch_head(&branch).await.context(StoreSnafu)?,
+            role: anchor.role,
+            branch,
+            state,
+        });
+    }
+    Ok(summaries)
 }
 
-fn read_session_details(
+async fn read_session_details(
     store: &(impl BranchStore + NodeStore + SessionStore),
     branch: &str,
 ) -> Result<SessionDetails> {
-    let head_id = store.get_branch_head(branch).context(StoreSnafu)?;
-    let state = store.get_session_state(branch).context(StoreSnafu)?;
-    let (anchor_id, anchor) = resolve_visible_session_anchor(store, branch)?;
+    let head_id = store.get_branch_head(branch).await.context(StoreSnafu)?;
+    let state = store.get_session_state(branch).await.context(StoreSnafu)?;
+    let (anchor_id, anchor) = resolve_visible_session_anchor(store, branch).await?;
 
     Ok(SessionDetails {
         branch: branch.to_owned(),
@@ -747,11 +753,11 @@ fn render_session_state_text(state: &SessionState) -> String {
     }
 }
 
-fn build_session_graph_entries(
+async fn build_session_graph_entries(
     store: &(impl BranchStore + NodeStore + SessionStore),
     mode: SessionGraphMode,
 ) -> Result<Vec<GraphNodeEntry>> {
-    let states = store.list_session_states().context(StoreSnafu)?;
+    let states = store.list_session_states().await.context(StoreSnafu)?;
     if states.is_empty() {
         return Ok(vec![]);
     }
@@ -765,8 +771,8 @@ fn build_session_graph_entries(
     let mut labels_by_node = HashMap::<String, Vec<GraphBranchLabel>>::new();
 
     for (branch, state) in branches {
-        let head_id = store.get_branch_head(&branch).context(StoreSnafu)?;
-        let mut scope_node_ids = initial_graph_scope(store, &head_id, mode)?;
+        let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
+        let mut scope_node_ids = initial_graph_scope(store, &head_id, mode).await?;
         let mut branch_visible_node_ids = BTreeSet::new();
         collect_visible_graph_nodes(
             store,
@@ -776,7 +782,8 @@ fn build_session_graph_entries(
             &mut visible_node_ids,
             &mut visible_nodes,
             &mut branch_visible_node_ids,
-        )?;
+        )
+        .await?;
         for node_id in branch_visible_node_ids {
             visible_node_scopes
                 .entry(node_id)
@@ -785,7 +792,7 @@ fn build_session_graph_entries(
         }
 
         if let Some(label_node_id) =
-            resolve_visible_parent(store, &visible_node_ids, &scope_node_ids, &head_id)?
+            resolve_visible_parent(store, &visible_node_ids, &scope_node_ids, &head_id).await?
         {
             labels_by_node
                 .entry(label_node_id)
@@ -794,51 +801,51 @@ fn build_session_graph_entries(
         }
     }
 
-    let mut entries = visible_nodes
-        .into_values()
-        .map(|node| {
-            let scope_node_ids = visible_node_scopes.remove(&node.id).unwrap_or_default();
-            let primary_parent = resolve_visible_parent(
-                store,
-                &visible_node_ids,
-                &scope_node_ids,
-                node.parent.as_str(),
-            )?;
-            let merge_parents = match &node.kind {
-                Kind::Anchor(anchor) => {
-                    let mut parents = Vec::new();
-                    for merge_parent in anchor.merge_parents() {
-                        let Some(parent_id) = resolve_visible_parent(
-                            store,
-                            &visible_node_ids,
-                            &scope_node_ids,
-                            merge_parent.node_id(),
-                        )?
-                        else {
-                            continue;
-                        };
-                        if primary_parent.as_ref() == Some(&parent_id)
-                            || parents
-                                .iter()
-                                .any(|existing: &MergeParent| existing.node_id() == parent_id)
-                        {
-                            continue;
-                        }
-                        parents.push(visible_merge_parent(merge_parent, parent_id));
+    let mut entries = Vec::new();
+    for node in visible_nodes.into_values() {
+        let scope_node_ids = visible_node_scopes.remove(&node.id).unwrap_or_default();
+        let primary_parent = resolve_visible_parent(
+            store,
+            &visible_node_ids,
+            &scope_node_ids,
+            node.parent.as_str(),
+        )
+        .await?;
+        let merge_parents = match &node.kind {
+            Kind::Anchor(anchor) => {
+                let mut parents = Vec::new();
+                for merge_parent in anchor.merge_parents() {
+                    let Some(parent_id) = resolve_visible_parent(
+                        store,
+                        &visible_node_ids,
+                        &scope_node_ids,
+                        merge_parent.node_id(),
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    if primary_parent.as_ref() == Some(&parent_id)
+                        || parents
+                            .iter()
+                            .any(|existing: &MergeParent| existing.node_id() == parent_id)
+                    {
+                        continue;
                     }
-                    parents
+                    parents.push(visible_merge_parent(merge_parent, parent_id));
                 }
-                _ => vec![],
-            };
+                parents
+            }
+            _ => vec![],
+        };
 
-            Ok(GraphNodeEntry {
-                labels: labels_by_node.remove(&node.id).unwrap_or_default(),
-                node,
-                primary_parent,
-                merge_parents,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        entries.push(GraphNodeEntry {
+            labels: labels_by_node.remove(&node.id).unwrap_or_default(),
+            node,
+            primary_parent,
+            merge_parents,
+        });
+    }
 
     entries = topologically_sort_graph_entries(entries);
 
@@ -946,7 +953,7 @@ fn compare_graph_entries_desc(left: &GraphNodeEntry, right: &GraphNodeEntry) -> 
         .then_with(|| right.node.id.cmp(&left.node.id))
 }
 
-fn collect_visible_graph_nodes(
+async fn collect_visible_graph_nodes(
     store: &impl NodeStore,
     head_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
@@ -966,7 +973,7 @@ fn collect_visible_graph_nodes(
             continue;
         }
 
-        let node = store.get_node(&node_id).context(StoreSnafu)?;
+        let node = store.get_node(&node_id).await.context(StoreSnafu)?;
         if node.is_root() {
             continue;
         }
@@ -989,7 +996,8 @@ fn collect_visible_graph_nodes(
                 &node.id,
                 scope_node_ids,
                 &mut pending,
-            )?;
+            )
+            .await?;
         }
 
         if is_visible_graph_node(&node, mode) {
@@ -1002,13 +1010,13 @@ fn collect_visible_graph_nodes(
     Ok(())
 }
 
-fn initial_graph_scope(
+async fn initial_graph_scope(
     store: &impl NodeStore,
     head_id: &str,
     mode: SessionGraphMode,
 ) -> Result<BTreeSet<String>> {
     match mode {
-        SessionGraphMode::Anchors => collect_provider_context_node_ids(store, head_id),
+        SessionGraphMode::Anchors => collect_provider_context_node_ids(store, head_id).await,
         SessionGraphMode::All => Ok(BTreeSet::from([head_id.to_owned()])),
     }
 }
@@ -1026,13 +1034,13 @@ fn push_scoped_graph_node(
     pending.push(node_id);
 }
 
-fn collect_provider_context_node_ids(
+async fn collect_provider_context_node_ids(
     store: &impl NodeStore,
     head_id: &str,
 ) -> Result<BTreeSet<String>> {
     let mut node_ids = BTreeSet::new();
 
-    for node in store.ancestry(head_id).context(StoreSnafu)? {
+    for node in store.ancestry(head_id).await.context(StoreSnafu)? {
         if node.is_root() {
             break;
         }
@@ -1069,7 +1077,7 @@ fn is_visible_graph_node(node: &Node, mode: SessionGraphMode) -> bool {
     }
 }
 
-fn collect_visible_skill_invocation_subtrees(
+async fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
     scope_node_ids: &mut BTreeSet<String>,
@@ -1077,6 +1085,7 @@ fn collect_visible_skill_invocation_subtrees(
 ) -> Result<()> {
     let mut descendants = store
         .list_children(parent_id)
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .filter_map(|child| match child.kind {
@@ -1092,7 +1101,7 @@ fn collect_visible_skill_invocation_subtrees(
         }
 
         push_scoped_graph_node(scope_node_ids, pending, node_id.clone());
-        for child in store.list_children(&node_id).context(StoreSnafu)? {
+        for child in store.list_children(&node_id).await.context(StoreSnafu)? {
             descendants.push(child.id);
         }
     }
@@ -1100,14 +1109,15 @@ fn collect_visible_skill_invocation_subtrees(
     Ok(())
 }
 
-fn render_session_show(
+async fn render_session_show(
     store: &impl NodeStore,
     reference: &str,
     json_output: bool,
 ) -> Result<String> {
-    let node = resolve_show_reference(store, reference)?;
+    let node = resolve_show_reference(store, reference).await?;
     let children = store
         .list_children(&node.id)
+        .await
         .context(StoreSnafu)?
         .into_iter()
         .map(|node| node.id)
@@ -1126,8 +1136,8 @@ fn render_session_show(
     }
 }
 
-fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Node> {
-    match store.get_node(reference) {
+async fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Node> {
+    match store.get_node(reference).await {
         Ok(node) => Ok(node),
         Err(StoreError::NotFound { .. }) => UnknownShowReferenceSnafu {
             reference: reference.to_owned(),
@@ -1140,7 +1150,7 @@ fn resolve_show_reference(store: &impl NodeStore, reference: &str) -> Result<Nod
     }
 }
 
-fn resolve_visible_parent(
+async fn resolve_visible_parent(
     store: &impl NodeStore,
     visible_node_ids: &BTreeSet<String>,
     scope_node_ids: &BTreeSet<String>,
@@ -1160,7 +1170,7 @@ fn resolve_visible_parent(
             return Ok(Some(current_id));
         }
 
-        let node = store.get_node(&current_id).context(StoreSnafu)?;
+        let node = store.get_node(&current_id).await.context(StoreSnafu)?;
         if node.is_root() {
             return Ok(None);
         }
@@ -1781,7 +1791,7 @@ fn shorten_id(node_id: &str) -> &str {
     &node_id[..node_id.len().min(8)]
 }
 
-fn build_pull_request_result(
+async fn build_pull_request_result(
     store: &impl SessionStore,
     pr: coco_llm::PullRequest,
 ) -> Result<PullRequestResult> {
@@ -1789,11 +1799,14 @@ fn build_pull_request_result(
         branch: pr.branch.clone(),
         target_branch: pr.target_branch,
         base_head_id: pr.base_head_id,
-        state: store.get_session_state(&pr.branch).context(StoreSnafu)?,
+        state: store
+            .get_session_state(&pr.branch)
+            .await
+            .context(StoreSnafu)?,
     })
 }
 
-fn build_session_merge_result(
+async fn build_session_merge_result(
     store: &impl SessionStore,
     merged: SessionMerge,
 ) -> Result<SessionMergeResult> {
@@ -1804,11 +1817,12 @@ fn build_session_merge_result(
         merged_anchor_id: merged.merged_anchor_id,
         state: store
             .get_session_state(&merged.branch)
+            .await
             .context(StoreSnafu)?,
     })
 }
 
-fn build_session_feedback_result(
+async fn build_session_feedback_result(
     store: &impl SessionStore,
     feedback: SessionFeedback,
 ) -> Result<SessionFeedbackResult> {
@@ -1820,15 +1834,16 @@ fn build_session_feedback_result(
         feedback_anchor_id: feedback.feedback_anchor_id,
         state: store
             .get_session_state(&feedback.branch)
+            .await
             .context(StoreSnafu)?,
     })
 }
 
-fn resolve_visible_session_anchor(
+async fn resolve_visible_session_anchor(
     store: &impl NodeStore,
     branch: &str,
 ) -> Result<(String, SessionAnchor)> {
-    let ancestry = store.ancestry(branch).context(StoreSnafu)?;
+    let ancestry = store.ancestry(branch).await.context(StoreSnafu)?;
     for node in ancestry {
         let coco_mem::Kind::Anchor(anchor) = node.kind else {
             continue;
@@ -1848,27 +1863,24 @@ fn resolve_visible_session_anchor(
     })
 }
 
-fn resolve_session_rebase(
+async fn resolve_session_rebase(
     command: SessionRebaseCommand,
     store: &impl PresetStore,
     provider_profiles: &impl ProviderProfileLookup,
 ) -> Result<ResolvedSessionRebase> {
-    let mut patch = command
-        .preset
-        .as_deref()
-        .map(|name| {
-            let record = store.get_preset_record(name).context(StoreSnafu)?;
-            let config = record
-                .current_preset()
-                .ok_or_else(|| StoreError::PresetVersionNotFound {
-                    name: name.to_owned(),
-                    version: record.current_version,
-                })
-                .context(StoreSnafu)?;
-            preset_to_session_anchor_patch(&config, provider_profiles)
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let mut patch = if let Some(name) = command.preset.as_deref() {
+        let record = store.get_preset_record(name).await.context(StoreSnafu)?;
+        let config = record
+            .current_preset()
+            .ok_or_else(|| StoreError::PresetVersionNotFound {
+                name: name.to_owned(),
+                version: record.current_version,
+            })
+            .context(StoreSnafu)?;
+        preset_to_session_anchor_patch(&config, provider_profiles)?
+    } else {
+        SessionAnchorPatch::default()
+    };
 
     if let Some(role) = command.role {
         patch.role = Some(role.into());

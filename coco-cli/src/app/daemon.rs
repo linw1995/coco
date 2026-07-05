@@ -82,9 +82,7 @@ pub struct CocoCliDaemonServerHandle<B, S> {
 
 pub struct DaemonServerOptions<'a> {
     pub channel_configs: &'a ChannelConfigs,
-    pub console_config: Option<ConsoleConfig>,
-    pub console_publisher: Option<ConsolePublisher>,
-    pub console_graph_store_path: PathBuf,
+    pub console: Option<ConsoleServerHandle>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,7 +120,7 @@ where
     let console_config = daemon_console_config(&command, console_publisher.as_ref());
 
     ensure_initial_session(shared_store, llm, provider_profiles).await?;
-    let server = start_daemon_server(
+    let mut server = start_daemon_server(
         &socket_path,
         shared_store,
         llm,
@@ -130,11 +128,32 @@ where
         &shared_engine,
         DaemonServerOptions {
             channel_configs,
-            console_config,
-            console_publisher,
-            console_graph_store_path,
+            console: None,
         },
     )?;
+    if let Some(config) = console_config {
+        let console = match start_console_server_with_graph_store_path(
+            config,
+            shared_store.clone(),
+            console_publisher.expect("console publisher should exist when console is enabled"),
+            console_graph_store_path,
+        )
+        .await
+        {
+            Ok(console) => console,
+            Err(source) => {
+                if let Err(error) = server.shutdown().await {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to shut down daemon after console startup failure"
+                    );
+                }
+                return Err(source).context(ConsoleSnafu);
+            }
+        };
+        tracing::info!(addr = %console.addr(), "coco console listening");
+        server.console = Some(console);
+    }
     spawn_resume_incomplete_jobs(shared_engine);
     server.wait().await?;
     Ok(None)
@@ -182,7 +201,9 @@ where
 {
     let mode = daemon_profile_graph_mode(command);
     let started_at = Instant::now();
-    let snapshot = build_graph_snapshot_with_mode(shared_store, 0, mode).context(ConsoleSnafu)?;
+    let snapshot = build_graph_snapshot_with_mode(shared_store, 0, mode)
+        .await
+        .context(ConsoleSnafu)?;
     let result = daemon_graph_profile_result(mode, &snapshot, started_at.elapsed());
 
     if command.json {
@@ -244,6 +265,7 @@ where
 {
     if shared_store
         .list_session_states()
+        .await
         .context(StoreSnafu)?
         .is_empty()
     {
@@ -270,11 +292,11 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    if builtin_day_session_is_valid(shared_store)? {
+    if builtin_day_session_is_valid(shared_store).await? {
         return Ok(());
     }
 
-    match shared_store.get_branch_head(BUILTIN_DAY_BRANCH) {
+    match shared_store.get_branch_head(BUILTIN_DAY_BRANCH).await {
         Ok(_) => {
             tracing::warn!(
                 branch = BUILTIN_DAY_BRANCH,
@@ -282,6 +304,7 @@ where
             );
             shared_store
                 .delete_branch(BUILTIN_DAY_BRANCH)
+                .await
                 .context(StoreSnafu)?;
         }
         Err(StoreError::BranchNotFound { .. }) => {}
@@ -291,7 +314,7 @@ where
     let config = match resolve_session_config(day_session_create_command(), provider_profiles) {
         Ok(config) => config,
         Err(error) => {
-            let Some(config) = derive_day_session_config(shared_store)? else {
+            let Some(config) = derive_day_session_config(shared_store).await? else {
                 return Err(error);
             };
             config
@@ -307,19 +330,19 @@ where
     Ok(())
 }
 
-fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
-    let head = match store.get_branch_head(BUILTIN_DAY_BRANCH) {
+async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
+    let head = match store.get_branch_head(BUILTIN_DAY_BRANCH).await {
         Ok(head) => head,
         Err(StoreError::BranchNotFound { .. }) => return Ok(false),
         Err(source) => return Err(source).context(StoreSnafu),
     };
-    match store.get_session_state(BUILTIN_DAY_BRANCH) {
+    match store.get_session_state(BUILTIN_DAY_BRANCH).await {
         Ok(_) => {}
         Err(StoreError::BranchNotFound { .. }) => return Ok(false),
         Err(source) => return Err(source).context(StoreSnafu),
     }
 
-    let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+    let ancestry = store.ancestry(&head).await.context(StoreSnafu)?;
     let Some(session) = ancestry.into_iter().find_map(|node| {
         let Kind::Anchor(Anchor {
             payload: AnchorPayload::Session(session),
@@ -348,9 +371,10 @@ fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
         && actual_tools == expected_tools)
 }
 
-fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
+async fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
     let mut branches = store
         .list_session_states()
+        .await
         .context(StoreSnafu)?
         .into_keys()
         .filter(|branch| branch != BUILTIN_DAY_BRANCH)
@@ -364,8 +388,8 @@ fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>
     }
 
     for branch in branches {
-        let head = store.get_branch_head(&branch).context(StoreSnafu)?;
-        let ancestry = store.ancestry(&head).context(StoreSnafu)?;
+        let head = store.get_branch_head(&branch).await.context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head).await.context(StoreSnafu)?;
         let Some(session_anchor) = ancestry.into_iter().find_map(|node| {
             let Kind::Anchor(anchor) = &node.kind else {
                 return None;
@@ -539,20 +563,7 @@ where
     let llm = llm.clone();
     let provider_profiles = provider_profiles.clone();
     let shared_engine = shared_engine.clone();
-    let console = match options.console_config {
-        Some(config) => Some(
-            start_console_server_with_graph_store_path(
-                config,
-                shared_store.clone(),
-                options
-                    .console_publisher
-                    .expect("console publisher should exist when console is enabled"),
-                options.console_graph_store_path,
-            )
-            .context(ConsoleSnafu)?,
-        ),
-        None => None,
-    };
+    let console = options.console;
     if let Some(console) = &console {
         tracing::info!(addr = %console.addr(), "coco console listening");
     }
@@ -828,20 +839,23 @@ impl<S> SystemEventMessageQueueWorker<S> {
         while let Some(item) = self
             .store
             .peek_message(SYSTEM_EVENT_QUEUE)
+            .await
             .context(StoreSnafu)?
         {
             match decode_system_event_message(item.payload.clone()) {
                 Ok(event) => {
-                    if !self.queue_prompt_job_for_event(&item, event)? {
+                    if !self.queue_prompt_job_for_event(&item, event).await? {
                         return Ok(handled);
                     }
                     self.store
                         .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .await
                         .context(StoreSnafu)?;
                 }
                 Err(error) => {
                     self.store
                         .dequeue_message(SYSTEM_EVENT_QUEUE)
+                        .await
                         .context(StoreSnafu)?;
                     tracing::error!(
                         message_id = %item.message_id,
@@ -856,7 +870,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         Ok(handled)
     }
 
-    fn queue_prompt_job_for_event(
+    async fn queue_prompt_job_for_event(
         &self,
         item: &MessageQueueItem,
         event: SystemEvent,
@@ -865,7 +879,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         S: Store,
     {
         let route = route_system_event(&event);
-        match self.store.get_branch_head(route.branch) {
+        match self.store.get_branch_head(route.branch).await {
             Ok(_) => {}
             Err(StoreError::BranchNotFound { .. }) => {
                 tracing::warn!(
@@ -881,7 +895,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
 
         let request = materialize_system_event_prompt_job(route, &event);
         let dedupe_job_ids = system_event_prompt_job_dedupe_ids(&event);
-        if self.prompt_job_request_exists(&dedupe_job_ids)? {
+        if self.prompt_job_request_exists(&dedupe_job_ids).await? {
             tracing::debug!(
                 message_id = %item.message_id,
                 queue = SYSTEM_EVENT_QUEUE,
@@ -892,7 +906,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
             return Ok(true);
         }
 
-        queue_prompt_job_request(&self.store, request)?;
+        queue_prompt_job_request(&self.store, request).await?;
         tracing::info!(
             message_id = %item.message_id,
             queue = SYSTEM_EVENT_QUEUE,
@@ -902,12 +916,12 @@ impl<S> SystemEventMessageQueueWorker<S> {
         Ok(true)
     }
 
-    fn prompt_job_request_exists(&self, job_ids: &[String]) -> Result<bool>
+    async fn prompt_job_request_exists(&self, job_ids: &[String]) -> Result<bool>
     where
         S: Store,
     {
         for job_id in job_ids {
-            match self.store.get_job(job_id) {
+            match self.store.get_job(job_id).await {
                 Ok(_) => return Ok(true),
                 Err(StoreError::PromptJobNotFound { .. }) => {}
                 Err(source) => return Err(source).context(StoreSnafu),
@@ -917,6 +931,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
         for queue in self
             .store
             .list_message_queues()
+            .await
             .context(StoreSnafu)?
             .into_iter()
             .filter(|queue| is_prompt_job_queue(queue))
@@ -924,6 +939,7 @@ impl<S> SystemEventMessageQueueWorker<S> {
             if self
                 .store
                 .list_queue_messages(&queue)
+                .await
                 .context(StoreSnafu)?
                 .into_iter()
                 .filter_map(|item| decode_prompt_job_message(item.payload).ok())
@@ -955,7 +971,7 @@ impl<B, S> PromptJobMessageQueueSupervisor<B, S> {
         let mut queues = HashSet::new();
         let mut workers = Vec::<(String, tokio::task::JoinHandle<Result<()>>)>::new();
         loop {
-            for queue in self.prompt_job_queues()? {
+            for queue in self.prompt_job_queues().await? {
                 if queues.insert(queue.clone()) {
                     let worker = PromptJobMessageQueueWorker::new(
                         queue.clone(),
@@ -981,13 +997,14 @@ impl<B, S> PromptJobMessageQueueSupervisor<B, S> {
         }
     }
 
-    fn prompt_job_queues(&self) -> Result<Vec<String>>
+    async fn prompt_job_queues(&self) -> Result<Vec<String>>
     where
         S: Store,
     {
         Ok(self
             .store
             .list_message_queues()
+            .await
             .context(StoreSnafu)?
             .into_iter()
             .filter(|queue| is_prompt_job_queue(queue))
@@ -1017,7 +1034,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     {
         loop {
             self.drain_once().await?;
-            if self.peek_prompt_queue_head()?.is_none() {
+            if self.peek_prompt_queue_head().await?.is_none() {
                 return Ok(());
             }
         }
@@ -1031,7 +1048,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         let mut progressed = false;
         let mut saw_item = false;
         let mut wait_duration = None;
-        while let Some(item) = self.peek_prompt_queue_head()? {
+        while let Some(item) = self.peek_prompt_queue_head().await? {
             saw_item = true;
             match decode_prompt_job_message(item.payload.clone()) {
                 Ok(request) => {
@@ -1052,6 +1069,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                     let Some(item) = self
                         .store
                         .dequeue_message(&self.queue)
+                        .await
                         .context(StoreSnafu)?
                     else {
                         continue;
@@ -1067,11 +1085,14 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(())
     }
 
-    fn peek_prompt_queue_head(&self) -> Result<Option<MessageQueueItem>>
+    async fn peek_prompt_queue_head(&self) -> Result<Option<MessageQueueItem>>
     where
         S: Store,
     {
-        self.store.peek_message(&self.queue).context(StoreSnafu)
+        self.store
+            .peek_message(&self.queue)
+            .await
+            .context(StoreSnafu)
     }
 
     async fn handle_prompt_request_queue_head(
@@ -1084,7 +1105,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         S: Store + Clone + Send + Sync + 'static,
     {
         if matches!(
-            self.ensure_prompt_request_queue_head_ready(item, request)?,
+            self.ensure_prompt_request_queue_head_ready(item, request)
+                .await?,
             PromptQueueHeadReadiness::Continue
         ) {
             return Ok(PromptQueueHeadResult::Continue);
@@ -1093,6 +1115,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if let Some(active_job) = self
             .engine
             .active_branch_prompt_job(&request.branch)
+            .await
             .context(CoreEngineSnafu)?
         {
             return self
@@ -1101,7 +1124,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         }
 
         let guard = self.engine.lock_branch(&request.branch).await;
-        let Some(item) = self.peek_prompt_queue_head()? else {
+        let Some(item) = self.peek_prompt_queue_head().await? else {
             return Ok(PromptQueueHeadResult::Continue);
         };
         let request = match decode_prompt_job_message(item.payload.clone()) {
@@ -1110,6 +1133,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
                 let Some(item) = self
                     .store
                     .dequeue_message(&self.queue)
+                    .await
                     .context(StoreSnafu)?
                 else {
                     return Ok(PromptQueueHeadResult::Continue);
@@ -1120,7 +1144,8 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         };
 
         if matches!(
-            self.ensure_prompt_request_queue_head_ready(&item, &request)?,
+            self.ensure_prompt_request_queue_head_ready(&item, &request)
+                .await?,
             PromptQueueHeadReadiness::Continue
         ) {
             return Ok(PromptQueueHeadResult::Continue);
@@ -1129,6 +1154,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if let Some(active_job) = self
             .engine
             .active_branch_prompt_job(&request.branch)
+            .await
             .context(CoreEngineSnafu)?
         {
             drop(guard);
@@ -1139,6 +1165,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         let Some(item) = self
             .store
             .dequeue_message(&self.queue)
+            .await
             .context(StoreSnafu)?
         else {
             return Ok(PromptQueueHeadResult::Continue);
@@ -1147,7 +1174,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(PromptQueueHeadResult::Continue)
     }
 
-    fn ensure_prompt_request_queue_head_ready(
+    async fn ensure_prompt_request_queue_head_ready(
         &self,
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
@@ -1155,18 +1182,19 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
     where
         S: Store,
     {
-        match self.store.get_branch_head(&request.branch) {
+        match self.store.get_branch_head(&request.branch).await {
             Ok(_) => {}
             Err(coco_mem::StoreError::BranchNotFound { .. }) => {
-                self.discard_prompt_request_for_missing_branch(item, request)?;
+                self.discard_prompt_request_for_missing_branch(item, request)
+                    .await?;
                 return Ok(PromptQueueHeadReadiness::Continue);
             }
             Err(error) => return Err(error).context(StoreSnafu),
         }
 
-        match self.store.get_job(&request.job_id) {
+        match self.store.get_job(&request.job_id).await {
             Ok(_) => {
-                self.discard_duplicate_prompt_request(item, request)?;
+                self.discard_duplicate_prompt_request(item, request).await?;
                 return Ok(PromptQueueHeadReadiness::Continue);
             }
             Err(coco_mem::StoreError::PromptJobNotFound { .. }) => {}
@@ -1176,7 +1204,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(PromptQueueHeadReadiness::Ready)
     }
 
-    fn discard_prompt_request_for_missing_branch(
+    async fn discard_prompt_request_for_missing_branch(
         &self,
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
@@ -1187,6 +1215,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if self
             .store
             .dequeue_message(&self.queue)
+            .await
             .context(StoreSnafu)?
             .is_some()
         {
@@ -1201,7 +1230,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         Ok(())
     }
 
-    fn discard_duplicate_prompt_request(
+    async fn discard_duplicate_prompt_request(
         &self,
         item: &MessageQueueItem,
         request: &QueuedPromptRequest,
@@ -1212,6 +1241,7 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
         if self
             .store
             .dequeue_message(&self.queue)
+            .await
             .context(StoreSnafu)?
             .is_some()
         {
@@ -1250,7 +1280,10 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL));
         }
 
-        if active_job_is_waiting_for_recovery(&self.store, &active_job).context(StoreSnafu)? {
+        if active_job_is_waiting_for_recovery(&self.store, &active_job)
+            .await
+            .context(StoreSnafu)?
+        {
             tracing::debug!(
                 message_id = %item.message_id,
                 queue = %self.queue,
@@ -1436,6 +1469,7 @@ where
         let item = self
             .store
             .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .await
             .map_err(ChannelError::handler)?;
         let conversation_id = message.conversation_id().to_owned();
         let sender_id = message.sender_id().to_owned();
@@ -1503,6 +1537,7 @@ impl<B, S> TelegramMessageQueueWorker<B, S> {
         while let Some(item) = self
             .store
             .dequeue_message(TELEGRAM_INBOUND_QUEUE)
+            .await
             .context(StoreSnafu)?
         {
             handled += 1;
@@ -1594,6 +1629,7 @@ where
     loop {
         let active_job = engine
             .active_branch_prompt_job(branch)
+            .await
             .context(CoreEngineSnafu)?;
         let Some(active_job) = active_job else {
             return Ok(());
@@ -1646,11 +1682,11 @@ fn shortest_wait(current: Option<Duration>, candidate: Duration) -> Duration {
     current.map_or(candidate, |current| current.min(candidate))
 }
 
-fn active_job_is_waiting_for_recovery(
+async fn active_job_is_waiting_for_recovery(
     store: &impl Store,
     active_job: &coco_mem::Job,
 ) -> std::result::Result<bool, StoreError> {
-    let path = match store.log(&active_job.base, &active_job.work_branch) {
+    let path = match store.log(&active_job.base, &active_job.work_branch).await {
         Ok(path) => path,
         Err(StoreError::RefsNotConnected { .. }) => return Ok(false),
         Err(error) => return Err(error),
@@ -1669,7 +1705,8 @@ fn active_job_is_waiting_for_recovery(
     }
 
     Ok(store
-        .list_children(&last_node.id)?
+        .list_children(&last_node.id)
+        .await?
         .into_iter()
         .any(|child| matches!(child.kind, Kind::Failure(_))))
 }
@@ -2251,8 +2288,10 @@ mod tests {
         run_daemon_command, start_chatgpt_auth_check_task,
     };
 
-    fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary().expect("temporary SQLite store should open")
+    async fn test_store() -> SqliteStore {
+        SqliteStore::open_temporary()
+            .await
+            .expect("temporary SQLite store should open")
     }
 
     fn daemon_command<I, T>(args: I) -> DaemonCommand
@@ -2311,9 +2350,9 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_profile_graph_builds_snapshot_without_serving() {
-        let store = test_store();
+        let store = test_store().await;
         let root = store.root_id();
-        store.fork("main", &root).unwrap();
+        store.fork("main", &root).await.unwrap();
         let node = store
             .append(NewNode {
                 parent: root.clone(),
@@ -2321,8 +2360,9 @@ mod tests {
                 metadata: None,
                 kind: Kind::Text("profile graph".to_owned()),
             })
+            .await
             .unwrap();
-        store.set_branch_head("main", &root, &node).unwrap();
+        store.set_branch_head("main", &root, &node).await.unwrap();
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),
@@ -2384,7 +2424,7 @@ mod tests {
         let socket_parent = temp_dir.path().join("not-a-directory");
         fs::write(&socket_parent, "").unwrap();
         let socket_path = socket_parent.join("coco.sock");
-        let store = test_store();
+        let store = test_store().await;
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),
@@ -2410,7 +2450,12 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, crate::Error::BindDaemonSocket { .. }));
-        assert!(store.get_session_state(DEFAULT_SESSION_BRANCH).is_ok());
+        assert!(
+            store
+                .get_session_state(DEFAULT_SESSION_BRANCH)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -2418,7 +2463,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let socket_path = temp_dir.path().join("coco.sock");
         fs::write(&socket_path, "").unwrap();
-        let store = test_store();
+        let store = test_store().await;
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),
@@ -2440,10 +2485,10 @@ mod tests {
         assert!(!socket_path.exists());
     }
 
-    #[test]
-    fn chatgpt_auth_check_task_skips_empty_config() {
+    #[tokio::test]
+    async fn chatgpt_auth_check_task_skips_empty_config() {
         let llm = Arc::new(LlmService::new(
-            test_store(),
+            test_store().await,
             BlockingOnceBackend::default(),
         ));
 
@@ -2549,7 +2594,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_message_queue_publisher_persists_inbound_message() {
-        let store = test_store();
+        let store = test_store().await;
         let publisher = TelegramMessageQueuePublisher::new(store.clone(), Arc::new(Notify::new()));
         let message =
             InboundMessage::telegram_with_message_id("chat-1", "sender-1", "message-1", "hello");
@@ -2557,7 +2602,10 @@ mod tests {
         let response = publisher.handle(message.clone()).await.unwrap();
 
         assert_eq!(response.text, "queued telegram inbound message");
-        let items = store.list_queue_messages(TELEGRAM_INBOUND_QUEUE).unwrap();
+        let items = store
+            .list_queue_messages(TELEGRAM_INBOUND_QUEUE)
+            .await
+            .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(
             decode_telegram_message(items[0].payload.clone()).unwrap(),
@@ -2567,7 +2615,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_queue_worker_returns_after_message_processing_finishes() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2576,6 +2624,7 @@ mod tests {
         let message = InboundMessage::telegram("chat", "user", "first");
         store
             .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .await
             .unwrap();
         let worker = TelegramMessageQueueWorker::new(
             "main",
@@ -2594,6 +2643,7 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(TELEGRAM_INBOUND_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -2601,7 +2651,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_queue_worker_waits_for_active_target_branch_job() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2620,6 +2670,7 @@ mod tests {
         let message = InboundMessage::telegram("chat", "user", "next");
         store
             .enqueue_message(TELEGRAM_INBOUND_QUEUE, encode_telegram_message(&message))
+            .await
             .unwrap();
         let worker =
             TelegramMessageQueueWorker::new("main", store, engine, Arc::new(Notify::new()));
@@ -2637,7 +2688,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_joins_inflight_active_branch_job() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2665,13 +2716,14 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
             store.clone(),
             engine.clone(),
         );
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        let item = store.peek_message(PROMPT_JOB_QUEUE).await.unwrap().unwrap();
         let request = super::decode_prompt_job_message(item.payload.clone()).unwrap();
 
         let join_task = tokio::spawn(async move {
@@ -2681,10 +2733,14 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!join_task.is_finished());
-        assert!(engine.get_job("job-request").is_err());
+        assert!(engine.get_job("job-request").await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -2696,14 +2752,14 @@ mod tests {
             super::PromptQueueHeadResult::Continue
         ));
         assert_eq!(
-            engine.get_job(&active_job_id).unwrap().status,
+            engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Finished
         );
     }
 
     #[tokio::test]
     async fn prompt_job_queue_worker_exits_after_draining_branch_queue() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2722,6 +2778,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(queue.clone(), store.clone(), engine.clone());
 
@@ -2733,7 +2790,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(store.list_queue_messages(&queue).unwrap().is_empty());
+        assert!(store.list_queue_messages(&queue).await.unwrap().is_empty());
         assert_eq!(
             engine.join_job("job-day-queued").await.unwrap().status,
             JobStatus::Finished
@@ -2742,7 +2799,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_backs_off_when_active_job_waits_for_recovery() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FailingBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -2767,6 +2824,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2779,15 +2837,20 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            engine.get_job(&active_job_id).unwrap().status,
+            engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Running
         );
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         let failure_count = store
             .list_children(&active_job.base)
+            .await
             .unwrap()
             .into_iter()
             .filter(|node| matches!(node.kind, Kind::Failure(_)))
@@ -2797,7 +2860,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_does_not_start_idle_active_job() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = FailingBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -2817,6 +2880,7 @@ mod tests {
         };
         store
             .enqueue_message(PROMPT_JOB_QUEUE, json!(request.clone()))
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2824,7 +2888,7 @@ mod tests {
             engine.clone(),
         );
 
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        let item = store.peek_message(PROMPT_JOB_QUEUE).await.unwrap().unwrap();
         assert!(matches!(
             worker
                 .handle_prompt_request_queue_head(&item, &request)
@@ -2835,11 +2899,11 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            engine.get_job(&active_job_id).unwrap().status,
+            engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Queued
         );
 
-        let item = store.peek_message(PROMPT_JOB_QUEUE).unwrap().unwrap();
+        let item = store.peek_message(PROMPT_JOB_QUEUE).await.unwrap().unwrap();
         assert!(matches!(
             worker
                 .handle_prompt_request_queue_head(&item, &request)
@@ -2850,14 +2914,18 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
     }
 
     #[tokio::test]
     async fn prompt_job_queue_worker_processes_branch_queue_when_legacy_head_waits() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2866,10 +2934,12 @@ mod tests {
         llm.create_session(session_config("day")).await.unwrap();
         let engine = ConversationEngine::new(llm);
         let active_job = store
-            .submit_job("main", &store.get_branch_head("main").unwrap())
+            .submit_job("main", &store.get_branch_head("main").await.unwrap())
+            .await
             .unwrap();
         store
             .set_job_status(&active_job.job_id, JobStatus::Queued, JobStatus::Running)
+            .await
             .unwrap();
         store
             .enqueue_message(
@@ -2882,6 +2952,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         super::queue_prompt_job_request(
             &store,
@@ -2893,6 +2964,7 @@ mod tests {
                 session_patch: None,
             },
         )
+        .await
         .unwrap();
         let legacy_worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2909,11 +2981,15 @@ mod tests {
         let day_task = tokio::spawn(async move { day_worker.drain_once().await });
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 1).await;
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            engine.get_job("job-day-queued").unwrap().status,
+            engine.get_job("job-day-queued").await.unwrap().status,
             JobStatus::Running
         );
 
@@ -2921,9 +2997,10 @@ mod tests {
         day_task.await.unwrap().unwrap();
         assert!(!legacy_task.is_finished());
         legacy_task.abort();
-        wait_until(Duration::from_secs(1), || {
+        wait_until_async(Duration::from_secs(1), || async {
             engine
                 .get_job("job-day-queued")
+                .await
                 .is_ok_and(|job| job.status == JobStatus::Finished)
         })
         .await;
@@ -2931,7 +3008,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_processes_branch_queue_when_legacy_head_is_inflight() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let release_first = backend.release_first.clone();
@@ -2959,6 +3036,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         super::queue_prompt_job_request(
             &store,
@@ -2970,6 +3048,7 @@ mod tests {
                 session_patch: None,
             },
         )
+        .await
         .unwrap();
         let legacy_worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -2987,15 +3066,20 @@ mod tests {
         assert!(!legacy_task.is_finished());
         day_worker.drain_once().await.unwrap();
 
-        assert!(engine.get_job("job-main-queued").is_err());
+        assert!(engine.get_job("job-main-queued").await.is_err());
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         wait_until(Duration::from_secs(1), || calls.load(Ordering::SeqCst) == 2).await;
-        wait_until(Duration::from_secs(1), || {
+        wait_until_async(Duration::from_secs(1), || async {
             engine
                 .get_job("job-day-queued")
+                .await
                 .is_ok_and(|job| job.status == JobStatus::Finished)
         })
         .await;
@@ -3006,12 +3090,12 @@ mod tests {
         legacy_task.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn active_job_waiting_for_recovery_detects_failure_child() {
-        let store = test_store();
-        store.fork("main", &store.root_id()).unwrap();
-        let base = store.get_branch_head("main").unwrap();
-        let active_job = store.submit_job("main", &base).unwrap();
+    #[tokio::test]
+    async fn active_job_waiting_for_recovery_detects_failure_child() {
+        let store = test_store().await;
+        store.fork("main", &store.root_id()).await.unwrap();
+        let base = store.get_branch_head("main").await.unwrap();
+        let active_job = store.submit_job("main", &base).await.unwrap();
         store
             .append(NewNode {
                 parent: base,
@@ -3019,17 +3103,22 @@ mod tests {
                 metadata: BackendMetadata::builder().build(),
                 kind: Kind::Failure("backend failed".to_owned()),
             })
+            .await
             .unwrap();
 
-        assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
+        assert!(
+            super::active_job_is_waiting_for_recovery(&store, &active_job)
+                .await
+                .unwrap()
+        );
     }
 
-    #[test]
-    fn active_job_waiting_for_recovery_detects_terminal_failure() {
-        let store = test_store();
-        store.fork("main", &store.root_id()).unwrap();
-        let base = store.get_branch_head("main").unwrap();
-        let active_job = store.submit_job("main", &base).unwrap();
+    #[tokio::test]
+    async fn active_job_waiting_for_recovery_detects_terminal_failure() {
+        let store = test_store().await;
+        store.fork("main", &store.root_id()).await.unwrap();
+        let base = store.get_branch_head("main").await.unwrap();
+        let active_job = store.submit_job("main", &base).await.unwrap();
         let failure = store
             .append(NewNode {
                 parent: base.clone(),
@@ -3037,25 +3126,37 @@ mod tests {
                 metadata: BackendMetadata::builder().build(),
                 kind: Kind::Failure("backend failed".to_owned()),
             })
+            .await
             .unwrap();
-        store.set_branch_head("main", &base, &failure).unwrap();
+        store
+            .set_branch_head("main", &base, &failure)
+            .await
+            .unwrap();
 
-        assert!(super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
+        assert!(
+            super::active_job_is_waiting_for_recovery(&store, &active_job)
+                .await
+                .unwrap()
+        );
     }
 
-    #[test]
-    fn active_job_waiting_for_recovery_ignores_clean_job() {
-        let store = test_store();
-        store.fork("main", &store.root_id()).unwrap();
-        let base = store.get_branch_head("main").unwrap();
-        let active_job = store.submit_job("main", &base).unwrap();
+    #[tokio::test]
+    async fn active_job_waiting_for_recovery_ignores_clean_job() {
+        let store = test_store().await;
+        store.fork("main", &store.root_id()).await.unwrap();
+        let base = store.get_branch_head("main").await.unwrap();
+        let active_job = store.submit_job("main", &base).await.unwrap();
 
-        assert!(!super::active_job_is_waiting_for_recovery(&store, &active_job).unwrap());
+        assert!(
+            !super::active_job_is_waiting_for_recovery(&store, &active_job)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
     async fn prompt_job_queue_worker_discards_prompt_request_for_missing_branch() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -3072,6 +3173,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker = PromptJobMessageQueueWorker::new(
             PROMPT_JOB_QUEUE.to_owned(),
@@ -3081,9 +3183,13 @@ mod tests {
 
         worker.drain_once().await.unwrap();
 
-        assert!(engine.get_job("job-missing-branch").is_err());
+        assert!(engine.get_job("job-missing-branch").await.is_err());
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             0
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -3091,7 +3197,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_job_queue_worker_discards_duplicate_prompt_request() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let calls = backend.calls.clone();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -3112,6 +3218,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         let worker =
             PromptJobMessageQueueWorker::new(PROMPT_JOB_QUEUE.to_owned(), store.clone(), engine);
@@ -3121,6 +3228,7 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -3129,7 +3237,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_materializes_day_prompt_request() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3153,6 +3261,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3161,17 +3270,20 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
@@ -3192,7 +3304,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_derives_missing_recovery_dedupe_key() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3215,6 +3327,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3224,6 +3337,7 @@ mod tests {
             super::backend_failure_recovery_dedupe_key("job-failed", "main", "retry-node");
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
@@ -3237,7 +3351,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_duplicate_recovery_prompt_request() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3259,8 +3373,12 @@ mod tests {
         });
         store
             .enqueue_message(SYSTEM_EVENT_QUEUE, payload.clone())
+            .await
             .unwrap();
-        store.enqueue_message(SYSTEM_EVENT_QUEUE, payload).unwrap();
+        store
+            .enqueue_message(SYSTEM_EVENT_QUEUE, payload)
+            .await
+            .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
         assert_eq!(worker.drain_once().await.unwrap(), 2);
@@ -3268,11 +3386,13 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
@@ -3288,7 +3408,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_queues_day_recovery_behind_blocked_main_queue() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("main")).await.unwrap();
@@ -3304,6 +3424,7 @@ mod tests {
                     session_patch: None,
                 }),
             )
+            .await
             .unwrap();
         store
             .enqueue_message(
@@ -3325,17 +3446,23 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
         assert_eq!(worker.drain_once().await.unwrap(), 1);
 
         assert_eq!(
-            store.list_queue_messages(PROMPT_JOB_QUEUE).unwrap().len(),
+            store
+                .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
     }
@@ -3379,7 +3506,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_recovery_prompt_when_job_exists() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3389,8 +3516,9 @@ mod tests {
                     "llm.backend_failure:job-failed:main:retry-node",
                 ),
                 "day",
-                &store.get_branch_head("day").unwrap(),
+                &store.get_branch_head("day").await.unwrap(),
             )
+            .await
             .unwrap();
         store
             .enqueue_message(
@@ -3412,6 +3540,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3420,12 +3549,14 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -3433,7 +3564,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_recovery_prompt_when_legacy_job_exists() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3443,8 +3574,9 @@ mod tests {
                     "llm.backend_failure:job-failed:main:retry-node",
                 ),
                 "day",
-                &store.get_branch_head("day").unwrap(),
+                &store.get_branch_head("day").await.unwrap(),
             )
+            .await
             .unwrap();
         store
             .enqueue_message(
@@ -3466,6 +3598,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3474,12 +3607,14 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
                 .list_queue_messages(PROMPT_JOB_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -3487,7 +3622,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_event_queue_worker_skips_recovery_prompt_when_legacy_request_exists() {
-        let store = test_store();
+        let store = test_store().await;
         let backend = BlockingOnceBackend::default();
         let llm = Arc::new(LlmService::new(store.clone(), backend));
         llm.create_session(session_config("day")).await.unwrap();
@@ -3503,6 +3638,7 @@ mod tests {
                 session_patch: None,
             },
         )
+        .await
         .unwrap();
         store
             .enqueue_message(
@@ -3524,6 +3660,7 @@ mod tests {
                     }
                 }),
             )
+            .await
             .unwrap();
         let worker = SystemEventMessageQueueWorker::new(store.clone());
 
@@ -3532,11 +3669,13 @@ mod tests {
         assert!(
             store
                 .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
                 .unwrap()
                 .is_empty()
         );
         let prompt_items = store
             .list_queue_messages(&prompt_job_queue_for_branch("day"))
+            .await
             .unwrap();
         assert_eq!(prompt_items.len(), 1);
         let request: QueuedPromptRequest =
@@ -3551,7 +3690,7 @@ mod tests {
 
     #[tokio::test]
     async fn derive_day_session_config_uses_latest_session_anchor() {
-        let store = test_store();
+        let store = test_store().await;
         let llm = Arc::new(LlmService::new(
             store.clone(),
             BlockingOnceBackend::default(),
@@ -3569,9 +3708,11 @@ mod tests {
                 },
                 "day handoff",
             )
+            .await
             .unwrap();
 
         let config = super::derive_day_session_config(&store)
+            .await
             .unwrap()
             .expect("day config should be derived");
 
@@ -3646,6 +3787,22 @@ mod tests {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("condition was not met before timeout");
+    }
+
+    async fn wait_until_async<F, Fut>(timeout: Duration, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition().await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -51,7 +51,7 @@ where
     match command.command {
         PresetSubcommand::Set(command) => {
             let json = command.json;
-            let preset = run_preset_set(command, store, provider_profiles)?;
+            let preset = run_preset_set(command, store, provider_profiles).await?;
             Ok(Some(if json {
                 render_json(preset)
             } else {
@@ -59,7 +59,7 @@ where
             }))
         }
         PresetSubcommand::List(command) => {
-            let presets = run_preset_list(store)?;
+            let presets = run_preset_list(store).await?;
             Ok(Some(if command.json {
                 render_json(presets)
             } else {
@@ -68,7 +68,7 @@ where
         }
         PresetSubcommand::Show(command) => {
             let json = command.json;
-            let preset = run_preset_show(command, store)?;
+            let preset = run_preset_show(command, store).await?;
             Ok(Some(if json {
                 render_json(preset)
             } else {
@@ -77,7 +77,7 @@ where
         }
         PresetSubcommand::Rollback(command) => {
             let json = command.json;
-            let preset = run_preset_rollback(command, store)?;
+            let preset = run_preset_rollback(command, store).await?;
             Ok(Some(if json {
                 render_json(preset)
             } else {
@@ -86,7 +86,7 @@ where
         }
         PresetSubcommand::Delete(command) => {
             let json = command.json;
-            let result = run_preset_delete(command, store)?;
+            let result = run_preset_delete(command, store).await?;
             Ok(Some(if json {
                 render_json(result)
             } else {
@@ -96,7 +96,7 @@ where
     }
 }
 
-fn run_preset_set<S>(
+async fn run_preset_set<S>(
     command: PresetSetCommand,
     store: &S,
     provider_profiles: &ProviderProfiles,
@@ -106,13 +106,14 @@ where
 {
     let name = command.name.clone();
     let config = resolve_preset(command, provider_profiles)?;
-    let record = store.set_preset(&name, config).context(StoreSnafu)?;
+    let record = store.set_preset(&name, config).await.context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }
 
-fn run_preset_list(store: &impl PresetStore) -> Result<Vec<PresetSummaryView>> {
+async fn run_preset_list(store: &impl PresetStore) -> Result<Vec<PresetSummaryView>> {
     let mut records = store
         .list_preset_records()
+        .await
         .context(StoreSnafu)?
         .into_values()
         .collect::<Vec<_>>();
@@ -120,8 +121,14 @@ fn run_preset_list(store: &impl PresetStore) -> Result<Vec<PresetSummaryView>> {
     Ok(records.iter().map(preset_summary_view).collect())
 }
 
-fn run_preset_show(command: PresetNameCommand, store: &impl PresetStore) -> Result<PresetShowView> {
-    let record = store.get_preset_record(&command.name).context(StoreSnafu)?;
+async fn run_preset_show(
+    command: PresetNameCommand,
+    store: &impl PresetStore,
+) -> Result<PresetShowView> {
+    let record = store
+        .get_preset_record(&command.name)
+        .await
+        .context(StoreSnafu)?;
     Ok(PresetShowView {
         name: record.name,
         current_version: record.current_version,
@@ -129,21 +136,25 @@ fn run_preset_show(command: PresetNameCommand, store: &impl PresetStore) -> Resu
     })
 }
 
-fn run_preset_rollback(
+async fn run_preset_rollback(
     command: PresetRollbackCommand,
     store: &impl PresetStore,
 ) -> Result<PresetSummaryView> {
     let record = store
         .rollback_preset(&command.name, command.to_version)
+        .await
         .context(StoreSnafu)?;
     Ok(preset_summary_view(&record))
 }
 
-fn run_preset_delete(
+async fn run_preset_delete(
     command: PresetNameCommand,
     store: &impl PresetStore,
 ) -> Result<PresetDeleteResult> {
-    store.delete_preset(&command.name).context(StoreSnafu)?;
+    store
+        .delete_preset(&command.name)
+        .await
+        .context(StoreSnafu)?;
     Ok(PresetDeleteResult { name: command.name })
 }
 

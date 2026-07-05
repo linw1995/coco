@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use async_trait::async_trait;
+
 mod lock;
 mod sqlite;
 
@@ -10,61 +12,122 @@ mod tests;
 pub use sqlite::{SqliteDatabase, SqliteGraphStore, SqliteStore};
 
 use crate::{
-    Job, JobStatus, MessageQueueItem, NewNode, Node, Preset, PresetRecord, SessionAnchorPatch,
-    SessionRole, SessionState, SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    Job, JobStatus, MergeParent, MessageQueueItem, NewNode, NewNodeContent, Node, Preset,
+    PresetRecord, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
+#[derive(Debug, Clone)]
+pub struct BranchAppendSessionState {
+    pub branch: String,
+    pub expected_old_head: String,
+    pub parent: String,
+    pub new_head: Option<String>,
+    pub nodes: Vec<NewNodeContent>,
+    pub session_branch: String,
+    pub expected_session: Option<SessionState>,
+    pub next_session: BranchSessionStateUpdate,
+}
+
+#[derive(Debug, Clone)]
+pub enum BranchSessionStateUpdate {
+    Set(SessionState),
+    PausedMergedToAppendedHead { target_branch: String },
+}
+
+impl BranchSessionStateUpdate {
+    pub fn into_session_state(self, appended_head: &str) -> SessionState {
+        match self {
+            Self::Set(state) => state,
+            Self::PausedMergedToAppendedHead { target_branch } => SessionState::Paused {
+                target_branch,
+                reason: crate::PauseReason::Merged {
+                    merged_anchor_id: appended_head.to_owned(),
+                },
+            },
+        }
+    }
+}
+
 /// Node graph storage API used by CoCo services.
+#[async_trait]
 pub trait NodeStore {
     /// Returns the global root node identifier.
     fn root_id(&self) -> String;
 
     /// Appends a new node and returns the persisted node identifier.
-    fn append(&self, node: NewNode) -> StoreResult<String>;
+    async fn append(&self, node: NewNode) -> StoreResult<String>;
 
     /// Returns the chain from a node id or branch reference back to the root.
-    fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>>;
+    async fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>>;
 
     /// Returns the main-parent chain from `head_ref` back to `base_ref`, inclusive.
-    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>>;
+    async fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>>;
 
     /// Returns a single node by branch name, full node ID, or node ID prefix.
-    fn get_node(&self, id: &str) -> StoreResult<Node>;
+    async fn get_node(&self, id: &str) -> StoreResult<Node>;
 
     /// Returns all direct children for a node, including merge-parent edges.
-    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
+    async fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
 }
 
 /// Branch reference storage API.
+#[async_trait]
 pub trait BranchStore {
     /// Creates a branch from a node id or branch reference and returns its head id.
-    fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String>;
+    async fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String>;
 
     /// Returns the current head node identifier for a branch.
-    fn get_branch_head(&self, name: &str) -> StoreResult<String>;
+    async fn get_branch_head(&self, name: &str) -> StoreResult<String>;
 
     /// Deletes a branch head and its session state.
-    fn delete_branch(&self, name: &str) -> StoreResult<()>;
+    async fn delete_branch(&self, name: &str) -> StoreResult<()>;
 
     /// Moves a branch head when the expected current head matches.
-    fn set_branch_head(
+    async fn set_branch_head(
         &self,
         name: &str,
         expected_old_head: &str,
         new_head: &str,
     ) -> StoreResult<()>;
+
+    /// Appends nodes after `parent` and moves a branch head in the same operation.
+    async fn append_nodes_and_set_branch_head(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String>;
+
+    /// Appends nodes after `parent` and moves a branch head to `new_head` in the same operation.
+    async fn append_nodes_and_set_branch_head_to(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        new_head: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String>;
+
+    /// Appends nodes, moves a branch head, and updates session state in the same operation.
+    async fn append_nodes_and_set_branch_head_with_session_state(
+        &self,
+        update: BranchAppendSessionState,
+    ) -> StoreResult<String>;
 }
 
 /// Branch workflow session state storage API.
+#[async_trait]
 pub trait SessionStore {
     /// Returns all persisted branch workflow states keyed by branch.
-    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>>;
+    async fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>>;
 
     /// Returns the workflow state for a branch.
-    fn get_session_state(&self, name: &str) -> StoreResult<SessionState>;
+    async fn get_session_state(&self, name: &str) -> StoreResult<SessionState>;
 
     /// Updates the persisted session workflow state.
-    fn set_session_state(
+    async fn set_session_state(
         &self,
         name: &str,
         expected: Option<&SessionState>,
@@ -72,10 +135,10 @@ pub trait SessionStore {
     ) -> StoreResult<SessionState>;
 
     /// Rewrites the visible session chain for a branch and returns the new head id.
-    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+    async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
 
     /// Appends a new full session anchor to reset provider context for a branch.
-    fn handoff_session(
+    async fn handoff_session(
         &self,
         name: &str,
         patch: &SessionAnchorPatch,
@@ -84,33 +147,35 @@ pub trait SessionStore {
 }
 
 /// Preset storage API.
+#[async_trait]
 pub trait PresetStore {
     /// Returns all persisted preset records keyed by preset name.
-    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>>;
+    async fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>>;
 
     /// Returns one preset record by preset name.
-    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord>;
+    async fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord>;
 
     /// Creates a new version for a preset under a preset name.
-    fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord>;
+    async fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord>;
 
     /// Creates a new version cloned from a previous preset version.
-    fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord>;
+    async fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord>;
 
     /// Deletes one preset by preset name.
-    fn delete_preset(&self, name: &str) -> StoreResult<()>;
+    async fn delete_preset(&self, name: &str) -> StoreResult<()>;
 }
 
 /// Persisted skill storage API.
+#[async_trait]
 pub trait SkillStore {
     /// Returns all persisted skills for the given role.
-    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>>;
+    async fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>>;
 
     /// Returns one persisted skill for the given role and name.
-    fn get_skill(&self, role: SessionRole, name: &str) -> StoreResult<SkillRecord>;
+    async fn get_skill(&self, role: SessionRole, name: &str) -> StoreResult<SkillRecord>;
 
     /// Creates a new persisted skill for the given role.
-    fn add_skill(
+    async fn add_skill(
         &self,
         role: SessionRole,
         name: &str,
@@ -118,7 +183,7 @@ pub trait SkillStore {
     ) -> StoreResult<SkillRecord>;
 
     /// Creates a new version for an existing skill by patching the current version.
-    fn update_skill(
+    async fn update_skill(
         &self,
         role: SessionRole,
         name: &str,
@@ -126,7 +191,7 @@ pub trait SkillStore {
     ) -> StoreResult<SkillRecord>;
 
     /// Creates a new version cloned from a previous version and makes it current.
-    fn rollback_skill(
+    async fn rollback_skill(
         &self,
         role: SessionRole,
         name: &str,
@@ -135,25 +200,49 @@ pub trait SkillStore {
 }
 
 /// Prompt job storage API.
+#[async_trait]
 pub trait JobStore {
     /// Creates a new single-task prompt job record with a generated id.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
-    fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job>;
+    async fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job>;
+
+    /// Appends the prompt job base and creates a prompt job record atomically.
+    ///
+    /// Rejects the request when the branch already has an unfinished prompt job.
+    async fn submit_job_with_prompt_base(
+        &self,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job>;
 
     /// Creates a new single-task prompt job record with a caller-provided id.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
-    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job>;
+    async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job>;
+
+    /// Appends the prompt job base and creates a prompt job record with a caller-provided id atomically.
+    ///
+    /// Rejects the request when the branch already has an unfinished prompt job.
+    async fn submit_job_with_id_and_prompt_base(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<Job>;
 
     /// Returns a persisted prompt job.
-    fn get_job(&self, job_id: &str) -> StoreResult<Job>;
+    async fn get_job(&self, job_id: &str) -> StoreResult<Job>;
 
     /// Returns all persisted prompt jobs keyed by job id.
-    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>>;
+    async fn list_jobs(&self) -> StoreResult<HashMap<String, Job>>;
 
     /// Updates a prompt job lifecycle state when the current state matches.
-    fn set_job_status(
+    async fn set_job_status(
         &self,
         job_id: &str,
         expected: JobStatus,
@@ -161,7 +250,7 @@ pub trait JobStore {
     ) -> StoreResult<Job>;
 
     /// Moves the current work branch for an unfinished prompt job.
-    fn set_job_work_branch(
+    async fn set_job_work_branch(
         &self,
         job_id: &str,
         expected_work_branch: &str,
@@ -170,25 +259,26 @@ pub trait JobStore {
 }
 
 /// Generic persistent message queue storage API.
+#[async_trait]
 pub trait MessageQueueStore {
     /// Enqueues one message in a named queue.
-    fn enqueue_message(
+    async fn enqueue_message(
         &self,
         queue: &str,
         payload: serde_json::Value,
     ) -> StoreResult<MessageQueueItem>;
 
     /// Removes and returns the oldest message in a named queue.
-    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
+    async fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
 
     /// Returns the oldest message in a named queue without removing it.
-    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
+    async fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>>;
 
     /// Returns all persisted messages for a named queue in dequeue order.
-    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
+    async fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>>;
 
     /// Returns all queue names that currently contain at least one message.
-    fn list_message_queues(&self) -> StoreResult<Vec<String>>;
+    async fn list_message_queues(&self) -> StoreResult<Vec<String>>;
 }
 
 /// Capability for stores with a process-shareable backing path.
@@ -214,251 +304,4 @@ impl<T> Store for T where
 {
 }
 
-#[derive(Clone, Debug)]
-pub enum PersistentStore {
-    Sqlite(SqliteStore),
-}
-
-impl PersistentStore {
-    pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        SqliteStore::open(path).map(Self::Sqlite)
-    }
-
-    pub fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> StoreResult<Self> {
-        SqliteStore::open_read_only_or_upgrade_schema(path).map(Self::Sqlite)
-    }
-
-    pub fn store_path(&self) -> &Path {
-        match self {
-            Self::Sqlite(store) => store.store_path(),
-        }
-    }
-}
-
-macro_rules! delegate_persistent_store {
-    ($self:expr, $store:ident, $body:expr) => {
-        match $self {
-            PersistentStore::Sqlite($store) => $body,
-        }
-    };
-}
-
-impl NodeStore for PersistentStore {
-    fn root_id(&self) -> String {
-        delegate_persistent_store!(self, store, store.root_id())
-    }
-
-    fn append(&self, node: NewNode) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.append(node))
-    }
-
-    fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
-        delegate_persistent_store!(self, store, store.ancestry(head_ref))
-    }
-
-    fn log(&self, base_ref: &str, head_ref: &str) -> StoreResult<Vec<Node>> {
-        delegate_persistent_store!(self, store, store.log(base_ref, head_ref))
-    }
-
-    fn get_node(&self, id: &str) -> StoreResult<Node> {
-        delegate_persistent_store!(self, store, store.get_node(id))
-    }
-
-    fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>> {
-        delegate_persistent_store!(self, store, store.list_children(node_id))
-    }
-}
-
-impl BranchStore for PersistentStore {
-    fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.fork(name, from_ref))
-    }
-
-    fn get_branch_head(&self, name: &str) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.get_branch_head(name))
-    }
-
-    fn delete_branch(&self, name: &str) -> StoreResult<()> {
-        delegate_persistent_store!(self, store, store.delete_branch(name))
-    }
-
-    fn set_branch_head(
-        &self,
-        name: &str,
-        expected_old_head: &str,
-        new_head: &str,
-    ) -> StoreResult<()> {
-        delegate_persistent_store!(
-            self,
-            store,
-            store.set_branch_head(name, expected_old_head, new_head)
-        )
-    }
-}
-
-impl SessionStore for PersistentStore {
-    fn list_session_states(&self) -> StoreResult<HashMap<String, SessionState>> {
-        delegate_persistent_store!(self, store, store.list_session_states())
-    }
-
-    fn get_session_state(&self, name: &str) -> StoreResult<SessionState> {
-        delegate_persistent_store!(self, store, store.get_session_state(name))
-    }
-
-    fn set_session_state(
-        &self,
-        name: &str,
-        expected: Option<&SessionState>,
-        next: SessionState,
-    ) -> StoreResult<SessionState> {
-        delegate_persistent_store!(self, store, store.set_session_state(name, expected, next))
-    }
-
-    fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.rebase_session(name, patch))
-    }
-
-    fn handoff_session(
-        &self,
-        name: &str,
-        patch: &SessionAnchorPatch,
-        prompt: &str,
-    ) -> StoreResult<String> {
-        delegate_persistent_store!(self, store, store.handoff_session(name, patch, prompt))
-    }
-}
-
-impl PresetStore for PersistentStore {
-    fn list_preset_records(&self) -> StoreResult<HashMap<String, PresetRecord>> {
-        delegate_persistent_store!(self, store, store.list_preset_records())
-    }
-
-    fn get_preset_record(&self, name: &str) -> StoreResult<PresetRecord> {
-        delegate_persistent_store!(self, store, store.get_preset_record(name))
-    }
-
-    fn set_preset(&self, name: &str, preset: Preset) -> StoreResult<PresetRecord> {
-        delegate_persistent_store!(self, store, store.set_preset(name, preset))
-    }
-
-    fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord> {
-        delegate_persistent_store!(self, store, store.rollback_preset(name, target_version))
-    }
-
-    fn delete_preset(&self, name: &str) -> StoreResult<()> {
-        delegate_persistent_store!(self, store, store.delete_preset(name))
-    }
-}
-
-impl SkillStore for PersistentStore {
-    fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>> {
-        delegate_persistent_store!(self, store, store.list_skills(role))
-    }
-
-    fn get_skill(&self, role: SessionRole, name: &str) -> StoreResult<SkillRecord> {
-        delegate_persistent_store!(self, store, store.get_skill(role, name))
-    }
-
-    fn add_skill(
-        &self,
-        role: SessionRole,
-        name: &str,
-        spec: SkillVersionSpec,
-    ) -> StoreResult<SkillRecord> {
-        delegate_persistent_store!(self, store, store.add_skill(role, name, spec))
-    }
-
-    fn update_skill(
-        &self,
-        role: SessionRole,
-        name: &str,
-        patch: &SkillUpdatePatch,
-    ) -> StoreResult<SkillRecord> {
-        delegate_persistent_store!(self, store, store.update_skill(role, name, patch))
-    }
-
-    fn rollback_skill(
-        &self,
-        role: SessionRole,
-        name: &str,
-        target_version: u64,
-    ) -> StoreResult<SkillRecord> {
-        delegate_persistent_store!(
-            self,
-            store,
-            store.rollback_skill(role, name, target_version)
-        )
-    }
-}
-
-impl JobStore for PersistentStore {
-    fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job> {
-        delegate_persistent_store!(self, store, store.submit_job(branch, base))
-    }
-
-    fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
-        delegate_persistent_store!(self, store, store.submit_job_with_id(job_id, branch, base))
-    }
-
-    fn get_job(&self, job_id: &str) -> StoreResult<Job> {
-        delegate_persistent_store!(self, store, store.get_job(job_id))
-    }
-
-    fn list_jobs(&self) -> StoreResult<HashMap<String, Job>> {
-        delegate_persistent_store!(self, store, store.list_jobs())
-    }
-
-    fn set_job_status(
-        &self,
-        job_id: &str,
-        expected: JobStatus,
-        next: JobStatus,
-    ) -> StoreResult<Job> {
-        delegate_persistent_store!(self, store, store.set_job_status(job_id, expected, next))
-    }
-
-    fn set_job_work_branch(
-        &self,
-        job_id: &str,
-        expected_work_branch: &str,
-        next_work_branch: &str,
-    ) -> StoreResult<Job> {
-        delegate_persistent_store!(
-            self,
-            store,
-            store.set_job_work_branch(job_id, expected_work_branch, next_work_branch)
-        )
-    }
-}
-
-impl MessageQueueStore for PersistentStore {
-    fn enqueue_message(
-        &self,
-        queue: &str,
-        payload: serde_json::Value,
-    ) -> StoreResult<MessageQueueItem> {
-        delegate_persistent_store!(self, store, store.enqueue_message(queue, payload))
-    }
-
-    fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        delegate_persistent_store!(self, store, store.dequeue_message(queue))
-    }
-
-    fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        delegate_persistent_store!(self, store, store.peek_message(queue))
-    }
-
-    fn list_queue_messages(&self, queue: &str) -> StoreResult<Vec<MessageQueueItem>> {
-        delegate_persistent_store!(self, store, store.list_queue_messages(queue))
-    }
-
-    fn list_message_queues(&self) -> StoreResult<Vec<String>> {
-        delegate_persistent_store!(self, store, store.list_message_queues())
-    }
-}
-
-impl ProcessShareableStore for PersistentStore {
-    fn store_path(&self) -> &Path {
-        delegate_persistent_store!(self, store, store.store_path())
-    }
-}
+pub type PersistentStore = SqliteStore;
