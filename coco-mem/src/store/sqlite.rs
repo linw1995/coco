@@ -44,10 +44,10 @@ use crate::schema::{
     skills, store_meta,
 };
 use crate::{
-    Anchor, AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, Node,
-    NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor, Role, SessionAnchorPatch,
-    SessionRole, SessionState, SkillGroups, SkillInvocationMode, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec, default_skill_groups,
+    Anchor, AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode,
+    NewNodeContent, Node, NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor, Role,
+    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillInvocationMode, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -2700,38 +2700,103 @@ async fn update_branch_head_checked(
 ) -> Result<()> {
     connection
         .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
-            let actual = load_branch_head(connection, path, branch)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            if actual != expected_old_head {
-                return Err(SqliteTransactionError::Operation(
-                    BranchHeadMovedSnafu {
-                        name: branch.to_owned(),
-                        expected: expected_old_head.to_owned(),
-                        actual,
-                    }
-                    .build(),
-                ));
-            }
-            load_node_by_exact_id(connection, path, new_head)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            let updated = update_branch_head(connection, path, branch, expected_old_head, new_head)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            if updated != 1 {
-                return Err(SqliteTransactionError::Operation(
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!("SQLite branch {branch:?} did not match expected head"),
-                    }
-                    .build(),
-                ));
-            }
-            Ok(())
+            update_branch_head_checked_in_transaction(
+                connection,
+                path,
+                branch,
+                expected_old_head,
+                new_head,
+            )
+            .await
         })
         .await
         .map_err(|error| error.into_store_error(path))
+}
+
+async fn update_branch_head_checked_in_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected_old_head: &str,
+    new_head: &str,
+) -> std::result::Result<(), SqliteTransactionError> {
+    let actual = load_branch_head(connection, path, branch)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    if actual != expected_old_head {
+        return Err(SqliteTransactionError::Operation(
+            BranchHeadMovedSnafu {
+                name: branch.to_owned(),
+                expected: expected_old_head.to_owned(),
+                actual,
+            }
+            .build(),
+        ));
+    }
+    load_node_by_exact_id(connection, path, new_head)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    let updated = update_branch_head(connection, path, branch, expected_old_head, new_head)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    if updated != 1 {
+        return Err(SqliteTransactionError::Operation(
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("SQLite branch {branch:?} did not match expected head"),
+            }
+            .build(),
+        ));
+    }
+    Ok(())
+}
+
+async fn append_nodes_and_set_branch_head_in_transaction(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    expected_old_head: &str,
+    parent: &str,
+    nodes: Vec<NewNodeContent>,
+) -> std::result::Result<String, SqliteTransactionError> {
+    let actual = load_branch_head(connection, path, branch)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    if actual != expected_old_head {
+        return Err(SqliteTransactionError::Operation(
+            BranchHeadMovedSnafu {
+                name: branch.to_owned(),
+                expected: expected_old_head.to_owned(),
+                actual,
+            }
+            .build(),
+        ));
+    }
+    load_node_by_exact_id(connection, path, parent)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+
+    let mut head = parent.to_owned();
+    for content in nodes {
+        let node = Node::new(
+            head,
+            content.role,
+            content.metadata,
+            content.kind,
+            jiff::Timestamp::now(),
+        );
+        validate_new_node(connection, path, &node)
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+        persist_node_without_transaction(connection, path, &node)
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+        head = node.id;
+    }
+
+    update_branch_head_checked_in_transaction(connection, path, branch, expected_old_head, &head)
+        .await?;
+    Ok(head)
 }
 
 async fn delete_branch_record(
@@ -3700,6 +3765,16 @@ impl BranchStore for SqliteGraphStore {
     ) -> Result<()> {
         self.ensure_read_only()
     }
+
+    async fn append_nodes_and_set_branch_head(
+        &self,
+        _name: &str,
+        _expected_old_head: &str,
+        _parent: &str,
+        _nodes: Vec<NewNodeContent>,
+    ) -> Result<String> {
+        self.ensure_read_only()
+    }
 }
 
 #[async_trait]
@@ -3823,6 +3898,32 @@ impl BranchStore for SqliteStore {
             new_head,
         )
         .await
+    }
+
+    async fn append_nodes_and_set_branch_head(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> Result<String> {
+        self.ensure_writable()?;
+        let _write = self.database.inner.write.lock().await;
+        let mut connection = self.connect().await?;
+        connection
+            .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
+                append_nodes_and_set_branch_head_in_transaction(
+                    connection,
+                    &self.database_path,
+                    name,
+                    expected_old_head,
+                    parent,
+                    nodes,
+                )
+                .await
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
     }
 }
 

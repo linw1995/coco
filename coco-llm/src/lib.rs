@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use coco_mem::{
     Anchor, AnchorPayload, BackendMetadata, BranchStore, ExecutionMetadata, Kind, MergeParent,
-    NewNode, NodeMetadata, NodeStore, PauseReason, PromptAnchor, PromptAttachment,
+    NewNode, NewNodeContent, NodeMetadata, NodeStore, PauseReason, PromptAnchor, PromptAttachment,
     ProviderMetadata, Role, SessionAnchor, SessionRole, SessionState, SessionStore, SkillRecord,
     SkillResultAnchor, SkillStore, SqliteStore, StoreError, Tool, ToolResult, ToolUse,
 };
@@ -1577,6 +1577,16 @@ struct PreparedCompletionRun {
     resolved: ResolvedCompletionRequest,
 }
 
+struct SuccessfulBackendRunPersistence<'a> {
+    resolved: &'a ResolvedCompletionRequest,
+    original_head: &'a str,
+    retry_from_node_id: &'a str,
+    execution_id: &'a str,
+    head: Option<&'a str>,
+    text: &'a str,
+    steps: &'a [BackendStep],
+}
+
 impl<B, S> LlmService<B, S>
 where
     B: CompletionBackend,
@@ -1765,16 +1775,15 @@ where
         } = prepared;
         let (last_execution_id, steps) = normalize_backend_steps(steps, Some(text.clone()));
         let response_node_id = self
-            .persist_successful_backend_run(
-                &resolved,
-                &retry_from_node_id,
-                &last_execution_id,
-                head.as_deref(),
-                &text,
-                &steps,
-            )
-            .await?;
-        self.move_branch_head(&resolved.branch, &original_head, &response_node_id)
+            .persist_successful_backend_run(SuccessfulBackendRunPersistence {
+                resolved: &resolved,
+                original_head: &original_head,
+                retry_from_node_id: &retry_from_node_id,
+                execution_id: &last_execution_id,
+                head: head.as_deref(),
+                text: &text,
+                steps: &steps,
+            })
             .await?;
 
         tracing::info!(
@@ -1797,36 +1806,34 @@ where
 
     async fn persist_successful_backend_run(
         &self,
-        resolved: &ResolvedCompletionRequest,
-        retry_from_node_id: &str,
-        execution_id: &str,
-        head: Option<&str>,
-        text: &str,
-        steps: &[BackendStep],
+        run: SuccessfulBackendRunPersistence<'_>,
     ) -> Result<String> {
-        let trace_node_appender = resolved
-            .trace_node_appender
-            .as_ref()
-            .expect("completion runs should always persist through a trace node appender");
-        match head {
+        match run.head {
             Some(head_id) => {
-                self.validate_terminal_text_with_trace_node_appender(
-                    &resolved.branch,
-                    execution_id,
-                    head_id,
-                    text,
-                )
-                .await
+                let response_node_id = self
+                    .validate_terminal_text_with_trace_node_appender(
+                        &run.resolved.branch,
+                        run.execution_id,
+                        head_id,
+                        run.text,
+                    )
+                    .await?;
+                self.move_branch_head(&run.resolved.branch, run.original_head, &response_node_id)
+                    .await?;
+                Ok(response_node_id)
             }
             None => {
-                self.persist_backend_steps_with_trace_node_appender(
-                    &resolved.branch,
-                    retry_from_node_id,
-                    trace_node_appender,
-                    resolved.trace_node_store.as_deref(),
-                    steps,
-                )
-                .await
+                let response_node_id = self
+                    .store
+                    .append_nodes_and_set_branch_head(
+                        &run.resolved.branch,
+                        run.original_head,
+                        run.retry_from_node_id,
+                        backend_step_node_contents(run.steps),
+                    )
+                    .await
+                    .context(MemorySnafu)?;
+                Ok(response_node_id)
             }
         }
     }
@@ -3214,6 +3221,18 @@ fn persisted_nodes_from_backend_events(
     flush_tool_results(&mut nodes, &mut tool_results, &mut tool_result_metadata);
 
     nodes
+}
+
+fn backend_step_node_contents(steps: &[BackendStep]) -> Vec<NewNodeContent> {
+    steps
+        .iter()
+        .flat_map(|step| persisted_nodes_from_backend_events(&step.events, &step.execution))
+        .map(|(role, metadata, kind)| NewNodeContent {
+            role,
+            metadata,
+            kind,
+        })
+        .collect()
 }
 
 fn normalize_kind_for_primary_parent(kind: Kind, primary_parent: &str) -> Kind {

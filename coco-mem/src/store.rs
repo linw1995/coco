@@ -12,9 +12,9 @@ mod tests;
 pub use sqlite::{SqliteDatabase, SqliteGraphStore, SqliteStore};
 
 use crate::{
-    Job, JobStatus, MergeParent, MessageQueueItem, NewNode, Node, Preset, PresetRecord,
-    PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillRecord, SkillUpdatePatch,
-    SkillVersionSpec, StoreResult,
+    Job, JobStatus, MergeParent, MessageQueueItem, NewNode, NewNodeContent, Node, Preset,
+    PresetRecord, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
+    SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 /// Node graph storage API used by CoCo services.
@@ -58,6 +58,15 @@ pub trait BranchStore {
         expected_old_head: &str,
         new_head: &str,
     ) -> StoreResult<()>;
+
+    /// Appends nodes after `parent` and moves a branch head in the same operation.
+    async fn append_nodes_and_set_branch_head(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String>;
 }
 
 /// Branch workflow session state storage API.

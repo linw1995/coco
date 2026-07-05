@@ -246,6 +246,16 @@ impl BranchStore for MaterializationSourceSnapshot {
     ) -> coco_mem::StoreResult<()> {
         Self::read_only_error()
     }
+
+    async fn append_nodes_and_set_branch_head(
+        &self,
+        _name: &str,
+        _expected_old_head: &str,
+        _parent: &str,
+        _nodes: Vec<coco_mem::NewNodeContent>,
+    ) -> coco_mem::StoreResult<String> {
+        Self::read_only_error()
+    }
 }
 
 #[async_trait]
@@ -6125,6 +6135,18 @@ mod tests {
             _expected_old_head: &str,
             _new_head: &str,
         ) -> coco_mem::StoreResult<()> {
+            Err(coco_mem::StoreError::StoreReadOnly {
+                path: PathBuf::from("branch advance test store"),
+            })
+        }
+
+        async fn append_nodes_and_set_branch_head(
+            &self,
+            _name: &str,
+            _expected_old_head: &str,
+            _parent: &str,
+            _nodes: Vec<coco_mem::NewNodeContent>,
+        ) -> coco_mem::StoreResult<String> {
             Err(coco_mem::StoreError::StoreReadOnly {
                 path: PathBuf::from("branch advance test store"),
             })

@@ -4,9 +4,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use coco_mem::{
     BranchStore, Job, JobStatus, JobStore, MergeParent, MessageQueueItem, MessageQueueStore,
-    NewNode, Node, NodeStore, Preset, PresetRecord, PresetStore, ProcessShareableStore,
-    PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillRecord,
-    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    NewNode, NewNodeContent, Node, NodeStore, Preset, PresetRecord, PresetStore,
+    ProcessShareableStore, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState,
+    SessionStore, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 use crate::ConsolePublisher;
@@ -95,6 +95,20 @@ where
         self.notify_if_ok(
             self.inner
                 .set_branch_head(name, expected_old_head, new_head)
+                .await,
+        )
+    }
+
+    async fn append_nodes_and_set_branch_head(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String> {
+        self.notify_if_ok(
+            self.inner
+                .append_nodes_and_set_branch_head(name, expected_old_head, parent, nodes)
                 .await,
         )
     }

@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use super::sqlite::SqliteStore;
 use crate::{
     Anchor, BranchStore, JobStatus, JobStore, Kind, MergeParent, MessageQueueItem,
-    MessageQueueStore, NewNode, NodeStore, PauseReason, Preset, PresetStore, PromptAnchor, Role,
-    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillScript,
-    SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError as Error,
+    MessageQueueStore, NewNode, NewNodeContent, NodeStore, PauseReason, Preset, PresetStore,
+    PromptAnchor, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
+    SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError as Error,
 };
 use serde_json::json;
 
@@ -786,6 +786,54 @@ where
             target_branch: "base".to_owned(),
             base_head_id: store.get_branch_head("base").await.unwrap(),
         }
+    );
+}
+
+async fn assert_append_nodes_and_set_branch_head_rolls_back_on_append_failure<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    let session_id = store
+        .append(make_session_anchor_node(&root_id))
+        .await
+        .unwrap();
+    store.fork("main", &session_id).await.unwrap();
+    let children_before = store.list_children(&session_id).await.unwrap();
+
+    let err = store
+        .append_nodes_and_set_branch_head(
+            "main",
+            &session_id,
+            &session_id,
+            vec![
+                NewNodeContent {
+                    role: Role::LLM,
+                    metadata: None,
+                    kind: Kind::Text("partial".to_owned()),
+                },
+                NewNodeContent {
+                    role: Role::System,
+                    metadata: None,
+                    kind: Kind::Anchor(Anchor::prompt(
+                        vec![MergeParent::merge("missing")],
+                        PromptAnchor {
+                            prompt: "invalid".to_owned(),
+                            attachments: vec![],
+                        },
+                    )),
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ParentNotFound { id } if id == "missing"));
+    assert_eq!(store.get_branch_head("main").await.unwrap(), session_id);
+    assert_eq!(
+        store.list_children(&session_id).await.unwrap(),
+        children_before
     );
 }
 
@@ -2542,6 +2590,11 @@ macro_rules! define_common_store_tests {
             #[tokio::test]
             async fn set_branch_head_preserves_attached_state() {
                 assert_set_branch_head_preserves_attached_state::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn append_nodes_and_set_branch_head_rolls_back_on_append_failure() {
+                assert_append_nodes_and_set_branch_head_rolls_back_on_append_failure::<$factory>().await;
             }
 
             #[tokio::test]
