@@ -2018,10 +2018,10 @@ mod tests {
             "parent": "parent-node",
             "created_at": "1970-01-01T00:00:00Z",
             "role": Role::User,
-            "metadata": {
+            "metadata": [{
                 "execution_id": "execution-1",
                 "call_id": null
-            },
+            }],
             "kind": kind,
         }))
         .expect("show test node should deserialize");
