@@ -2,9 +2,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{
-    Anchor, AnchorPayloadKind, NodeMetadata, OneOrMany, ToolResult, ToolUse, hash::hex_encode,
-};
+use super::{Anchor, AnchorPayloadKind, NodeMetadata, ToolResult, ToolUse, hash::hex_encode};
 
 /// Represents a node in the memory graph, similar to a git commit
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -42,8 +40,8 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Kind {
     Anchor(Anchor),
-    ToolUse(OneOrMany<ToolUse>),
-    ToolResult(OneOrMany<ToolResult>),
+    ToolUse(Vec<ToolUse>),
+    ToolResult(Vec<ToolResult>),
     Text(String),
     Failure(String),
 }
@@ -101,37 +99,37 @@ impl Kind {
     }
 
     pub fn tool_use(tool_use: ToolUse) -> Self {
-        Self::ToolUse(OneOrMany::one(tool_use))
+        Self::ToolUse(vec![tool_use])
     }
 
     pub fn tool_uses(tool_uses: Vec<ToolUse>) -> Self {
-        Self::ToolUse(OneOrMany::many(tool_uses))
+        Self::ToolUse(tool_uses)
     }
 
     pub fn tool_use_items(tool_uses: Vec<ToolUse>) -> Self {
-        Self::ToolUse(OneOrMany::from_items(tool_uses))
+        Self::ToolUse(tool_uses)
     }
 
     pub fn tool_result(tool_result: ToolResult) -> Self {
-        Self::ToolResult(OneOrMany::one(tool_result))
+        Self::ToolResult(vec![tool_result])
     }
 
     pub fn tool_results(tool_results: Vec<ToolResult>) -> Self {
-        Self::ToolResult(OneOrMany::many(tool_results))
+        Self::ToolResult(tool_results)
     }
 
     pub fn tool_result_items(tool_results: Vec<ToolResult>) -> Self {
-        Self::ToolResult(OneOrMany::from_items(tool_results))
+        Self::ToolResult(tool_results)
     }
 
-    pub fn as_tool_uses(&self) -> Option<&OneOrMany<ToolUse>> {
+    pub fn as_tool_uses(&self) -> Option<&[ToolUse]> {
         match self {
             Self::ToolUse(tool_uses) => Some(tool_uses),
             Self::Anchor(_) | Self::ToolResult(_) | Self::Text(_) | Self::Failure(_) => None,
         }
     }
 
-    pub fn as_tool_results(&self) -> Option<&OneOrMany<ToolResult>> {
+    pub fn as_tool_results(&self) -> Option<&[ToolResult]> {
         match self {
             Self::ToolResult(tool_results) => Some(tool_results),
             Self::Anchor(_) | Self::ToolUse(_) | Self::Text(_) | Self::Failure(_) => None,

@@ -45,10 +45,10 @@ use crate::schema::{
     node_tool_uses, nodes, presets, sessions, skills, store_meta,
 };
 use crate::{
-    Anchor, AnchorPayload, Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode,
-    NewNodeContent, Node, NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor, Role,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillInvocationMode, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec, ToolResult, ToolUse, default_skill_groups,
+    Anchor, AnchorPayload, BackendMetadata, Job, JobStatus, Kind, MergeParent, MessageQueueItem,
+    NewNode, NewNodeContent, Node, NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor,
+    Role, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillInvocationMode,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec, ToolResult, ToolUse, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -1360,11 +1360,7 @@ fn canonical_node_metadata_json(
             path: path.to_owned(),
             column: "nodes.metadata_json".to_owned(),
         })?;
-    let metadata = NodeMetadata::from_items(legacy_one_or_many_items(
-        path,
-        "nodes.metadata_json",
-        value,
-    )?);
+    let metadata = legacy_one_or_many_items::<BackendMetadata>(path, "nodes.metadata_json", value)?;
     serde_json::to_string(&metadata)
         .map(Some)
         .context(ParseSqliteStoreValueSnafu {
@@ -5223,9 +5219,9 @@ mod tests {
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MergeParent,
-        MessageQueueStore, NewNode, Node, NodeMetadata, NodeStore, PauseReason, Preset,
-        PresetStore, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
-        SessionStore, SkillStore, SkillUpdatePatch, SkillVersionSpec, ToolResult, ToolUse,
+        MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore, Role,
+        SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillStore,
+        SkillUpdatePatch, SkillVersionSpec, ToolResult, ToolUse,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -5635,7 +5631,7 @@ mod tests {
             ]))
         );
         let tool_use = store.get_node("tool-use-node").await.unwrap();
-        assert_eq!(tool_use.kind.as_tool_uses().unwrap().items().len(), 1);
+        assert_eq!(tool_use.kind.as_tool_uses().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -5903,7 +5899,7 @@ mod tests {
             .append(NewNode {
                 parent: root_id.clone(),
                 role: Role::User,
-                metadata: Some(NodeMetadata::one(single_metadata)),
+                metadata: Some(vec![single_metadata]),
                 kind: Kind::Text("single metadata".to_owned()),
             })
             .await
@@ -5912,7 +5908,7 @@ mod tests {
             .append(NewNode {
                 parent: root_id,
                 role: Role::LLM,
-                metadata: Some(NodeMetadata::many(vec![
+                metadata: Some(vec![
                     BackendMetadata {
                         execution_id: Some("execution-many".to_owned()),
                         call_id: Some("call-a".to_owned()),
@@ -5921,7 +5917,7 @@ mod tests {
                         execution_id: Some("execution-many".to_owned()),
                         call_id: Some("call-b".to_owned()),
                     },
-                ])),
+                ]),
                 kind: Kind::Text("many metadata".to_owned()),
             })
             .await
