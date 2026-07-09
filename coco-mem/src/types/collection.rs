@@ -1,34 +1,24 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum ManyOrOne<T> {
-    One(T),
-    Many(Vec<T>),
-}
+#[serde(transparent)]
+pub struct OneOrMany<T>(Vec<T>);
 
-impl<T> ManyOrOne<T> {
+impl<T> OneOrMany<T> {
     pub fn one(value: T) -> Self {
-        Self::One(value)
+        Self(vec![value])
     }
 
     pub fn many(values: Vec<T>) -> Self {
         Self::from_items(values)
     }
 
-    pub fn from_items(mut items: Vec<T>) -> Self {
-        if items.len() == 1 {
-            Self::One(items.pop().expect("items length is one"))
-        } else {
-            Self::Many(items)
-        }
+    pub fn from_items(items: Vec<T>) -> Self {
+        Self(items)
     }
 
     pub fn items(&self) -> &[T] {
-        match self {
-            Self::One(item) => std::slice::from_ref(item),
-            Self::Many(items) => items,
-        }
+        &self.0
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
@@ -40,14 +30,15 @@ impl<T> ManyOrOne<T> {
     }
 
     pub fn as_one(&self) -> Option<&T> {
-        match self {
-            Self::One(item) => Some(item),
-            Self::Many(_) => None,
+        if self.0.len() == 1 {
+            self.0.first()
+        } else {
+            None
         }
     }
 }
 
-impl<T> From<T> for ManyOrOne<T> {
+impl<T> From<T> for OneOrMany<T> {
     fn from(value: T) -> Self {
         Self::one(value)
     }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ManyOrOne;
+use super::OneOrMany;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionMetadata {
@@ -20,7 +20,7 @@ pub struct BackendMetadata {
     pub call_id: Option<String>,
 }
 
-pub type NodeMetadata = ManyOrOne<BackendMetadata>;
+pub type NodeMetadata = OneOrMany<BackendMetadata>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendMetadataBuilder {

@@ -374,15 +374,7 @@ fn skill_version_id_is_lower_hex_sha256() {
 }
 
 #[test]
-fn tool_use_payload_accepts_one_or_many_items() {
-    let one: Kind = serde_json::from_value(serde_json::json!({
-        "ToolUse": {
-            "id": "tool-call-1",
-            "name": "exec_command",
-            "input": { "cmd": "pwd" }
-        }
-    }))
-    .unwrap();
+fn tool_use_payload_requires_item_list() {
     let many: Kind = serde_json::from_value(serde_json::json!({
         "ToolUse": [
             {
@@ -399,7 +391,15 @@ fn tool_use_payload_accepts_one_or_many_items() {
     }))
     .unwrap();
 
-    assert_eq!(one.as_tool_uses().unwrap().iter().count(), 1);
+    let one = serde_json::from_value::<Kind>(serde_json::json!({
+        "ToolUse": {
+            "id": "tool-call-1",
+            "name": "exec_command",
+            "input": { "cmd": "pwd" }
+        }
+    }));
+
+    assert!(one.is_err());
     assert_eq!(many.as_tool_uses().unwrap().iter().count(), 2);
     assert_eq!(many.as_tool_uses().unwrap().items()[0].id, "tool-call-1");
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use coco_mem::{
-    Anchor, AnchorPayload, BranchStore, Kind, ManyOrOne, MergeParent, Node, NodeStore, PauseReason,
+    Anchor, AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, OneOrMany, PauseReason,
     SessionAnchor, SessionState, SessionStore, ToolResult, ToolUse,
 };
 use serde::{Deserialize, Serialize};
@@ -1222,14 +1222,14 @@ fn render_session_content(session: &SessionAnchor) -> String {
     }
 }
 
-fn render_tool_use_content(tool_uses: &ManyOrOne<ToolUse>) -> String {
+fn render_tool_use_content(tool_uses: &OneOrMany<ToolUse>) -> String {
     tool_uses
         .first()
         .map(|tool_use| tool_use.input.to_string())
         .unwrap_or_default()
 }
 
-fn render_tool_result_content(tool_results: &ManyOrOne<ToolResult>) -> String {
+fn render_tool_result_content(tool_results: &OneOrMany<ToolResult>) -> String {
     tool_results
         .first()
         .map(|tool_result| tool_result.output.clone())
