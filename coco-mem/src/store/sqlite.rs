@@ -5743,7 +5743,7 @@ mod tests {
             .unwrap();
     }
 
-    fn create_v6_store_with_legacy_node_items(path: &std::path::Path) {
+    fn create_v6_store_with_legacy_data(path: &std::path::Path) {
         use diesel::connection::SimpleConnection;
 
         std::fs::create_dir(path).unwrap();
@@ -5807,6 +5807,25 @@ mod tests {
                 INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal) VALUES
                     ('tool-use-node', 'root', 'primary', 0),
                     ('tool-result-node', 'tool-use-node', 'primary', 0);
+                INSERT INTO jobs (
+                    job_id,
+                    created_at,
+                    finished_at,
+                    branch,
+                    work_branch,
+                    base,
+                    status,
+                    payload_json
+                ) VALUES (
+                    'job-v6',
+                    '2026-03-25T09:10:13Z',
+                    NULL,
+                    'main',
+                    'main',
+                    'root',
+                    'running',
+                    '{"job_id":"job-v6","created_at":"2026-03-25T09:10:13Z","branch":"main","base":"root","status":"running"}'
+                );
                 "#,
             )
             .unwrap();
@@ -5825,10 +5844,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_migrates_v6_tool_items_to_item_tables() {
+    async fn open_migrates_v6_data_to_current_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
 
         let store = SqliteStore::open(&path).await.unwrap();
 
@@ -5877,6 +5896,18 @@ mod tests {
         );
         assert!(!node_has_metadata_json_column(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
+        assert_eq!(
+            store.get_job("job-v6").await.unwrap(),
+            Job {
+                job_id: "job-v6".to_owned(),
+                created_at: "2026-03-25T09:10:13Z".parse().unwrap(),
+                finished_at: None,
+                branch: "main".to_owned(),
+                work_branch: "main".to_owned(),
+                base: "root".to_owned(),
+                status: JobStatus::Running,
+            }
+        );
         let tool_use = store.get_node("tool-use-node").await.unwrap();
         assert_eq!(tool_use.kind.as_tool_uses().unwrap().len(), 2);
         assert_eq!(
@@ -5907,7 +5938,7 @@ mod tests {
     fn contraction_migration_requires_completed_backfill() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
@@ -5932,7 +5963,7 @@ mod tests {
     async fn contraction_migration_down_restores_metadata_json() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
         let store = SqliteStore::open(&path).await.unwrap();
         drop(store);
         let database_path = super::sqlite_database_path(&path);
@@ -5971,7 +6002,7 @@ mod tests {
     async fn node_item_migration_down_restores_kind_json() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
         let store = SqliteStore::open(&path).await.unwrap();
         drop(store);
         let database_path = super::sqlite_database_path(&path);
