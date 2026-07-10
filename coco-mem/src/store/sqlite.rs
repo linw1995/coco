@@ -5647,6 +5647,18 @@ mod tests {
             != 0
     }
 
+    fn valid_job_row() -> super::JobRow {
+        super::JobRow {
+            job_id: "job-test".to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            finished_at: None,
+            branch: "main".to_owned(),
+            work_branch: "main".to_owned(),
+            base: "base".to_owned(),
+            status: "queued".to_owned(),
+        }
+    }
+
     async fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
         let mut connection = store.connect().await.unwrap();
         nodes::table
@@ -6118,6 +6130,39 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[test]
+    fn job_row_rejects_empty_work_branch() {
+        let mut row = valid_job_row();
+        row.work_branch.clear();
+
+        let error = super::job_row_into_job(std::path::Path::new("store.sqlite3"), row)
+            .expect_err("empty work branch must fail");
+
+        assert!(error.to_string().contains("empty work branch"));
+    }
+
+    #[test]
+    fn job_row_rejects_invalid_timestamp() {
+        let mut row = valid_job_row();
+        row.created_at = "invalid".to_owned();
+
+        let error = super::job_row_into_job(std::path::Path::new("store.sqlite3"), row)
+            .expect_err("invalid timestamp must fail");
+
+        assert!(error.to_string().contains("invalid SQLite job timestamp"));
+    }
+
+    #[test]
+    fn job_row_rejects_invalid_status() {
+        let mut row = valid_job_row();
+        row.status = "invalid".to_owned();
+
+        let error = super::job_row_into_job(std::path::Path::new("store.sqlite3"), row)
+            .expect_err("invalid status must fail");
+
+        assert!(error.to_string().contains("invalid SQLite job status"));
     }
 
     #[tokio::test]
