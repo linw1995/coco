@@ -251,6 +251,12 @@ struct NodeItemBackfillRow {
     kind_json: String,
 }
 
+enum LegacyNodeMetadata {
+    Missing,
+    One(BackendMetadata),
+    Many(NodeMetadata),
+}
+
 #[derive(Queryable, QueryableByName)]
 struct SessionRow {
     #[diesel(sql_type = Text)]
@@ -1337,8 +1343,9 @@ async fn backfill_node_item_row(
     row: NodeItemBackfillRow,
 ) -> Result<()> {
     let metadata = legacy_node_metadata(path, row.metadata_json.as_deref())?;
-    let (kind_json, tool_use_rows, tool_result_rows) =
+    let (kind_json, tool_use_rows, tool_result_rows, tool_item_count) =
         canonical_kind_json_and_tool_rows(path, &row.id, &row.kind_json)?;
+    let metadata = metadata.into_node_metadata(tool_item_count);
 
     diesel::update(nodes::table.filter(nodes::id.eq(&row.id)))
         .set(nodes::kind_json.eq(kind_json))
@@ -1397,23 +1404,56 @@ async fn backfill_node_item_row(
     Ok(())
 }
 
-fn legacy_node_metadata(path: &Path, metadata_json: Option<&str>) -> Result<Option<NodeMetadata>> {
+fn legacy_node_metadata(path: &Path, metadata_json: Option<&str>) -> Result<LegacyNodeMetadata> {
     let Some(metadata_json) = metadata_json else {
-        return Ok(None);
+        return Ok(LegacyNodeMetadata::Missing);
     };
     let value =
         serde_json::from_str::<Value>(metadata_json).context(ParseSqliteStoreValueSnafu {
             path: path.to_owned(),
             column: "nodes.metadata_json".to_owned(),
         })?;
-    legacy_one_or_many_items::<BackendMetadata>(path, "nodes.metadata_json", value).map(Some)
+    match value {
+        Value::Object(_) => serde_json::from_value(value)
+            .map(LegacyNodeMetadata::One)
+            .context(ParseSqliteStoreValueSnafu {
+                path: path.to_owned(),
+                column: "nodes.metadata_json".to_owned(),
+            }),
+        Value::Array(items) => items
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value(value).context(ParseSqliteStoreValueSnafu {
+                    path: path.to_owned(),
+                    column: "nodes.metadata_json".to_owned(),
+                })
+            })
+            .collect::<Result<_>>()
+            .map(LegacyNodeMetadata::Many),
+        _ => CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "SQLite nodes.metadata_json must be an object or array for migration"
+                .to_owned(),
+        }
+        .fail(),
+    }
+}
+
+impl LegacyNodeMetadata {
+    fn into_node_metadata(self, tool_item_count: usize) -> Option<NodeMetadata> {
+        match self {
+            Self::Missing => None,
+            Self::One(metadata) => Some(vec![metadata; tool_item_count.max(1)]),
+            Self::Many(metadata) => Some(metadata),
+        }
+    }
 }
 
 fn canonical_kind_json_and_tool_rows(
     path: &Path,
     node_id: &str,
     kind_json: &str,
-) -> Result<(String, Vec<NodeToolUseRow>, Vec<NodeToolResultRow>)> {
+) -> Result<(String, Vec<NodeToolUseRow>, Vec<NodeToolResultRow>, usize)> {
     let value = serde_json::from_str::<Value>(kind_json).context(ParseSqliteStoreValueSnafu {
         path: path.to_owned(),
         column: "nodes.kind_json".to_owned(),
@@ -1425,7 +1465,8 @@ fn canonical_kind_json_and_tool_rows(
         let kind = Kind::tool_use_items(tool_uses);
         let kind_json = kind_residual_json(&kind, path)?;
         let rows = expected_node_tool_use_rows(node_id, &kind, path)?;
-        return Ok((kind_json, rows, Vec::new()));
+        let item_count = rows.len();
+        return Ok((kind_json, rows, Vec::new(), item_count));
     }
 
     if let Some(payload) = value.get("ToolResult") {
@@ -1437,10 +1478,11 @@ fn canonical_kind_json_and_tool_rows(
         let kind = Kind::tool_result_items(tool_results);
         let kind_json = kind_residual_json(&kind, path)?;
         let rows = expected_node_tool_result_rows(node_id, &kind);
-        return Ok((kind_json, Vec::new(), rows));
+        let item_count = rows.len();
+        return Ok((kind_json, Vec::new(), rows, item_count));
     }
 
-    Ok((kind_json.to_owned(), Vec::new(), Vec::new()))
+    Ok((kind_json.to_owned(), Vec::new(), Vec::new(), 1))
 }
 
 fn legacy_one_or_many_items<T>(path: &Path, column: &str, value: Value) -> Result<Vec<T>>
@@ -5661,7 +5703,7 @@ mod tests {
             .unwrap();
     }
 
-    fn create_v6_store_with_legacy_single_tool_items(path: &std::path::Path) {
+    fn create_v6_store_with_legacy_node_items(path: &std::path::Path) {
         use diesel::connection::SimpleConnection;
 
         std::fs::create_dir(path).unwrap();
@@ -5710,7 +5752,7 @@ mod tests {
                     'tool_use',
                     NULL,
                     '{"execution_id":"execution-1","call_id":"call-1"}',
-                    '{"ToolUse":{"id":"tool-call-1","name":"exec_command","input":{"cmd":"pwd"}}}'
+                    '{"ToolUse":[{"id":"tool-call-1","name":"exec_command","input":{"cmd":"pwd"}},{"id":"tool-call-2","name":"exec_command","input":{"cmd":"ls"}}]}'
                 ),
                 (
                     'tool-result-node',
@@ -5719,8 +5761,8 @@ mod tests {
                     'user',
                     'tool_result',
                     NULL,
-                    NULL,
-                    '{"ToolResult":{"id":"tool-call-1","output":"ok"}}'
+                    '[{"execution_id":"execution-2","call_id":"call-result"}]',
+                    '{"ToolResult":[{"id":"tool-call-1","output":"ok"},{"id":"tool-call-2","output":"done"}]}'
                 );
                 INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal) VALUES
                     ('tool-use-node', 'root', 'primary', 0),
@@ -5745,29 +5787,46 @@ mod tests {
     async fn open_migrates_v6_tool_items_to_item_tables() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_single_tool_items(&path);
+        create_v6_store_with_legacy_node_items(&path);
 
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert_eq!(store.schema_version().await.unwrap(), 8);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
-            vec![NodeToolUseRow {
-                node_id: "tool-use-node".to_owned(),
-                ordinal: 0,
-                tool_use_id: "tool-call-1".to_owned(),
-                name: "exec_command".to_owned(),
-                input_json: r#"{"cmd":"pwd"}"#.to_owned(),
-            }]
+            vec![
+                NodeToolUseRow {
+                    node_id: "tool-use-node".to_owned(),
+                    ordinal: 0,
+                    tool_use_id: "tool-call-1".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input_json: r#"{"cmd":"pwd"}"#.to_owned(),
+                },
+                NodeToolUseRow {
+                    node_id: "tool-use-node".to_owned(),
+                    ordinal: 1,
+                    tool_use_id: "tool-call-2".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input_json: r#"{"cmd":"ls"}"#.to_owned(),
+                },
+            ]
         );
         assert_eq!(
             node_tool_result_rows(&store, "tool-result-node").await,
-            vec![NodeToolResultRow {
-                node_id: "tool-result-node".to_owned(),
-                ordinal: 0,
-                tool_result_id: "tool-call-1".to_owned(),
-                output: "ok".to_owned(),
-            }]
+            vec![
+                NodeToolResultRow {
+                    node_id: "tool-result-node".to_owned(),
+                    ordinal: 0,
+                    tool_result_id: "tool-call-1".to_owned(),
+                    output: "ok".to_owned(),
+                },
+                NodeToolResultRow {
+                    node_id: "tool-result-node".to_owned(),
+                    ordinal: 1,
+                    tool_result_id: "tool-call-2".to_owned(),
+                    output: "done".to_owned(),
+                },
+            ]
         );
         assert_eq!(
             node_kind_json(&store, "tool-use-node").await,
@@ -5777,12 +5836,27 @@ mod tests {
         );
         assert!(!node_has_metadata_json_column(&store).await);
         let tool_use = store.get_node("tool-use-node").await.unwrap();
-        assert_eq!(tool_use.kind.as_tool_uses().unwrap().len(), 1);
+        assert_eq!(tool_use.kind.as_tool_uses().unwrap().len(), 2);
         assert_eq!(
             tool_use.metadata,
+            Some(vec![
+                BackendMetadata {
+                    execution_id: Some("execution-1".to_owned()),
+                    call_id: Some("call-1".to_owned()),
+                },
+                BackendMetadata {
+                    execution_id: Some("execution-1".to_owned()),
+                    call_id: Some("call-1".to_owned()),
+                },
+            ])
+        );
+        let tool_result = store.get_node("tool-result-node").await.unwrap();
+        assert_eq!(tool_result.kind.as_tool_results().unwrap().len(), 2);
+        assert_eq!(
+            tool_result.metadata,
             Some(vec![BackendMetadata {
-                execution_id: Some("execution-1".to_owned()),
-                call_id: Some("call-1".to_owned()),
+                execution_id: Some("execution-2".to_owned()),
+                call_id: Some("call-result".to_owned()),
             }])
         );
     }
@@ -5791,7 +5865,7 @@ mod tests {
     fn contraction_migration_requires_completed_backfill() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_single_tool_items(&path);
+        create_v6_store_with_legacy_node_items(&path);
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
@@ -5816,7 +5890,7 @@ mod tests {
     async fn contraction_migration_down_restores_metadata_json() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_single_tool_items(&path);
+        create_v6_store_with_legacy_node_items(&path);
         let store = SqliteStore::open(&path).await.unwrap();
         drop(store);
         let database_path = super::sqlite_database_path(&path);
@@ -5835,10 +5909,16 @@ mod tests {
         assert_eq!(
             row.metadata_json
                 .map(|value| serde_json::from_str::<serde_json::Value>(&value).unwrap()),
-            Some(serde_json::json!([{
-                "execution_id": "execution-1",
-                "call_id": "call-1"
-            }]))
+            Some(serde_json::json!([
+                {
+                    "execution_id": "execution-1",
+                    "call_id": "call-1"
+                },
+                {
+                    "execution_id": "execution-1",
+                    "call_id": "call-1"
+                }
+            ]))
         );
     }
 
