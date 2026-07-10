@@ -52,7 +52,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 8;
+const SQLITE_SCHEMA_VERSION: i32 = 9;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -284,7 +284,6 @@ struct JobRow {
     work_branch: String,
     base: String,
     status: String,
-    payload_json: String,
 }
 
 macro_rules! node_row_columns {
@@ -3736,7 +3735,6 @@ async fn load_job_map(
             jobs::work_branch,
             jobs::base,
             jobs::status,
-            jobs::payload_json,
         ))
         .order(jobs::job_id)
         .load::<JobRow>(connection)
@@ -3767,7 +3765,6 @@ async fn load_job(
             jobs::work_branch,
             jobs::base,
             jobs::status,
-            jobs::payload_json,
         ))
         .get_result::<JobRow>(connection)
         .await
@@ -3782,14 +3779,52 @@ async fn load_job(
 }
 
 fn job_row_into_job(path: &Path, row: JobRow) -> Result<Job> {
-    let mut job =
-        serde_json::from_str::<Job>(&row.payload_json).context(ParseSqliteStoreValueSnafu {
+    ensure!(
+        !row.work_branch.is_empty(),
+        CorruptedStoreSnafu {
             path: path.to_owned(),
-            column: "jobs.payload_json".to_owned(),
-        })?;
-    job.normalize_work_branch();
-    validate_job_row_summary(&row, &job, path)?;
-    Ok(job)
+            message: format!("SQLite job {:?} has an empty work branch", row.job_id),
+        }
+    );
+    let created_at = parse_job_timestamp(path, "jobs.created_at", &row.created_at)?;
+    let finished_at = row
+        .finished_at
+        .as_deref()
+        .map(|value| parse_job_timestamp(path, "jobs.finished_at", value))
+        .transpose()?;
+    let status = parse_job_status(path, &row.status)?;
+
+    Ok(Job {
+        job_id: row.job_id,
+        created_at,
+        finished_at,
+        branch: row.branch,
+        work_branch: row.work_branch,
+        base: row.base,
+        status,
+    })
+}
+
+fn parse_job_timestamp(path: &Path, column: &str, value: &str) -> Result<jiff::Timestamp> {
+    value
+        .parse()
+        .map_err(|source| crate::StoreError::CorruptedStore {
+            path: path.to_owned(),
+            message: format!("invalid SQLite job timestamp in {column}: {source}"),
+        })
+}
+
+fn parse_job_status(path: &Path, status: &str) -> Result<JobStatus> {
+    match status {
+        "queued" => Ok(JobStatus::Queued),
+        "running" => Ok(JobStatus::Running),
+        "finished" => Ok(JobStatus::Finished),
+        _ => CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("invalid SQLite job status {status:?}"),
+        }
+        .fail(),
+    }
 }
 
 async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &Job) -> Result<()> {
@@ -3799,10 +3834,6 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
         .finished_at
         .as_ref()
         .map(std::string::ToString::to_string);
-    let payload_json = serde_json::to_string(job).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: "jobs.payload_json".to_owned(),
-    })?;
     diesel::insert_into(jobs::table)
         .values((
             jobs::job_id.eq(&job.job_id),
@@ -3812,7 +3843,6 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
             jobs::work_branch.eq(&summary.work_branch),
             jobs::base.eq(&summary.base),
             jobs::status.eq(summary.status.as_str()),
-            jobs::payload_json.eq(payload_json),
         ))
         .on_conflict(jobs::job_id)
         .do_update()
@@ -3823,7 +3853,6 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
             jobs::work_branch.eq(diesel::upsert::excluded(jobs::work_branch)),
             jobs::base.eq(diesel::upsert::excluded(jobs::base)),
             jobs::status.eq(diesel::upsert::excluded(jobs::status)),
-            jobs::payload_json.eq(diesel::upsert::excluded(jobs::payload_json)),
         ))
         .execute(connection)
         .await
@@ -3962,31 +3991,6 @@ fn job_uses_active_branch(job: &Job, branch: &str) -> bool {
         job.work_branch.as_str()
     };
     job.branch == branch || work_branch == branch
-}
-
-fn validate_job_row_summary(row: &JobRow, job: &Job, path: &Path) -> Result<()> {
-    let finished_at = job
-        .finished_at
-        .as_ref()
-        .map(std::string::ToString::to_string);
-
-    validate_text_summary(path, "jobs.job_id", &row.job_id, &job.job_id)?;
-    validate_text_summary(
-        path,
-        "jobs.created_at",
-        &row.created_at,
-        &job.created_at.to_string(),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "jobs.finished_at",
-        row.finished_at.as_deref(),
-        finished_at.as_deref(),
-    )?;
-    validate_text_summary(path, "jobs.branch", &row.branch, &job.branch)?;
-    validate_text_summary(path, "jobs.work_branch", &row.work_branch, &job.work_branch)?;
-    validate_text_summary(path, "jobs.base", &row.base, &job.base)?;
-    validate_text_summary(path, "jobs.status", &row.status, job.status.as_str())
 }
 
 fn validate_text_summary(
@@ -5408,7 +5412,7 @@ mod tests {
         store_meta,
     };
     use crate::{
-        Anchor, BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MergeParent,
+        Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
         MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore, Role,
         SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillStore,
         SkillUpdatePatch, SkillVersionSpec, ToolResult, ToolUse,
@@ -5480,6 +5484,12 @@ mod tests {
     struct LegacyKindJson {
         #[diesel(sql_type = diesel::sql_types::Text)]
         kind_json: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct LegacyJobPayloadJson {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        payload_json: String,
     }
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -5625,6 +5635,30 @@ mod tests {
             != 0
     }
 
+    async fn job_has_payload_json_column(store: &SqliteStore) -> bool {
+        let mut connection = store.connect().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('jobs') WHERE name = 'payload_json'",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
+    }
+
+    fn valid_job_row() -> super::JobRow {
+        super::JobRow {
+            job_id: "job-test".to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            finished_at: None,
+            branch: "main".to_owned(),
+            work_branch: "main".to_owned(),
+            base: "base".to_owned(),
+            status: "queued".to_owned(),
+        }
+    }
+
     async fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
         let mut connection = store.connect().await.unwrap();
         nodes::table
@@ -5709,7 +5743,7 @@ mod tests {
             .unwrap();
     }
 
-    fn create_v6_store_with_legacy_node_items(path: &std::path::Path) {
+    fn create_v6_store_with_legacy_data(path: &std::path::Path) {
         use diesel::connection::SimpleConnection;
 
         std::fs::create_dir(path).unwrap();
@@ -5773,6 +5807,25 @@ mod tests {
                 INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal) VALUES
                     ('tool-use-node', 'root', 'primary', 0),
                     ('tool-result-node', 'tool-use-node', 'primary', 0);
+                INSERT INTO jobs (
+                    job_id,
+                    created_at,
+                    finished_at,
+                    branch,
+                    work_branch,
+                    base,
+                    status,
+                    payload_json
+                ) VALUES (
+                    'job-v6',
+                    '2026-03-25T09:10:13Z',
+                    NULL,
+                    'main',
+                    'main',
+                    'root',
+                    'running',
+                    '{"job_id":"job-v6","created_at":"2026-03-25T09:10:13Z","branch":"main","base":"root","status":"running"}'
+                );
                 "#,
             )
             .unwrap();
@@ -5786,18 +5839,19 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
+        assert!(!job_has_payload_json_column(&store).await);
     }
 
     #[tokio::test]
-    async fn open_migrates_v6_tool_items_to_item_tables() {
+    async fn open_migrates_v6_data_to_current_schema() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
             vec![
@@ -5841,6 +5895,19 @@ mod tests {
             })
         );
         assert!(!node_has_metadata_json_column(&store).await);
+        assert!(!job_has_payload_json_column(&store).await);
+        assert_eq!(
+            store.get_job("job-v6").await.unwrap(),
+            Job {
+                job_id: "job-v6".to_owned(),
+                created_at: "2026-03-25T09:10:13Z".parse().unwrap(),
+                finished_at: None,
+                branch: "main".to_owned(),
+                work_branch: "main".to_owned(),
+                base: "root".to_owned(),
+                status: JobStatus::Running,
+            }
+        );
         let tool_use = store.get_node("tool-use-node").await.unwrap();
         assert_eq!(tool_use.kind.as_tool_uses().unwrap().len(), 2);
         assert_eq!(
@@ -5871,7 +5938,7 @@ mod tests {
     fn contraction_migration_requires_completed_backfill() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
@@ -5896,13 +5963,16 @@ mod tests {
     async fn contraction_migration_down_restores_metadata_json() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
         let store = SqliteStore::open(&path).await.unwrap();
         drop(store);
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
 
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
         connection
             .revert_last_migration(super::STORE_MIGRATIONS)
             .unwrap();
@@ -5932,13 +6002,16 @@ mod tests {
     async fn node_item_migration_down_restores_kind_json() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        create_v6_store_with_legacy_node_items(&path);
+        create_v6_store_with_legacy_data(&path);
         let store = SqliteStore::open(&path).await.unwrap();
         drop(store);
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
 
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
         connection
             .revert_last_migration(super::STORE_MIGRATIONS)
             .unwrap();
@@ -6007,6 +6080,120 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn job_payload_migration_down_restores_payload_json() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        let session = store.append(session_anchor_node(&root_id)).await.unwrap();
+        store.fork("main", &session).await.unwrap();
+        store
+            .submit_job_with_id("job-test", "main", &session)
+            .await
+            .unwrap();
+        store
+            .set_job_status("job-test", JobStatus::Queued, JobStatus::Running)
+            .await
+            .unwrap();
+        let job = store
+            .set_job_status("job-test", JobStatus::Running, JobStatus::Finished)
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        let row = diesel::RunQueryDsl::get_result::<LegacyJobPayloadJson>(
+            diesel::sql_query("SELECT payload_json FROM jobs WHERE job_id = 'job-test'"),
+            &mut connection,
+        )
+        .unwrap();
+
+        assert_eq!(serde_json::from_str::<Job>(&row.payload_json).unwrap(), job);
+
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open(&path).await.unwrap();
+        assert!(!job_has_payload_json_column(&reopened).await);
+        assert_eq!(reopened.get_job("job-test").await.unwrap(), job);
+    }
+
+    #[tokio::test]
+    async fn job_payload_migration_rejects_mismatched_summary() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        let session = store.append(session_anchor_node(&root_id)).await.unwrap();
+        store.fork("main", &session).await.unwrap();
+        store
+            .submit_job_with_id("job-test", "main", &session)
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE jobs SET payload_json = json_set(payload_json, '$.status', 'finished')",
+            ),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[test]
+    fn job_row_rejects_empty_work_branch() {
+        let mut row = valid_job_row();
+        row.work_branch.clear();
+
+        let error = super::job_row_into_job(std::path::Path::new("store.sqlite3"), row)
+            .expect_err("empty work branch must fail");
+
+        assert!(error.to_string().contains("empty work branch"));
+    }
+
+    #[test]
+    fn job_row_rejects_invalid_timestamp() {
+        let mut row = valid_job_row();
+        row.created_at = "invalid".to_owned();
+
+        let error = super::job_row_into_job(std::path::Path::new("store.sqlite3"), row)
+            .expect_err("invalid timestamp must fail");
+
+        assert!(error.to_string().contains("invalid SQLite job timestamp"));
+    }
+
+    #[test]
+    fn job_row_rejects_invalid_status() {
+        let mut row = valid_job_row();
+        row.status = "invalid".to_owned();
+
+        let error = super::job_row_into_job(std::path::Path::new("store.sqlite3"), row)
+            .expect_err("invalid status must fail");
+
+        assert!(error.to_string().contains("invalid SQLite job status"));
     }
 
     #[tokio::test]
@@ -6164,7 +6351,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
     }
 
     #[tokio::test]
@@ -6660,7 +6847,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
     }
 
     #[tokio::test]
@@ -6688,7 +6875,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=8")
+                .contains("unsupported SQLite schema version 5, expected 6..=9")
         );
     }
 
@@ -6703,7 +6890,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=8")
+                .contains("unsupported SQLite schema version 5, expected 6..=9")
         );
     }
 
@@ -6750,7 +6937,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 8);
+        assert_eq!(reopened.schema_version().await.unwrap(), 9);
     }
 
     #[tokio::test]
