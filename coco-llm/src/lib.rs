@@ -3710,7 +3710,10 @@ fn node_metadata_first(metadata: Option<&NodeMetadata>) -> Option<&BackendMetada
 }
 
 fn node_metadata_at(metadata: Option<&NodeMetadata>, index: usize) -> Option<&BackendMetadata> {
-    metadata.and_then(|metadata| metadata.get(index))
+    metadata.and_then(|metadata| match metadata.as_slice() {
+        [metadata] => Some(metadata),
+        metadata => metadata.get(index),
+    })
 }
 
 impl ProviderHistoryBuilder {
@@ -9030,6 +9033,69 @@ mod tests {
                             rig::completion::message::UserContent::ToolResult(tool_result)
                                 if tool_result.call_id.as_deref() == Some("call-next")
                         )
+                }
+        ));
+    }
+
+    #[test]
+    fn rig_messages_from_nodes_broadcasts_single_node_metadata() {
+        let messages = rig_messages_from_nodes(&[
+            context_node(
+                Role::LLM,
+                metadata(Some("execution-1"), Some("call-shared")),
+                Kind::tool_uses(vec![
+                    ToolUse {
+                        id: "tool-call-1".to_owned(),
+                        name: "exec_command".to_owned(),
+                        input: serde_json::json!({"cmd": "pwd"}),
+                    },
+                    ToolUse {
+                        id: "tool-call-2".to_owned(),
+                        name: "exec_command".to_owned(),
+                        input: serde_json::json!({"cmd": "ls"}),
+                    },
+                ]),
+            ),
+            context_node(
+                Role::User,
+                metadata(Some("execution-1"), Some("call-shared")),
+                Kind::tool_results(vec![
+                    ToolResult {
+                        id: "tool-call-1".to_owned(),
+                        output: "/tmp".to_owned(),
+                    },
+                    ToolResult {
+                        id: "tool-call-2".to_owned(),
+                        output: "Cargo.toml".to_owned(),
+                    },
+                ]),
+            ),
+        ]);
+
+        assert!(matches!(
+            &messages[0],
+            rig::completion::message::Message::Assistant { content, .. }
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                        && items.iter().all(|item| matches!(
+                            item,
+                            rig::completion::message::AssistantContent::ToolCall(tool_call)
+                                if tool_call.call_id.as_deref() == Some("call-shared")
+                        ))
+                }
+        ));
+        assert!(matches!(
+            &messages[1],
+            rig::completion::message::Message::User { content }
+                if {
+                    let items = content.iter().collect::<Vec<_>>();
+                    items.len() == 2
+                        && items.iter().all(|item| matches!(
+                            item,
+                            rig::completion::message::UserContent::ToolResult(tool_result)
+                                if tool_result.call_id.as_deref() == Some("call-shared")
+                        ))
                 }
         ));
     }
