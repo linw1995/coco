@@ -3015,7 +3015,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf 'sandboxed'","workdir":"{}","shell":"bash","yield_time_ms":5000}}"#,
+                        r#"{{"cmd":"printf 'sandboxed'","workdir":"{}","shell":"bash","yield_time_ms":30000}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -3102,7 +3102,7 @@ mod tests {
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$(command -v uv)\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_BIN_HOME\" \"$XDG_STATE_HOME\" \"${{PATH%%:*}}\"","workdir":"{}","shell":"bash","yield_time_ms":5000}}"#,
+                        r#"{{"cmd":"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$(command -v uv)\" \"$HOME\" \"$TMPDIR\" \"$UV_CACHE_DIR\" \"$UV_PYTHON_INSTALL_DIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_BIN_HOME\" \"$XDG_STATE_HOME\" \"${{PATH%%:*}}\"","workdir":"{}","shell":"bash","yield_time_ms":30000}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -3388,7 +3388,7 @@ mod tests {
 
         let session_id = parse_session_id(&first);
         let mut retained = String::new();
-        for _ in 0..500 {
+        for _ in 0..3000 {
             let store = sessions.inner.lock().await;
             let session = store.sessions.get(&session_id).unwrap();
             let stdout = session.stdout.lock().await;

@@ -1,5 +1,4 @@
 mod anchor;
-mod collection;
 mod hash;
 mod job;
 mod message_queue;
@@ -12,7 +11,6 @@ mod skill;
 mod tool;
 
 pub use anchor::*;
-pub use collection::*;
 pub use job::*;
 pub use message_queue::*;
 pub use metadata::*;

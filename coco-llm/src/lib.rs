@@ -3190,7 +3190,7 @@ fn persisted_nodes_from_backend_events(
             return;
         }
         let kind = Kind::tool_use_items(std::mem::take(tool_uses));
-        let metadata = Some(NodeMetadata::from_items(std::mem::take(tool_metadata)));
+        let metadata = Some(std::mem::take(tool_metadata));
         nodes.push((Role::LLM, metadata, kind));
     }
 
@@ -3203,7 +3203,7 @@ fn persisted_nodes_from_backend_events(
             return;
         }
         let kind = Kind::tool_result_items(std::mem::take(tool_results));
-        let metadata = Some(NodeMetadata::from_items(std::mem::take(tool_metadata)));
+        let metadata = Some(std::mem::take(tool_metadata));
         nodes.push((Role::User, metadata, kind));
     }
 
@@ -3331,7 +3331,7 @@ async fn skill_result_node_contents_after_tool_result(
 
     let mut contents = Vec::new();
     let mut fanned_in = HashSet::new();
-    for tool_result in tool_results.items() {
+    for tool_result in tool_results {
         if !is_terminal_unified_exec_output(&tool_result.output) {
             continue;
         }
@@ -3459,7 +3459,6 @@ fn find_tool_use_for_result<'a>(
     ancestry.iter().find_map(|node| {
         let tool_uses = node.kind.as_tool_uses()?;
         tool_uses
-            .items()
             .iter()
             .find(|tool_use| tool_use.id == tool_result_id)
             .map(|tool_use| (node, tool_use))
@@ -3474,7 +3473,7 @@ fn find_exec_command_tool_use_for_session<'a>(
         let Some(tool_results) = node.kind.as_tool_results() else {
             continue;
         };
-        for tool_result in tool_results.items() {
+        for tool_result in tool_results {
             if output_session_id(&tool_result.output) != Some(session_id) {
                 continue;
             }
@@ -3574,7 +3573,7 @@ async fn append_skill_results_after_tool_result(
     let mut appended = Vec::new();
     let mut fanned_in = HashSet::new();
 
-    for tool_result in tool_results.items() {
+    for tool_result in tool_results {
         if !is_terminal_unified_exec_output(&tool_result.output) {
             continue;
         }
@@ -3707,11 +3706,11 @@ struct PendingToolResultGroup {
 }
 
 fn node_metadata_first(metadata: Option<&NodeMetadata>) -> Option<&BackendMetadata> {
-    metadata.and_then(NodeMetadata::first)
+    metadata.and_then(|metadata| metadata.first())
 }
 
 fn node_metadata_at(metadata: Option<&NodeMetadata>, index: usize) -> Option<&BackendMetadata> {
-    metadata.and_then(|metadata| metadata.as_one().or_else(|| metadata.items().get(index)))
+    metadata.and_then(|metadata| metadata.get(index))
 }
 
 impl ProviderHistoryBuilder {
@@ -3732,12 +3731,12 @@ impl ProviderHistoryBuilder {
                 Role::System => {}
             },
             Kind::ToolUse(tool_uses) => {
-                for (index, tool_use) in tool_uses.items().iter().enumerate() {
+                for (index, tool_use) in tool_uses.iter().enumerate() {
                     self.push_tool_use(node_metadata_at(node.metadata.as_ref(), index), tool_use);
                 }
             }
             Kind::ToolResult(tool_results) => {
-                for (index, tool_result) in tool_results.items().iter().enumerate() {
+                for (index, tool_result) in tool_results.iter().enumerate() {
                     self.push_tool_result(
                         node_metadata_at(node.metadata.as_ref(), index),
                         &tool_result.id,
@@ -5683,7 +5682,7 @@ mod tests {
                 .append(NewNode {
                     parent: session_head.clone(),
                     role: Role::LLM,
-                    metadata: Some(NodeMetadata::many(vec![
+                    metadata: Some(vec![
                         BackendMetadata {
                             execution_id: Some("execution-1".to_owned()),
                             call_id: Some("call-1".to_owned()),
@@ -5692,7 +5691,7 @@ mod tests {
                             execution_id: Some("execution-1".to_owned()),
                             call_id: Some("call-2".to_owned()),
                         },
-                    ])),
+                    ]),
                     kind: Kind::tool_uses(vec![
                         ToolUse {
                             id: "tool-call-1".to_owned(),
@@ -5804,14 +5803,14 @@ mod tests {
     fn node_execution_id(node: &coco_mem::Node) -> Option<&str> {
         node.metadata
             .as_ref()
-            .and_then(NodeMetadata::first)
+            .and_then(|metadata| metadata.first())
             .and_then(|metadata| metadata.execution_id.as_deref())
     }
 
     fn node_call_id_at(node: &coco_mem::Node, index: usize) -> Option<&str> {
         node.metadata
             .as_ref()
-            .and_then(|metadata| metadata.items().get(index))
+            .and_then(|metadata| metadata.get(index))
             .and_then(|metadata| metadata.call_id.as_deref())
     }
 
@@ -8067,7 +8066,6 @@ mod tests {
             .kind
             .as_tool_uses()
             .unwrap()
-            .items()
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(tool_uses.len(), 2);
@@ -8080,7 +8078,6 @@ mod tests {
             .kind
             .as_tool_results()
             .unwrap()
-            .items()
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(tool_results.len(), 2);
@@ -8142,7 +8139,7 @@ mod tests {
                 .kind
                 .as_tool_results()
                 .is_some_and(|tool_results| {
-                    let results = tool_results.items().iter().collect::<Vec<_>>();
+                    let results = tool_results.iter().collect::<Vec<_>>();
                     results.len() == 1
                         && results[0].id == "tool-call-1"
                         && node_call_id_at(&tool_result, 0) == Some("call-1")
@@ -8951,7 +8948,7 @@ mod tests {
         let messages = rig_messages_from_nodes(&[
             context_node(
                 Role::LLM,
-                Some(NodeMetadata::many(vec![
+                Some(vec![
                     BackendMetadata {
                         execution_id: Some("execution-1".to_owned()),
                         call_id: Some("call-payload".to_owned()),
@@ -8960,7 +8957,7 @@ mod tests {
                         execution_id: Some("execution-1".to_owned()),
                         call_id: Some("call-next".to_owned()),
                     },
-                ])),
+                ]),
                 Kind::tool_uses(vec![
                     ToolUse {
                         id: "tool-call-payload".to_owned(),
@@ -8976,7 +8973,7 @@ mod tests {
             ),
             context_node(
                 Role::User,
-                Some(NodeMetadata::many(vec![
+                Some(vec![
                     BackendMetadata {
                         execution_id: Some("execution-1".to_owned()),
                         call_id: Some("call-payload".to_owned()),
@@ -8985,7 +8982,7 @@ mod tests {
                         execution_id: Some("execution-1".to_owned()),
                         call_id: Some("call-next".to_owned()),
                     },
-                ])),
+                ]),
                 Kind::tool_results(vec![
                     ToolResult {
                         id: "tool-call-payload".to_owned(),
@@ -9035,6 +9032,17 @@ mod tests {
                         )
                 }
         ));
+    }
+
+    #[test]
+    fn node_metadata_at_uses_positional_lookup() {
+        let metadata = vec![BackendMetadata {
+            execution_id: Some("execution-1".to_owned()),
+            call_id: Some("call-1".to_owned()),
+        }];
+
+        assert_eq!(node_metadata_at(Some(&metadata), 0), metadata.first());
+        assert_eq!(node_metadata_at(Some(&metadata), 1), None);
     }
 
     #[test]

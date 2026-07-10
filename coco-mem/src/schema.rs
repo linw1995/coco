@@ -48,6 +48,25 @@ diesel::table! {
 }
 
 diesel::table! {
+    node_tool_results (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        tool_result_id -> Text,
+        output -> Text,
+    }
+}
+
+diesel::table! {
+    node_tool_uses (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        tool_use_id -> Text,
+        name -> Text,
+        input_json -> Text,
+    }
+}
+
+diesel::table! {
     nodes (id) {
         id -> Text,
         parent_id -> Text,
@@ -62,8 +81,8 @@ diesel::table! {
         anchor_prompt -> Nullable<Text>,
         anchor_skill_name -> Nullable<Text>,
         anchor_skill_invocation_mode -> Nullable<Text>,
-        metadata_json -> Nullable<Text>,
         kind_json -> Text,
+        metadata_present -> Bool,
     }
 }
 
@@ -103,6 +122,8 @@ diesel::table! {
 
 diesel::joinable!(branches -> nodes (head_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
+diesel::joinable!(node_tool_results -> nodes (node_id));
+diesel::joinable!(node_tool_uses -> nodes (node_id));
 diesel::joinable!(sessions -> branches (branch_name));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -111,6 +132,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     message_queue_items,
     node_metadata,
     node_relations,
+    node_tool_results,
+    node_tool_uses,
     nodes,
     presets,
     sessions,

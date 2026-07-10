@@ -1,8 +1,8 @@
 use super::{
-    Anchor, BackendMetadata, ExecutionMetadata, Kind, MergeParent, NewNode, Node, NodeMetadata,
-    PauseReason, Preset, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch,
-    SessionRole, SessionState, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
-    SkillScript, SkillVersion, SkillVersionSpec, Tool, ToolResult, ToolUse,
+    Anchor, BackendMetadata, ExecutionMetadata, Kind, MergeParent, NewNode, Node, PauseReason,
+    Preset, PromptAnchor, ProviderMetadata, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
+    SessionState, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, SkillScript,
+    SkillVersion, SkillVersionSpec, Tool, ToolResult, ToolUse,
 };
 use jiff::Timestamp;
 use serde_json::json;
@@ -374,15 +374,7 @@ fn skill_version_id_is_lower_hex_sha256() {
 }
 
 #[test]
-fn tool_use_payload_accepts_one_or_many_items() {
-    let one: Kind = serde_json::from_value(serde_json::json!({
-        "ToolUse": {
-            "id": "tool-call-1",
-            "name": "exec_command",
-            "input": { "cmd": "pwd" }
-        }
-    }))
-    .unwrap();
+fn tool_use_payload_requires_item_list() {
     let many: Kind = serde_json::from_value(serde_json::json!({
         "ToolUse": [
             {
@@ -399,9 +391,17 @@ fn tool_use_payload_accepts_one_or_many_items() {
     }))
     .unwrap();
 
-    assert_eq!(one.as_tool_uses().unwrap().iter().count(), 1);
+    let one = serde_json::from_value::<Kind>(serde_json::json!({
+        "ToolUse": {
+            "id": "tool-call-1",
+            "name": "exec_command",
+            "input": { "cmd": "pwd" }
+        }
+    }));
+
+    assert!(one.is_err());
     assert_eq!(many.as_tool_uses().unwrap().iter().count(), 2);
-    assert_eq!(many.as_tool_uses().unwrap().items()[0].id, "tool-call-1");
+    assert_eq!(many.as_tool_uses().unwrap()[0].id, "tool-call-1");
 }
 
 #[test]
@@ -409,7 +409,7 @@ fn many_tool_node_metadata_round_trip_preserves_call_ids() {
     let node = Node::new(
         "parent".to_owned(),
         Role::LLM,
-        Some(NodeMetadata::many(vec![
+        Some(vec![
             BackendMetadata {
                 execution_id: Some("execution-1".to_owned()),
                 call_id: Some("call-1".to_owned()),
@@ -418,7 +418,7 @@ fn many_tool_node_metadata_round_trip_preserves_call_ids() {
                 execution_id: Some("execution-1".to_owned()),
                 call_id: Some("call-2".to_owned()),
             },
-        ])),
+        ]),
         Kind::tool_uses(vec![
             ToolUse {
                 id: "tool-call-1".to_owned(),
@@ -437,7 +437,7 @@ fn many_tool_node_metadata_round_trip_preserves_call_ids() {
     let encoded = serde_json::to_string(&node).unwrap();
     let decoded: Node = serde_json::from_str(&encoded).unwrap();
     let metadata = decoded.metadata.expect("expected node metadata");
-    let items = metadata.items();
+    let items = metadata.as_slice();
 
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].call_id.as_deref(), Some("call-1"));
@@ -629,7 +629,7 @@ fn node_metadata_round_trip_preserves_execution_id() {
     let metadata = decoded
         .metadata
         .expect("expected node metadata")
-        .as_one()
+        .first()
         .expect("expected single node metadata")
         .clone();
 

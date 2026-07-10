@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use super::ManyOrOne;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionMetadata {
     pub execution_id: String,
@@ -20,7 +18,7 @@ pub struct BackendMetadata {
     pub call_id: Option<String>,
 }
 
-pub type NodeMetadata = ManyOrOne<BackendMetadata>;
+pub type NodeMetadata = Vec<BackendMetadata>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendMetadataBuilder {
@@ -86,10 +84,10 @@ impl BackendMetadataBuilder {
             return None;
         }
 
-        Some(NodeMetadata::one(BackendMetadata {
+        Some(vec![BackendMetadata {
             execution_id: self.execution_id,
             call_id: self.call_id,
-        }))
+        }])
     }
 
     pub fn build_item(self) -> Option<BackendMetadata> {
