@@ -16,7 +16,6 @@ diesel::table! {
         work_branch -> Text,
         base -> Text,
         status -> Text,
-        payload_json -> Text,
     }
 }
 
