@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
-use diesel::sql_types::{Nullable, Text};
+use diesel::sql_types::{Bool, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_async::pooled_connection::bb8::{
     Pool as AsyncSqlitePool, PooledConnection as AsyncSqlitePooledConnection,
@@ -52,11 +52,12 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 7;
+const SQLITE_SCHEMA_VERSION: i32 = 8;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
+const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
-const NODE_ITEM_ROWS_BACKFILL_META_KEY: &str = "node_item_rows_backfilled";
+const NODE_ITEM_ROWS_BACKFILL_META_KEY: &str = "node_items_backfilled";
 const LEGACY_JSON_STORE_MARKERS: &[&str] = &["meta.json", "nodes.jsonl"];
 const STORE_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const SQLITE_POOL_MAX_SIZE: u32 = 4;
@@ -209,10 +210,10 @@ struct NodeRow {
     anchor_skill_name: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     anchor_skill_invocation_mode: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    metadata_json: Option<String>,
     #[diesel(sql_type = Text)]
     kind_json: String,
+    #[diesel(sql_type = Bool)]
+    metadata_present: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
@@ -240,10 +241,13 @@ struct NodeToolResultRow {
     output: String,
 }
 
-#[derive(Queryable)]
+#[derive(QueryableByName)]
 struct NodeItemBackfillRow {
+    #[diesel(sql_type = Text)]
     id: String,
+    #[diesel(sql_type = Nullable<Text>)]
     metadata_json: Option<String>,
+    #[diesel(sql_type = Text)]
     kind_json: String,
 }
 
@@ -293,8 +297,8 @@ macro_rules! node_row_columns {
             nodes::anchor_prompt,
             nodes::anchor_skill_name,
             nodes::anchor_skill_invocation_mode,
-            nodes::metadata_json,
             nodes::kind_json,
+            nodes::metadata_present,
         )
     };
 }
@@ -590,7 +594,9 @@ impl SqliteStore {
         configure_writable_connection(&mut connection, &self.database_path).await?;
         reject_unsupported_schema_version(&mut connection, &self.database_path).await?;
         let before_version = current_schema_version(&mut connection, &self.database_path).await?;
-        let backfill_complete = if before_version == Some(SQLITE_SCHEMA_VERSION) {
+        let backfill_complete = if before_version
+            .is_some_and(|version| version >= NODE_ITEM_EXPANSION_SCHEMA_VERSION)
+        {
             node_item_rows_backfill_complete(&mut connection, &self.database_path).await?
         } else {
             false
@@ -604,8 +610,19 @@ impl SqliteStore {
                 "starting SQLite store migrations"
             );
         }
-        run_embedded_migrations(&mut connection, &self.database_path).await?;
+        run_embedded_migrations_through(
+            &mut connection,
+            &self.database_path,
+            NODE_ITEM_EXPANSION_SCHEMA_VERSION,
+        )
+        .await?;
         backfill_node_item_rows_with_progress(&mut connection, &self.database_path).await?;
+        run_embedded_migrations_through(
+            &mut connection,
+            &self.database_path,
+            SQLITE_SCHEMA_VERSION,
+        )
+        .await?;
         if needs_migration {
             tracing::info!(
                 path = %self.database_path.display(),
@@ -1207,16 +1224,25 @@ fn ensure_supported_schema_version(version: i32, path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_embedded_migrations(
+async fn run_embedded_migrations_through(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
+    target_version: i32,
 ) -> Result<()> {
     let path = path.to_owned();
+    let target_version = format!("{target_version:014}");
     let result = connection
         .spawn_blocking(move |connection| {
-            Ok(connection
-                .run_pending_migrations(STORE_MIGRATIONS)
-                .map(|_| ()))
+            Ok((|| -> diesel::migration::Result<()> {
+                let pending = connection.pending_migrations(STORE_MIGRATIONS)?;
+                for migration in pending {
+                    if migration.name().version().to_string() > target_version {
+                        break;
+                    }
+                    connection.run_migration(migration.as_ref())?;
+                }
+                Ok(())
+            })())
         })
         .await
         .context(QuerySqliteStoreSnafu { path: path.clone() })?;
@@ -1229,6 +1255,14 @@ async fn backfill_node_item_rows_with_progress(
 ) -> Result<()> {
     if node_item_rows_backfill_complete(connection, path).await? {
         return Ok(());
+    }
+    if current_schema_version(connection, path).await? > Some(NODE_ITEM_EXPANSION_SCHEMA_VERSION) {
+        return CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "missing node item backfill marker after legacy columns were removed"
+                .to_owned(),
+        }
+        .fail();
     }
 
     let total = nodes::table
@@ -1254,13 +1288,16 @@ async fn backfill_node_item_rows_with_progress(
                 .execute(connection)
                 .await
                 .map_err(SqliteTransactionError::Query)?;
-
-            let rows = nodes::table
-                .select((nodes::id, nodes::metadata_json, nodes::kind_json))
-                .order(nodes::id)
-                .load::<NodeItemBackfillRow>(connection)
+            diesel::delete(node_metadata::table)
+                .execute(connection)
                 .await
                 .map_err(SqliteTransactionError::Query)?;
+
+            let rows =
+                diesel::sql_query("SELECT id, metadata_json, kind_json FROM nodes ORDER BY id")
+                    .load::<NodeItemBackfillRow>(connection)
+                    .await
+                    .map_err(SqliteTransactionError::Query)?;
 
             let mut processed = 0usize;
             for row in rows {
@@ -1299,20 +1336,32 @@ async fn backfill_node_item_row(
     path: &Path,
     row: NodeItemBackfillRow,
 ) -> Result<()> {
-    let metadata_json = canonical_node_metadata_json(path, row.metadata_json.as_deref())?;
+    let metadata = legacy_node_metadata(path, row.metadata_json.as_deref())?;
     let (kind_json, tool_use_rows, tool_result_rows) =
         canonical_kind_json_and_tool_rows(path, &row.id, &row.kind_json)?;
 
     diesel::update(nodes::table.filter(nodes::id.eq(&row.id)))
-        .set((
-            nodes::metadata_json.eq(metadata_json),
-            nodes::kind_json.eq(kind_json),
-        ))
+        .set(nodes::kind_json.eq(kind_json))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+
+    for metadata_row in expected_node_metadata_rows(&row.id, metadata.as_ref()) {
+        diesel::insert_into(node_metadata::table)
+            .values((
+                node_metadata::node_id.eq(metadata_row.node_id),
+                node_metadata::ordinal.eq(metadata_row.ordinal),
+                node_metadata::execution_id.eq(metadata_row.execution_id),
+                node_metadata::call_id.eq(metadata_row.call_id),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
 
     for tool_use_row in tool_use_rows {
         diesel::insert_into(node_tool_uses::table)
@@ -1348,10 +1397,7 @@ async fn backfill_node_item_row(
     Ok(())
 }
 
-fn canonical_node_metadata_json(
-    path: &Path,
-    metadata_json: Option<&str>,
-) -> Result<Option<String>> {
+fn legacy_node_metadata(path: &Path, metadata_json: Option<&str>) -> Result<Option<NodeMetadata>> {
     let Some(metadata_json) = metadata_json else {
         return Ok(None);
     };
@@ -1360,13 +1406,7 @@ fn canonical_node_metadata_json(
             path: path.to_owned(),
             column: "nodes.metadata_json".to_owned(),
         })?;
-    let metadata = legacy_one_or_many_items::<BackendMetadata>(path, "nodes.metadata_json", value)?;
-    serde_json::to_string(&metadata)
-        .map(Some)
-        .context(ParseSqliteStoreValueSnafu {
-            path: path.to_owned(),
-            column: "nodes.metadata_json".to_owned(),
-        })
+    legacy_one_or_many_items::<BackendMetadata>(path, "nodes.metadata_json", value).map(Some)
 }
 
 fn canonical_kind_json_and_tool_rows(
@@ -1383,10 +1423,7 @@ fn canonical_kind_json_and_tool_rows(
         let tool_uses =
             legacy_one_or_many_items::<ToolUse>(path, "nodes.kind_json.ToolUse", payload.clone())?;
         let kind = Kind::tool_use_items(tool_uses);
-        let kind_json = serde_json::to_string(&kind).context(ParseSqliteStoreValueSnafu {
-            path: path.to_owned(),
-            column: "nodes.kind_json".to_owned(),
-        })?;
+        let kind_json = kind_residual_json(&kind, path)?;
         let rows = expected_node_tool_use_rows(node_id, &kind, path)?;
         return Ok((kind_json, rows, Vec::new()));
     }
@@ -1398,10 +1435,7 @@ fn canonical_kind_json_and_tool_rows(
             payload.clone(),
         )?;
         let kind = Kind::tool_result_items(tool_results);
-        let kind_json = serde_json::to_string(&kind).context(ParseSqliteStoreValueSnafu {
-            path: path.to_owned(),
-            column: "nodes.kind_json".to_owned(),
-        })?;
+        let kind_json = kind_residual_json(&kind, path)?;
         let rows = expected_node_tool_result_rows(node_id, &kind);
         return Ok((kind_json, Vec::new(), rows));
     }
@@ -2074,8 +2108,8 @@ async fn persist_node_without_transaction(
             nodes::anchor_prompt.eq(row.anchor_prompt),
             nodes::anchor_skill_name.eq(row.anchor_skill_name),
             nodes::anchor_skill_invocation_mode.eq(row.anchor_skill_invocation_mode),
-            nodes::metadata_json.eq(row.metadata_json),
             nodes::kind_json.eq(row.kind_json),
+            nodes::metadata_present.eq(row.metadata_present),
         ))
         .execute(connection)
         .await
@@ -2124,8 +2158,8 @@ async fn upsert_node_without_transaction(
             nodes::anchor_prompt.eq(row.anchor_prompt),
             nodes::anchor_skill_name.eq(row.anchor_skill_name),
             nodes::anchor_skill_invocation_mode.eq(row.anchor_skill_invocation_mode),
-            nodes::metadata_json.eq(row.metadata_json),
             nodes::kind_json.eq(row.kind_json),
+            nodes::metadata_present.eq(row.metadata_present),
         ))
         .on_conflict(nodes::id)
         .do_update()
@@ -2145,8 +2179,8 @@ async fn upsert_node_without_transaction(
             nodes::anchor_skill_invocation_mode.eq(diesel::upsert::excluded(
                 nodes::anchor_skill_invocation_mode,
             )),
-            nodes::metadata_json.eq(diesel::upsert::excluded(nodes::metadata_json)),
             nodes::kind_json.eq(diesel::upsert::excluded(nodes::kind_json)),
+            nodes::metadata_present.eq(diesel::upsert::excluded(nodes::metadata_present)),
         ))
         .execute(connection)
         .await
@@ -2374,6 +2408,7 @@ fn merge_parent_relation_kind(parent: &MergeParent) -> &'static str {
 impl NodeRow {
     fn from_node(node: Node, path: &Path) -> Result<Self> {
         let kind = node.kind.tag().as_str().to_owned();
+        let metadata_present = node.metadata.is_some();
         let anchor_kind = node
             .kind
             .anchor_payload_kind()
@@ -2393,16 +2428,8 @@ impl NodeRow {
             anchor_prompt: anchor_summary.prompt,
             anchor_skill_name: anchor_summary.skill_name,
             anchor_skill_invocation_mode: anchor_summary.skill_invocation_mode,
-            metadata_json: node
-                .metadata
-                .map(|metadata| {
-                    serde_json::to_string(&metadata).context(ParseSqliteStoreValueSnafu {
-                        path: path.to_owned(),
-                        column: "nodes.metadata_json".to_owned(),
-                    })
-                })
-                .transpose()?,
             kind_json: kind_residual_json(&node.kind, path)?,
+            metadata_present,
         })
     }
 
@@ -2413,7 +2440,7 @@ impl NodeRow {
         tool_use_rows: &[NodeToolUseRow],
         tool_result_rows: &[NodeToolResultRow],
     ) -> Result<Node> {
-        let kind = self.kind_from_residual_json(path)?;
+        let kind = self.kind_from_storage(path, tool_use_rows, tool_result_rows)?;
         ensure!(
             self.kind == kind.tag().as_str(),
             CorruptedStoreSnafu {
@@ -2435,20 +2462,8 @@ impl NodeRow {
             }
         );
         validate_node_anchor_summary(path, &self, &kind)?;
-        let metadata = self
-            .metadata_json
-            .map(|metadata| {
-                serde_json::from_str::<NodeMetadata>(&metadata).context(
-                    ParseSqliteStoreValueSnafu {
-                        path: path.to_owned(),
-                        column: "nodes.metadata_json".to_owned(),
-                    },
-                )
-            })
-            .transpose()?;
-        validate_node_metadata_rows(path, &self.id, metadata.as_ref(), metadata_rows)?;
-        validate_node_tool_use_rows(path, &self.id, &kind, tool_use_rows)?;
-        validate_node_tool_result_rows(path, &self.id, &kind, tool_result_rows)?;
+        let metadata =
+            node_metadata_from_rows(path, &self.id, self.metadata_present, metadata_rows)?;
         Ok(Node {
             id: self.id,
             parent: self.parent_id,
@@ -2476,10 +2491,59 @@ impl NodeRow {
             column: "nodes.kind_json".to_owned(),
         })
     }
+
+    fn kind_from_storage(
+        &self,
+        path: &Path,
+        tool_use_rows: &[NodeToolUseRow],
+        tool_result_rows: &[NodeToolResultRow],
+    ) -> Result<Kind> {
+        match self.kind_from_residual_json(path)? {
+            Kind::ToolUse(items) => {
+                ensure!(
+                    items.is_empty(),
+                    CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: format!(
+                            "SQLite node kind_json for {:?} contains relational tool use payloads",
+                            self.id
+                        ),
+                    }
+                );
+                ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
+                node_tool_uses_from_rows(path, &self.id, tool_use_rows).map(Kind::tool_use_items)
+            }
+            Kind::ToolResult(items) => {
+                ensure!(
+                    items.is_empty(),
+                    CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: format!(
+                            "SQLite node kind_json for {:?} contains relational tool result payloads",
+                            self.id
+                        ),
+                    }
+                );
+                ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
+                node_tool_results_from_rows(path, &self.id, tool_result_rows)
+                    .map(Kind::tool_result_items)
+            }
+            kind => {
+                ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
+                ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
+                Ok(kind)
+            }
+        }
+    }
 }
 
 fn kind_residual_json(kind: &Kind, path: &Path) -> Result<String> {
-    let mut value = serde_json::to_value(kind).context(ParseSqliteStoreValueSnafu {
+    let residual = match kind {
+        Kind::ToolUse(_) => Kind::tool_use_items(Vec::new()),
+        Kind::ToolResult(_) => Kind::tool_result_items(Vec::new()),
+        _ => kind.clone(),
+    };
+    let mut value = serde_json::to_value(residual).context(ParseSqliteStoreValueSnafu {
         path: path.to_owned(),
         column: "nodes.kind_json".to_owned(),
     })?;
@@ -2758,54 +2822,138 @@ fn validate_node_anchor_summary(path: &Path, row: &NodeRow, kind: &Kind) -> Resu
     )
 }
 
-fn validate_node_metadata_rows(
+fn node_metadata_from_rows(
     path: &Path,
     node_id: &str,
-    metadata: Option<&NodeMetadata>,
+    metadata_present: bool,
     metadata_rows: &[NodeMetadataRow],
-) -> Result<()> {
-    let expected = expected_node_metadata_rows(node_id, metadata);
+) -> Result<Option<NodeMetadata>> {
     ensure!(
-        expected == metadata_rows,
+        metadata_present || metadata_rows.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("SQLite node {node_id:?} has metadata rows without metadata_present"),
+        }
+    );
+    if !metadata_present {
+        return Ok(None);
+    }
+    metadata_rows
+        .iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            ensure_node_item_row(
+                path,
+                node_id,
+                ordinal,
+                &row.node_id,
+                row.ordinal,
+                "metadata",
+            )?;
+            Ok(BackendMetadata {
+                execution_id: row.execution_id.clone(),
+                call_id: row.call_id.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn node_tool_uses_from_rows(
+    path: &Path,
+    node_id: &str,
+    rows: &[NodeToolUseRow],
+) -> Result<Vec<ToolUse>> {
+    rows.iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            ensure_node_item_row(
+                path,
+                node_id,
+                ordinal,
+                &row.node_id,
+                row.ordinal,
+                "tool use",
+            )?;
+            Ok(ToolUse {
+                id: row.tool_use_id.clone(),
+                name: row.name.clone(),
+                input: serde_json::from_str(&row.input_json).context(
+                    ParseSqliteStoreValueSnafu {
+                        path: path.to_owned(),
+                        column: "node_tool_uses.input_json".to_owned(),
+                    },
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn node_tool_results_from_rows(
+    path: &Path,
+    node_id: &str,
+    rows: &[NodeToolResultRow],
+) -> Result<Vec<ToolResult>> {
+    rows.iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            ensure_node_item_row(
+                path,
+                node_id,
+                ordinal,
+                &row.node_id,
+                row.ordinal,
+                "tool result",
+            )?;
+            Ok(ToolResult {
+                id: row.tool_result_id.clone(),
+                output: row.output.clone(),
+            })
+        })
+        .collect()
+}
+
+fn ensure_no_tool_use_rows(path: &Path, node_id: &str, rows: &[NodeToolUseRow]) -> Result<()> {
+    ensure!(
+        rows.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("SQLite node {node_id:?} has unexpected tool use rows"),
+        }
+    );
+    Ok(())
+}
+
+fn ensure_no_tool_result_rows(
+    path: &Path,
+    node_id: &str,
+    rows: &[NodeToolResultRow],
+) -> Result<()> {
+    ensure!(
+        rows.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("SQLite node {node_id:?} has unexpected tool result rows"),
+        }
+    );
+    Ok(())
+}
+
+fn ensure_node_item_row(
+    path: &Path,
+    node_id: &str,
+    expected_ordinal: usize,
+    row_node_id: &str,
+    row_ordinal: i32,
+    item_kind: &str,
+) -> Result<()> {
+    ensure!(
+        row_node_id == node_id && row_ordinal == expected_ordinal as i32,
         CorruptedStoreSnafu {
             path: path.to_owned(),
             message: format!(
-                "SQLite node metadata rows for {node_id:?} do not match metadata_json"
+                "invalid SQLite node {item_kind} row for {node_id:?} at ordinal {expected_ordinal}"
             ),
-        }
-    );
-    Ok(())
-}
-
-fn validate_node_tool_use_rows(
-    path: &Path,
-    node_id: &str,
-    kind: &Kind,
-    rows: &[NodeToolUseRow],
-) -> Result<()> {
-    let expected = expected_node_tool_use_rows(node_id, kind, path)?;
-    ensure!(
-        expected == rows,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("SQLite node tool use rows for {node_id:?} do not match kind_json"),
-        }
-    );
-    Ok(())
-}
-
-fn validate_node_tool_result_rows(
-    path: &Path,
-    node_id: &str,
-    kind: &Kind,
-    rows: &[NodeToolResultRow],
-) -> Result<()> {
-    let expected = expected_node_tool_result_rows(node_id, kind);
-    ensure!(
-        expected == rows,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("SQLite node tool result rows for {node_id:?} do not match kind_json"),
         }
     );
     Ok(())
@@ -5225,6 +5373,7 @@ mod tests {
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
+    use diesel_migrations::MigrationHarness;
     use std::sync::mpsc;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -5271,6 +5420,18 @@ mod tests {
         work_branch: String,
         base: String,
         status: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct ColumnCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct LegacyMetadataJson {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        metadata_json: Option<String>,
     }
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -5404,15 +5565,16 @@ mod tests {
         serde_json::from_str(&kind_json).unwrap()
     }
 
-    async fn node_metadata_json(store: &SqliteStore, node_id: &str) -> Option<serde_json::Value> {
+    async fn node_has_metadata_json_column(store: &SqliteStore) -> bool {
         let mut connection = store.connect().await.unwrap();
-        let metadata_json = nodes::table
-            .filter(nodes::id.eq(node_id))
-            .select(nodes::metadata_json)
-            .get_result::<Option<String>>(&mut connection)
-            .await
-            .unwrap();
-        metadata_json.map(|metadata_json| serde_json::from_str(&metadata_json).unwrap())
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('nodes') WHERE name = 'metadata_json'",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
     }
 
     async fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
@@ -5563,8 +5725,6 @@ mod tests {
                 INSERT INTO node_relations (child_node_id, parent_node_id, kind, ordinal) VALUES
                     ('tool-use-node', 'root', 'primary', 0),
                     ('tool-result-node', 'tool-use-node', 'primary', 0);
-                INSERT INTO node_metadata (node_id, ordinal, execution_id, call_id) VALUES
-                    ('tool-use-node', 0, 'execution-1', 'call-1');
                 "#,
             )
             .unwrap();
@@ -5578,7 +5738,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 7);
+        assert_eq!(store.schema_version().await.unwrap(), 8);
     }
 
     #[tokio::test]
@@ -5589,7 +5749,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 7);
+        assert_eq!(store.schema_version().await.unwrap(), 8);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
             vec![NodeToolUseRow {
@@ -5612,26 +5772,74 @@ mod tests {
         assert_eq!(
             node_kind_json(&store, "tool-use-node").await,
             serde_json::json!({
-                "ToolUse": [
-                    {
-                        "id": "tool-call-1",
-                        "name": "exec_command",
-                        "input": { "cmd": "pwd" }
-                    }
-                ]
+                "ToolUse": []
             })
         );
-        assert_eq!(
-            node_metadata_json(&store, "tool-use-node").await,
-            Some(serde_json::json!([
-                {
-                    "execution_id": "execution-1",
-                    "call_id": "call-1"
-                }
-            ]))
-        );
+        assert!(!node_has_metadata_json_column(&store).await);
         let tool_use = store.get_node("tool-use-node").await.unwrap();
         assert_eq!(tool_use.kind.as_tool_uses().unwrap().len(), 1);
+        assert_eq!(
+            tool_use.metadata,
+            Some(vec![BackendMetadata {
+                execution_id: Some("execution-1".to_owned()),
+                call_id: Some("call-1".to_owned()),
+            }])
+        );
+    }
+
+    #[test]
+    fn contraction_migration_requires_completed_backfill() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        create_v6_store_with_legacy_single_tool_items(&path);
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+        let row = diesel::RunQueryDsl::get_result::<LegacyMetadataJson>(
+            diesel::sql_query("SELECT metadata_json FROM nodes WHERE id = 'tool-use-node'"),
+            &mut connection,
+        )
+        .unwrap();
+        assert!(row.metadata_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn contraction_migration_down_restores_metadata_json() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        create_v6_store_with_legacy_single_tool_items(&path);
+        let store = SqliteStore::open(&path).await.unwrap();
+        drop(store);
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+
+        let row = diesel::RunQueryDsl::get_result::<LegacyMetadataJson>(
+            diesel::sql_query("SELECT metadata_json FROM nodes WHERE id = 'tool-use-node'"),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(
+            row.metadata_json
+                .map(|value| serde_json::from_str::<serde_json::Value>(&value).unwrap()),
+            Some(serde_json::json!([{
+                "execution_id": "execution-1",
+                "call_id": "call-1"
+            }]))
+        );
     }
 
     #[tokio::test]
@@ -5789,7 +5997,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 7);
+        assert_eq!(store.schema_version().await.unwrap(), 8);
     }
 
     #[tokio::test]
@@ -5952,6 +6160,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_round_trips_present_empty_metadata() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let node_id = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: Some(Vec::new()),
+                kind: Kind::Text("empty metadata".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_node(&node_id).await.unwrap().metadata,
+            Some(Vec::new())
+        );
+        drop(store);
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert_eq!(
+            reopened.get_node(&node_id).await.unwrap().metadata,
+            Some(Vec::new())
+        );
+    }
+
+    #[tokio::test]
     async fn append_persists_node_tool_item_rows() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -6007,7 +6242,7 @@ mod tests {
                     input_json: r#"{"cmd":"pwd"}"#.to_owned(),
                 },
                 NodeToolUseRow {
-                    node_id: tool_use_node,
+                    node_id: tool_use_node.clone(),
                     ordinal: 1,
                     tool_use_id: "tool-call-b".to_owned(),
                     name: "exec_command".to_owned(),
@@ -6025,12 +6260,20 @@ mod tests {
                     output: "left".to_owned(),
                 },
                 NodeToolResultRow {
-                    node_id: tool_result_node,
+                    node_id: tool_result_node.clone(),
                     ordinal: 1,
                     tool_result_id: "tool-call-b".to_owned(),
                     output: "right".to_owned(),
                 },
             ]
+        );
+        assert_eq!(
+            node_kind_json(&store, &tool_use_node).await,
+            serde_json::json!({ "ToolUse": [] })
+        );
+        assert_eq!(
+            node_kind_json(&store, &tool_result_node).await,
+            serde_json::json!({ "ToolResult": [] })
         );
     }
 
@@ -6250,7 +6493,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 7);
+        assert_eq!(store.schema_version().await.unwrap(), 8);
     }
 
     #[tokio::test]
@@ -6278,7 +6521,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=7")
+                .contains("unsupported SQLite schema version 5, expected 6..=8")
         );
     }
 
@@ -6293,7 +6536,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=7")
+                .contains("unsupported SQLite schema version 5, expected 6..=8")
         );
     }
 
@@ -6340,7 +6583,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 7);
+        assert_eq!(reopened.schema_version().await.unwrap(), 8);
     }
 
     #[tokio::test]

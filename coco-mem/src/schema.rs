@@ -81,8 +81,8 @@ diesel::table! {
         anchor_prompt -> Nullable<Text>,
         anchor_skill_name -> Nullable<Text>,
         anchor_skill_invocation_mode -> Nullable<Text>,
-        metadata_json -> Nullable<Text>,
         kind_json -> Text,
+        metadata_present -> Bool,
     }
 }
 
