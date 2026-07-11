@@ -40,6 +40,23 @@ diesel::table! {
         skill_name -> Nullable<Text>,
         skill_invocation_mode -> Nullable<Text>,
         kind_json -> Text,
+        session_system_prompt -> Nullable<Text>,
+        session_temperature -> Nullable<Double>,
+        session_max_tokens -> Nullable<Text>,
+        session_additional_params_json -> Nullable<Text>,
+        session_enable_coco_shim -> Nullable<Bool>,
+        session_active_skill_name -> Nullable<Text>,
+        session_active_skill_handoff -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    node_anchor_session_tools (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        name -> Text,
+        description -> Text,
+        input_schema_json -> Text,
     }
 }
 
@@ -128,6 +145,7 @@ diesel::table! {
 
 diesel::joinable!(branches -> nodes (head_id));
 diesel::joinable!(node_anchors -> nodes (node_id));
+diesel::joinable!(node_anchor_session_tools -> node_anchors (node_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
 diesel::joinable!(node_tool_results -> nodes (node_id));
 diesel::joinable!(node_tool_uses -> nodes (node_id));
@@ -137,6 +155,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     branches,
     jobs,
     message_queue_items,
+    node_anchor_session_tools,
     node_anchors,
     node_metadata,
     node_relations,

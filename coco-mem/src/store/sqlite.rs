@@ -41,18 +41,20 @@ use crate::error::{
     StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::{
-    branches, jobs, message_queue_items, node_anchors, node_metadata, node_relations,
-    node_tool_results, node_tool_uses, nodes, presets, sessions, skills, store_meta,
+    branches, jobs, message_queue_items, node_anchor_session_tools, node_anchors, node_metadata,
+    node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions, skills,
+    store_meta,
 };
 use crate::{
     Anchor, AnchorPayload, BackendMetadata, Job, JobStatus, Kind, MergeParent, MessageQueueItem,
     NewNode, NewNodeContent, Node, NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor,
-    Role, SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillInvocationMode,
-    SkillRecord, SkillUpdatePatch, SkillVersionSpec, ToolResult, ToolUse, default_skill_groups,
+    Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillInvocationMode, SkillRecord, SkillRuntimeContext, SkillUpdatePatch, SkillVersionSpec,
+    Tool, ToolResult, ToolUse, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 11;
+const SQLITE_SCHEMA_VERSION: i32 = 12;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -200,7 +202,7 @@ struct NodeRow {
     content: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+#[derive(Clone, Debug, PartialEq, Queryable)]
 struct NodeAnchorRow {
     node_id: String,
     kind: String,
@@ -212,6 +214,39 @@ struct NodeAnchorRow {
     skill_name: Option<String>,
     skill_invocation_mode: Option<String>,
     kind_json: String,
+    session_system_prompt: Option<String>,
+    session_temperature: Option<f64>,
+    session_max_tokens: Option<String>,
+    session_additional_params_json: Option<String>,
+    session_enable_coco_shim: Option<bool>,
+    session_active_skill_name: Option<String>,
+    session_active_skill_handoff: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct NodeAnchorSessionToolRow {
+    node_id: String,
+    ordinal: i32,
+    name: String,
+    description: String,
+    input_schema_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct NodeRelationRow {
+    child_node_id: String,
+    parent_node_id: String,
+    kind: String,
+    ordinal: i32,
+}
+
+struct NodeStorageRows<'a> {
+    anchor: Option<&'a NodeAnchorRow>,
+    anchor_session_tools: &'a [NodeAnchorSessionToolRow],
+    relations: &'a [NodeRelationRow],
+    metadata: &'a [NodeMetadataRow],
+    tool_uses: &'a [NodeToolUseRow],
+    tool_results: &'a [NodeToolResultRow],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
@@ -1679,6 +1714,13 @@ async fn load_node_anchor_rows_for_ids(
             node_anchors::skill_name,
             node_anchors::skill_invocation_mode,
             node_anchors::kind_json,
+            node_anchors::session_system_prompt,
+            node_anchors::session_temperature,
+            node_anchors::session_max_tokens,
+            node_anchors::session_additional_params_json,
+            node_anchors::session_enable_coco_shim,
+            node_anchors::session_active_skill_name,
+            node_anchors::session_active_skill_handoff,
         ))
         .into_boxed();
     if let Some(node_ids) = node_ids {
@@ -1700,11 +1742,97 @@ async fn load_node_anchor_rows_for_ids(
         })
 }
 
+async fn load_node_anchor_session_tool_rows_for_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_ids: Option<&[String]>,
+) -> Result<HashMap<String, Vec<NodeAnchorSessionToolRow>>> {
+    let mut query = node_anchor_session_tools::table
+        .select((
+            node_anchor_session_tools::node_id,
+            node_anchor_session_tools::ordinal,
+            node_anchor_session_tools::name,
+            node_anchor_session_tools::description,
+            node_anchor_session_tools::input_schema_json,
+        ))
+        .into_boxed();
+    if let Some(node_ids) = node_ids {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        query = query.filter(node_anchor_session_tools::node_id.eq_any(node_ids));
+    }
+    let rows = query
+        .order((
+            node_anchor_session_tools::node_id,
+            node_anchor_session_tools::ordinal,
+        ))
+        .load::<NodeAnchorSessionToolRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(group_node_anchor_session_tool_rows(rows))
+}
+
+async fn load_node_relation_rows_for_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_ids: Option<&[String]>,
+) -> Result<HashMap<String, Vec<NodeRelationRow>>> {
+    let mut query = node_relations::table
+        .select((
+            node_relations::child_node_id,
+            node_relations::parent_node_id,
+            node_relations::kind,
+            node_relations::ordinal,
+        ))
+        .into_boxed();
+    if let Some(node_ids) = node_ids {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        query = query.filter(node_relations::child_node_id.eq_any(node_ids));
+    }
+    let rows = query
+        .order((node_relations::child_node_id, node_relations::ordinal))
+        .load::<NodeRelationRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(group_node_relation_rows(rows))
+}
+
 fn group_node_metadata_rows(rows: Vec<NodeMetadataRow>) -> HashMap<String, Vec<NodeMetadataRow>> {
     let mut grouped = HashMap::new();
     for row in rows {
         grouped
             .entry(row.node_id.clone())
+            .or_insert_with(Vec::new)
+            .push(row);
+    }
+    grouped
+}
+
+fn group_node_anchor_session_tool_rows(
+    rows: Vec<NodeAnchorSessionToolRow>,
+) -> HashMap<String, Vec<NodeAnchorSessionToolRow>> {
+    let mut grouped = HashMap::new();
+    for row in rows {
+        grouped
+            .entry(row.node_id.clone())
+            .or_insert_with(Vec::new)
+            .push(row);
+    }
+    grouped
+}
+
+fn group_node_relation_rows(rows: Vec<NodeRelationRow>) -> HashMap<String, Vec<NodeRelationRow>> {
+    let mut grouped = HashMap::new();
+    for row in rows {
+        grouped
+            .entry(row.child_node_id.clone())
             .or_insert_with(Vec::new)
             .push(row);
     }
@@ -1801,6 +1929,20 @@ fn node_metadata_slice<'a>(
     rows.get(node_id).map(Vec::as_slice).unwrap_or_default()
 }
 
+fn node_anchor_session_tool_slice<'a>(
+    rows: &'a HashMap<String, Vec<NodeAnchorSessionToolRow>>,
+    node_id: &str,
+) -> &'a [NodeAnchorSessionToolRow] {
+    rows.get(node_id).map(Vec::as_slice).unwrap_or_default()
+}
+
+fn node_relation_slice<'a>(
+    rows: &'a HashMap<String, Vec<NodeRelationRow>>,
+    node_id: &str,
+) -> &'a [NodeRelationRow] {
+    rows.get(node_id).map(Vec::as_slice).unwrap_or_default()
+}
+
 fn node_tool_use_slice<'a>(
     rows: &'a HashMap<String, Vec<NodeToolUseRow>>,
     node_id: &str,
@@ -1822,6 +1964,9 @@ async fn node_rows_into_nodes(
 ) -> Result<Vec<Node>> {
     let node_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
     let anchor_rows = load_node_anchor_rows_for_ids(connection, path, Some(&node_ids)).await?;
+    let anchor_session_tool_rows =
+        load_node_anchor_session_tool_rows_for_ids(connection, path, Some(&node_ids)).await?;
+    let relation_rows = load_node_relation_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let metadata_rows = load_node_metadata_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let tool_use_rows = load_node_tool_use_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let tool_result_rows =
@@ -1831,10 +1976,17 @@ async fn node_rows_into_nodes(
             let node_id = row.id.clone();
             row.into_node(
                 path,
-                anchor_rows.get(&node_id),
-                node_metadata_slice(&metadata_rows, &node_id),
-                node_tool_use_slice(&tool_use_rows, &node_id),
-                node_tool_result_slice(&tool_result_rows, &node_id),
+                NodeStorageRows {
+                    anchor: anchor_rows.get(&node_id),
+                    anchor_session_tools: node_anchor_session_tool_slice(
+                        &anchor_session_tool_rows,
+                        &node_id,
+                    ),
+                    relations: node_relation_slice(&relation_rows, &node_id),
+                    metadata: node_metadata_slice(&metadata_rows, &node_id),
+                    tool_uses: node_tool_use_slice(&tool_use_rows, &node_id),
+                    tool_results: node_tool_result_slice(&tool_result_rows, &node_id),
+                },
             )
         })
         .collect()
@@ -1859,6 +2011,15 @@ async fn load_node_by_exact_id(
     let anchor_rows =
         load_node_anchor_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
             .await?;
+    let anchor_session_tool_rows = load_node_anchor_session_tool_rows_for_ids(
+        connection,
+        path,
+        Some(std::slice::from_ref(&node_id)),
+    )
+    .await?;
+    let relation_rows =
+        load_node_relation_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
+            .await?;
     let metadata_rows =
         load_node_metadata_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
             .await?;
@@ -1870,10 +2031,17 @@ async fn load_node_by_exact_id(
             .await?;
     row.into_node(
         path,
-        anchor_rows.get(&node_id),
-        node_metadata_slice(&metadata_rows, &node_id),
-        node_tool_use_slice(&tool_use_rows, &node_id),
-        node_tool_result_slice(&tool_result_rows, &node_id),
+        NodeStorageRows {
+            anchor: anchor_rows.get(&node_id),
+            anchor_session_tools: node_anchor_session_tool_slice(
+                &anchor_session_tool_rows,
+                &node_id,
+            ),
+            relations: node_relation_slice(&relation_rows, &node_id),
+            metadata: node_metadata_slice(&metadata_rows, &node_id),
+            tool_uses: node_tool_use_slice(&tool_use_rows, &node_id),
+            tool_results: node_tool_result_slice(&tool_result_rows, &node_id),
+        },
     )
 }
 
@@ -2186,6 +2354,7 @@ async fn persist_node_without_transaction(
         })?;
 
     persist_node_anchor_row(connection, path, node).await?;
+    persist_node_anchor_session_tool_rows(connection, path, node).await?;
     for relation in node_relations(node) {
         diesel::insert_into(node_relations::table)
             .values((
@@ -2270,6 +2439,7 @@ async fn upsert_node_without_transaction(
         })?;
 
     persist_node_anchor_row(connection, path, node).await?;
+    persist_node_anchor_session_tool_rows(connection, path, node).await?;
     for relation in node_relations(node) {
         diesel::insert_into(node_relations::table)
             .values((
@@ -2310,12 +2480,42 @@ async fn persist_node_anchor_row(
             node_anchors::skill_name.eq(row.skill_name),
             node_anchors::skill_invocation_mode.eq(row.skill_invocation_mode),
             node_anchors::kind_json.eq(row.kind_json),
+            node_anchors::session_system_prompt.eq(row.session_system_prompt),
+            node_anchors::session_temperature.eq(row.session_temperature),
+            node_anchors::session_max_tokens.eq(row.session_max_tokens),
+            node_anchors::session_additional_params_json.eq(row.session_additional_params_json),
+            node_anchors::session_enable_coco_shim.eq(row.session_enable_coco_shim),
+            node_anchors::session_active_skill_name.eq(row.session_active_skill_name),
+            node_anchors::session_active_skill_handoff.eq(row.session_active_skill_handoff),
         ))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+    Ok(())
+}
+
+async fn persist_node_anchor_session_tool_rows(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    for row in node_anchor_session_tool_rows(node, path)? {
+        diesel::insert_into(node_anchor_session_tools::table)
+            .values((
+                node_anchor_session_tools::node_id.eq(row.node_id),
+                node_anchor_session_tools::ordinal.eq(row.ordinal),
+                node_anchor_session_tools::name.eq(row.name),
+                node_anchor_session_tools::description.eq(row.description),
+                node_anchor_session_tools::input_schema_json.eq(row.input_schema_json),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
     Ok(())
 }
 
@@ -2395,6 +2595,38 @@ struct NodeRelation {
 
 fn node_metadata_rows(node: &Node) -> Vec<NodeMetadataRow> {
     expected_node_metadata_rows(&node.id, node.metadata.as_ref())
+}
+
+fn node_anchor_session_tool_rows(
+    node: &Node,
+    path: &Path,
+) -> Result<Vec<NodeAnchorSessionToolRow>> {
+    let Kind::Anchor(Anchor {
+        payload: AnchorPayload::Session(anchor),
+        ..
+    }) = &node.kind
+    else {
+        return Ok(Vec::new());
+    };
+    anchor
+        .tools
+        .iter()
+        .enumerate()
+        .map(|(ordinal, tool)| {
+            Ok(NodeAnchorSessionToolRow {
+                node_id: node.id.clone(),
+                ordinal: ordinal as i32,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema_json: serde_json::to_string(&tool.input_schema).context(
+                    ParseSqliteStoreValueSnafu {
+                        path: path.to_owned(),
+                        column: "node_anchor_session_tools.input_schema_json".to_owned(),
+                    },
+                )?,
+            })
+        })
+        .collect()
 }
 
 fn expected_node_metadata_rows(
@@ -2509,15 +2741,15 @@ impl NodeRow {
         }
     }
 
-    fn into_node(
-        self,
-        path: &Path,
-        anchor_row: Option<&NodeAnchorRow>,
-        metadata_rows: &[NodeMetadataRow],
-        tool_use_rows: &[NodeToolUseRow],
-        tool_result_rows: &[NodeToolResultRow],
-    ) -> Result<Node> {
-        let kind = self.kind_from_storage(path, anchor_row, tool_use_rows, tool_result_rows)?;
+    fn into_node(self, path: &Path, rows: NodeStorageRows<'_>) -> Result<Node> {
+        let kind = self.kind_from_storage(
+            path,
+            rows.anchor,
+            rows.anchor_session_tools,
+            rows.relations,
+            rows.tool_uses,
+            rows.tool_results,
+        )?;
         ensure!(
             self.kind == kind.tag().as_str(),
             CorruptedStoreSnafu {
@@ -2529,7 +2761,7 @@ impl NodeRow {
             }
         );
         let metadata =
-            node_metadata_from_rows(path, &self.id, self.metadata_present, metadata_rows)?;
+            node_metadata_from_rows(path, &self.id, self.metadata_present, rows.metadata)?;
         Ok(Node {
             id: self.id,
             parent: self.parent_id,
@@ -2549,6 +2781,8 @@ impl NodeRow {
         &self,
         path: &Path,
         anchor_row: Option<&NodeAnchorRow>,
+        anchor_session_tool_rows: &[NodeAnchorSessionToolRow],
+        relation_rows: &[NodeRelationRow],
         tool_use_rows: &[NodeToolUseRow],
         tool_result_rows: &[NodeToolResultRow],
     ) -> Result<Kind> {
@@ -2570,7 +2804,13 @@ impl NodeRow {
                     path: path.to_owned(),
                     message: format!("missing SQLite node anchor row for {:?}", self.id),
                 })?;
-                anchor_row.kind_from_storage(path, &self.id)
+                anchor_row.kind_from_storage(
+                    path,
+                    &self.id,
+                    &self.parent_id,
+                    anchor_session_tool_rows,
+                    relation_rows,
+                )
             }
             "tool_use" => {
                 self.ensure_no_content(path)?;
@@ -2632,6 +2872,7 @@ impl NodeAnchorRow {
             return Ok(None);
         };
         let summary = NodeAnchorSummary::from_kind(&node.kind);
+        let session = NodeAnchorSessionColumns::from_kind(&node.kind, path)?;
         Ok(Some(Self {
             node_id: node.id.clone(),
             kind: anchor.payload_kind().as_str().to_owned(),
@@ -2643,10 +2884,24 @@ impl NodeAnchorRow {
             skill_name: summary.skill_name,
             skill_invocation_mode: summary.skill_invocation_mode,
             kind_json: anchor_kind_residual_json(&node.kind, path)?,
+            session_system_prompt: session.system_prompt,
+            session_temperature: session.temperature,
+            session_max_tokens: session.max_tokens,
+            session_additional_params_json: session.additional_params_json,
+            session_enable_coco_shim: session.enable_coco_shim,
+            session_active_skill_name: session.active_skill_name,
+            session_active_skill_handoff: session.active_skill_handoff,
         }))
     }
 
-    fn kind_from_storage(&self, path: &Path, node_id: &str) -> Result<Kind> {
+    fn kind_from_storage(
+        &self,
+        path: &Path,
+        node_id: &str,
+        parent_id: &str,
+        session_tool_rows: &[NodeAnchorSessionToolRow],
+        relation_rows: &[NodeRelationRow],
+    ) -> Result<Kind> {
         ensure!(
             self.node_id == node_id,
             CorruptedStoreSnafu {
@@ -2655,6 +2910,22 @@ impl NodeAnchorRow {
                     "SQLite node anchor row {:?} does not belong to node {node_id:?}",
                     self.node_id
                 ),
+            }
+        );
+        if self.kind == "session" {
+            return self.session_kind_from_storage(
+                path,
+                node_id,
+                parent_id,
+                session_tool_rows,
+                relation_rows,
+            );
+        }
+        ensure!(
+            session_tool_rows.is_empty(),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("SQLite non-session anchor {node_id:?} has session tool rows"),
             }
         );
         let mut value: Value =
@@ -2689,6 +2960,172 @@ impl NodeAnchorRow {
         validate_node_anchor_summary(path, self, &kind)?;
         Ok(kind)
     }
+
+    fn session_kind_from_storage(
+        &self,
+        path: &Path,
+        node_id: &str,
+        parent_id: &str,
+        tool_rows: &[NodeAnchorSessionToolRow],
+        relation_rows: &[NodeRelationRow],
+    ) -> Result<Kind> {
+        let role = parse_session_role(
+            self.session_role.as_deref().context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: "missing SQLite node_anchors.session_role".to_owned(),
+            })?,
+            path,
+        )?;
+        let model = required_anchor_summary(path, "node_anchors.model", self.model.as_deref())?;
+        let prompt = required_anchor_summary(path, "node_anchors.prompt", self.prompt.as_deref())?;
+        let system_prompt = required_anchor_summary(
+            path,
+            "node_anchors.session_system_prompt",
+            self.session_system_prompt.as_deref(),
+        )?;
+        let max_tokens = self
+            .session_max_tokens
+            .as_deref()
+            .map(|value| parse_u64_column(path, "node_anchors.session_max_tokens", value))
+            .transpose()?;
+        let additional_params = self
+            .session_additional_params_json
+            .as_deref()
+            .map(|value| {
+                parse_json_column(path, "node_anchors.session_additional_params_json", value)
+            })
+            .transpose()?;
+        let enable_coco_shim = self.session_enable_coco_shim.context(CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "missing SQLite node_anchors.session_enable_coco_shim".to_owned(),
+        })?;
+        let active_skill = match self.session_active_skill_name.as_deref() {
+            Some(name) => Some(SkillRuntimeContext {
+                name: name.to_owned(),
+                handoff: self.session_active_skill_handoff.clone(),
+            }),
+            None => {
+                ensure!(
+                    self.session_active_skill_handoff.is_none(),
+                    CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: "SQLite session active skill handoff is present without a name"
+                            .to_owned(),
+                    }
+                );
+                None
+            }
+        };
+        let merge_parents =
+            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
+        let tools = session_tools_from_rows(path, node_id, tool_rows)?;
+        Ok(Kind::Anchor(Anchor::session(
+            merge_parents,
+            SessionAnchor {
+                role,
+                provider_profile: self.provider_profile.clone(),
+                provider: self.provider.clone(),
+                model,
+                tools,
+                system_prompt,
+                prompt,
+                temperature: self.session_temperature,
+                max_tokens,
+                additional_params,
+                enable_coco_shim,
+                active_skill,
+            },
+        )))
+    }
+}
+
+fn parse_json_column(path: &Path, column: &str, value: &str) -> Result<Value> {
+    serde_json::from_str(value).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: column.to_owned(),
+    })
+}
+
+fn parse_u64_column(path: &Path, column: &str, value: &str) -> Result<u64> {
+    value.parse().map_err(|source| StoreError::CorruptedStore {
+        path: path.to_owned(),
+        message: format!("invalid SQLite {column}: {source}"),
+    })
+}
+
+fn session_tools_from_rows(
+    path: &Path,
+    node_id: &str,
+    rows: &[NodeAnchorSessionToolRow],
+) -> Result<Vec<Tool>> {
+    rows.iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            ensure!(
+                row.node_id == node_id && row.ordinal == ordinal as i32,
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("invalid SQLite session tool ordinal for node {node_id:?}"),
+                }
+            );
+            Ok(Tool {
+                name: row.name.clone(),
+                description: row.description.clone(),
+                input_schema: parse_json_column(
+                    path,
+                    "node_anchor_session_tools.input_schema_json",
+                    &row.input_schema_json,
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn merge_parents_from_relation_rows(
+    path: &Path,
+    node_id: &str,
+    parent_id: &str,
+    rows: &[NodeRelationRow],
+) -> Result<Vec<MergeParent>> {
+    let primary_rows = rows
+        .iter()
+        .filter(|row| row.kind == "primary")
+        .collect::<Vec<_>>();
+    ensure!(
+        primary_rows.len() == 1
+            && primary_rows[0].parent_node_id == parent_id
+            && primary_rows[0].ordinal == 0,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("invalid SQLite primary relation for anchor node {node_id:?}"),
+        }
+    );
+    let mut merge_parents = Vec::new();
+    for row in rows.iter().filter(|row| row.kind != "primary") {
+        ensure!(
+            row.child_node_id == node_id && row.ordinal == merge_parents.len() as i32,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("invalid SQLite merge relation for anchor node {node_id:?}"),
+            }
+        );
+        let merge_parent = match row.kind.as_str() {
+            "merge" => MergeParent::merge(row.parent_node_id.clone()),
+            "shadow" => MergeParent::shadow(row.parent_node_id.clone()),
+            _ => {
+                return CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "invalid SQLite relation kind {:?} for anchor node {node_id:?}",
+                        row.kind
+                    ),
+                }
+                .fail();
+            }
+        };
+        merge_parents.push(merge_parent);
+    }
+    Ok(merge_parents)
 }
 
 fn legacy_node_kind_residual_json(kind: &Kind, path: &Path) -> Result<String> {
@@ -2887,6 +3324,51 @@ struct NodeAnchorSummary {
     prompt: Option<String>,
     skill_name: Option<String>,
     skill_invocation_mode: Option<String>,
+}
+
+#[derive(Default)]
+struct NodeAnchorSessionColumns {
+    system_prompt: Option<String>,
+    temperature: Option<f64>,
+    max_tokens: Option<String>,
+    additional_params_json: Option<String>,
+    enable_coco_shim: Option<bool>,
+    active_skill_name: Option<String>,
+    active_skill_handoff: Option<String>,
+}
+
+impl NodeAnchorSessionColumns {
+    fn from_kind(kind: &Kind, path: &Path) -> Result<Self> {
+        let Kind::Anchor(Anchor {
+            payload: AnchorPayload::Session(anchor),
+            ..
+        }) = kind
+        else {
+            return Ok(Self::default());
+        };
+        let additional_params_json = anchor
+            .additional_params
+            .as_ref()
+            .map(|value| {
+                serde_json::to_string(value).context(ParseSqliteStoreValueSnafu {
+                    path: path.to_owned(),
+                    column: "node_anchors.session_additional_params_json".to_owned(),
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            system_prompt: Some(anchor.system_prompt.clone()),
+            temperature: anchor.temperature,
+            max_tokens: anchor.max_tokens.map(|value| value.to_string()),
+            additional_params_json,
+            enable_coco_shim: Some(anchor.enable_coco_shim),
+            active_skill_name: anchor.active_skill.as_ref().map(|skill| skill.name.clone()),
+            active_skill_handoff: anchor
+                .active_skill
+                .as_ref()
+                .and_then(|skill| skill.handoff.clone()),
+        })
+    }
 }
 
 impl NodeAnchorSummary {
@@ -5519,18 +6001,19 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageQueueItem, NodeAnchorRow, NodeMetadataRow, NodeToolResultRow, NodeToolUseRow,
-        SqliteGraphStore, SqliteStore,
+        MessageQueueItem, NodeAnchorRow, NodeAnchorSessionToolRow, NodeMetadataRow,
+        NodeToolResultRow, NodeToolUseRow, SqliteGraphStore, SqliteStore,
     };
     use crate::schema::{
-        jobs, node_anchors, node_metadata, node_relations, node_tool_results, node_tool_uses,
-        nodes, sessions, store_meta,
+        jobs, node_anchor_session_tools, node_anchors, node_metadata, node_relations,
+        node_tool_results, node_tool_uses, nodes, sessions, store_meta,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
         MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore, Role,
-        SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillStore,
-        SkillUpdatePatch, SkillVersionSpec, ToolResult, ToolUse,
+        SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
+        SkillRuntimeContext, SkillStore, SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult,
+        ToolUse,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -5648,6 +6131,50 @@ mod tests {
         }
     }
 
+    fn rich_session_anchor_node(parent: &str, merge_parents: Vec<MergeParent>) -> NewNode {
+        NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::session(
+                merge_parents,
+                SessionAnchor {
+                    role: SessionRole::Runner,
+                    provider_profile: Some("runner-profile".to_owned()),
+                    provider: Some("openai".to_owned()),
+                    model: "gpt-5.4".to_owned(),
+                    tools: vec![
+                        Tool {
+                            name: "lookup".to_owned(),
+                            description: "Look up a value".to_owned(),
+                            input_schema: serde_json::json!({
+                                "type": "object",
+                                "properties": {"key": {"type": "string"}}
+                            }),
+                        },
+                        Tool {
+                            name: "finish".to_owned(),
+                            description: "Finish the task".to_owned(),
+                            input_schema: serde_json::json!({"type": "object"}),
+                        },
+                    ],
+                    system_prompt: "system".to_owned(),
+                    prompt: "session prompt".to_owned(),
+                    temperature: Some(0.25),
+                    max_tokens: Some(u64::MAX),
+                    additional_params: Some(serde_json::json!({
+                        "reasoning": {"effort": "high"}
+                    })),
+                    enable_coco_shim: true,
+                    active_skill: Some(SkillRuntimeContext {
+                        name: "compact".to_owned(),
+                        handoff: Some("Preserve the decisions".to_owned()),
+                    }),
+                },
+            )),
+        }
+    }
+
     fn preset(model: &str) -> Preset {
         Preset {
             role: SessionRole::Orchestrator,
@@ -5728,6 +6255,26 @@ mod tests {
             ))
             .order(node_tool_results::ordinal)
             .load::<NodeToolResultRow>(&mut connection)
+            .await
+            .unwrap()
+    }
+
+    async fn node_anchor_session_tool_rows(
+        store: &SqliteStore,
+        node_id: &str,
+    ) -> Vec<NodeAnchorSessionToolRow> {
+        let mut connection = store.connect().await.unwrap();
+        node_anchor_session_tools::table
+            .filter(node_anchor_session_tools::node_id.eq(node_id))
+            .select((
+                node_anchor_session_tools::node_id,
+                node_anchor_session_tools::ordinal,
+                node_anchor_session_tools::name,
+                node_anchor_session_tools::description,
+                node_anchor_session_tools::input_schema_json,
+            ))
+            .order(node_anchor_session_tools::ordinal)
+            .load::<NodeAnchorSessionToolRow>(&mut connection)
             .await
             .unwrap()
     }
@@ -5853,6 +6400,13 @@ mod tests {
                 node_anchors::skill_name,
                 node_anchors::skill_invocation_mode,
                 node_anchors::kind_json,
+                node_anchors::session_system_prompt,
+                node_anchors::session_temperature,
+                node_anchors::session_max_tokens,
+                node_anchors::session_additional_params_json,
+                node_anchors::session_enable_coco_shim,
+                node_anchors::session_active_skill_name,
+                node_anchors::session_active_skill_handoff,
             ))
             .get_result::<NodeAnchorRow>(&mut connection)
             .await
@@ -5923,6 +6477,28 @@ mod tests {
             INSERT INTO __diesel_schema_migrations (version) VALUES ('{version}');"
             ))
             .unwrap();
+    }
+
+    fn revert_store_migrations_to(
+        connection: &mut diesel::sqlite::SqliteConnection,
+        target_version: i32,
+    ) {
+        loop {
+            let current_version = diesel::RunQueryDsl::get_result::<Option<String>>(
+                super::__diesel_schema_migrations::table
+                    .select(diesel::dsl::max(super::__diesel_schema_migrations::version)),
+                connection,
+            )
+            .unwrap()
+            .map(|version| version.trim_start_matches('0').parse::<i32>().unwrap())
+            .unwrap_or_default();
+            if current_version <= target_version {
+                break;
+            }
+            connection
+                .revert_last_migration(super::STORE_MIGRATIONS)
+                .unwrap();
+        }
     }
 
     fn create_v6_store_with_legacy_data(path: &std::path::Path) {
@@ -6021,7 +6597,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 12);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
@@ -6035,7 +6611,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 12);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -6155,18 +6731,7 @@ mod tests {
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
 
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
+        revert_store_migrations_to(&mut connection, 7);
 
         let row = diesel::RunQueryDsl::get_result::<LegacyMetadataJson>(
             diesel::sql_query("SELECT metadata_json FROM nodes WHERE id = 'tool-use-node'"),
@@ -6200,21 +6765,7 @@ mod tests {
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
 
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
+        revert_store_migrations_to(&mut connection, 6);
 
         let tool_use = diesel::RunQueryDsl::get_result::<LegacyKindJson>(
             diesel::sql_query("SELECT kind_json FROM nodes WHERE id = 'tool-use-node'"),
@@ -6332,9 +6883,7 @@ mod tests {
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
+        revert_store_migrations_to(&mut connection, 10);
 
         for (node_id, expected_json) in [
             (&root_id, serde_json::json!({ "Text": "The Big Bang" })),
@@ -6356,7 +6905,7 @@ mod tests {
         }
 
         connection
-            .run_next_migration(super::STORE_MIGRATIONS)
+            .run_pending_migrations(super::STORE_MIGRATIONS)
             .unwrap();
         drop(connection);
 
@@ -6378,13 +6927,100 @@ mod tests {
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
+        revert_store_migrations_to(&mut connection, 10);
         diesel::RunQueryDsl::execute(
             diesel::sql_query("UPDATE nodes SET kind_json = ? WHERE id = ?")
                 .bind::<diesel::sql_types::Text, _>(r#"{"Failure":"The Big Bang"}"#)
                 .bind::<diesel::sql_types::Text, _>(&root_id),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
+    async fn node_anchor_session_migration_round_trips_relational_fields() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let merge_parent = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("merge parent".to_owned()),
+            })
+            .await
+            .unwrap();
+        let anchor_id = store
+            .append(rich_session_anchor_node(
+                &store.root_id(),
+                vec![MergeParent::merge(merge_parent)],
+            ))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 11);
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
+        assert_eq!(
+            node_anchor_session_tool_rows(&reopened, &anchor_id).await,
+            vec![
+                NodeAnchorSessionToolRow {
+                    node_id: anchor_id.clone(),
+                    ordinal: 0,
+                    name: "lookup".to_owned(),
+                    description: "Look up a value".to_owned(),
+                    input_schema_json:
+                        r#"{"properties":{"key":{"type":"string"}},"type":"object"}"#.to_owned(),
+                },
+                NodeAnchorSessionToolRow {
+                    node_id: anchor_id,
+                    ordinal: 1,
+                    name: "finish".to_owned(),
+                    description: "Finish the task".to_owned(),
+                    input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn node_anchor_session_migration_rejects_invalid_payload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(session_anchor_node(&store.root_id()))
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 11);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE node_anchors SET kind_json = json_set(\
+                 kind_json, '$.Anchor.payload.Session.system_prompt', 1) WHERE node_id = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(&anchor_id),
             &mut connection,
         )
         .unwrap();
@@ -6411,12 +7047,7 @@ mod tests {
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
+        revert_store_migrations_to(&mut connection, 9);
 
         let legacy = diesel::RunQueryDsl::get_result::<LegacyNodeAnchorRow>(
             diesel::sql_query(
@@ -6449,10 +7080,7 @@ mod tests {
         );
 
         connection
-            .run_next_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .run_next_migration(super::STORE_MIGRATIONS)
+            .run_pending_migrations(super::STORE_MIGRATIONS)
             .unwrap();
         drop(connection);
 
@@ -6486,15 +7114,7 @@ mod tests {
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
+        revert_store_migrations_to(&mut connection, 8);
         let row = diesel::RunQueryDsl::get_result::<LegacyJobPayloadJson>(
             diesel::sql_query("SELECT payload_json FROM jobs WHERE job_id = 'job-test'"),
             &mut connection,
@@ -6530,15 +7150,7 @@ mod tests {
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
-        connection
-            .revert_last_migration(super::STORE_MIGRATIONS)
-            .unwrap();
+        revert_store_migrations_to(&mut connection, 8);
         diesel::RunQueryDsl::execute(
             diesel::sql_query(
                 "UPDATE jobs SET payload_json = json_set(payload_json, '$.status', 'finished')",
@@ -6742,7 +7354,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 12);
     }
 
     #[tokio::test]
@@ -7168,6 +7780,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_session_anchor_uses_relational_payload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(rich_session_anchor_node(&store.root_id(), vec![]))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        let mut connection = store.connect().await.unwrap();
+        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
+            .set(node_anchors::kind_json.eq("not JSON"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
     async fn reading_anchor_node_requires_anchor_row() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -7347,7 +7980,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 12);
     }
 
     #[tokio::test]
@@ -7375,7 +8008,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=11")
+                .contains("unsupported SQLite schema version 5, expected 6..=12")
         );
     }
 
@@ -7390,7 +8023,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=11")
+                .contains("unsupported SQLite schema version 5, expected 6..=12")
         );
     }
 
@@ -7437,7 +8070,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 11);
+        assert_eq!(reopened.schema_version().await.unwrap(), 12);
     }
 
     #[tokio::test]
