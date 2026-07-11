@@ -65,7 +65,7 @@ CREATE TABLE node_anchor_skill_invocations (
     skill_name TEXT NOT NULL,
     mode TEXT NOT NULL,
     prompt TEXT,
-    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+    FOREIGN KEY (node_id) REFERENCES nodes(id)
 );
 
 INSERT INTO node_anchor_skill_invocations (

@@ -43,9 +43,9 @@ use crate::error::{
 use crate::schema::{
     branches, jobs, message_queue_items, node_anchor_prompt_attachments, node_anchor_prompts,
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
-    node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_anchors,
-    node_metadata, node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions,
-    skills, store_meta,
+    node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_metadata,
+    node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions, skills,
+    store_meta,
 };
 use crate::{
     Anchor, AnchorPayload, BackendMetadata, Job, JobStatus, Kind, MergeParent, MessageQueueItem,
@@ -205,12 +205,6 @@ struct NodeRow {
     content: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
-struct NodeAnchorRow {
-    node_id: String,
-    kind: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Queryable)]
 struct NodeAnchorSessionRow {
     node_id: String,
@@ -308,7 +302,6 @@ struct NodeRelationRow {
 }
 
 struct NodeAnchorStorageRows<'a> {
-    row: Option<&'a NodeAnchorRow>,
     session: Option<&'a NodeAnchorSessionRow>,
     session_tools: &'a [NodeAnchorSessionToolRow],
     session_patch: Option<&'a NodeAnchorSessionPatchRow>,
@@ -1775,33 +1768,6 @@ async fn load_node_metadata_rows_for_ids(
     Ok(group_node_metadata_rows(rows))
 }
 
-async fn load_node_anchor_rows_for_ids(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    node_ids: Option<&[String]>,
-) -> Result<HashMap<String, NodeAnchorRow>> {
-    let mut query = node_anchors::table
-        .select((node_anchors::node_id, node_anchors::kind))
-        .into_boxed();
-    if let Some(node_ids) = node_ids {
-        if node_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        query = query.filter(node_anchors::node_id.eq_any(node_ids));
-    }
-    query
-        .load::<NodeAnchorRow>(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| (row.node_id.clone(), row))
-                .collect()
-        })
-}
-
 async fn load_node_anchor_prompt_rows_for_ids(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -2307,7 +2273,6 @@ async fn node_rows_into_nodes(
     rows: Vec<NodeRow>,
 ) -> Result<Vec<Node>> {
     let node_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-    let anchor_rows = load_node_anchor_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_session_rows =
         load_node_anchor_session_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_session_tool_rows =
@@ -2336,7 +2301,6 @@ async fn node_rows_into_nodes(
                 path,
                 NodeStorageRows {
                     anchor: NodeAnchorStorageRows {
-                        row: anchor_rows.get(&node_id),
                         session: anchor_session_rows.get(&node_id),
                         session_tools: node_anchor_session_tool_slice(
                             &anchor_session_tool_rows,
@@ -2381,9 +2345,6 @@ async fn load_node_by_exact_id(
         })?
         .context(NotFoundSnafu { id: id.to_owned() })?;
     let node_id = row.id.clone();
-    let anchor_rows =
-        load_node_anchor_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
-            .await?;
     let anchor_session_rows = load_node_anchor_session_rows_for_ids(
         connection,
         path,
@@ -2448,7 +2409,6 @@ async fn load_node_by_exact_id(
         path,
         NodeStorageRows {
             anchor: NodeAnchorStorageRows {
-                row: anchor_rows.get(&node_id),
                 session: anchor_session_rows.get(&node_id),
                 session_tools: node_anchor_session_tool_slice(&anchor_session_tool_rows, &node_id),
                 session_patch: anchor_session_patch_rows.get(&node_id),
@@ -2780,7 +2740,6 @@ async fn persist_node_without_transaction(
             path: path.to_owned(),
         })?;
 
-    persist_node_anchor_row(connection, path, node).await?;
     persist_node_anchor_session_row(connection, path, node).await?;
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
@@ -2841,12 +2800,7 @@ async fn upsert_node_without_transaction(
             path: path.to_owned(),
         })?;
 
-    diesel::delete(node_anchors::table.filter(node_anchors::node_id.eq(&node.id)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
+    delete_node_anchor_payload_rows(connection, path, &node.id).await?;
     diesel::delete(node_relations::table.filter(node_relations::child_node_id.eq(&node.id)))
         .execute(connection)
         .await
@@ -2872,7 +2826,6 @@ async fn upsert_node_without_transaction(
             path: path.to_owned(),
         })?;
 
-    persist_node_anchor_row(connection, path, node).await?;
     persist_node_anchor_session_row(connection, path, node).await?;
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
@@ -2901,24 +2854,48 @@ async fn upsert_node_without_transaction(
     Ok(())
 }
 
-async fn persist_node_anchor_row(
+async fn delete_node_anchor_payload_rows(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
-    node: &Node,
+    node_id: &str,
 ) -> Result<()> {
-    let Some(row) = NodeAnchorRow::from_node(node) else {
-        return Ok(());
-    };
-    diesel::insert_into(node_anchors::table)
-        .values((
-            node_anchors::node_id.eq(row.node_id),
-            node_anchors::kind.eq(row.kind),
-        ))
+    diesel::delete(node_anchor_sessions::table.filter(node_anchor_sessions::node_id.eq(node_id)))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+    diesel::delete(
+        node_anchor_session_patches::table.filter(node_anchor_session_patches::node_id.eq(node_id)),
+    )
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    diesel::delete(node_anchor_prompts::table.filter(node_anchor_prompts::node_id.eq(node_id)))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    diesel::delete(
+        node_anchor_skill_invocations::table
+            .filter(node_anchor_skill_invocations::node_id.eq(node_id)),
+    )
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    diesel::delete(
+        node_anchor_skill_results::table.filter(node_anchor_skill_results::node_id.eq(node_id)),
+    )
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
     Ok(())
 }
 
@@ -3448,10 +3425,16 @@ impl NodeRow {
     ) -> Result<Kind> {
         if self.kind != "anchor" {
             ensure!(
-                anchor_rows.row.is_none(),
+                node_anchor_payload_row_count(anchor_rows) == 0
+                    && anchor_rows.session_tools.is_empty()
+                    && anchor_rows.session_patch_tools.is_empty()
+                    && anchor_rows.prompt_attachments.is_empty(),
                 CorruptedStoreSnafu {
                     path: path.to_owned(),
-                    message: format!("SQLite non-anchor node {:?} has an anchor row", self.id),
+                    message: format!(
+                        "SQLite non-anchor node {:?} has anchor payload rows",
+                        self.id
+                    ),
                 }
             );
         }
@@ -3460,11 +3443,7 @@ impl NodeRow {
                 self.ensure_no_content(path)?;
                 ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
                 ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
-                let anchor_row = anchor_rows.row.context(CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: format!("missing SQLite node anchor row for {:?}", self.id),
-                })?;
-                anchor_row.kind_from_storage(path, &self.id, &self.parent_id, anchor_rows)
+                node_anchor_kind_from_storage(path, &self.id, &self.parent_id, anchor_rows)
             }
             "tool_use" => {
                 self.ensure_no_content(path)?;
@@ -3520,170 +3499,166 @@ impl NodeRow {
     }
 }
 
-impl NodeAnchorRow {
-    fn from_node(node: &Node) -> Option<Self> {
-        let Kind::Anchor(anchor) = &node.kind else {
-            return None;
-        };
-        Some(Self {
-            node_id: node.id.clone(),
-            kind: anchor.payload_kind().as_str().to_owned(),
-        })
-    }
+fn node_anchor_payload_row_count(rows: &NodeAnchorStorageRows<'_>) -> usize {
+    usize::from(rows.session.is_some())
+        + usize::from(rows.session_patch.is_some())
+        + usize::from(rows.prompt.is_some())
+        + usize::from(rows.skill_invocation.is_some())
+        + usize::from(rows.skill_result.is_some())
+}
 
-    fn kind_from_storage(
-        &self,
-        path: &Path,
-        node_id: &str,
-        parent_id: &str,
-        rows: &NodeAnchorStorageRows<'_>,
-    ) -> Result<Kind> {
-        ensure!(
-            self.node_id == node_id,
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "SQLite node anchor row {:?} does not belong to node {node_id:?}",
-                    self.node_id
-                ),
-            }
-        );
-        match self.kind.as_str() {
-            "session" => {
-                ensure!(
-                    rows.session_patch.is_none()
-                        && rows.session_patch_tools.is_empty()
-                        && rows.prompt.is_none()
-                        && rows.prompt_attachments.is_empty()
-                        && rows.skill_invocation.is_none()
-                        && rows.skill_result.is_none(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!(
-                            "SQLite session anchor {node_id:?} has session patch rows"
-                        ),
-                    }
-                );
-                let session_row = rows.session.context(CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: format!("missing SQLite node anchor session row for {node_id:?}"),
-                })?;
-                session_row.kind_from_storage(
-                    path,
-                    node_id,
-                    parent_id,
-                    rows.session_tools,
-                    rows.relations,
-                )
-            }
-            "session_patch" => {
-                ensure!(
-                    rows.session.is_none()
-                        && rows.session_tools.is_empty()
-                        && rows.prompt.is_none()
-                        && rows.prompt_attachments.is_empty()
-                        && rows.skill_invocation.is_none()
-                        && rows.skill_result.is_none(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!(
-                            "SQLite session patch anchor {node_id:?} has session tool rows"
-                        ),
-                    }
-                );
-                let patch_row = rows.session_patch.context(CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: format!(
-                        "missing SQLite node anchor session patch row for {node_id:?}"
-                    ),
-                })?;
-                patch_row.kind_from_storage(
-                    path,
-                    node_id,
-                    parent_id,
-                    rows.session_patch_tools,
-                    rows.relations,
-                )
-            }
-            "prompt" => {
-                ensure!(
-                    rows.session.is_none()
-                        && rows.session_tools.is_empty()
-                        && rows.session_patch.is_none()
-                        && rows.session_patch_tools.is_empty()
-                        && rows.skill_invocation.is_none()
-                        && rows.skill_result.is_none(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!(
-                            "SQLite prompt anchor {node_id:?} has rows for another payload kind"
-                        ),
-                    }
-                );
-                let prompt_row = rows.prompt.context(CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: format!("missing SQLite node anchor prompt row for {node_id:?}"),
-                })?;
-                prompt_row.kind_from_storage(
-                    path,
-                    node_id,
-                    parent_id,
-                    rows.prompt_attachments,
-                    rows.relations,
-                )
-            }
-            "skill_invocation" => {
-                ensure!(
-                    rows.session.is_none()
-                        && rows.session_tools.is_empty()
-                        && rows.session_patch.is_none()
-                        && rows.session_patch_tools.is_empty()
-                        && rows.prompt.is_none()
-                        && rows.prompt_attachments.is_empty()
-                        && rows.skill_result.is_none(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!(
-                            "SQLite skill invocation anchor {node_id:?} has rows for another payload kind"
-                        ),
-                    }
-                );
-                let invocation_row = rows.skill_invocation.context(CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: format!(
-                        "missing SQLite node anchor skill invocation row for {node_id:?}"
-                    ),
-                })?;
-                invocation_row.kind_from_storage(path, node_id, parent_id, rows.relations)
-            }
-            "skill_result" => {
-                ensure!(
-                    rows.session.is_none()
-                        && rows.session_tools.is_empty()
-                        && rows.session_patch.is_none()
-                        && rows.session_patch_tools.is_empty()
-                        && rows.prompt.is_none()
-                        && rows.prompt_attachments.is_empty()
-                        && rows.skill_invocation.is_none(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!(
-                            "SQLite skill result anchor {node_id:?} has rows for another payload kind"
-                        ),
-                    }
-                );
-                let result_row = rows.skill_result.context(CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: format!("missing SQLite node anchor skill result row for {node_id:?}"),
-                })?;
-                result_row.kind_from_storage(path, node_id, parent_id, rows.relations)
-            }
-            _ => CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!("invalid SQLite node anchor kind {:?}", self.kind),
-            }
-            .fail(),
+fn node_anchor_kind_from_storage(
+    path: &Path,
+    node_id: &str,
+    parent_id: &str,
+    rows: &NodeAnchorStorageRows<'_>,
+) -> Result<Kind> {
+    let payload_count = node_anchor_payload_row_count(rows);
+    ensure!(
+        payload_count == 1,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "SQLite anchor node {node_id:?} has {payload_count} payload rows; expected exactly one"
+            ),
         }
+    );
+    let payload_kind = if rows.session.is_some() {
+        "session"
+    } else if rows.session_patch.is_some() {
+        "session_patch"
+    } else if rows.prompt.is_some() {
+        "prompt"
+    } else if rows.skill_invocation.is_some() {
+        "skill_invocation"
+    } else {
+        "skill_result"
+    };
+    match payload_kind {
+        "session" => {
+            ensure!(
+                rows.session_patch.is_none()
+                    && rows.session_patch_tools.is_empty()
+                    && rows.prompt.is_none()
+                    && rows.prompt_attachments.is_empty()
+                    && rows.skill_invocation.is_none()
+                    && rows.skill_result.is_none(),
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("SQLite session anchor {node_id:?} has session patch rows"),
+                }
+            );
+            let session_row = rows.session.context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("missing SQLite node anchor session row for {node_id:?}"),
+            })?;
+            session_row.kind_from_storage(
+                path,
+                node_id,
+                parent_id,
+                rows.session_tools,
+                rows.relations,
+            )
+        }
+        "session_patch" => {
+            ensure!(
+                rows.session.is_none()
+                    && rows.session_tools.is_empty()
+                    && rows.prompt.is_none()
+                    && rows.prompt_attachments.is_empty()
+                    && rows.skill_invocation.is_none()
+                    && rows.skill_result.is_none(),
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "SQLite session patch anchor {node_id:?} has session tool rows"
+                    ),
+                }
+            );
+            let patch_row = rows.session_patch.context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("missing SQLite node anchor session patch row for {node_id:?}"),
+            })?;
+            patch_row.kind_from_storage(
+                path,
+                node_id,
+                parent_id,
+                rows.session_patch_tools,
+                rows.relations,
+            )
+        }
+        "prompt" => {
+            ensure!(
+                rows.session.is_none()
+                    && rows.session_tools.is_empty()
+                    && rows.session_patch.is_none()
+                    && rows.session_patch_tools.is_empty()
+                    && rows.skill_invocation.is_none()
+                    && rows.skill_result.is_none(),
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "SQLite prompt anchor {node_id:?} has rows for another payload kind"
+                    ),
+                }
+            );
+            let prompt_row = rows.prompt.context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("missing SQLite node anchor prompt row for {node_id:?}"),
+            })?;
+            prompt_row.kind_from_storage(
+                path,
+                node_id,
+                parent_id,
+                rows.prompt_attachments,
+                rows.relations,
+            )
+        }
+        "skill_invocation" => {
+            ensure!(
+                rows.session.is_none()
+                    && rows.session_tools.is_empty()
+                    && rows.session_patch.is_none()
+                    && rows.session_patch_tools.is_empty()
+                    && rows.prompt.is_none()
+                    && rows.prompt_attachments.is_empty()
+                    && rows.skill_result.is_none(),
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "SQLite skill invocation anchor {node_id:?} has rows for another payload kind"
+                    ),
+                }
+            );
+            let invocation_row = rows.skill_invocation.context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("missing SQLite node anchor skill invocation row for {node_id:?}"),
+            })?;
+            invocation_row.kind_from_storage(path, node_id, parent_id, rows.relations)
+        }
+        "skill_result" => {
+            ensure!(
+                rows.session.is_none()
+                    && rows.session_tools.is_empty()
+                    && rows.session_patch.is_none()
+                    && rows.session_patch_tools.is_empty()
+                    && rows.prompt.is_none()
+                    && rows.prompt_attachments.is_empty()
+                    && rows.skill_invocation.is_none(),
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "SQLite skill result anchor {node_id:?} has rows for another payload kind"
+                    ),
+                }
+            );
+            let result_row = rows.skill_result.context(CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("missing SQLite node anchor skill result row for {node_id:?}"),
+            })?;
+            result_row.kind_from_storage(path, node_id, parent_id, rows.relations)
+        }
+        _ => unreachable!("payload kind is derived from the known payload tables"),
     }
 }
 
@@ -6871,8 +6846,8 @@ mod tests {
     use crate::schema::{
         jobs, node_anchor_prompt_attachments, node_anchor_prompts, node_anchor_session_patch_tools,
         node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
-        node_anchor_skill_invocations, node_anchor_skill_results, node_anchors, node_metadata,
-        node_relations, node_tool_results, node_tool_uses, nodes, sessions, store_meta,
+        node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_relations,
+        node_tool_results, node_tool_uses, nodes, sessions, store_meta,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
@@ -7366,22 +7341,14 @@ mod tests {
             .unwrap()
     }
 
-    async fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
+    async fn node_kind(store: &SqliteStore, node_id: &str) -> String {
         let mut connection = store.connect().await.unwrap();
-        let kind = nodes::table
+        nodes::table
             .filter(nodes::id.eq(node_id))
             .select(nodes::kind)
             .get_result::<String>(&mut connection)
             .await
-            .unwrap();
-        let anchor_kind = node_anchors::table
-            .filter(node_anchors::node_id.eq(node_id))
-            .select(node_anchors::kind)
-            .get_result::<String>(&mut connection)
-            .await
-            .optional()
-            .unwrap();
-        (kind, anchor_kind)
+            .unwrap()
     }
 
     async fn node_content(store: &SqliteStore, node_id: &str) -> Option<String> {
@@ -7418,24 +7385,11 @@ mod tests {
             != 0
     }
 
-    async fn node_anchor_has_kind_json_column(store: &SqliteStore) -> bool {
+    async fn node_anchor_table_exists(store: &SqliteStore) -> bool {
         let mut connection = store.connect().await.unwrap();
         diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM pragma_table_info('node_anchors') \
-             WHERE name = 'kind_json'",
-        )
-        .get_result::<ColumnCount>(&mut connection)
-        .await
-        .unwrap()
-        .count
-            != 0
-    }
-
-    async fn node_anchor_has_payload_columns(store: &SqliteStore) -> bool {
-        let mut connection = store.connect().await.unwrap();
-        diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM pragma_table_info('node_anchors') \
-             WHERE name NOT IN ('node_id', 'kind')",
+            "SELECT COUNT(*) AS count FROM sqlite_master \
+             WHERE type = 'table' AND name = 'node_anchors'",
         )
         .get_result::<ColumnCount>(&mut connection)
         .await
@@ -7667,7 +7621,7 @@ mod tests {
         assert_eq!(store.schema_version().await.unwrap(), 17);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
-        assert!(!node_anchor_has_kind_json_column(&store).await);
+        assert!(!node_anchor_table_exists(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
     }
 
@@ -8685,8 +8639,7 @@ mod tests {
         drop(connection);
 
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
-        assert!(!node_anchor_has_kind_json_column(&reopened).await);
-        assert!(!node_anchor_has_payload_columns(&reopened).await);
+        assert!(!node_anchor_table_exists(&reopened).await);
         for node in expected {
             assert_eq!(reopened.get_node(&node.id).await.unwrap(), node);
         }
@@ -9099,12 +9052,7 @@ mod tests {
                 active_skill: None,
             },
         ));
-        let expected_node_kinds = (
-            child_kind.tag().as_str().to_owned(),
-            child_kind
-                .anchor_payload_kind()
-                .map(|kind| kind.as_str().to_owned()),
-        );
+        let expected_node_kind = child_kind.tag().as_str().to_owned();
         let child = store
             .append(NewNode {
                 parent: primary_parent.clone(),
@@ -9117,7 +9065,7 @@ mod tests {
 
         let relations = node_relation_rows(&store, &child).await;
 
-        assert_eq!(node_kinds(&store, &child).await, expected_node_kinds);
+        assert_eq!(node_kind(&store, &child).await, expected_node_kind);
         assert_eq!(relations.len(), 3);
         assert!(relations.contains(&NodeRelationRow {
             child_node_id: child.clone(),
@@ -9362,7 +9310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_persists_node_anchor_row() {
+    async fn append_persists_node_anchor_payload_rows() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).await.unwrap();
@@ -9553,7 +9501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reading_anchor_node_requires_anchor_row() {
+    async fn reading_anchor_node_requires_exactly_one_payload_row() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).await.unwrap();
@@ -9562,7 +9510,38 @@ mod tests {
             .await
             .unwrap();
         let mut connection = store.connect().await.unwrap();
-        diesel::delete(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
+        diesel::delete(
+            node_anchor_sessions::table.filter(node_anchor_sessions::node_id.eq(&anchor_id)),
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        drop(connection);
+
+        let error = store.get_node(&anchor_id).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::StoreError::CorruptedStore { message, .. }
+                if message.contains("has 0 payload rows; expected exactly one")
+        ));
+    }
+
+    #[tokio::test]
+    async fn reading_anchor_node_rejects_multiple_payload_rows() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(session_anchor_node(&store.root_id()))
+            .await
+            .unwrap();
+        let mut connection = store.connect().await.unwrap();
+        diesel::insert_into(node_anchor_prompts::table)
+            .values((
+                node_anchor_prompts::node_id.eq(&anchor_id),
+                node_anchor_prompts::prompt.eq("unexpected"),
+            ))
             .execute(&mut connection)
             .await
             .unwrap();
@@ -9573,7 +9552,7 @@ mod tests {
         assert!(matches!(
             error,
             crate::StoreError::CorruptedStore { message, .. }
-                if message.contains("missing SQLite node anchor row")
+                if message.contains("has 2 payload rows; expected exactly one")
         ));
     }
 

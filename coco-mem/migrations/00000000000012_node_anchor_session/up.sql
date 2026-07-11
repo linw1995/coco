@@ -100,7 +100,7 @@ CREATE TABLE node_anchor_sessions (
     enable_coco_shim BOOLEAN NOT NULL,
     active_skill_name TEXT,
     active_skill_handoff TEXT,
-    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+    FOREIGN KEY (node_id) REFERENCES nodes(id)
 );
 
 INSERT INTO node_anchor_sessions (

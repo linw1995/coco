@@ -11,6 +11,22 @@ SELECT CASE
     )
     AND NOT EXISTS (
         SELECT 1
+        FROM nodes AS node
+        WHERE node.kind = 'anchor'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM node_anchors AS anchor
+              WHERE anchor.node_id = node.id
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchors AS anchor
+        JOIN nodes AS node ON node.id = anchor.node_id
+        WHERE node.kind <> 'anchor'
+    )
+    AND NOT EXISTS (
+        SELECT 1
         FROM node_anchors AS anchor
         WHERE anchor.kind = 'session'
           AND NOT EXISTS (
@@ -22,8 +38,9 @@ SELECT CASE
     AND NOT EXISTS (
         SELECT 1
         FROM node_anchor_sessions AS session
-        JOIN node_anchors AS anchor ON anchor.node_id = session.node_id
-        WHERE anchor.kind <> 'session'
+        LEFT JOIN node_anchors AS anchor ON anchor.node_id = session.node_id
+        WHERE anchor.node_id IS NULL
+           OR anchor.kind <> 'session'
            OR session.role NOT IN ('orchestrator', 'runner')
            OR (session.max_tokens IS NOT NULL AND (
                json_valid(session.max_tokens) = 0
@@ -57,8 +74,9 @@ SELECT CASE
     AND NOT EXISTS (
         SELECT 1
         FROM node_anchor_session_patches AS patch
-        JOIN node_anchors AS anchor ON anchor.node_id = patch.node_id
-        WHERE anchor.kind <> 'session_patch'
+        LEFT JOIN node_anchors AS anchor ON anchor.node_id = patch.node_id
+        WHERE anchor.node_id IS NULL
+           OR anchor.kind <> 'session_patch'
            OR patch.role NOT IN ('orchestrator', 'runner')
            OR (patch.provider_profile_present = 0 AND patch.provider_profile IS NOT NULL)
            OR (patch.provider_present = 0 AND patch.provider IS NOT NULL)
@@ -98,8 +116,9 @@ SELECT CASE
     AND NOT EXISTS (
         SELECT 1
         FROM node_anchor_prompts AS prompt
-        JOIN node_anchors AS anchor ON anchor.node_id = prompt.node_id
-        WHERE anchor.kind <> 'prompt'
+        LEFT JOIN node_anchors AS anchor ON anchor.node_id = prompt.node_id
+        WHERE anchor.node_id IS NULL
+           OR anchor.kind <> 'prompt'
     )
     AND NOT EXISTS (
         SELECT 1
@@ -133,8 +152,9 @@ SELECT CASE
     AND NOT EXISTS (
         SELECT 1
         FROM node_anchor_skill_invocations AS invocation
-        JOIN node_anchors AS anchor ON anchor.node_id = invocation.node_id
-        WHERE anchor.kind <> 'skill_invocation'
+        LEFT JOIN node_anchors AS anchor ON anchor.node_id = invocation.node_id
+        WHERE anchor.node_id IS NULL
+           OR anchor.kind <> 'skill_invocation'
            OR invocation.mode NOT IN ('inherit_context', 'handoff')
            OR (invocation.mode = 'inherit_context' AND invocation.prompt IS NOT NULL)
            OR (invocation.mode = 'handoff' AND invocation.prompt IS NULL)
@@ -152,8 +172,9 @@ SELECT CASE
     AND NOT EXISTS (
         SELECT 1
         FROM node_anchor_skill_results AS result
-        JOIN node_anchors AS anchor ON anchor.node_id = result.node_id
-        WHERE anchor.kind <> 'skill_result'
+        LEFT JOIN node_anchors AS anchor ON anchor.node_id = result.node_id
+        WHERE anchor.node_id IS NULL
+           OR anchor.kind <> 'skill_result'
     )
     AND NOT EXISTS (
         SELECT 1
@@ -196,4 +217,4 @@ END;
 
 DROP TABLE node_anchor_kind_json_migration_guard;
 
-ALTER TABLE node_anchors DROP COLUMN kind_json;
+DROP TABLE node_anchors;

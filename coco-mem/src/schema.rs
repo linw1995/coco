@@ -29,13 +29,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    node_anchors (node_id) {
-        node_id -> Text,
-        kind -> Text,
-    }
-}
-
-diesel::table! {
     node_anchor_prompts (node_id) {
         node_id -> Text,
         prompt -> Text,
@@ -215,15 +208,14 @@ diesel::table! {
 }
 
 diesel::joinable!(branches -> nodes (head_id));
-diesel::joinable!(node_anchors -> nodes (node_id));
-diesel::joinable!(node_anchor_sessions -> node_anchors (node_id));
+diesel::joinable!(node_anchor_sessions -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchor_sessions (node_id));
-diesel::joinable!(node_anchor_skill_invocations -> node_anchors (node_id));
-diesel::joinable!(node_anchor_skill_results -> node_anchors (node_id));
-diesel::joinable!(node_anchor_prompts -> node_anchors (node_id));
+diesel::joinable!(node_anchor_skill_invocations -> nodes (node_id));
+diesel::joinable!(node_anchor_skill_results -> nodes (node_id));
+diesel::joinable!(node_anchor_prompts -> nodes (node_id));
 diesel::joinable!(node_anchor_prompt_attachments -> node_anchor_prompts (node_id));
 diesel::joinable!(node_anchor_session_patch_tools -> node_anchor_session_patches (node_id));
-diesel::joinable!(node_anchor_session_patches -> node_anchors (node_id));
+diesel::joinable!(node_anchor_session_patches -> nodes (node_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
 diesel::joinable!(node_tool_results -> nodes (node_id));
 diesel::joinable!(node_tool_uses -> nodes (node_id));
@@ -241,7 +233,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     node_anchor_session_tools,
     node_anchor_skill_invocations,
     node_anchor_skill_results,
-    node_anchors,
     node_metadata,
     node_relations,
     node_tool_results,

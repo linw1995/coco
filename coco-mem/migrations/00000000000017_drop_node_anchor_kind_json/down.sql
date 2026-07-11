@@ -1,5 +1,22 @@
-ALTER TABLE node_anchors
-ADD COLUMN kind_json TEXT NOT NULL DEFAULT '{"Anchor":null}';
+CREATE TABLE node_anchors (
+    node_id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL,
+    kind_json TEXT NOT NULL DEFAULT '{"Anchor":null}',
+    FOREIGN KEY (node_id) REFERENCES nodes(id)
+);
+
+CREATE INDEX node_anchors_kind_idx ON node_anchors(kind);
+
+INSERT INTO node_anchors (node_id, kind)
+SELECT node_id, 'session' FROM node_anchor_sessions
+UNION ALL
+SELECT node_id, 'session_patch' FROM node_anchor_session_patches
+UNION ALL
+SELECT node_id, 'prompt' FROM node_anchor_prompts
+UNION ALL
+SELECT node_id, 'skill_invocation' FROM node_anchor_skill_invocations
+UNION ALL
+SELECT node_id, 'skill_result' FROM node_anchor_skill_results;
 
 UPDATE node_anchors AS anchor
 SET kind_json = json_object(

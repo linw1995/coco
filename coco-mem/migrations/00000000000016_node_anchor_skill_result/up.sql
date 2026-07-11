@@ -60,7 +60,7 @@ CREATE TABLE node_anchor_skill_results (
     node_id TEXT PRIMARY KEY NOT NULL,
     skill_name TEXT NOT NULL,
     output TEXT NOT NULL,
-    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+    FOREIGN KEY (node_id) REFERENCES nodes(id)
 );
 
 INSERT INTO node_anchor_skill_results (

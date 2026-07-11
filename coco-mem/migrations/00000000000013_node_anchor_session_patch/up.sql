@@ -95,7 +95,7 @@ CREATE TABLE node_anchor_session_patches (
     additional_params_present BOOLEAN NOT NULL,
     additional_params_json TEXT,
     enable_coco_shim BOOLEAN,
-    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+    FOREIGN KEY (node_id) REFERENCES nodes(id)
 );
 
 INSERT INTO node_anchor_session_patches (
