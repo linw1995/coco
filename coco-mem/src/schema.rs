@@ -39,7 +39,6 @@ diesel::table! {
         prompt -> Nullable<Text>,
         skill_name -> Nullable<Text>,
         skill_invocation_mode -> Nullable<Text>,
-        kind_json -> Text,
         session_system_prompt -> Nullable<Text>,
         session_temperature -> Nullable<Double>,
         session_max_tokens -> Nullable<Text>,

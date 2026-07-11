@@ -18,7 +18,7 @@ use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 use diesel_async::{AsyncConnection, RunQueryDsl, TransactionManager};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use snafu::{IntoError, prelude::*};
 use tokio::runtime::Runtime;
 
@@ -56,7 +56,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 16;
+const SQLITE_SCHEMA_VERSION: i32 = 17;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -215,7 +215,6 @@ struct NodeAnchorRow {
     prompt: Option<String>,
     skill_name: Option<String>,
     skill_invocation_mode: Option<String>,
-    kind_json: String,
     session_system_prompt: Option<String>,
     session_temperature: Option<f64>,
     session_max_tokens: Option<String>,
@@ -1764,7 +1763,6 @@ async fn load_node_anchor_rows_for_ids(
             node_anchors::prompt,
             node_anchors::skill_name,
             node_anchors::skill_invocation_mode,
-            node_anchors::kind_json,
             node_anchors::session_system_prompt,
             node_anchors::session_temperature,
             node_anchors::session_max_tokens,
@@ -2733,7 +2731,6 @@ async fn persist_node_anchor_row(
             node_anchors::prompt.eq(row.prompt),
             node_anchors::skill_name.eq(row.skill_name),
             node_anchors::skill_invocation_mode.eq(row.skill_invocation_mode),
-            node_anchors::kind_json.eq(row.kind_json),
             node_anchors::session_system_prompt.eq(row.session_system_prompt),
             node_anchors::session_temperature.eq(row.session_temperature),
             node_anchors::session_max_tokens.eq(row.session_max_tokens),
@@ -3268,7 +3265,6 @@ impl NodeAnchorRow {
             prompt: summary.prompt,
             skill_name: summary.skill_name,
             skill_invocation_mode: summary.skill_invocation_mode,
-            kind_json: anchor_kind_residual_json(&node.kind, path)?,
             session_system_prompt: session.system_prompt,
             session_temperature: session.temperature,
             session_max_tokens: session.max_tokens,
@@ -3323,7 +3319,7 @@ impl NodeAnchorRow {
                     rows.session_tools,
                     rows.relations,
                 )?;
-                return self.validate_relational_kind(path, kind);
+                self.validate_relational_kind(path, kind)
             }
             "session_patch" => {
                 ensure!(
@@ -3348,7 +3344,7 @@ impl NodeAnchorRow {
                     rows.session_patch_tools,
                     rows.relations,
                 )?;
-                return self.validate_relational_kind(path, kind);
+                self.validate_relational_kind(path, kind)
             }
             "prompt" => {
                 ensure!(
@@ -3369,7 +3365,7 @@ impl NodeAnchorRow {
                     rows.prompt_attachments,
                     rows.relations,
                 )?;
-                return self.validate_relational_kind(path, kind);
+                self.validate_relational_kind(path, kind)
             }
             "skill_invocation" => {
                 ensure!(
@@ -3390,7 +3386,7 @@ impl NodeAnchorRow {
                     parent_id,
                     rows.relations,
                 )?;
-                return self.validate_relational_kind(path, kind);
+                self.validate_relational_kind(path, kind)
             }
             "skill_result" => {
                 ensure!(
@@ -3407,51 +3403,14 @@ impl NodeAnchorRow {
                 );
                 let kind =
                     self.skill_result_kind_from_storage(path, node_id, parent_id, rows.relations)?;
-                return self.validate_relational_kind(path, kind);
+                self.validate_relational_kind(path, kind)
             }
-            _ => {}
+            _ => CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("invalid SQLite node anchor kind {:?}", self.kind),
+            }
+            .fail(),
         }
-        ensure!(
-            rows.session_tools.is_empty()
-                && rows.session_patch.is_none()
-                && rows.session_patch_tools.is_empty()
-                && rows.prompt_attachments.is_empty(),
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!("SQLite anchor {node_id:?} has rows for another payload kind"),
-            }
-        );
-        let mut value: Value =
-            serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
-                path: path.to_owned(),
-                column: "node_anchors.kind_json".to_owned(),
-            })?;
-        restore_kind_anchor_summary(self, &mut value, path)?;
-        let kind: Kind = serde_json::from_value(value).context(ParseSqliteStoreValueSnafu {
-            path: path.to_owned(),
-            column: "node_anchors.kind_json".to_owned(),
-        })?;
-        ensure!(
-            matches!(&kind, Kind::Anchor(_)),
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "SQLite node anchor row for {node_id:?} contains a non-anchor kind"
-                ),
-            }
-        );
-        ensure!(
-            Some(self.kind.as_str()) == kind.anchor_payload_kind().map(|kind| kind.as_str()),
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "SQLite node anchor kind column {:?} does not match kind_json",
-                    self.kind
-                ),
-            }
-        );
-        validate_node_anchor_summary(path, self, &kind)?;
-        Ok(kind)
     }
 
     fn session_kind_from_storage(
@@ -3974,176 +3933,15 @@ fn merge_parents_from_relation_rows(
 }
 
 fn legacy_node_kind_residual_json(kind: &Kind, path: &Path) -> Result<String> {
-    kind_residual_json_for_column(kind, path, "nodes.kind_json")
-}
-
-fn anchor_kind_residual_json(kind: &Kind, path: &Path) -> Result<String> {
-    kind_residual_json_for_column(kind, path, "node_anchors.kind_json")
-}
-
-fn kind_residual_json_for_column(kind: &Kind, path: &Path, column: &str) -> Result<String> {
     let residual = match kind {
         Kind::ToolUse(_) => Kind::tool_use_items(Vec::new()),
         Kind::ToolResult(_) => Kind::tool_result_items(Vec::new()),
         _ => kind.clone(),
     };
-    let mut value = serde_json::to_value(residual).context(ParseSqliteStoreValueSnafu {
+    serde_json::to_string(&residual).context(ParseSqliteStoreValueSnafu {
         path: path.to_owned(),
-        column: column.to_owned(),
-    })?;
-    remove_kind_anchor_summary(&mut value);
-    serde_json::to_string(&value).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: column.to_owned(),
+        column: "nodes.kind_json".to_owned(),
     })
-}
-
-fn remove_kind_anchor_summary(value: &mut Value) {
-    if let Some(payload) = anchor_payload_object_mut(value, "Session") {
-        payload.remove("role");
-        payload.remove("provider_profile");
-        payload.remove("provider");
-        payload.remove("model");
-        payload.remove("prompt");
-    }
-    if let Some(payload) = anchor_payload_object_mut(value, "Prompt") {
-        payload.remove("prompt");
-    }
-    if let Some(payload) = anchor_payload_object_mut(value, "SkillInvocation") {
-        payload.remove("skill_name");
-        if let Some(mode) = payload.get_mut("mode").and_then(Value::as_object_mut) {
-            mode.remove("kind");
-            mode.remove("prompt");
-        }
-    }
-    if let Some(payload) = anchor_payload_object_mut(value, "SkillResult") {
-        payload.remove("skill_name");
-    }
-}
-
-fn restore_kind_anchor_summary(row: &NodeAnchorRow, value: &mut Value, path: &Path) -> Result<()> {
-    if let Some(payload) = anchor_payload_object_mut(value, "Session") {
-        ensure_absent(path, "node_anchors.kind_json", payload, "role")?;
-        ensure_absent(path, "node_anchors.kind_json", payload, "provider_profile")?;
-        ensure_absent(path, "node_anchors.kind_json", payload, "provider")?;
-        ensure_absent(path, "node_anchors.kind_json", payload, "model")?;
-        ensure_absent(path, "node_anchors.kind_json", payload, "prompt")?;
-        payload.insert(
-            "role".to_owned(),
-            session_role_json_value(
-                row.session_role.as_deref().context(CorruptedStoreSnafu {
-                    path: path.to_owned(),
-                    message: "missing SQLite node_anchors.session_role".to_owned(),
-                })?,
-                path,
-            )?,
-        );
-        insert_optional_string(payload, "provider_profile", row.provider_profile.as_deref());
-        insert_optional_string(payload, "provider", row.provider.as_deref());
-        payload.insert(
-            "model".to_owned(),
-            Value::String(required_anchor_summary(
-                path,
-                "node_anchors.model",
-                row.model.as_deref(),
-            )?),
-        );
-        payload.insert(
-            "prompt".to_owned(),
-            Value::String(required_anchor_summary(
-                path,
-                "node_anchors.prompt",
-                row.prompt.as_deref(),
-            )?),
-        );
-    }
-    if let Some(payload) = anchor_payload_object_mut(value, "Prompt") {
-        ensure_absent(path, "node_anchors.kind_json", payload, "prompt")?;
-        payload.insert(
-            "prompt".to_owned(),
-            Value::String(required_anchor_summary(
-                path,
-                "node_anchors.prompt",
-                row.prompt.as_deref(),
-            )?),
-        );
-    }
-    if let Some(payload) = anchor_payload_object_mut(value, "SkillInvocation") {
-        ensure_absent(path, "node_anchors.kind_json", payload, "skill_name")?;
-        payload.insert(
-            "skill_name".to_owned(),
-            Value::String(required_anchor_summary(
-                path,
-                "node_anchors.skill_name",
-                row.skill_name.as_deref(),
-            )?),
-        );
-        let mode = payload
-            .get_mut("mode")
-            .and_then(Value::as_object_mut)
-            .context(CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: "missing SQLite node skill invocation mode".to_owned(),
-            })?;
-        ensure_absent(path, "node_anchors.kind_json", mode, "kind")?;
-        ensure_absent(path, "node_anchors.kind_json", mode, "prompt")?;
-        let mode_kind = required_anchor_summary(
-            path,
-            "node_anchors.skill_invocation_mode",
-            row.skill_invocation_mode.as_deref(),
-        )?;
-        mode.insert("kind".to_owned(), Value::String(mode_kind.clone()));
-        if mode_kind == "handoff" {
-            mode.insert(
-                "prompt".to_owned(),
-                Value::String(required_anchor_summary(
-                    path,
-                    "node_anchors.prompt",
-                    row.prompt.as_deref(),
-                )?),
-            );
-        }
-    }
-    if let Some(payload) = anchor_payload_object_mut(value, "SkillResult") {
-        ensure_absent(path, "node_anchors.kind_json", payload, "skill_name")?;
-        payload.insert(
-            "skill_name".to_owned(),
-            Value::String(required_anchor_summary(
-                path,
-                "node_anchors.skill_name",
-                row.skill_name.as_deref(),
-            )?),
-        );
-    }
-    Ok(())
-}
-
-fn anchor_payload_object_mut<'a>(
-    value: &'a mut Value,
-    payload_kind: &str,
-) -> Option<&'a mut Map<String, Value>> {
-    value
-        .get_mut("Anchor")?
-        .get_mut("payload")?
-        .get_mut(payload_kind)?
-        .as_object_mut()
-}
-
-fn ensure_absent(path: &Path, column: &str, object: &Map<String, Value>, key: &str) -> Result<()> {
-    ensure!(
-        !object.contains_key(key),
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("SQLite {column} duplicates column-owned field {key:?}"),
-        }
-    );
-    Ok(())
-}
-
-fn insert_optional_string(object: &mut Map<String, Value>, key: &str, value: Option<&str>) {
-    if let Some(value) = value {
-        object.insert(key.to_owned(), Value::String(value.to_owned()));
-    }
 }
 
 fn required_anchor_summary(path: &Path, column: &str, value: Option<&str>) -> Result<String> {
@@ -4151,13 +3949,6 @@ fn required_anchor_summary(path: &Path, column: &str, value: Option<&str>) -> Re
         path: path.to_owned(),
         message: format!("missing SQLite {column}"),
     })
-}
-
-fn session_role_json_value(role: &str, path: &Path) -> Result<Value> {
-    Ok(Value::String(match parse_session_role(role, path)? {
-        SessionRole::Orchestrator => "orchestrator".to_owned(),
-        SessionRole::Runner => "runner".to_owned(),
-    }))
 }
 
 #[derive(Default)]
@@ -7341,6 +7132,19 @@ mod tests {
             != 0
     }
 
+    async fn node_anchor_has_kind_json_column(store: &SqliteStore) -> bool {
+        let mut connection = store.connect().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('node_anchors') \
+             WHERE name = 'kind_json'",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
+    }
+
     async fn nodes_have_anchor_columns(store: &SqliteStore) -> bool {
         let mut connection = store.connect().await.unwrap();
         diesel::sql_query(
@@ -7409,7 +7213,6 @@ mod tests {
                 node_anchors::prompt,
                 node_anchors::skill_name,
                 node_anchors::skill_invocation_mode,
-                node_anchors::kind_json,
                 node_anchors::session_system_prompt,
                 node_anchors::session_temperature,
                 node_anchors::session_max_tokens,
@@ -7608,9 +7411,10 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 16);
+        assert_eq!(store.schema_version().await.unwrap(), 17);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
+        assert!(!node_anchor_has_kind_json_column(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
     }
 
@@ -7622,7 +7426,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 16);
+        assert_eq!(store.schema_version().await.unwrap(), 17);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -8347,7 +8151,7 @@ mod tests {
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
         revert_store_migrations_to(&mut connection, 15);
         connection
-            .run_next_migration(super::STORE_MIGRATIONS)
+            .run_pending_migrations(super::STORE_MIGRATIONS)
             .unwrap();
         drop(connection);
 
@@ -8380,6 +8184,180 @@ mod tests {
             diesel::sql_query(
                 "UPDATE node_anchors SET kind_json = json_set(\
                  kind_json, '$.Anchor.payload.SkillResult.output', json('{}')) WHERE node_id = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(&anchor_id),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
+    async fn node_anchor_kind_json_migration_round_trips_all_payloads() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let merge_parent = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("merge parent".to_owned()),
+            })
+            .await
+            .unwrap();
+        let new_nodes = [
+            rich_session_anchor_node(
+                &store.root_id(),
+                vec![MergeParent::merge(merge_parent.clone())],
+            ),
+            rich_session_patch_anchor_node(
+                &store.root_id(),
+                vec![MergeParent::shadow(merge_parent.clone())],
+            ),
+            rich_prompt_anchor_node(
+                &store.root_id(),
+                vec![MergeParent::merge(merge_parent.clone())],
+            ),
+            skill_invocation_anchor_node(
+                &store.root_id(),
+                vec![MergeParent::shadow(merge_parent.clone())],
+            ),
+            skill_result_anchor_node(&store.root_id(), vec![MergeParent::merge(merge_parent)]),
+        ];
+        let mut expected = Vec::new();
+        for new_node in new_nodes {
+            let node_id = store.append(new_node).await.unwrap();
+            expected.push(store.get_node(&node_id).await.unwrap());
+        }
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 16);
+        for node in &expected {
+            let row = diesel::RunQueryDsl::get_result::<LegacyKindJson>(
+                diesel::sql_query("SELECT kind_json FROM node_anchors WHERE node_id = ?")
+                    .bind::<diesel::sql_types::Text, _>(&node.id),
+                &mut connection,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Kind>(&row.kind_json).unwrap(),
+                node.kind
+            );
+        }
+        revert_store_migrations_to(&mut connection, 10);
+        for node in &expected {
+            let row = diesel::RunQueryDsl::get_result::<LegacyKindJson>(
+                diesel::sql_query("SELECT kind_json FROM node_anchors WHERE node_id = ?")
+                    .bind::<diesel::sql_types::Text, _>(&node.id),
+                &mut connection,
+            )
+            .unwrap();
+            let value = serde_json::from_str::<serde_json::Value>(&row.kind_json).unwrap();
+            match &node.kind {
+                Kind::Anchor(Anchor {
+                    payload: crate::AnchorPayload::Session(_),
+                    ..
+                }) => {
+                    assert_eq!(value.pointer("/Anchor/payload/Session/role"), None);
+                    assert_eq!(value.pointer("/Anchor/payload/Session/prompt"), None);
+                    assert!(
+                        value
+                            .pointer("/Anchor/payload/Session/system_prompt")
+                            .is_some()
+                    );
+                }
+                Kind::Anchor(Anchor {
+                    payload: crate::AnchorPayload::SessionPatch(_),
+                    ..
+                }) => {
+                    assert!(value.pointer("/Anchor/payload/SessionPatch").is_some());
+                }
+                Kind::Anchor(Anchor {
+                    payload: crate::AnchorPayload::Prompt(_),
+                    ..
+                }) => {
+                    assert_eq!(value.pointer("/Anchor/payload/Prompt/prompt"), None);
+                    assert!(
+                        value
+                            .pointer("/Anchor/payload/Prompt/attachments")
+                            .is_some()
+                    );
+                }
+                Kind::Anchor(Anchor {
+                    payload: crate::AnchorPayload::SkillInvocation(_),
+                    ..
+                }) => {
+                    assert_eq!(
+                        value.pointer("/Anchor/payload/SkillInvocation/skill_name"),
+                        None
+                    );
+                    assert_eq!(
+                        value.pointer("/Anchor/payload/SkillInvocation/mode/kind"),
+                        None
+                    );
+                    assert_eq!(
+                        value.pointer("/Anchor/payload/SkillInvocation/mode/prompt"),
+                        None
+                    );
+                }
+                Kind::Anchor(Anchor {
+                    payload: crate::AnchorPayload::SkillResult(_),
+                    ..
+                }) => {
+                    assert_eq!(
+                        value.pointer("/Anchor/payload/SkillResult/skill_name"),
+                        None
+                    );
+                    assert!(
+                        value
+                            .pointer("/Anchor/payload/SkillResult/output")
+                            .is_some()
+                    );
+                }
+                Kind::ToolUse(_) | Kind::ToolResult(_) | Kind::Text(_) | Kind::Failure(_) => {
+                    panic!("expected anchor node")
+                }
+            }
+        }
+        connection
+            .run_pending_migrations(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert!(!node_anchor_has_kind_json_column(&reopened).await);
+        for node in expected {
+            assert_eq!(reopened.get_node(&node.id).await.unwrap(), node);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_anchor_kind_json_migration_rejects_incomplete_relational_payload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(session_anchor_node(&store.root_id()))
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 16);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE node_anchors SET session_system_prompt = NULL WHERE node_id = ?",
             )
             .bind::<diesel::sql_types::Text, _>(&anchor_id),
             &mut connection,
@@ -8715,7 +8693,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 16);
+        assert_eq!(store.schema_version().await.unwrap(), 17);
     }
 
     #[tokio::test]
@@ -9093,30 +9071,6 @@ mod tests {
             }
         );
         assert_eq!(node_content(&store, &session).await, None);
-        let session_kind_json = serde_json::from_str::<serde_json::Value>(
-            &node_anchor_row(&store, &session).await.kind_json,
-        )
-        .unwrap();
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/role"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/provider_profile"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/provider"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/model"),
-            None
-        );
-        assert_eq!(
-            session_kind_json.pointer("/Anchor/payload/Session/prompt"),
-            None
-        );
         assert_eq!(
             node_anchor_summary(&store, &prompt).await,
             NodeAnchorSummaryRow {
@@ -9130,14 +9084,6 @@ mod tests {
             }
         );
         assert_eq!(node_content(&store, &prompt).await, None);
-        let prompt_kind_json = serde_json::from_str::<serde_json::Value>(
-            &node_anchor_row(&store, &prompt).await.kind_json,
-        )
-        .unwrap();
-        assert_eq!(
-            prompt_kind_json.pointer("/Anchor/payload/Prompt/prompt"),
-            None
-        );
     }
 
     #[tokio::test]
@@ -9150,13 +9096,6 @@ mod tests {
             .await
             .unwrap();
         let expected = store.get_node(&anchor_id).await.unwrap();
-        let mut connection = store.connect().await.unwrap();
-        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
-            .set(node_anchors::kind_json.eq("not JSON"))
-            .execute(&mut connection)
-            .await
-            .unwrap();
-        drop(connection);
 
         assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
     }
@@ -9187,13 +9126,6 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut connection = store.connect().await.unwrap();
-        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
-            .set(node_anchors::kind_json.eq("not JSON"))
-            .execute(&mut connection)
-            .await
-            .unwrap();
-        drop(connection);
 
         assert_eq!(store.get_node(&anchor_id).await.unwrap().kind, kind);
         let row = node_anchor_session_patch_row(&store, &anchor_id).await;
@@ -9220,13 +9152,6 @@ mod tests {
             .await
             .unwrap();
         let expected = store.get_node(&anchor_id).await.unwrap();
-        let mut connection = store.connect().await.unwrap();
-        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
-            .set(node_anchors::kind_json.eq("not JSON"))
-            .execute(&mut connection)
-            .await
-            .unwrap();
-        drop(connection);
 
         assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
     }
@@ -9241,13 +9166,6 @@ mod tests {
             .await
             .unwrap();
         let expected = store.get_node(&anchor_id).await.unwrap();
-        let mut connection = store.connect().await.unwrap();
-        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
-            .set(node_anchors::kind_json.eq("not JSON"))
-            .execute(&mut connection)
-            .await
-            .unwrap();
-        drop(connection);
 
         assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
     }
@@ -9262,13 +9180,6 @@ mod tests {
             .await
             .unwrap();
         let expected = store.get_node(&anchor_id).await.unwrap();
-        let mut connection = store.connect().await.unwrap();
-        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
-            .set(node_anchors::kind_json.eq("not JSON"))
-            .execute(&mut connection)
-            .await
-            .unwrap();
-        drop(connection);
 
         assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
     }
@@ -9453,7 +9364,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 16);
+        assert_eq!(store.schema_version().await.unwrap(), 17);
     }
 
     #[tokio::test]
@@ -9481,7 +9392,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=16")
+                .contains("unsupported SQLite schema version 5, expected 6..=17")
         );
     }
 
@@ -9496,7 +9407,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=16")
+                .contains("unsupported SQLite schema version 5, expected 6..=17")
         );
     }
 
@@ -9543,7 +9454,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 16);
+        assert_eq!(reopened.schema_version().await.unwrap(), 17);
     }
 
     #[tokio::test]

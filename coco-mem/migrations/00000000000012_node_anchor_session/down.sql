@@ -1,3 +1,14 @@
+UPDATE node_anchors
+SET kind_json = json_remove(
+    kind_json,
+    '$.Anchor.payload.Session.role',
+    '$.Anchor.payload.Session.provider_profile',
+    '$.Anchor.payload.Session.provider',
+    '$.Anchor.payload.Session.model',
+    '$.Anchor.payload.Session.prompt'
+)
+WHERE kind = 'session';
+
 DROP TABLE node_anchor_session_tools;
 
 ALTER TABLE node_anchors DROP COLUMN session_active_skill_handoff;
