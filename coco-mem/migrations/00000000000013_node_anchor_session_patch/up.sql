@@ -23,7 +23,6 @@ SELECT CASE
               OR json_type(kind_json, '$.Anchor.payload.SessionPatch.system_prompt') NOT IN ('null', 'text')
               OR json_type(kind_json, '$.Anchor.payload.SessionPatch.temperature') NOT IN ('null', 'integer', 'real')
               OR json_type(kind_json, '$.Anchor.payload.SessionPatch.max_tokens') NOT IN ('null', 'integer')
-              OR json_type(kind_json, '$.Anchor.payload.SessionPatch.additional_params') IS NULL
               OR json_type(kind_json, '$.Anchor.payload.SessionPatch.enable_coco_shim') NOT IN ('null', 'true', 'false')
           )
     )
@@ -119,21 +118,21 @@ INSERT INTO node_anchor_session_patches (
 SELECT
     node_id,
     json_extract(kind_json, '$.Anchor.payload.SessionPatch.role'),
-    json_type(kind_json, '$.Anchor.payload.SessionPatch.provider_profile') <> 'null',
+    COALESCE(json_type(kind_json, '$.Anchor.payload.SessionPatch.provider_profile') <> 'null', 0),
     json_extract(kind_json, '$.Anchor.payload.SessionPatch.provider_profile'),
-    json_type(kind_json, '$.Anchor.payload.SessionPatch.provider') <> 'null',
+    COALESCE(json_type(kind_json, '$.Anchor.payload.SessionPatch.provider') <> 'null', 0),
     json_extract(kind_json, '$.Anchor.payload.SessionPatch.provider'),
     json_extract(kind_json, '$.Anchor.payload.SessionPatch.model'),
-    json_type(kind_json, '$.Anchor.payload.SessionPatch.tools') = 'array',
+    COALESCE(json_type(kind_json, '$.Anchor.payload.SessionPatch.tools') = 'array', 0),
     json_extract(kind_json, '$.Anchor.payload.SessionPatch.system_prompt'),
-    json_type(kind_json, '$.Anchor.payload.SessionPatch.temperature') <> 'null',
+    COALESCE(json_type(kind_json, '$.Anchor.payload.SessionPatch.temperature') <> 'null', 0),
     json_extract(kind_json, '$.Anchor.payload.SessionPatch.temperature'),
-    json_type(kind_json, '$.Anchor.payload.SessionPatch.max_tokens') <> 'null',
+    COALESCE(json_type(kind_json, '$.Anchor.payload.SessionPatch.max_tokens') <> 'null', 0),
     CASE
         WHEN json_type(kind_json, '$.Anchor.payload.SessionPatch.max_tokens') = 'null' THEN NULL
         ELSE kind_json -> '$.Anchor.payload.SessionPatch.max_tokens'
     END,
-    json_type(kind_json, '$.Anchor.payload.SessionPatch.additional_params') <> 'null',
+    COALESCE(json_type(kind_json, '$.Anchor.payload.SessionPatch.additional_params') <> 'null', 0),
     CASE
         WHEN json_type(kind_json, '$.Anchor.payload.SessionPatch.additional_params') = 'null' THEN NULL
         ELSE kind_json -> '$.Anchor.payload.SessionPatch.additional_params'
