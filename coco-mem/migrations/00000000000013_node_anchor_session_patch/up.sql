@@ -32,6 +32,7 @@ SELECT CASE
         FROM node_anchors AS anchor
         JOIN json_each(anchor.kind_json, '$.Anchor.payload.SessionPatch.tools') AS tool
         WHERE anchor.kind = 'session_patch'
+          AND json_type(anchor.kind_json, '$.Anchor.payload.SessionPatch.tools') = 'array'
           AND (
               json_type(tool.value) <> 'object'
               OR json_type(tool.value, '$.name') <> 'text'
@@ -166,4 +167,5 @@ SELECT
     tool.value -> '$.input_schema'
 FROM node_anchors AS anchor
 JOIN json_each(anchor.kind_json, '$.Anchor.payload.SessionPatch.tools') AS tool
-WHERE anchor.kind = 'session_patch';
+WHERE anchor.kind = 'session_patch'
+  AND json_type(anchor.kind_json, '$.Anchor.payload.SessionPatch.tools') = 'array';

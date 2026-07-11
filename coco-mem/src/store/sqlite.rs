@@ -7916,6 +7916,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_anchor_session_patch_migration_accepts_absent_tools() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session_patch(vec![], SessionAnchorPatch::default())),
+            })
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 12);
+        connection
+            .run_pending_migrations(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
+        assert!(
+            !node_anchor_session_patch_row(&reopened, &anchor_id)
+                .await
+                .tools_present
+        );
+        assert!(
+            node_anchor_session_patch_tool_rows(&reopened, &anchor_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn node_anchor_session_patch_migration_rejects_invalid_payload() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
