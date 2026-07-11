@@ -58,7 +58,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 20;
+const SQLITE_SCHEMA_VERSION: i32 = 21;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -425,8 +425,6 @@ struct SessionRow {
     pause_reason: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     merged_anchor_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    state_json: String,
 }
 
 #[derive(Queryable)]
@@ -4426,7 +4424,6 @@ async fn load_session_states(
             sessions::base_head_id,
             sessions::pause_reason,
             sessions::merged_anchor_id,
-            sessions::state_json,
         ))
         .order(sessions::branch_name)
         .load::<SessionRow>(connection)
@@ -4454,7 +4451,6 @@ async fn load_session_state(
             sessions::base_head_id,
             sessions::pause_reason,
             sessions::merged_anchor_id,
-            sessions::state_json,
         ))
         .get_result::<SessionRow>(connection)
         .await
@@ -4470,14 +4466,52 @@ async fn load_session_state(
 }
 
 fn session_row_into_state(path: &Path, session: SessionRow) -> Result<(String, SessionState)> {
-    let state = serde_json::from_str::<SessionState>(&session.state_json).context(
-        ParseSqliteStoreValueSnafu {
-            path: path.to_owned(),
-            column: "sessions.state_json".to_owned(),
+    let SessionRow {
+        branch_name,
+        state,
+        target_branch,
+        base_head_id,
+        pause_reason,
+        merged_anchor_id,
+    } = session;
+    let parsed = match (
+        state.as_str(),
+        target_branch,
+        base_head_id,
+        pause_reason.as_deref(),
+        merged_anchor_id,
+    ) {
+        ("active", None, None, None, None) => SessionState::Active,
+        ("attached", Some(target_branch), Some(base_head_id), None, None) => {
+            SessionState::Attached {
+                target_branch,
+                base_head_id,
+            }
+        }
+        ("paused", Some(target_branch), None, Some("closed"), None) => SessionState::Paused {
+            target_branch,
+            reason: PauseReason::Closed,
         },
-    )?;
-    validate_session_row_summary(&session, &state, path)?;
-    Ok((session.branch_name, state))
+        ("paused", Some(target_branch), None, Some("merged"), Some(merged_anchor_id)) => {
+            SessionState::Paused {
+                target_branch,
+                reason: PauseReason::Merged { merged_anchor_id },
+            }
+        }
+        (state, target_branch, base_head_id, pause_reason, merged_anchor_id) => {
+            return CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "invalid SQLite session row for branch {branch_name:?}: \
+                     state={state:?}, target_branch={target_branch:?}, \
+                     base_head_id={base_head_id:?}, pause_reason={pause_reason:?}, \
+                     merged_anchor_id={merged_anchor_id:?}"
+                ),
+            }
+            .fail();
+        }
+    };
+    Ok((branch_name, parsed))
 }
 
 async fn persist_branch(
@@ -4537,10 +4571,6 @@ async fn persist_session_state(
     branch: &str,
     state: &SessionState,
 ) -> Result<()> {
-    let state_json = serde_json::to_string(state).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: "sessions.state_json".to_owned(),
-    })?;
     let pause_reason = state.pause_reason();
     diesel::insert_into(sessions::table)
         .values((
@@ -4551,7 +4581,6 @@ async fn persist_session_state(
             sessions::pause_reason.eq(pause_reason.map(|reason| reason.as_str())),
             sessions::merged_anchor_id
                 .eq(pause_reason.and_then(|reason| reason.merged_anchor_id())),
-            sessions::state_json.eq(state_json),
         ))
         .on_conflict(sessions::branch_name)
         .do_update()
@@ -4561,7 +4590,6 @@ async fn persist_session_state(
             sessions::base_head_id.eq(diesel::upsert::excluded(sessions::base_head_id)),
             sessions::pause_reason.eq(diesel::upsert::excluded(sessions::pause_reason)),
             sessions::merged_anchor_id.eq(diesel::upsert::excluded(sessions::merged_anchor_id)),
-            sessions::state_json.eq(diesel::upsert::excluded(sessions::state_json)),
         ))
         .execute(connection)
         .await
@@ -4673,36 +4701,6 @@ async fn update_branch_head_after_session_write(
         }
     );
     Ok(())
-}
-
-fn validate_session_row_summary(row: &SessionRow, state: &SessionState, path: &Path) -> Result<()> {
-    validate_text_summary(path, "sessions.state", &row.state, state.as_str())?;
-    validate_optional_text_summary(
-        path,
-        "sessions.target_branch",
-        row.target_branch.as_deref(),
-        state.target_branch(),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "sessions.base_head_id",
-        row.base_head_id.as_deref(),
-        state.base_head_id(),
-    )?;
-
-    let pause_reason = state.pause_reason();
-    validate_optional_text_summary(
-        path,
-        "sessions.pause_reason",
-        row.pause_reason.as_deref(),
-        pause_reason.map(|reason| reason.as_str()),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "sessions.merged_anchor_id",
-        row.merged_anchor_id.as_deref(),
-        pause_reason.and_then(|reason| reason.merged_anchor_id()),
-    )
 }
 
 async fn validate_session_state(
@@ -5345,22 +5343,6 @@ fn validate_text_summary(
     column: &'static str,
     actual: &str,
     expected: &str,
-) -> Result<()> {
-    ensure!(
-        actual == expected,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("{column} value {actual:?} does not match JSON value {expected:?}"),
-        }
-    );
-    Ok(())
-}
-
-fn validate_optional_text_summary(
-    path: &Path,
-    column: &'static str,
-    actual: Option<&str>,
-    expected: Option<&str>,
 ) -> Result<()> {
     ensure!(
         actual == expected,
@@ -7164,6 +7146,14 @@ mod tests {
     }
 
     #[derive(diesel::QueryableByName)]
+    struct LegacySessionStateJson {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        branch_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state_json: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
     struct LegacyPresetRecordJson {
         #[diesel(sql_type = diesel::sql_types::Text)]
         record_json: String,
@@ -7675,6 +7665,18 @@ mod tests {
             != 0
     }
 
+    async fn session_has_state_json_column(store: &SqliteStore) -> bool {
+        let mut connection = store.connect().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('sessions') WHERE name = 'state_json'",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
+    }
+
     async fn preset_has_record_json_column(store: &SqliteStore) -> bool {
         let mut connection = store.connect().await.unwrap();
         diesel::sql_query(
@@ -7884,7 +7886,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!node_anchor_table_exists(&store).await);
@@ -7900,7 +7902,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -9165,7 +9167,7 @@ mod tests {
         );
 
         connection
-            .run_next_migration(super::STORE_MIGRATIONS)
+            .run_pending_migrations(super::STORE_MIGRATIONS)
             .unwrap();
         drop(connection);
 
@@ -9493,6 +9495,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_state_json_migration_round_trips_all_states() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        let session = store.append(session_anchor_node(&root_id)).await.unwrap();
+
+        let states = std::collections::HashMap::from([
+            ("main".to_owned(), SessionState::Active),
+            (
+                "attached".to_owned(),
+                SessionState::Attached {
+                    target_branch: "main".to_owned(),
+                    base_head_id: session.clone(),
+                },
+            ),
+            (
+                "closed".to_owned(),
+                SessionState::Paused {
+                    target_branch: "main".to_owned(),
+                    reason: PauseReason::Closed,
+                },
+            ),
+            (
+                "merged".to_owned(),
+                SessionState::Paused {
+                    target_branch: "main".to_owned(),
+                    reason: PauseReason::Merged {
+                        merged_anchor_id: session.clone(),
+                    },
+                },
+            ),
+        ]);
+        for branch in states.keys() {
+            store.fork(branch, &session).await.unwrap();
+        }
+        for (branch, state) in &states {
+            if state != &SessionState::Active {
+                store
+                    .set_session_state(branch, Some(&SessionState::Active), state.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(!session_has_state_json_column(&store).await);
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 20);
+        let legacy_rows = diesel::RunQueryDsl::load::<LegacySessionStateJson>(
+            diesel::sql_query("SELECT branch_name, state_json FROM sessions ORDER BY branch_name"),
+            &mut connection,
+        )
+        .unwrap();
+        let restored = legacy_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.branch_name,
+                    serde_json::from_str::<SessionState>(&row.state_json).unwrap(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(restored, states);
+
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert!(!session_has_state_json_column(&reopened).await);
+        assert_eq!(reopened.list_session_states().await.unwrap(), states);
+    }
+
+    #[tokio::test]
+    async fn session_state_json_migration_rejects_mismatched_relational_state() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        let session = store.append(session_anchor_node(&root_id)).await.unwrap();
+        store.fork("main", &session).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 20);
+        let mismatched = serde_json::to_string(&SessionState::Attached {
+            target_branch: "main".to_owned(),
+            base_head_id: session,
+        })
+        .unwrap();
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query("UPDATE sessions SET state_json = ? WHERE branch_name = 'main'")
+                .bind::<diesel::sql_types::Text, _>(mismatched),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
     async fn job_payload_migration_rejects_mismatched_summary() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -9534,6 +9648,23 @@ mod tests {
             .expect_err("empty work branch must fail");
 
         assert!(error.to_string().contains("empty work branch"));
+    }
+
+    #[test]
+    fn session_row_rejects_inconsistent_relational_state() {
+        let row = super::SessionRow {
+            branch_name: "main".to_owned(),
+            state: "attached".to_owned(),
+            target_branch: Some("base".to_owned()),
+            base_head_id: None,
+            pause_reason: None,
+            merged_anchor_id: None,
+        };
+
+        let error = super::session_row_into_state(std::path::Path::new("store.sqlite3"), row)
+            .expect_err("inconsistent session row must fail");
+
+        assert!(error.to_string().contains("invalid SQLite session row"));
     }
 
     #[test]
@@ -9713,7 +9844,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
     }
 
     #[tokio::test]
@@ -10473,7 +10604,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
     }
 
     #[tokio::test]
@@ -10501,7 +10632,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=20")
+                .contains("unsupported SQLite schema version 5, expected 6..=21")
         );
     }
 
@@ -10516,7 +10647,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=20")
+                .contains("unsupported SQLite schema version 5, expected 6..=21")
         );
     }
 
@@ -10563,7 +10694,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 20);
+        assert_eq!(reopened.schema_version().await.unwrap(), 21);
     }
 
     #[tokio::test]
