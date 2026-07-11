@@ -167,9 +167,37 @@ diesel::table! {
 }
 
 diesel::table! {
+    preset_version_tools (preset_name, version, ordinal) {
+        preset_name -> Text,
+        version -> Text,
+        ordinal -> Integer,
+        name -> Text,
+        description -> Text,
+        input_schema_json -> Text,
+    }
+}
+
+diesel::table! {
+    preset_versions (preset_name, version) {
+        preset_name -> Text,
+        version -> Text,
+        created_at -> Text,
+        role -> Text,
+        provider_profile -> Text,
+        model -> Text,
+        system_prompt -> Text,
+        prompt -> Text,
+        temperature -> Nullable<Double>,
+        max_tokens -> Nullable<Text>,
+        additional_params_json -> Nullable<Text>,
+        enable_coco_shim -> Bool,
+    }
+}
+
+diesel::table! {
     presets (name) {
         name -> Text,
-        record_json -> Text,
+        current_version -> Text,
     }
 }
 
@@ -229,6 +257,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     node_tool_results,
     node_tool_uses,
     nodes,
+    preset_version_tools,
+    preset_versions,
     presets,
     sessions,
     skills,

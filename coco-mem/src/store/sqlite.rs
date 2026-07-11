@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -44,20 +44,21 @@ use crate::schema::{
     branches, jobs, message_queue_items, node_anchor_prompt_attachments,
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
     node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_metadata,
-    node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions, skills,
-    store_meta,
+    node_relations, node_tool_results, node_tool_uses, nodes, preset_version_tools,
+    preset_versions, presets, sessions, skills, store_meta,
 };
 use crate::{
     Anchor, AnchorPayload, AnchorPayloadKind, BackendMetadata, Job, JobStatus, Kind, MergeParent,
     MessageQueueItem, NewNode, NewNodeContent, Node, NodeMetadata, PauseReason, Preset,
-    PresetRecord, PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
-    SessionAnchorPatch, SessionRole, SessionState, SkillGroups, SkillInvocationAnchor,
-    SkillInvocationMode, SkillRecord, SkillResultAnchor, SkillRuntimeContext, SkillUpdatePatch,
-    SkillVersionSpec, Tool, ToolResult, ToolUse, default_skill_groups,
+    PresetRecord, PresetVersion, PromptAnchor, PromptAttachment, PromptImageAttachment, Role,
+    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillInvocationAnchor, SkillInvocationMode, SkillRecord, SkillResultAnchor,
+    SkillRuntimeContext, SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult, ToolUse,
+    default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 19;
+const SQLITE_SCHEMA_VERSION: i32 = 20;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -458,6 +459,38 @@ struct MessageQueueItemRow {
     row_id: i64,
     created_at: String,
     item_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct PresetRow {
+    name: String,
+    current_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Queryable)]
+struct PresetVersionRow {
+    preset_name: String,
+    version: String,
+    created_at: String,
+    role: String,
+    provider_profile: String,
+    model: String,
+    system_prompt: String,
+    prompt: String,
+    temperature: Option<f64>,
+    max_tokens: Option<String>,
+    additional_params_json: Option<String>,
+    enable_coco_shim: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct PresetVersionToolRow {
+    preset_name: String,
+    version: String,
+    ordinal: i32,
+    name: String,
+    description: String,
+    input_schema_json: String,
 }
 
 #[derive(Queryable, QueryableByName)]
@@ -5497,20 +5530,78 @@ async fn load_preset_records(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<HashMap<String, PresetRecord>> {
-    let rows = presets::table
-        .select(presets::record_json)
+    query_preset_records(connection, path, None).await
+}
+
+async fn query_preset_records(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    name: Option<&str>,
+) -> Result<HashMap<String, PresetRecord>> {
+    let mut preset_query = presets::table.into_boxed();
+    if let Some(name) = name {
+        preset_query = preset_query.filter(presets::name.eq(name));
+    }
+    let preset_rows = preset_query
+        .select((presets::name, presets::current_version))
         .order(presets::name)
-        .load::<String>(connection)
+        .load::<PresetRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
-    rows.into_iter()
-        .map(|record_json| {
-            let record = preset_record_from_json(path, &record_json)?;
-            Ok((record.name.clone(), record))
-        })
-        .collect()
+
+    let mut version_query = preset_versions::table.into_boxed();
+    if let Some(name) = name {
+        version_query = version_query.filter(preset_versions::preset_name.eq(name));
+    }
+    let version_rows = version_query
+        .select((
+            preset_versions::preset_name,
+            preset_versions::version,
+            preset_versions::created_at,
+            preset_versions::role,
+            preset_versions::provider_profile,
+            preset_versions::model,
+            preset_versions::system_prompt,
+            preset_versions::prompt,
+            preset_versions::temperature,
+            preset_versions::max_tokens,
+            preset_versions::additional_params_json,
+            preset_versions::enable_coco_shim,
+        ))
+        .order((preset_versions::preset_name, preset_versions::version))
+        .load::<PresetVersionRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    let mut tool_query = preset_version_tools::table.into_boxed();
+    if let Some(name) = name {
+        tool_query = tool_query.filter(preset_version_tools::preset_name.eq(name));
+    }
+    let tool_rows = tool_query
+        .select((
+            preset_version_tools::preset_name,
+            preset_version_tools::version,
+            preset_version_tools::ordinal,
+            preset_version_tools::name,
+            preset_version_tools::description,
+            preset_version_tools::input_schema_json,
+        ))
+        .order((
+            preset_version_tools::preset_name,
+            preset_version_tools::version,
+            preset_version_tools::ordinal,
+        ))
+        .load::<PresetVersionToolRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    preset_records_from_rows(path, preset_rows, version_rows, tool_rows)
 }
 
 async fn load_preset_record(
@@ -5518,26 +5609,234 @@ async fn load_preset_record(
     path: &Path,
     name: &str,
 ) -> Result<PresetRecord> {
-    let record_json = presets::table
-        .filter(presets::name.eq(name))
-        .select(presets::record_json)
-        .get_result::<String>(connection)
-        .await
-        .optional()
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?
+    query_preset_records(connection, path, Some(name))
+        .await?
+        .remove(name)
         .context(PresetNotFoundSnafu {
             name: name.to_owned(),
-        })?;
-    preset_record_from_json(path, &record_json)
+        })
 }
 
-fn preset_record_from_json(path: &Path, record_json: &str) -> Result<PresetRecord> {
-    serde_json::from_str::<PresetRecord>(record_json).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: "presets.record_json".to_owned(),
-    })
+fn preset_records_from_rows(
+    path: &Path,
+    preset_rows: Vec<PresetRow>,
+    version_rows: Vec<PresetVersionRow>,
+    tool_rows: Vec<PresetVersionToolRow>,
+) -> Result<HashMap<String, PresetRecord>> {
+    let mut tools_by_version = HashMap::<(String, String), Vec<_>>::new();
+    for row in tool_rows {
+        tools_by_version
+            .entry((row.preset_name.clone(), row.version.clone()))
+            .or_default()
+            .push(row);
+    }
+
+    let mut versions_by_preset = HashMap::<String, BTreeMap<u64, PresetVersion>>::new();
+    for row in version_rows {
+        let preset_name = row.preset_name.clone();
+        let version_text = row.version.clone();
+        let tool_rows = tools_by_version
+            .remove(&(preset_name.clone(), version_text))
+            .unwrap_or_default();
+        let version = row.into_version(path, &tool_rows)?;
+        let version_number = version.version;
+        let previous = versions_by_preset
+            .entry(preset_name.clone())
+            .or_default()
+            .insert(version_number, version);
+        ensure!(
+            previous.is_none(),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "duplicate SQLite preset version {version_number} for {preset_name:?}"
+                ),
+            }
+        );
+    }
+    ensure!(
+        tools_by_version.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "SQLite preset tool rows have no matching version".to_owned(),
+        }
+    );
+
+    let mut records = HashMap::with_capacity(preset_rows.len());
+    for row in preset_rows {
+        let current_version =
+            parse_u64_column(path, "presets.current_version", &row.current_version)?;
+        let versions = versions_by_preset.remove(&row.name).unwrap_or_default();
+        ensure!(
+            versions.contains_key(&current_version),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "missing current SQLite preset version {current_version} for {:?}",
+                    row.name
+                ),
+            }
+        );
+        let name = row.name;
+        let previous = records.insert(
+            name.clone(),
+            PresetRecord {
+                name: name.clone(),
+                current_version,
+                versions,
+            },
+        );
+        ensure!(
+            previous.is_none(),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("duplicate SQLite preset row for {name:?}"),
+            }
+        );
+    }
+    ensure!(
+        versions_by_preset.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "SQLite preset versions have no matching preset".to_owned(),
+        }
+    );
+    Ok(records)
+}
+
+impl PresetVersionRow {
+    fn from_version(preset_name: &str, version: &PresetVersion, path: &Path) -> Result<Self> {
+        let additional_params_json = version
+            .config
+            .additional_params
+            .as_ref()
+            .map(|value| {
+                serde_json::to_string(value).context(ParseSqliteStoreValueSnafu {
+                    path: path.to_owned(),
+                    column: "preset_versions.additional_params_json".to_owned(),
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            preset_name: preset_name.to_owned(),
+            version: version.version.to_string(),
+            created_at: version.created_at.to_string(),
+            role: version.config.role.as_str().to_owned(),
+            provider_profile: version.config.provider_profile.clone(),
+            model: version.config.model.clone(),
+            system_prompt: version.config.system_prompt.clone(),
+            prompt: version.config.prompt.clone(),
+            temperature: version.config.temperature,
+            max_tokens: version.config.max_tokens.map(|value| value.to_string()),
+            additional_params_json,
+            enable_coco_shim: version.config.enable_coco_shim,
+        })
+    }
+
+    fn into_version(
+        self,
+        path: &Path,
+        tool_rows: &[PresetVersionToolRow],
+    ) -> Result<PresetVersion> {
+        let version = parse_u64_column(path, "preset_versions.version", &self.version)?;
+        let created_at = self
+            .created_at
+            .parse()
+            .map_err(|source| StoreError::CorruptedStore {
+                path: path.to_owned(),
+                message: format!(
+                    "invalid SQLite preset timestamp in preset_versions.created_at: {source}"
+                ),
+            })?;
+        let max_tokens = self
+            .max_tokens
+            .as_deref()
+            .map(|value| parse_u64_column(path, "preset_versions.max_tokens", value))
+            .transpose()?;
+        let additional_params = self
+            .additional_params_json
+            .as_deref()
+            .map(|value| parse_json_column(path, "preset_versions.additional_params_json", value))
+            .transpose()?;
+        let tools = preset_tools_from_rows(path, &self.preset_name, &self.version, tool_rows)?;
+        Ok(PresetVersion {
+            version,
+            created_at,
+            config: Preset {
+                role: parse_session_role(&self.role, path)?,
+                provider_profile: self.provider_profile,
+                model: self.model,
+                tools,
+                system_prompt: self.system_prompt,
+                prompt: self.prompt,
+                temperature: self.temperature,
+                max_tokens,
+                additional_params,
+                enable_coco_shim: self.enable_coco_shim,
+            },
+        })
+    }
+}
+
+fn preset_version_tool_rows(
+    preset_name: &str,
+    version: &PresetVersion,
+    path: &Path,
+) -> Result<Vec<PresetVersionToolRow>> {
+    version
+        .config
+        .tools
+        .iter()
+        .enumerate()
+        .map(|(ordinal, tool)| {
+            Ok(PresetVersionToolRow {
+                preset_name: preset_name.to_owned(),
+                version: version.version.to_string(),
+                ordinal: ordinal as i32,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema_json: serde_json::to_string(&tool.input_schema).context(
+                    ParseSqliteStoreValueSnafu {
+                        path: path.to_owned(),
+                        column: "preset_version_tools.input_schema_json".to_owned(),
+                    },
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn preset_tools_from_rows(
+    path: &Path,
+    preset_name: &str,
+    version: &str,
+    rows: &[PresetVersionToolRow],
+) -> Result<Vec<Tool>> {
+    rows.iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            ensure!(
+                row.preset_name == preset_name
+                    && row.version == version
+                    && row.ordinal == ordinal as i32,
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "invalid SQLite preset tool ordinal for {preset_name:?} version {version}"
+                    ),
+                }
+            );
+            Ok(Tool {
+                name: row.name.clone(),
+                description: row.description.clone(),
+                input_schema: parse_json_column(
+                    path,
+                    "preset_version_tools.input_schema_json",
+                    &row.input_schema_json,
+                )?,
+            })
+        })
+        .collect()
 }
 
 async fn persist_preset(
@@ -5545,23 +5844,77 @@ async fn persist_preset(
     path: &Path,
     record: &PresetRecord,
 ) -> Result<()> {
-    let record_json = serde_json::to_string(record).context(ParseSqliteStoreValueSnafu {
+    let version = record.current().context(CorruptedStoreSnafu {
         path: path.to_owned(),
-        column: "presets.record_json".to_owned(),
+        message: format!(
+            "missing current preset version {} for {:?}",
+            record.current_version, record.name
+        ),
     })?;
+    ensure!(
+        version.version == record.current_version,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "preset version {} does not match current version {} for {:?}",
+                version.version, record.current_version, record.name
+            ),
+        }
+    );
+    let version_row = PresetVersionRow::from_version(&record.name, version, path)?;
+    let tool_rows = preset_version_tool_rows(&record.name, version, path)?;
+
     diesel::insert_into(presets::table)
         .values((
             presets::name.eq(&record.name),
-            presets::record_json.eq(record_json),
+            presets::current_version.eq(record.current_version.to_string()),
         ))
         .on_conflict(presets::name)
         .do_update()
-        .set(presets::record_json.eq(diesel::upsert::excluded(presets::record_json)))
+        .set(presets::current_version.eq(diesel::upsert::excluded(presets::current_version)))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+
+    diesel::insert_into(preset_versions::table)
+        .values((
+            preset_versions::preset_name.eq(version_row.preset_name),
+            preset_versions::version.eq(version_row.version),
+            preset_versions::created_at.eq(version_row.created_at),
+            preset_versions::role.eq(version_row.role),
+            preset_versions::provider_profile.eq(version_row.provider_profile),
+            preset_versions::model.eq(version_row.model),
+            preset_versions::system_prompt.eq(version_row.system_prompt),
+            preset_versions::prompt.eq(version_row.prompt),
+            preset_versions::temperature.eq(version_row.temperature),
+            preset_versions::max_tokens.eq(version_row.max_tokens),
+            preset_versions::additional_params_json.eq(version_row.additional_params_json),
+            preset_versions::enable_coco_shim.eq(version_row.enable_coco_shim),
+        ))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    for row in tool_rows {
+        diesel::insert_into(preset_version_tools::table)
+            .values((
+                preset_version_tools::preset_name.eq(row.preset_name),
+                preset_version_tools::version.eq(row.version),
+                preset_version_tools::ordinal.eq(row.ordinal),
+                preset_version_tools::name.eq(row.name),
+                preset_version_tools::description.eq(row.description),
+                preset_version_tools::input_schema_json.eq(row.input_schema_json),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
     Ok(())
 }
 
@@ -5573,19 +5926,10 @@ async fn set_preset_record(
 ) -> Result<PresetRecord> {
     connection
         .immediate_transaction::<PresetRecord, SqliteTransactionError, _>(async |connection| {
-            let record_json = presets::table
-                .filter(presets::name.eq(name))
-                .select(presets::record_json)
-                .get_result::<String>(connection)
+            let mut records = query_preset_records(connection, path, Some(name))
                 .await
-                .optional()
-                .context(QuerySqliteStoreSnafu {
-                    path: path.to_owned(),
-                })
                 .map_err(SqliteTransactionError::Operation)?;
-            let record = if let Some(record_json) = record_json {
-                let mut record = preset_record_from_json(path, &record_json)
-                    .map_err(SqliteTransactionError::Operation)?;
+            let record = if let Some(mut record) = records.remove(name) {
                 let current_version = record.current_version;
                 record.update(config).ok_or_else(|| {
                     SqliteTransactionError::Operation(
@@ -6727,7 +7071,8 @@ mod tests {
         jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
         node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
         node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_relations,
-        node_tool_results, node_tool_uses, nodes, sessions, store_meta,
+        node_tool_results, node_tool_uses, nodes, preset_version_tools, preset_versions, sessions,
+        store_meta,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
@@ -6816,6 +7161,12 @@ mod tests {
     struct LegacyJobPayloadJson {
         #[diesel(sql_type = diesel::sql_types::Text)]
         payload_json: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct LegacyPresetRecordJson {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        record_json: String,
     }
 
     fn session_anchor_node(parent: &str) -> NewNode {
@@ -6988,6 +7339,38 @@ mod tests {
             max_tokens: Some(64),
             additional_params: None,
             enable_coco_shim: false,
+        }
+    }
+
+    fn rich_preset(model: &str) -> Preset {
+        Preset {
+            role: SessionRole::Runner,
+            provider_profile: "custom".to_owned(),
+            model: model.to_owned(),
+            tools: vec![
+                Tool {
+                    name: "lookup".to_owned(),
+                    description: "Look up a value".to_owned(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"key": {"type": "string"}}
+                    }),
+                },
+                Tool {
+                    name: "notify".to_owned(),
+                    description: "Send a notification".to_owned(),
+                    input_schema: serde_json::Value::Null,
+                },
+            ],
+            system_prompt: "First line\nSecond line with \"quotes\"".to_owned(),
+            prompt: "Run the preset".to_owned(),
+            temperature: Some(0.25),
+            max_tokens: Some(u64::MAX),
+            additional_params: Some(serde_json::json!({
+                "priority": ["high", null],
+                "nested": {"enabled": true}
+            })),
+            enable_coco_shim: true,
         }
     }
 
@@ -7292,6 +7675,19 @@ mod tests {
             != 0
     }
 
+    async fn preset_has_record_json_column(store: &SqliteStore) -> bool {
+        let mut connection = store.connect().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('presets') \
+             WHERE name = 'record_json'",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
+    }
+
     fn valid_job_row() -> super::JobRow {
         super::JobRow {
             job_id: "job-test".to_owned(),
@@ -7488,7 +7884,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 19);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!node_anchor_table_exists(&store).await);
@@ -7504,7 +7900,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 19);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -8730,6 +9126,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preset_migration_round_trips_records() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        store
+            .set_preset("default", preset("gpt-5.4"))
+            .await
+            .unwrap();
+        let expected = store
+            .set_preset("default", rich_preset("gpt-5.5"))
+            .await
+            .unwrap();
+        let mut nullable_config = preset("gpt-5.6");
+        nullable_config.temperature = None;
+        nullable_config.max_tokens = None;
+        nullable_config.additional_params = Some(serde_json::Value::Null);
+        let nullable_expected = store.set_preset("nullable", nullable_config).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        diesel::connection::SimpleConnection::batch_execute(
+            &mut connection,
+            "PRAGMA foreign_keys = ON",
+        )
+        .unwrap();
+        revert_store_migrations_to(&mut connection, 19);
+        let legacy = diesel::RunQueryDsl::get_result::<LegacyPresetRecordJson>(
+            diesel::sql_query("SELECT record_json FROM presets WHERE name = 'default'"),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::PresetRecord>(&legacy.record_json).unwrap(),
+            expected
+        );
+
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert!(!preset_has_record_json_column(&reopened).await);
+        assert!(table_exists(&reopened, "preset_versions").await);
+        assert!(table_exists(&reopened, "preset_version_tools").await);
+        assert_eq!(
+            reopened.get_preset_record("default").await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened.get_preset_record("nullable").await.unwrap(),
+            nullable_expected
+        );
+        let mut connection = reopened.connect().await.unwrap();
+        assert_eq!(
+            preset_versions::table
+                .filter(preset_versions::preset_name.eq("default"))
+                .count()
+                .get_result::<i64>(&mut connection)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            preset_version_tools::table
+                .filter(preset_version_tools::preset_name.eq("default"))
+                .count()
+                .get_result::<i64>(&mut connection)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn preset_migration_rejects_mismatched_record_name() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        store
+            .set_preset("default", preset("gpt-5.4"))
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 19);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE presets \
+                 SET record_json = json_set(record_json, '$.name', 'other') \
+                 WHERE name = 'default'",
+            ),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
     async fn node_anchor_prompt_content_migration_round_trips_payload() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -9208,7 +9713,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 19);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
     }
 
     #[tokio::test]
@@ -9968,7 +10473,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 19);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
     }
 
     #[tokio::test]
@@ -9996,7 +10501,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=19")
+                .contains("unsupported SQLite schema version 5, expected 6..=20")
         );
     }
 
@@ -10011,7 +10516,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=19")
+                .contains("unsupported SQLite schema version 5, expected 6..=20")
         );
     }
 
@@ -10058,7 +10563,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 19);
+        assert_eq!(reopened.schema_version().await.unwrap(), 20);
     }
 
     #[tokio::test]
