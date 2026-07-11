@@ -8,26 +8,6 @@ SELECT CASE
         SELECT 1
         FROM node_anchors
         WHERE kind NOT IN ('session', 'session_patch', 'prompt', 'skill_invocation', 'skill_result')
-           OR (
-                kind = 'session'
-                AND prompt IS NOT NULL
-           )
-           OR (
-                kind = 'session_patch'
-                AND prompt IS NOT NULL
-           )
-           OR (
-                kind = 'prompt'
-                AND prompt IS NULL
-           )
-           OR (
-                kind = 'skill_invocation'
-                AND prompt IS NOT NULL
-           )
-           OR (
-                kind = 'skill_result'
-                AND prompt IS NOT NULL
-           )
     )
     AND NOT EXISTS (
         SELECT 1
@@ -107,10 +87,25 @@ SELECT CASE
     )
     AND NOT EXISTS (
         SELECT 1
-        FROM node_anchor_prompt_attachments AS attachment
-        JOIN node_anchors AS anchor ON anchor.node_id = attachment.node_id
+        FROM node_anchors AS anchor
+        WHERE anchor.kind = 'prompt'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM node_anchor_prompts AS prompt
+              WHERE prompt.node_id = anchor.node_id
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchor_prompts AS prompt
+        JOIN node_anchors AS anchor ON anchor.node_id = prompt.node_id
         WHERE anchor.kind <> 'prompt'
-           OR attachment.kind <> 'image'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchor_prompt_attachments AS attachment
+        JOIN node_anchor_prompts AS prompt ON prompt.node_id = attachment.node_id
+        WHERE attachment.kind <> 'image'
            OR attachment.ordinal < 0
            OR attachment.width NOT BETWEEN 0 AND 4294967295
            OR attachment.height NOT BETWEEN 0 AND 4294967295

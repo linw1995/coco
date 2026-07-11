@@ -1,3 +1,5 @@
+ALTER TABLE node_anchors ADD COLUMN prompt TEXT;
+
 UPDATE node_anchors AS anchor
 SET skill_name = invocation.skill_name,
     skill_invocation_mode = invocation.mode,

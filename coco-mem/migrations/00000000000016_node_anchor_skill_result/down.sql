@@ -3,8 +3,7 @@ ALTER TABLE node_anchors ADD COLUMN skill_invocation_mode TEXT;
 
 UPDATE node_anchors AS anchor
 SET skill_name = invocation.skill_name,
-    skill_invocation_mode = invocation.mode,
-    prompt = invocation.prompt
+    skill_invocation_mode = invocation.mode
 FROM node_anchor_skill_invocations AS invocation
 WHERE anchor.node_id = invocation.node_id;
 

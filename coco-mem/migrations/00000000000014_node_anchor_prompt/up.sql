@@ -73,6 +73,17 @@ END;
 
 DROP TABLE node_anchor_prompt_migration_guard;
 
+CREATE TABLE node_anchor_prompts (
+    node_id TEXT PRIMARY KEY NOT NULL,
+    prompt TEXT NOT NULL,
+    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+);
+
+INSERT INTO node_anchor_prompts (node_id, prompt)
+SELECT node_id, prompt
+FROM node_anchors
+WHERE kind = 'prompt';
+
 CREATE TABLE node_anchor_prompt_attachments (
     node_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
@@ -83,7 +94,7 @@ CREATE TABLE node_anchor_prompt_attachments (
     file_size TEXT,
     media_type TEXT,
     PRIMARY KEY (node_id, ordinal),
-    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+    FOREIGN KEY (node_id) REFERENCES node_anchor_prompts(node_id) ON DELETE CASCADE
 );
 
 INSERT INTO node_anchor_prompt_attachments (
@@ -111,3 +122,7 @@ SELECT
 FROM node_anchors AS anchor
 JOIN json_each(anchor.kind_json, '$.Anchor.payload.Prompt.attachments') AS attachment
 WHERE anchor.kind = 'prompt';
+
+UPDATE node_anchors
+SET prompt = NULL
+WHERE kind = 'prompt';

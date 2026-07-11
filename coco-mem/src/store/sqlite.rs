@@ -41,7 +41,7 @@ use crate::error::{
     StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::{
-    branches, jobs, message_queue_items, node_anchor_prompt_attachments,
+    branches, jobs, message_queue_items, node_anchor_prompt_attachments, node_anchor_prompts,
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
     node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_anchors,
     node_metadata, node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions,
@@ -205,11 +205,10 @@ struct NodeRow {
     content: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Queryable)]
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
 struct NodeAnchorRow {
     node_id: String,
     kind: String,
-    prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Queryable)]
@@ -268,6 +267,12 @@ struct NodeAnchorSessionPatchToolRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct NodeAnchorPromptRow {
+    node_id: String,
+    prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
 struct NodeAnchorPromptAttachmentRow {
     node_id: String,
     ordinal: i32,
@@ -308,6 +313,7 @@ struct NodeAnchorStorageRows<'a> {
     session_tools: &'a [NodeAnchorSessionToolRow],
     session_patch: Option<&'a NodeAnchorSessionPatchRow>,
     session_patch_tools: &'a [NodeAnchorSessionPatchToolRow],
+    prompt: Option<&'a NodeAnchorPromptRow>,
     prompt_attachments: &'a [NodeAnchorPromptAttachmentRow],
     skill_invocation: Option<&'a NodeAnchorSkillInvocationRow>,
     skill_result: Option<&'a NodeAnchorSkillResultRow>,
@@ -1775,11 +1781,7 @@ async fn load_node_anchor_rows_for_ids(
     node_ids: Option<&[String]>,
 ) -> Result<HashMap<String, NodeAnchorRow>> {
     let mut query = node_anchors::table
-        .select((
-            node_anchors::node_id,
-            node_anchors::kind,
-            node_anchors::prompt,
-        ))
+        .select((node_anchors::node_id, node_anchors::kind))
         .into_boxed();
     if let Some(node_ids) = node_ids {
         if node_ids.is_empty() {
@@ -1789,6 +1791,33 @@ async fn load_node_anchor_rows_for_ids(
     }
     query
         .load::<NodeAnchorRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.node_id.clone(), row))
+                .collect()
+        })
+}
+
+async fn load_node_anchor_prompt_rows_for_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_ids: Option<&[String]>,
+) -> Result<HashMap<String, NodeAnchorPromptRow>> {
+    let mut query = node_anchor_prompts::table
+        .select((node_anchor_prompts::node_id, node_anchor_prompts::prompt))
+        .into_boxed();
+    if let Some(node_ids) = node_ids {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        query = query.filter(node_anchor_prompts::node_id.eq_any(node_ids));
+    }
+    query
+        .load::<NodeAnchorPromptRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
@@ -2287,6 +2316,8 @@ async fn node_rows_into_nodes(
         load_node_anchor_session_patch_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_session_patch_tool_rows =
         load_node_anchor_session_patch_tool_rows_for_ids(connection, path, Some(&node_ids)).await?;
+    let anchor_prompt_rows =
+        load_node_anchor_prompt_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_prompt_attachment_rows =
         load_node_anchor_prompt_attachment_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_skill_invocation_rows =
@@ -2316,6 +2347,7 @@ async fn node_rows_into_nodes(
                             &anchor_session_patch_tool_rows,
                             &node_id,
                         ),
+                        prompt: anchor_prompt_rows.get(&node_id),
                         prompt_attachments: node_anchor_prompt_attachment_slice(
                             &anchor_prompt_attachment_rows,
                             &node_id,
@@ -2376,6 +2408,12 @@ async fn load_node_by_exact_id(
         Some(std::slice::from_ref(&node_id)),
     )
     .await?;
+    let anchor_prompt_rows = load_node_anchor_prompt_rows_for_ids(
+        connection,
+        path,
+        Some(std::slice::from_ref(&node_id)),
+    )
+    .await?;
     let anchor_prompt_attachment_rows = load_node_anchor_prompt_attachment_rows_for_ids(
         connection,
         path,
@@ -2418,6 +2456,7 @@ async fn load_node_by_exact_id(
                     &anchor_session_patch_tool_rows,
                     &node_id,
                 ),
+                prompt: anchor_prompt_rows.get(&node_id),
                 prompt_attachments: node_anchor_prompt_attachment_slice(
                     &anchor_prompt_attachment_rows,
                     &node_id,
@@ -2746,6 +2785,7 @@ async fn persist_node_without_transaction(
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
+    persist_node_anchor_prompt_row(connection, path, node).await?;
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
     persist_node_anchor_skill_result_row(connection, path, node).await?;
@@ -2837,6 +2877,7 @@ async fn upsert_node_without_transaction(
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
+    persist_node_anchor_prompt_row(connection, path, node).await?;
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
     persist_node_anchor_skill_result_row(connection, path, node).await?;
@@ -2872,7 +2913,27 @@ async fn persist_node_anchor_row(
         .values((
             node_anchors::node_id.eq(row.node_id),
             node_anchors::kind.eq(row.kind),
-            node_anchors::prompt.eq(row.prompt),
+        ))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
+async fn persist_node_anchor_prompt_row(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    let Some(row) = NodeAnchorPromptRow::from_node(node) else {
+        return Ok(());
+    };
+    diesel::insert_into(node_anchor_prompts::table)
+        .values((
+            node_anchor_prompts::node_id.eq(row.node_id),
+            node_anchor_prompts::prompt.eq(row.prompt),
         ))
         .execute(connection)
         .await
@@ -3464,11 +3525,9 @@ impl NodeAnchorRow {
         let Kind::Anchor(anchor) = &node.kind else {
             return None;
         };
-        let summary = NodeAnchorSummary::from_kind(&node.kind);
         Some(Self {
             node_id: node.id.clone(),
             kind: anchor.payload_kind().as_str().to_owned(),
-            prompt: summary.prompt,
         })
     }
 
@@ -3494,6 +3553,7 @@ impl NodeAnchorRow {
                 ensure!(
                     rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
+                        && rows.prompt.is_none()
                         && rows.prompt_attachments.is_empty()
                         && rows.skill_invocation.is_none()
                         && rows.skill_result.is_none(),
@@ -3508,19 +3568,19 @@ impl NodeAnchorRow {
                     path: path.to_owned(),
                     message: format!("missing SQLite node anchor session row for {node_id:?}"),
                 })?;
-                let kind = session_row.kind_from_storage(
+                session_row.kind_from_storage(
                     path,
                     node_id,
                     parent_id,
                     rows.session_tools,
                     rows.relations,
-                )?;
-                self.validate_relational_kind(path, kind)
+                )
             }
             "session_patch" => {
                 ensure!(
                     rows.session.is_none()
                         && rows.session_tools.is_empty()
+                        && rows.prompt.is_none()
                         && rows.prompt_attachments.is_empty()
                         && rows.skill_invocation.is_none()
                         && rows.skill_result.is_none(),
@@ -3537,14 +3597,13 @@ impl NodeAnchorRow {
                         "missing SQLite node anchor session patch row for {node_id:?}"
                     ),
                 })?;
-                let kind = patch_row.kind_from_storage(
+                patch_row.kind_from_storage(
                     path,
                     node_id,
                     parent_id,
                     rows.session_patch_tools,
                     rows.relations,
-                )?;
-                self.validate_relational_kind(path, kind)
+                )
             }
             "prompt" => {
                 ensure!(
@@ -3561,14 +3620,17 @@ impl NodeAnchorRow {
                         ),
                     }
                 );
-                let kind = self.prompt_kind_from_storage(
+                let prompt_row = rows.prompt.context(CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("missing SQLite node anchor prompt row for {node_id:?}"),
+                })?;
+                prompt_row.kind_from_storage(
                     path,
                     node_id,
                     parent_id,
                     rows.prompt_attachments,
                     rows.relations,
-                )?;
-                self.validate_relational_kind(path, kind)
+                )
             }
             "skill_invocation" => {
                 ensure!(
@@ -3576,6 +3638,7 @@ impl NodeAnchorRow {
                         && rows.session_tools.is_empty()
                         && rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
+                        && rows.prompt.is_none()
                         && rows.prompt_attachments.is_empty()
                         && rows.skill_result.is_none(),
                     CorruptedStoreSnafu {
@@ -3591,9 +3654,7 @@ impl NodeAnchorRow {
                         "missing SQLite node anchor skill invocation row for {node_id:?}"
                     ),
                 })?;
-                let kind =
-                    invocation_row.kind_from_storage(path, node_id, parent_id, rows.relations)?;
-                self.validate_relational_kind(path, kind)
+                invocation_row.kind_from_storage(path, node_id, parent_id, rows.relations)
             }
             "skill_result" => {
                 ensure!(
@@ -3601,6 +3662,7 @@ impl NodeAnchorRow {
                         && rows.session_tools.is_empty()
                         && rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
+                        && rows.prompt.is_none()
                         && rows.prompt_attachments.is_empty()
                         && rows.skill_invocation.is_none(),
                     CorruptedStoreSnafu {
@@ -3614,9 +3676,7 @@ impl NodeAnchorRow {
                     path: path.to_owned(),
                     message: format!("missing SQLite node anchor skill result row for {node_id:?}"),
                 })?;
-                let kind =
-                    result_row.kind_from_storage(path, node_id, parent_id, rows.relations)?;
-                self.validate_relational_kind(path, kind)
+                result_row.kind_from_storage(path, node_id, parent_id, rows.relations)
             }
             _ => CorruptedStoreSnafu {
                 path: path.to_owned(),
@@ -3625,8 +3685,24 @@ impl NodeAnchorRow {
             .fail(),
         }
     }
+}
 
-    fn prompt_kind_from_storage(
+impl NodeAnchorPromptRow {
+    fn from_node(node: &Node) -> Option<Self> {
+        let Kind::Anchor(Anchor {
+            payload: AnchorPayload::Prompt(prompt),
+            ..
+        }) = &node.kind
+        else {
+            return None;
+        };
+        Some(Self {
+            node_id: node.id.clone(),
+            prompt: prompt.prompt.clone(),
+        })
+    }
+
+    fn kind_from_storage(
         &self,
         path: &Path,
         node_id: &str,
@@ -3634,22 +3710,26 @@ impl NodeAnchorRow {
         attachment_rows: &[NodeAnchorPromptAttachmentRow],
         relation_rows: &[NodeRelationRow],
     ) -> Result<Kind> {
-        let prompt = required_anchor_summary(path, "node_anchors.prompt", self.prompt.as_deref())?;
+        ensure!(
+            self.node_id == node_id,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite prompt row {:?} does not belong to node {node_id:?}",
+                    self.node_id
+                ),
+            }
+        );
         let attachments = prompt_attachments_from_rows(path, node_id, attachment_rows)?;
         let merge_parents =
             merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
         Ok(Kind::Anchor(Anchor::prompt(
             merge_parents,
             PromptAnchor {
-                prompt,
+                prompt: self.prompt.clone(),
                 attachments,
             },
         )))
-    }
-
-    fn validate_relational_kind(&self, path: &Path, kind: Kind) -> Result<Kind> {
-        validate_node_anchor_summary(path, self, &kind)?;
-        Ok(kind)
     }
 }
 
@@ -4240,38 +4320,6 @@ fn required_anchor_summary(path: &Path, column: &str, value: Option<&str>) -> Re
         path: path.to_owned(),
         message: format!("missing SQLite {column}"),
     })
-}
-
-#[derive(Default)]
-struct NodeAnchorSummary {
-    prompt: Option<String>,
-}
-
-impl NodeAnchorSummary {
-    fn from_kind(kind: &Kind) -> Self {
-        let Kind::Anchor(anchor) = kind else {
-            return Self::default();
-        };
-        match &anchor.payload {
-            AnchorPayload::Session(_) => Self::default(),
-            AnchorPayload::SessionPatch(_) => Self::default(),
-            AnchorPayload::Prompt(anchor) => Self {
-                prompt: Some(anchor.prompt.clone()),
-            },
-            AnchorPayload::SkillInvocation(_) => Self::default(),
-            AnchorPayload::SkillResult(_) => Self::default(),
-        }
-    }
-}
-
-fn validate_node_anchor_summary(path: &Path, row: &NodeAnchorRow, kind: &Kind) -> Result<()> {
-    let expected = NodeAnchorSummary::from_kind(kind);
-    validate_optional_text_summary(
-        path,
-        "node_anchors.prompt",
-        row.prompt.as_deref(),
-        expected.prompt.as_deref(),
-    )
 }
 
 fn node_metadata_from_rows(
@@ -6815,13 +6863,13 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorSessionPatchRow,
-        NodeAnchorSessionPatchToolRow, NodeAnchorSessionRow, NodeAnchorSessionToolRow,
-        NodeAnchorSkillInvocationRow, NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow,
-        NodeToolUseRow, SqliteGraphStore, SqliteStore,
+        MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorPromptRow,
+        NodeAnchorSessionPatchRow, NodeAnchorSessionPatchToolRow, NodeAnchorSessionRow,
+        NodeAnchorSessionToolRow, NodeAnchorSkillInvocationRow, NodeAnchorSkillResultRow,
+        NodeMetadataRow, NodeToolResultRow, NodeToolUseRow, SqliteGraphStore, SqliteStore,
     };
     use crate::schema::{
-        jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
+        jobs, node_anchor_prompt_attachments, node_anchor_prompts, node_anchor_session_patch_tools,
         node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
         node_anchor_skill_invocations, node_anchor_skill_results, node_anchors, node_metadata,
         node_relations, node_tool_results, node_tool_uses, nodes, sessions, store_meta,
@@ -6847,11 +6895,6 @@ mod tests {
         parent_node_id: String,
         kind: String,
         ordinal: i32,
-    }
-
-    #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
-    struct NodeAnchorSummaryRow {
-        prompt: Option<String>,
     }
 
     #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
@@ -7255,6 +7298,16 @@ mod tests {
             .unwrap()
     }
 
+    async fn node_anchor_prompt_row(store: &SqliteStore, node_id: &str) -> NodeAnchorPromptRow {
+        let mut connection = store.connect().await.unwrap();
+        node_anchor_prompts::table
+            .filter(node_anchor_prompts::node_id.eq(node_id))
+            .select((node_anchor_prompts::node_id, node_anchor_prompts::prompt))
+            .get_result::<NodeAnchorPromptRow>(&mut connection)
+            .await
+            .unwrap()
+    }
+
     async fn node_anchor_prompt_attachment_rows(
         store: &SqliteStore,
         node_id: &str,
@@ -7378,11 +7431,11 @@ mod tests {
             != 0
     }
 
-    async fn node_anchor_has_skill_payload_columns(store: &SqliteStore) -> bool {
+    async fn node_anchor_has_payload_columns(store: &SqliteStore) -> bool {
         let mut connection = store.connect().await.unwrap();
         diesel::sql_query(
             "SELECT COUNT(*) AS count FROM pragma_table_info('node_anchors') \
-             WHERE name IN ('skill_name', 'skill_invocation_mode', 'skill_result_output')",
+             WHERE name NOT IN ('node_id', 'kind')",
         )
         .get_result::<ColumnCount>(&mut connection)
         .await
@@ -7425,17 +7478,6 @@ mod tests {
             base: "base".to_owned(),
             status: "queued".to_owned(),
         }
-    }
-
-    async fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
-        let mut connection = store.connect().await.unwrap();
-        let prompt = node_anchors::table
-            .filter(node_anchors::node_id.eq(node_id))
-            .select(node_anchors::prompt)
-            .get_result::<Option<String>>(&mut connection)
-            .await
-            .unwrap();
-        NodeAnchorSummaryRow { prompt }
     }
 
     async fn session_summary(store: &SqliteStore, branch: &str) -> SessionSummaryRow {
@@ -8023,10 +8065,6 @@ mod tests {
             }
         );
         assert_eq!(
-            node_anchor_summary(&reopened, &anchor_id).await,
-            NodeAnchorSummaryRow { prompt: None }
-        );
-        assert_eq!(
             node_anchor_session_tool_rows(&reopened, &anchor_id).await,
             vec![
                 NodeAnchorSessionToolRow {
@@ -8290,6 +8328,13 @@ mod tests {
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
         assert_eq!(
+            node_anchor_prompt_row(&reopened, &anchor_id).await,
+            NodeAnchorPromptRow {
+                node_id: anchor_id.clone(),
+                prompt: "Inspect these images".to_owned(),
+            }
+        );
+        assert_eq!(
             node_anchor_prompt_attachment_rows(&reopened, &anchor_id).await,
             vec![
                 NodeAnchorPromptAttachmentRow {
@@ -8392,10 +8437,6 @@ mod tests {
                 mode: "handoff".to_owned(),
                 prompt: Some("Compact this branch".to_owned()),
             }
-        );
-        assert_eq!(
-            node_anchor_summary(&reopened, &anchor_id).await,
-            NodeAnchorSummaryRow { prompt: None }
         );
     }
 
@@ -8645,7 +8686,7 @@ mod tests {
 
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert!(!node_anchor_has_kind_json_column(&reopened).await);
-        assert!(!node_anchor_has_skill_payload_columns(&reopened).await);
+        assert!(!node_anchor_has_payload_columns(&reopened).await);
         for node in expected {
             assert_eq!(reopened.get_node(&node.id).await.unwrap(), node);
         }
@@ -9368,10 +9409,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            node_anchor_summary(&store, &session).await,
-            NodeAnchorSummaryRow { prompt: None }
-        );
-        assert_eq!(
             node_anchor_session_row(&store, &session).await,
             NodeAnchorSessionRow {
                 node_id: session.clone(),
@@ -9391,9 +9428,10 @@ mod tests {
         );
         assert_eq!(node_content(&store, &session).await, None);
         assert_eq!(
-            node_anchor_summary(&store, &prompt).await,
-            NodeAnchorSummaryRow {
-                prompt: Some("detached prompt".to_owned()),
+            node_anchor_prompt_row(&store, &prompt).await,
+            NodeAnchorPromptRow {
+                node_id: prompt.clone(),
+                prompt: "detached prompt".to_owned(),
             }
         );
         assert_eq!(node_content(&store, &prompt).await, None);

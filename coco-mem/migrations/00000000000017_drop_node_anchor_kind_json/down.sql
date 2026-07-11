@@ -153,7 +153,7 @@ SET kind_json = json_object(
         json_object(
             'Prompt',
             json_object(
-                'prompt', anchor.prompt,
+                'prompt', prompt.prompt,
                 'attachments', json(COALESCE((
                     SELECT json_group_array(json(attachment_json))
                     FROM (
@@ -174,7 +174,9 @@ SET kind_json = json_object(
         )
     )
 )
-WHERE anchor.kind = 'prompt';
+FROM node_anchor_prompts AS prompt
+WHERE anchor.kind = 'prompt'
+  AND prompt.node_id = anchor.node_id;
 
 UPDATE node_anchors AS anchor
 SET kind_json = json_object(

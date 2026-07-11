@@ -87,3 +87,5 @@ SET skill_name = NULL,
     skill_invocation_mode = NULL,
     prompt = NULL
 WHERE kind = 'skill_invocation';
+
+ALTER TABLE node_anchors DROP COLUMN prompt;
