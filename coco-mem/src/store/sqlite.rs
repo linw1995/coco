@@ -41,7 +41,7 @@ use crate::error::{
     StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::{
-    branches, jobs, message_queue_items, node_anchor_prompt_attachments, node_anchor_prompts,
+    branches, jobs, message_queue_items, node_anchor_prompt_attachments,
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
     node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_metadata,
     node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions, skills,
@@ -57,7 +57,7 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 18;
+const SQLITE_SCHEMA_VERSION: i32 = 19;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -266,12 +266,6 @@ struct NodeAnchorSessionPatchToolRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
-struct NodeAnchorPromptRow {
-    node_id: String,
-    prompt: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
 struct NodeAnchorPromptAttachmentRow {
     node_id: String,
     ordinal: i32,
@@ -311,7 +305,6 @@ struct NodeAnchorStorageRows<'a> {
     session_tools: &'a [NodeAnchorSessionToolRow],
     session_patch: Option<&'a NodeAnchorSessionPatchRow>,
     session_patch_tools: &'a [NodeAnchorSessionPatchToolRow],
-    prompt: Option<&'a NodeAnchorPromptRow>,
     prompt_attachments: &'a [NodeAnchorPromptAttachmentRow],
     skill_invocation: Option<&'a NodeAnchorSkillInvocationRow>,
     skill_result: Option<&'a NodeAnchorSkillResultRow>,
@@ -1824,33 +1817,6 @@ async fn load_node_metadata_rows_for_ids(
     Ok(group_node_metadata_rows(rows))
 }
 
-async fn load_node_anchor_prompt_rows_for_ids(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    node_ids: Option<&[String]>,
-) -> Result<HashMap<String, NodeAnchorPromptRow>> {
-    let mut query = node_anchor_prompts::table
-        .select((node_anchor_prompts::node_id, node_anchor_prompts::prompt))
-        .into_boxed();
-    if let Some(node_ids) = node_ids {
-        if node_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        query = query.filter(node_anchor_prompts::node_id.eq_any(node_ids));
-    }
-    query
-        .load::<NodeAnchorPromptRow>(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| (row.node_id.clone(), row))
-                .collect()
-        })
-}
-
 async fn load_node_anchor_session_rows_for_ids(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -2346,8 +2312,6 @@ async fn node_rows_into_nodes(
         Some(&ids.anchor_session_patches),
     )
     .await?;
-    let anchor_prompt_rows =
-        load_node_anchor_prompt_rows_for_ids(connection, path, Some(&ids.anchor_prompts)).await?;
     let anchor_prompt_attachment_rows = load_node_anchor_prompt_attachment_rows_for_ids(
         connection,
         path,
@@ -2391,7 +2355,6 @@ async fn node_rows_into_nodes(
                             &anchor_session_patch_tool_rows,
                             &node_id,
                         ),
-                        prompt: anchor_prompt_rows.get(&node_id),
                         prompt_attachments: node_anchor_prompt_attachment_slice(
                             &anchor_prompt_attachment_rows,
                             &node_id,
@@ -2745,7 +2708,6 @@ async fn persist_node_without_transaction(
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
-    persist_node_anchor_prompt_row(connection, path, node).await?;
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
     persist_node_anchor_skill_result_row(connection, path, node).await?;
@@ -2831,7 +2793,6 @@ async fn upsert_node_without_transaction(
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
-    persist_node_anchor_prompt_row(connection, path, node).await?;
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
     persist_node_anchor_skill_result_row(connection, path, node).await?;
@@ -2860,6 +2821,15 @@ async fn delete_node_anchor_payload_rows(
     path: &Path,
     node_id: &str,
 ) -> Result<()> {
+    diesel::delete(
+        node_anchor_prompt_attachments::table
+            .filter(node_anchor_prompt_attachments::node_id.eq(node_id)),
+    )
+    .execute(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
     diesel::delete(node_anchor_sessions::table.filter(node_anchor_sessions::node_id.eq(node_id)))
         .execute(connection)
         .await
@@ -2874,12 +2844,6 @@ async fn delete_node_anchor_payload_rows(
     .context(QuerySqliteStoreSnafu {
         path: path.to_owned(),
     })?;
-    diesel::delete(node_anchor_prompts::table.filter(node_anchor_prompts::node_id.eq(node_id)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
     diesel::delete(
         node_anchor_skill_invocations::table
             .filter(node_anchor_skill_invocations::node_id.eq(node_id)),
@@ -2897,27 +2861,6 @@ async fn delete_node_anchor_payload_rows(
     .context(QuerySqliteStoreSnafu {
         path: path.to_owned(),
     })?;
-    Ok(())
-}
-
-async fn persist_node_anchor_prompt_row(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    node: &Node,
-) -> Result<()> {
-    let Some(row) = NodeAnchorPromptRow::from_node(node) else {
-        return Ok(());
-    };
-    diesel::insert_into(node_anchor_prompts::table)
-        .values((
-            node_anchor_prompts::node_id.eq(row.node_id),
-            node_anchor_prompts::prompt.eq(row.prompt),
-        ))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
     Ok(())
 }
 
@@ -3411,6 +3354,10 @@ impl NodeRow {
             kind,
             content: match &node.kind {
                 Kind::Text(content) | Kind::Failure(content) => Some(content.clone()),
+                Kind::Anchor(Anchor {
+                    payload: AnchorPayload::Prompt(prompt),
+                    ..
+                }) => Some(prompt.prompt.clone()),
                 Kind::Anchor(_) | Kind::ToolUse(_) | Kind::ToolResult(_) => None,
             },
             metadata_present,
@@ -3526,10 +3473,26 @@ impl NodeRow {
         tool_use_rows: &[NodeToolUseRow],
         tool_result_rows: &[NodeToolResultRow],
     ) -> Result<Kind> {
-        self.ensure_no_content(path)?;
+        let prompt = match payload_kind {
+            AnchorPayloadKind::Prompt => Some(self.required_content(path)?),
+            AnchorPayloadKind::Session
+            | AnchorPayloadKind::SessionPatch
+            | AnchorPayloadKind::SkillInvocation
+            | AnchorPayloadKind::SkillResult => {
+                self.ensure_no_content(path)?;
+                None
+            }
+        };
         ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
         ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
-        node_anchor_kind_from_storage(path, &self.id, &self.parent_id, payload_kind, anchor_rows)
+        node_anchor_kind_from_storage(
+            path,
+            &self.id,
+            &self.parent_id,
+            payload_kind,
+            prompt,
+            anchor_rows,
+        )
     }
 
     fn ensure_no_content(&self, path: &Path) -> Result<()> {
@@ -3562,6 +3525,7 @@ fn node_anchor_kind_from_storage(
     node_id: &str,
     parent_id: &str,
     payload_kind: AnchorPayloadKind,
+    prompt: Option<String>,
     rows: &NodeAnchorStorageRows<'_>,
 ) -> Result<Kind> {
     match payload_kind {
@@ -3592,17 +3556,20 @@ fn node_anchor_kind_from_storage(
             )
         }
         AnchorPayloadKind::Prompt => {
-            let prompt_row = rows.prompt.context(CorruptedStoreSnafu {
+            let prompt = prompt.context(CorruptedStoreSnafu {
                 path: path.to_owned(),
-                message: format!("missing SQLite node anchor prompt row for {node_id:?}"),
+                message: format!("missing SQLite node anchor prompt content for {node_id:?}"),
             })?;
-            prompt_row.kind_from_storage(
-                path,
-                node_id,
-                parent_id,
-                rows.prompt_attachments,
-                rows.relations,
-            )
+            let attachments = prompt_attachments_from_rows(path, node_id, rows.prompt_attachments)?;
+            let merge_parents =
+                merge_parents_from_relation_rows(path, node_id, parent_id, rows.relations)?;
+            Ok(Kind::Anchor(Anchor::prompt(
+                merge_parents,
+                PromptAnchor {
+                    prompt,
+                    attachments,
+                },
+            )))
         }
         AnchorPayloadKind::SkillInvocation => {
             let invocation_row = rows.skill_invocation.context(CorruptedStoreSnafu {
@@ -3618,52 +3585,6 @@ fn node_anchor_kind_from_storage(
             })?;
             result_row.kind_from_storage(path, node_id, parent_id, rows.relations)
         }
-    }
-}
-
-impl NodeAnchorPromptRow {
-    fn from_node(node: &Node) -> Option<Self> {
-        let Kind::Anchor(Anchor {
-            payload: AnchorPayload::Prompt(prompt),
-            ..
-        }) = &node.kind
-        else {
-            return None;
-        };
-        Some(Self {
-            node_id: node.id.clone(),
-            prompt: prompt.prompt.clone(),
-        })
-    }
-
-    fn kind_from_storage(
-        &self,
-        path: &Path,
-        node_id: &str,
-        parent_id: &str,
-        attachment_rows: &[NodeAnchorPromptAttachmentRow],
-        relation_rows: &[NodeRelationRow],
-    ) -> Result<Kind> {
-        ensure!(
-            self.node_id == node_id,
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!(
-                    "SQLite prompt row {:?} does not belong to node {node_id:?}",
-                    self.node_id
-                ),
-            }
-        );
-        let attachments = prompt_attachments_from_rows(path, node_id, attachment_rows)?;
-        let merge_parents =
-            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
-        Ok(Kind::Anchor(Anchor::prompt(
-            merge_parents,
-            PromptAnchor {
-                prompt: self.prompt.clone(),
-                attachments,
-            },
-        )))
     }
 }
 
@@ -6797,13 +6718,13 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorPromptRow,
-        NodeAnchorSessionPatchRow, NodeAnchorSessionPatchToolRow, NodeAnchorSessionRow,
-        NodeAnchorSessionToolRow, NodeAnchorSkillInvocationRow, NodeAnchorSkillResultRow,
-        NodeMetadataRow, NodeToolResultRow, NodeToolUseRow, SqliteGraphStore, SqliteStore,
+        MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorSessionPatchRow,
+        NodeAnchorSessionPatchToolRow, NodeAnchorSessionRow, NodeAnchorSessionToolRow,
+        NodeAnchorSkillInvocationRow, NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow,
+        NodeToolUseRow, SqliteGraphStore, SqliteStore,
     };
     use crate::schema::{
-        jobs, node_anchor_prompt_attachments, node_anchor_prompts, node_anchor_session_patch_tools,
+        jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
         node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
         node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_relations,
         node_tool_results, node_tool_uses, nodes, sessions, store_meta,
@@ -7233,16 +7154,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn node_anchor_prompt_row(store: &SqliteStore, node_id: &str) -> NodeAnchorPromptRow {
-        let mut connection = store.connect().await.unwrap();
-        node_anchor_prompts::table
-            .filter(node_anchor_prompts::node_id.eq(node_id))
-            .select((node_anchor_prompts::node_id, node_anchor_prompts::prompt))
-            .get_result::<NodeAnchorPromptRow>(&mut connection)
-            .await
-            .unwrap()
-    }
-
     async fn node_anchor_prompt_attachment_rows(
         store: &SqliteStore,
         node_id: &str,
@@ -7345,17 +7256,16 @@ mod tests {
             != 0
     }
 
-    async fn node_anchor_table_exists(store: &SqliteStore) -> bool {
+    async fn table_exists(store: &SqliteStore, table_name: &str) -> bool {
         let mut connection = store.connect().await.unwrap();
-        diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM sqlite_master \
-             WHERE type = 'table' AND name = 'node_anchors'",
-        )
-        .get_result::<ColumnCount>(&mut connection)
-        .await
-        .unwrap()
-        .count
+        super::table_count(&mut connection, &store.database_path, table_name)
+            .await
+            .unwrap()
             != 0
+    }
+
+    async fn node_anchor_table_exists(store: &SqliteStore) -> bool {
+        table_exists(store, "node_anchors").await
     }
 
     async fn nodes_have_anchor_columns(store: &SqliteStore) -> bool {
@@ -7578,10 +7488,11 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!node_anchor_table_exists(&store).await);
+        assert!(!table_exists(&store, "node_anchor_prompts").await);
         assert!(!job_has_payload_json_column(&store).await);
     }
 
@@ -7593,7 +7504,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -8347,11 +8258,8 @@ mod tests {
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
         assert_eq!(
-            node_anchor_prompt_row(&reopened, &anchor_id).await,
-            NodeAnchorPromptRow {
-                node_id: anchor_id.clone(),
-                prompt: "Inspect these images".to_owned(),
-            }
+            node_content(&reopened, &anchor_id).await.as_deref(),
+            Some("Inspect these images")
         );
         assert_eq!(
             node_anchor_prompt_attachment_rows(&reopened, &anchor_id).await,
@@ -8822,6 +8730,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_anchor_prompt_content_migration_round_trips_payload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(rich_prompt_anchor_node(&store.root_id(), vec![]))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        diesel::connection::SimpleConnection::batch_execute(
+            &mut connection,
+            "PRAGMA foreign_keys = ON",
+        )
+        .unwrap();
+        revert_store_migrations_to(&mut connection, 18);
+        let content = diesel::RunQueryDsl::get_result::<Option<String>>(
+            nodes::table
+                .filter(nodes::id.eq(&anchor_id))
+                .select(nodes::content),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(content, None);
+
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        let content = diesel::RunQueryDsl::get_result::<Option<String>>(
+            nodes::table
+                .filter(nodes::id.eq(&anchor_id))
+                .select(nodes::content),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(content.as_deref(), Some("Inspect these images"));
+        let prompt_table_count = diesel::RunQueryDsl::get_result::<ColumnCount>(
+            diesel::sql_query(
+                "SELECT COUNT(*) AS count FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'node_anchor_prompts'",
+            ),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(prompt_table_count.count, 0);
+
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        connection
+            .run_pending_migrations(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
+        assert_eq!(
+            node_anchor_prompt_attachment_rows(&reopened, &anchor_id).await,
+            vec![
+                NodeAnchorPromptAttachmentRow {
+                    node_id: anchor_id.clone(),
+                    ordinal: 0,
+                    kind: "image".to_owned(),
+                    attachment_id: "image-a".to_owned(),
+                    width: Some(i64::from(u32::MAX)),
+                    height: Some(1080),
+                    file_size: Some(u64::MAX.to_string()),
+                    media_type: Some("image/png".to_owned()),
+                },
+                NodeAnchorPromptAttachmentRow {
+                    node_id: anchor_id,
+                    ordinal: 1,
+                    kind: "image".to_owned(),
+                    attachment_id: "image-b".to_owned(),
+                    width: None,
+                    height: None,
+                    file_size: None,
+                    media_type: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn node_anchor_prompt_content_migration_rejects_missing_prompt() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: "prompt".to_owned(),
+                        attachments: vec![],
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 18);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query("DELETE FROM node_anchor_prompts WHERE node_id = ?")
+                .bind::<diesel::sql_types::Text, _>(&anchor_id),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
     async fn node_anchor_kind_json_migration_rejects_incomplete_relational_payload() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -9172,7 +9208,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
     }
 
     #[tokio::test]
@@ -9552,13 +9588,9 @@ mod tests {
         );
         assert_eq!(node_content(&store, &session).await, None);
         assert_eq!(
-            node_anchor_prompt_row(&store, &prompt).await,
-            NodeAnchorPromptRow {
-                node_id: prompt.clone(),
-                prompt: "detached prompt".to_owned(),
-            }
+            node_content(&store, &prompt).await.as_deref(),
+            Some("detached prompt")
         );
-        assert_eq!(node_content(&store, &prompt).await, None);
     }
 
     #[tokio::test]
@@ -9618,7 +9650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reading_prompt_anchor_uses_relational_payload() {
+    async fn reading_prompt_anchor_uses_content_and_relational_attachments() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).await.unwrap();
@@ -9741,7 +9773,6 @@ mod tests {
         for table in [
             "node_anchor_session_patches",
             "node_anchor_session_patch_tools",
-            "node_anchor_prompts",
             "node_anchor_prompt_attachments",
             "node_anchor_skill_invocations",
             "node_anchor_skill_results",
@@ -9771,6 +9802,21 @@ mod tests {
             })
             .await
             .unwrap();
+        let prompt_id = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: "prompt".to_owned(),
+                        attachments: vec![],
+                    },
+                )),
+            })
+            .await
+            .unwrap();
         let mut connection = store.connect().await.unwrap();
         diesel::update(nodes::table.filter(nodes::id.eq(&root_id)))
             .set(nodes::content.eq(None::<String>))
@@ -9780,6 +9826,17 @@ mod tests {
         drop(connection);
 
         let error = store.get_node(&root_id).await.unwrap_err();
+        assert!(error.to_string().contains("missing SQLite node content"));
+
+        let mut connection = store.connect().await.unwrap();
+        diesel::update(nodes::table.filter(nodes::id.eq(&prompt_id)))
+            .set(nodes::content.eq(None::<String>))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let error = store.get_node(&prompt_id).await.unwrap_err();
         assert!(error.to_string().contains("missing SQLite node content"));
 
         let mut connection = store.connect().await.unwrap();
@@ -9911,7 +9968,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
     }
 
     #[tokio::test]
@@ -9939,7 +9996,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=18")
+                .contains("unsupported SQLite schema version 5, expected 6..=19")
         );
     }
 
@@ -9954,7 +10011,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=18")
+                .contains("unsupported SQLite schema version 5, expected 6..=19")
         );
     }
 
@@ -10001,7 +10058,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 18);
+        assert_eq!(reopened.schema_version().await.unwrap(), 19);
     }
 
     #[tokio::test]
