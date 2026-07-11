@@ -61,6 +61,37 @@ diesel::table! {
 }
 
 diesel::table! {
+    node_anchor_session_patch_tools (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        name -> Text,
+        description -> Text,
+        input_schema_json -> Text,
+    }
+}
+
+diesel::table! {
+    node_anchor_session_patches (node_id) {
+        node_id -> Text,
+        role -> Nullable<Text>,
+        provider_profile_present -> Bool,
+        provider_profile -> Nullable<Text>,
+        provider_present -> Bool,
+        provider -> Nullable<Text>,
+        model -> Nullable<Text>,
+        tools_present -> Bool,
+        system_prompt -> Nullable<Text>,
+        temperature_present -> Bool,
+        temperature -> Nullable<Double>,
+        max_tokens_present -> Bool,
+        max_tokens -> Nullable<Text>,
+        additional_params_present -> Bool,
+        additional_params_json -> Nullable<Text>,
+        enable_coco_shim -> Nullable<Bool>,
+    }
+}
+
+diesel::table! {
     node_metadata (node_id, ordinal) {
         node_id -> Text,
         ordinal -> Integer,
@@ -146,6 +177,8 @@ diesel::table! {
 diesel::joinable!(branches -> nodes (head_id));
 diesel::joinable!(node_anchors -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchors (node_id));
+diesel::joinable!(node_anchor_session_patch_tools -> node_anchor_session_patches (node_id));
+diesel::joinable!(node_anchor_session_patches -> node_anchors (node_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
 diesel::joinable!(node_tool_results -> nodes (node_id));
 diesel::joinable!(node_tool_uses -> nodes (node_id));
@@ -155,6 +188,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     branches,
     jobs,
     message_queue_items,
+    node_anchor_session_patch_tools,
+    node_anchor_session_patches,
     node_anchor_session_tools,
     node_anchors,
     node_metadata,

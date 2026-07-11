@@ -1,0 +1,2 @@
+DROP TABLE node_anchor_session_patch_tools;
+DROP TABLE node_anchor_session_patches;
