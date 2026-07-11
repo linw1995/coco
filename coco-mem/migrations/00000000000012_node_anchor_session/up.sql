@@ -105,7 +105,10 @@ SET session_system_prompt = json_extract(kind_json, '$.Anchor.payload.Session.sy
         WHEN json_type(kind_json, '$.Anchor.payload.Session.additional_params') = 'null' THEN NULL
         ELSE kind_json -> '$.Anchor.payload.Session.additional_params'
     END,
-    session_enable_coco_shim = json_extract(kind_json, '$.Anchor.payload.Session.enable_coco_shim'),
+    session_enable_coco_shim = COALESCE(
+        json_extract(kind_json, '$.Anchor.payload.Session.enable_coco_shim'),
+        0
+    ),
     session_active_skill_name = json_extract(kind_json, '$.Anchor.payload.Session.active_skill.name'),
     session_active_skill_handoff = json_extract(kind_json, '$.Anchor.payload.Session.active_skill.handoff')
 WHERE kind = 'session';
