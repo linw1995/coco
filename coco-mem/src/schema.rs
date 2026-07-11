@@ -29,17 +29,98 @@ diesel::table! {
 }
 
 diesel::table! {
-    node_anchors (node_id) {
+    node_anchor_prompts (node_id) {
         node_id -> Text,
-        kind -> Text,
-        session_role -> Nullable<Text>,
+        prompt -> Text,
+    }
+}
+
+diesel::table! {
+    node_anchor_sessions (node_id) {
+        node_id -> Text,
+        role -> Text,
         provider_profile -> Nullable<Text>,
         provider -> Nullable<Text>,
-        model -> Nullable<Text>,
+        model -> Text,
+        system_prompt -> Text,
+        prompt -> Text,
+        temperature -> Nullable<Double>,
+        max_tokens -> Nullable<Text>,
+        additional_params_json -> Nullable<Text>,
+        enable_coco_shim -> Bool,
+        active_skill_name -> Nullable<Text>,
+        active_skill_handoff -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    node_anchor_session_tools (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        name -> Text,
+        description -> Text,
+        input_schema_json -> Text,
+    }
+}
+
+diesel::table! {
+    node_anchor_skill_invocations (node_id) {
+        node_id -> Text,
+        skill_name -> Text,
+        mode -> Text,
         prompt -> Nullable<Text>,
-        skill_name -> Nullable<Text>,
-        skill_invocation_mode -> Nullable<Text>,
-        kind_json -> Text,
+    }
+}
+
+diesel::table! {
+    node_anchor_skill_results (node_id) {
+        node_id -> Text,
+        skill_name -> Text,
+        output -> Text,
+    }
+}
+
+diesel::table! {
+    node_anchor_session_patch_tools (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        name -> Text,
+        description -> Text,
+        input_schema_json -> Text,
+    }
+}
+
+diesel::table! {
+    node_anchor_prompt_attachments (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        kind -> Text,
+        attachment_id -> Text,
+        width -> Nullable<BigInt>,
+        height -> Nullable<BigInt>,
+        file_size -> Nullable<Text>,
+        media_type -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    node_anchor_session_patches (node_id) {
+        node_id -> Text,
+        role -> Nullable<Text>,
+        provider_profile_present -> Bool,
+        provider_profile -> Nullable<Text>,
+        provider_present -> Bool,
+        provider -> Nullable<Text>,
+        model -> Nullable<Text>,
+        tools_present -> Bool,
+        system_prompt -> Nullable<Text>,
+        temperature_present -> Bool,
+        temperature -> Nullable<Double>,
+        max_tokens_present -> Bool,
+        max_tokens -> Nullable<Text>,
+        additional_params_present -> Bool,
+        additional_params_json -> Nullable<Text>,
+        enable_coco_shim -> Nullable<Bool>,
     }
 }
 
@@ -127,7 +208,14 @@ diesel::table! {
 }
 
 diesel::joinable!(branches -> nodes (head_id));
-diesel::joinable!(node_anchors -> nodes (node_id));
+diesel::joinable!(node_anchor_sessions -> nodes (node_id));
+diesel::joinable!(node_anchor_session_tools -> node_anchor_sessions (node_id));
+diesel::joinable!(node_anchor_skill_invocations -> nodes (node_id));
+diesel::joinable!(node_anchor_skill_results -> nodes (node_id));
+diesel::joinable!(node_anchor_prompts -> nodes (node_id));
+diesel::joinable!(node_anchor_prompt_attachments -> node_anchor_prompts (node_id));
+diesel::joinable!(node_anchor_session_patch_tools -> node_anchor_session_patches (node_id));
+diesel::joinable!(node_anchor_session_patches -> nodes (node_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
 diesel::joinable!(node_tool_results -> nodes (node_id));
 diesel::joinable!(node_tool_uses -> nodes (node_id));
@@ -137,7 +225,14 @@ diesel::allow_tables_to_appear_in_same_query!(
     branches,
     jobs,
     message_queue_items,
-    node_anchors,
+    node_anchor_prompt_attachments,
+    node_anchor_prompts,
+    node_anchor_session_patch_tools,
+    node_anchor_session_patches,
+    node_anchor_sessions,
+    node_anchor_session_tools,
+    node_anchor_skill_invocations,
+    node_anchor_skill_results,
     node_metadata,
     node_relations,
     node_tool_results,
