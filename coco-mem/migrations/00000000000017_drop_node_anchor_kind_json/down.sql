@@ -234,10 +234,12 @@ SET kind_json = json_object(
         json_object(
             'SkillResult',
             json_object(
-                'skill_name', anchor.skill_name,
-                'output', anchor.skill_result_output
+                'skill_name', result.skill_name,
+                'output', result.output
             )
         )
     )
 )
-WHERE anchor.kind = 'skill_result';
+FROM node_anchor_skill_results AS result
+WHERE anchor.kind = 'skill_result'
+  AND result.node_id = anchor.node_id;

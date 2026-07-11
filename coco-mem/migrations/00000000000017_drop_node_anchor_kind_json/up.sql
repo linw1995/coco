@@ -16,9 +16,6 @@ SELECT CASE
                     OR prompt IS NULL
                     OR session_system_prompt IS NULL
                     OR session_enable_coco_shim IS NULL
-                    OR skill_name IS NOT NULL
-                    OR skill_invocation_mode IS NOT NULL
-                    OR skill_result_output IS NOT NULL
                     OR (session_max_tokens IS NOT NULL AND (
                         json_valid(session_max_tokens) = 0
                         OR json_type(session_max_tokens) <> 'integer'
@@ -35,8 +32,6 @@ SELECT CASE
                     OR provider IS NOT NULL
                     OR model IS NOT NULL
                     OR prompt IS NOT NULL
-                    OR skill_name IS NOT NULL
-                    OR skill_invocation_mode IS NOT NULL
                     OR session_system_prompt IS NOT NULL
                     OR session_temperature IS NOT NULL
                     OR session_max_tokens IS NOT NULL
@@ -44,7 +39,6 @@ SELECT CASE
                     OR session_enable_coco_shim IS NOT NULL
                     OR session_active_skill_name IS NOT NULL
                     OR session_active_skill_handoff IS NOT NULL
-                    OR skill_result_output IS NOT NULL
                 )
            )
            OR (
@@ -55,8 +49,6 @@ SELECT CASE
                     OR provider_profile IS NOT NULL
                     OR provider IS NOT NULL
                     OR model IS NOT NULL
-                    OR skill_name IS NOT NULL
-                    OR skill_invocation_mode IS NOT NULL
                     OR session_system_prompt IS NOT NULL
                     OR session_temperature IS NOT NULL
                     OR session_max_tokens IS NOT NULL
@@ -64,15 +56,12 @@ SELECT CASE
                     OR session_enable_coco_shim IS NOT NULL
                     OR session_active_skill_name IS NOT NULL
                     OR session_active_skill_handoff IS NOT NULL
-                    OR skill_result_output IS NOT NULL
                 )
            )
            OR (
                 kind = 'skill_invocation'
                 AND (
                     prompt IS NOT NULL
-                    OR skill_name IS NOT NULL
-                    OR skill_invocation_mode IS NOT NULL
                     OR session_role IS NOT NULL
                     OR provider_profile IS NOT NULL
                     OR provider IS NOT NULL
@@ -84,16 +73,12 @@ SELECT CASE
                     OR session_enable_coco_shim IS NOT NULL
                     OR session_active_skill_name IS NOT NULL
                     OR session_active_skill_handoff IS NOT NULL
-                    OR skill_result_output IS NOT NULL
                 )
            )
            OR (
                 kind = 'skill_result'
                 AND (
-                    skill_name IS NULL
-                    OR skill_result_output IS NULL
-                    OR prompt IS NOT NULL
-                    OR skill_invocation_mode IS NOT NULL
+                    prompt IS NOT NULL
                     OR session_role IS NOT NULL
                     OR provider_profile IS NOT NULL
                     OR provider IS NOT NULL
@@ -199,6 +184,22 @@ SELECT CASE
            OR invocation.mode NOT IN ('inherit_context', 'handoff')
            OR (invocation.mode = 'inherit_context' AND invocation.prompt IS NOT NULL)
            OR (invocation.mode = 'handoff' AND invocation.prompt IS NULL)
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchors AS anchor
+        WHERE anchor.kind = 'skill_result'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM node_anchor_skill_results AS result
+              WHERE result.node_id = anchor.node_id
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchor_skill_results AS result
+        JOIN node_anchors AS anchor ON anchor.node_id = result.node_id
+        WHERE anchor.kind <> 'skill_result'
     )
     AND NOT EXISTS (
         SELECT 1

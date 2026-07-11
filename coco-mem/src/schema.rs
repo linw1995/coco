@@ -37,8 +37,6 @@ diesel::table! {
         provider -> Nullable<Text>,
         model -> Nullable<Text>,
         prompt -> Nullable<Text>,
-        skill_name -> Nullable<Text>,
-        skill_invocation_mode -> Nullable<Text>,
         session_system_prompt -> Nullable<Text>,
         session_temperature -> Nullable<Double>,
         session_max_tokens -> Nullable<Text>,
@@ -46,7 +44,6 @@ diesel::table! {
         session_enable_coco_shim -> Nullable<Bool>,
         session_active_skill_name -> Nullable<Text>,
         session_active_skill_handoff -> Nullable<Text>,
-        skill_result_output -> Nullable<Text>,
     }
 }
 
@@ -66,6 +63,14 @@ diesel::table! {
         skill_name -> Text,
         mode -> Text,
         prompt -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    node_anchor_skill_results (node_id) {
+        node_id -> Text,
+        skill_name -> Text,
+        output -> Text,
     }
 }
 
@@ -200,6 +205,7 @@ diesel::joinable!(branches -> nodes (head_id));
 diesel::joinable!(node_anchors -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchors (node_id));
 diesel::joinable!(node_anchor_skill_invocations -> node_anchors (node_id));
+diesel::joinable!(node_anchor_skill_results -> node_anchors (node_id));
 diesel::joinable!(node_anchor_prompt_attachments -> node_anchors (node_id));
 diesel::joinable!(node_anchor_session_patch_tools -> node_anchor_session_patches (node_id));
 diesel::joinable!(node_anchor_session_patches -> node_anchors (node_id));
@@ -217,6 +223,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     node_anchor_session_patches,
     node_anchor_session_tools,
     node_anchor_skill_invocations,
+    node_anchor_skill_results,
     node_anchors,
     node_metadata,
     node_relations,

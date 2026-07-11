@@ -56,8 +56,24 @@ END;
 
 DROP TABLE node_anchor_skill_result_migration_guard;
 
-ALTER TABLE node_anchors ADD COLUMN skill_result_output TEXT;
+CREATE TABLE node_anchor_skill_results (
+    node_id TEXT PRIMARY KEY NOT NULL,
+    skill_name TEXT NOT NULL,
+    output TEXT NOT NULL,
+    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+);
 
-UPDATE node_anchors
-SET skill_result_output = json_extract(kind_json, '$.Anchor.payload.SkillResult.output')
+INSERT INTO node_anchor_skill_results (
+    node_id,
+    skill_name,
+    output
+)
+SELECT
+    node_id,
+    skill_name,
+    json_extract(kind_json, '$.Anchor.payload.SkillResult.output')
+FROM node_anchors
 WHERE kind = 'skill_result';
+
+ALTER TABLE node_anchors DROP COLUMN skill_invocation_mode;
+ALTER TABLE node_anchors DROP COLUMN skill_name;

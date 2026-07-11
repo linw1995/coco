@@ -43,8 +43,9 @@ use crate::error::{
 use crate::schema::{
     branches, jobs, message_queue_items, node_anchor_prompt_attachments,
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
-    node_anchor_skill_invocations, node_anchors, node_metadata, node_relations, node_tool_results,
-    node_tool_uses, nodes, presets, sessions, skills, store_meta,
+    node_anchor_skill_invocations, node_anchor_skill_results, node_anchors, node_metadata,
+    node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions, skills,
+    store_meta,
 };
 use crate::{
     Anchor, AnchorPayload, BackendMetadata, Job, JobStatus, Kind, MergeParent, MessageQueueItem,
@@ -213,8 +214,6 @@ struct NodeAnchorRow {
     provider: Option<String>,
     model: Option<String>,
     prompt: Option<String>,
-    skill_name: Option<String>,
-    skill_invocation_mode: Option<String>,
     session_system_prompt: Option<String>,
     session_temperature: Option<f64>,
     session_max_tokens: Option<String>,
@@ -222,7 +221,6 @@ struct NodeAnchorRow {
     session_enable_coco_shim: Option<bool>,
     session_active_skill_name: Option<String>,
     session_active_skill_handoff: Option<String>,
-    skill_result_output: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
@@ -284,6 +282,13 @@ struct NodeAnchorSkillInvocationRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct NodeAnchorSkillResultRow {
+    node_id: String,
+    skill_name: String,
+    output: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
 struct NodeRelationRow {
     child_node_id: String,
     parent_node_id: String,
@@ -298,6 +303,7 @@ struct NodeAnchorStorageRows<'a> {
     session_patch_tools: &'a [NodeAnchorSessionPatchToolRow],
     prompt_attachments: &'a [NodeAnchorPromptAttachmentRow],
     skill_invocation: Option<&'a NodeAnchorSkillInvocationRow>,
+    skill_result: Option<&'a NodeAnchorSkillResultRow>,
     relations: &'a [NodeRelationRow],
 }
 
@@ -1770,8 +1776,6 @@ async fn load_node_anchor_rows_for_ids(
             node_anchors::provider,
             node_anchors::model,
             node_anchors::prompt,
-            node_anchors::skill_name,
-            node_anchors::skill_invocation_mode,
             node_anchors::session_system_prompt,
             node_anchors::session_temperature,
             node_anchors::session_max_tokens,
@@ -1779,7 +1783,6 @@ async fn load_node_anchor_rows_for_ids(
             node_anchors::session_enable_coco_shim,
             node_anchors::session_active_skill_name,
             node_anchors::session_active_skill_handoff,
-            node_anchors::skill_result_output,
         ))
         .into_boxed();
     if let Some(node_ids) = node_ids {
@@ -1968,6 +1971,37 @@ async fn load_node_anchor_skill_invocation_rows_for_ids(
     }
     query
         .load::<NodeAnchorSkillInvocationRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.node_id.clone(), row))
+                .collect()
+        })
+}
+
+async fn load_node_anchor_skill_result_rows_for_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_ids: Option<&[String]>,
+) -> Result<HashMap<String, NodeAnchorSkillResultRow>> {
+    let mut query = node_anchor_skill_results::table
+        .select((
+            node_anchor_skill_results::node_id,
+            node_anchor_skill_results::skill_name,
+            node_anchor_skill_results::output,
+        ))
+        .into_boxed();
+    if let Some(node_ids) = node_ids {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        query = query.filter(node_anchor_skill_results::node_id.eq_any(node_ids));
+    }
+    query
+        .load::<NodeAnchorSkillResultRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
@@ -2218,6 +2252,8 @@ async fn node_rows_into_nodes(
         load_node_anchor_prompt_attachment_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_skill_invocation_rows =
         load_node_anchor_skill_invocation_rows_for_ids(connection, path, Some(&node_ids)).await?;
+    let anchor_skill_result_rows =
+        load_node_anchor_skill_result_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let relation_rows = load_node_relation_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let metadata_rows = load_node_metadata_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let tool_use_rows = load_node_tool_use_rows_for_ids(connection, path, Some(&node_ids)).await?;
@@ -2245,6 +2281,7 @@ async fn node_rows_into_nodes(
                             &node_id,
                         ),
                         skill_invocation: anchor_skill_invocation_rows.get(&node_id),
+                        skill_result: anchor_skill_result_rows.get(&node_id),
                         relations: node_relation_slice(&relation_rows, &node_id),
                     },
                     metadata: node_metadata_slice(&metadata_rows, &node_id),
@@ -2305,6 +2342,12 @@ async fn load_node_by_exact_id(
         Some(std::slice::from_ref(&node_id)),
     )
     .await?;
+    let anchor_skill_result_rows = load_node_anchor_skill_result_rows_for_ids(
+        connection,
+        path,
+        Some(std::slice::from_ref(&node_id)),
+    )
+    .await?;
     let relation_rows =
         load_node_relation_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
             .await?;
@@ -2333,6 +2376,7 @@ async fn load_node_by_exact_id(
                     &node_id,
                 ),
                 skill_invocation: anchor_skill_invocation_rows.get(&node_id),
+                skill_result: anchor_skill_result_rows.get(&node_id),
                 relations: node_relation_slice(&relation_rows, &node_id),
             },
             metadata: node_metadata_slice(&metadata_rows, &node_id),
@@ -2656,6 +2700,7 @@ async fn persist_node_without_transaction(
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
+    persist_node_anchor_skill_result_row(connection, path, node).await?;
     for relation in node_relations(node) {
         diesel::insert_into(node_relations::table)
             .values((
@@ -2745,6 +2790,7 @@ async fn upsert_node_without_transaction(
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
+    persist_node_anchor_skill_result_row(connection, path, node).await?;
     for relation in node_relations(node) {
         diesel::insert_into(node_relations::table)
             .values((
@@ -2782,8 +2828,6 @@ async fn persist_node_anchor_row(
             node_anchors::provider.eq(row.provider),
             node_anchors::model.eq(row.model),
             node_anchors::prompt.eq(row.prompt),
-            node_anchors::skill_name.eq(row.skill_name),
-            node_anchors::skill_invocation_mode.eq(row.skill_invocation_mode),
             node_anchors::session_system_prompt.eq(row.session_system_prompt),
             node_anchors::session_temperature.eq(row.session_temperature),
             node_anchors::session_max_tokens.eq(row.session_max_tokens),
@@ -2791,7 +2835,6 @@ async fn persist_node_anchor_row(
             node_anchors::session_enable_coco_shim.eq(row.session_enable_coco_shim),
             node_anchors::session_active_skill_name.eq(row.session_active_skill_name),
             node_anchors::session_active_skill_handoff.eq(row.session_active_skill_handoff),
-            node_anchors::skill_result_output.eq(row.skill_result_output),
         ))
         .execute(connection)
         .await
@@ -2923,6 +2966,28 @@ async fn persist_node_anchor_skill_invocation_row(
             node_anchor_skill_invocations::skill_name.eq(row.skill_name),
             node_anchor_skill_invocations::mode.eq(row.mode),
             node_anchor_skill_invocations::prompt.eq(row.prompt),
+        ))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
+async fn persist_node_anchor_skill_result_row(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    let Some(row) = NodeAnchorSkillResultRow::from_node(node) else {
+        return Ok(());
+    };
+    diesel::insert_into(node_anchor_skill_results::table)
+        .values((
+            node_anchor_skill_results::node_id.eq(row.node_id),
+            node_anchor_skill_results::skill_name.eq(row.skill_name),
+            node_anchor_skill_results::output.eq(row.output),
         ))
         .execute(connection)
         .await
@@ -3339,8 +3404,6 @@ impl NodeAnchorRow {
             provider: summary.provider,
             model: summary.model,
             prompt: summary.prompt,
-            skill_name: summary.skill_name,
-            skill_invocation_mode: summary.skill_invocation_mode,
             session_system_prompt: session.system_prompt,
             session_temperature: session.temperature,
             session_max_tokens: session.max_tokens,
@@ -3348,13 +3411,6 @@ impl NodeAnchorRow {
             session_enable_coco_shim: session.enable_coco_shim,
             session_active_skill_name: session.active_skill_name,
             session_active_skill_handoff: session.active_skill_handoff,
-            skill_result_output: match &anchor.payload {
-                AnchorPayload::SkillResult(result) => Some(result.output.clone()),
-                AnchorPayload::Session(_)
-                | AnchorPayload::SessionPatch(_)
-                | AnchorPayload::Prompt(_)
-                | AnchorPayload::SkillInvocation(_) => None,
-            },
         }))
     }
 
@@ -3381,7 +3437,8 @@ impl NodeAnchorRow {
                     rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
                         && rows.prompt_attachments.is_empty()
-                        && rows.skill_invocation.is_none(),
+                        && rows.skill_invocation.is_none()
+                        && rows.skill_result.is_none(),
                     CorruptedStoreSnafu {
                         path: path.to_owned(),
                         message: format!(
@@ -3402,7 +3459,8 @@ impl NodeAnchorRow {
                 ensure!(
                     rows.session_tools.is_empty()
                         && rows.prompt_attachments.is_empty()
-                        && rows.skill_invocation.is_none(),
+                        && rows.skill_invocation.is_none()
+                        && rows.skill_result.is_none(),
                     CorruptedStoreSnafu {
                         path: path.to_owned(),
                         message: format!(
@@ -3430,7 +3488,8 @@ impl NodeAnchorRow {
                     rows.session_tools.is_empty()
                         && rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
-                        && rows.skill_invocation.is_none(),
+                        && rows.skill_invocation.is_none()
+                        && rows.skill_result.is_none(),
                     CorruptedStoreSnafu {
                         path: path.to_owned(),
                         message: format!(
@@ -3452,7 +3511,8 @@ impl NodeAnchorRow {
                     rows.session_tools.is_empty()
                         && rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
-                        && rows.prompt_attachments.is_empty(),
+                        && rows.prompt_attachments.is_empty()
+                        && rows.skill_result.is_none(),
                     CorruptedStoreSnafu {
                         path: path.to_owned(),
                         message: format!(
@@ -3484,8 +3544,12 @@ impl NodeAnchorRow {
                         ),
                     }
                 );
+                let result_row = rows.skill_result.context(CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("missing SQLite node anchor skill result row for {node_id:?}"),
+                })?;
                 let kind =
-                    self.skill_result_kind_from_storage(path, node_id, parent_id, rows.relations)?;
+                    result_row.kind_from_storage(path, node_id, parent_id, rows.relations)?;
                 self.validate_relational_kind(path, kind)
             }
             _ => CorruptedStoreSnafu {
@@ -3594,47 +3658,8 @@ impl NodeAnchorRow {
         )))
     }
 
-    fn skill_result_kind_from_storage(
-        &self,
-        path: &Path,
-        node_id: &str,
-        parent_id: &str,
-        relation_rows: &[NodeRelationRow],
-    ) -> Result<Kind> {
-        let skill_name =
-            required_anchor_summary(path, "node_anchors.skill_name", self.skill_name.as_deref())?;
-        let output = required_anchor_summary(
-            path,
-            "node_anchors.skill_result_output",
-            self.skill_result_output.as_deref(),
-        )?;
-        let merge_parents =
-            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
-        Ok(Kind::Anchor(Anchor::skill_result(
-            merge_parents,
-            SkillResultAnchor { skill_name, output },
-        )))
-    }
-
     fn validate_relational_kind(&self, path: &Path, kind: Kind) -> Result<Kind> {
         validate_node_anchor_summary(path, self, &kind)?;
-        let expected_output = match &kind {
-            Kind::Anchor(Anchor {
-                payload: AnchorPayload::SkillResult(result),
-                ..
-            }) => Some(result.output.as_str()),
-            Kind::Anchor(_)
-            | Kind::ToolUse(_)
-            | Kind::ToolResult(_)
-            | Kind::Text(_)
-            | Kind::Failure(_) => None,
-        };
-        validate_optional_text_summary(
-            path,
-            "node_anchors.skill_result_output",
-            self.skill_result_output.as_deref(),
-            expected_output,
-        )?;
         Ok(kind)
     }
 }
@@ -3710,6 +3735,51 @@ impl NodeAnchorSkillInvocationRow {
             SkillInvocationAnchor {
                 skill_name: self.skill_name.clone(),
                 mode,
+            },
+        )))
+    }
+}
+
+impl NodeAnchorSkillResultRow {
+    fn from_node(node: &Node) -> Option<Self> {
+        let Kind::Anchor(Anchor {
+            payload: AnchorPayload::SkillResult(result),
+            ..
+        }) = &node.kind
+        else {
+            return None;
+        };
+        Some(Self {
+            node_id: node.id.clone(),
+            skill_name: result.skill_name.clone(),
+            output: result.output.clone(),
+        })
+    }
+
+    fn kind_from_storage(
+        &self,
+        path: &Path,
+        node_id: &str,
+        parent_id: &str,
+        relation_rows: &[NodeRelationRow],
+    ) -> Result<Kind> {
+        ensure!(
+            self.node_id == node_id,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite skill result row {:?} does not belong to node {node_id:?}",
+                    self.node_id
+                ),
+            }
+        );
+        let merge_parents =
+            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
+        Ok(Kind::Anchor(Anchor::skill_result(
+            merge_parents,
+            SkillResultAnchor {
+                skill_name: self.skill_name.clone(),
+                output: self.output.clone(),
             },
         )))
     }
@@ -4077,8 +4147,6 @@ struct NodeAnchorSummary {
     provider: Option<String>,
     model: Option<String>,
     prompt: Option<String>,
-    skill_name: Option<String>,
-    skill_invocation_mode: Option<String>,
 }
 
 #[derive(Default)]
@@ -4146,10 +4214,7 @@ impl NodeAnchorSummary {
                 ..Self::default()
             },
             AnchorPayload::SkillInvocation(_) => Self::default(),
-            AnchorPayload::SkillResult(anchor) => Self {
-                skill_name: Some(anchor.skill_name.clone()),
-                ..Self::default()
-            },
+            AnchorPayload::SkillResult(_) => Self::default(),
         }
     }
 }
@@ -4185,18 +4250,6 @@ fn validate_node_anchor_summary(path: &Path, row: &NodeAnchorRow, kind: &Kind) -
         "node_anchors.prompt",
         row.prompt.as_deref(),
         expected.prompt.as_deref(),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "node_anchors.skill_name",
-        row.skill_name.as_deref(),
-        expected.skill_name.as_deref(),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "node_anchors.skill_invocation_mode",
-        row.skill_invocation_mode.as_deref(),
-        expected.skill_invocation_mode.as_deref(),
     )
 }
 
@@ -6741,15 +6794,16 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorRow, NodeAnchorSessionPatchRow,
+        MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorSessionPatchRow,
         NodeAnchorSessionPatchToolRow, NodeAnchorSessionToolRow, NodeAnchorSkillInvocationRow,
-        NodeMetadataRow, NodeToolResultRow, NodeToolUseRow, SqliteGraphStore, SqliteStore,
+        NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow, NodeToolUseRow,
+        SqliteGraphStore, SqliteStore,
     };
     use crate::schema::{
         jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
         node_anchor_session_patches, node_anchor_session_tools, node_anchor_skill_invocations,
-        node_anchors, node_metadata, node_relations, node_tool_results, node_tool_uses, nodes,
-        sessions, store_meta,
+        node_anchor_skill_results, node_anchors, node_metadata, node_relations, node_tool_results,
+        node_tool_uses, nodes, sessions, store_meta,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
@@ -6781,8 +6835,6 @@ mod tests {
         provider: Option<String>,
         model: Option<String>,
         prompt: Option<String>,
-        skill_name: Option<String>,
-        skill_invocation_mode: Option<String>,
     }
 
     #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
@@ -7203,6 +7255,23 @@ mod tests {
             .unwrap()
     }
 
+    async fn node_anchor_skill_result_row(
+        store: &SqliteStore,
+        node_id: &str,
+    ) -> NodeAnchorSkillResultRow {
+        let mut connection = store.connect().await.unwrap();
+        node_anchor_skill_results::table
+            .filter(node_anchor_skill_results::node_id.eq(node_id))
+            .select((
+                node_anchor_skill_results::node_id,
+                node_anchor_skill_results::skill_name,
+                node_anchor_skill_results::output,
+            ))
+            .get_result::<NodeAnchorSkillResultRow>(&mut connection)
+            .await
+            .unwrap()
+    }
+
     async fn node_kinds(store: &SqliteStore, node_id: &str) -> (String, Option<String>) {
         let mut connection = store.connect().await.unwrap();
         let kind = nodes::table
@@ -7268,6 +7337,19 @@ mod tests {
             != 0
     }
 
+    async fn node_anchor_has_skill_payload_columns(store: &SqliteStore) -> bool {
+        let mut connection = store.connect().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('node_anchors') \
+             WHERE name IN ('skill_name', 'skill_invocation_mode', 'skill_result_output')",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
+    }
+
     async fn nodes_have_anchor_columns(store: &SqliteStore) -> bool {
         let mut connection = store.connect().await.unwrap();
         diesel::sql_query(
@@ -7314,38 +7396,8 @@ mod tests {
                 node_anchors::provider,
                 node_anchors::model,
                 node_anchors::prompt,
-                node_anchors::skill_name,
-                node_anchors::skill_invocation_mode,
             ))
             .get_result::<NodeAnchorSummaryRow>(&mut connection)
-            .await
-            .unwrap()
-    }
-
-    async fn node_anchor_row(store: &SqliteStore, node_id: &str) -> NodeAnchorRow {
-        let mut connection = store.connect().await.unwrap();
-        node_anchors::table
-            .filter(node_anchors::node_id.eq(node_id))
-            .select((
-                node_anchors::node_id,
-                node_anchors::kind,
-                node_anchors::session_role,
-                node_anchors::provider_profile,
-                node_anchors::provider,
-                node_anchors::model,
-                node_anchors::prompt,
-                node_anchors::skill_name,
-                node_anchors::skill_invocation_mode,
-                node_anchors::session_system_prompt,
-                node_anchors::session_temperature,
-                node_anchors::session_max_tokens,
-                node_anchors::session_additional_params_json,
-                node_anchors::session_enable_coco_shim,
-                node_anchors::session_active_skill_name,
-                node_anchors::session_active_skill_handoff,
-                node_anchors::skill_result_output,
-            ))
-            .get_result::<NodeAnchorRow>(&mut connection)
             .await
             .unwrap()
     }
@@ -8249,10 +8301,16 @@ mod tests {
                 prompt: Some("Compact this branch".to_owned()),
             }
         );
-        let summary = node_anchor_summary(&reopened, &anchor_id).await;
-        assert_eq!(summary.prompt, None);
-        assert_eq!(summary.skill_name, None);
-        assert_eq!(summary.skill_invocation_mode, None);
+        assert_eq!(
+            node_anchor_summary(&reopened, &anchor_id).await,
+            NodeAnchorSummaryRow {
+                session_role: None,
+                provider_profile: None,
+                provider: None,
+                model: None,
+                prompt: None,
+            }
+        );
     }
 
     #[tokio::test]
@@ -8322,10 +8380,12 @@ mod tests {
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
         assert_eq!(
-            node_anchor_row(&reopened, &anchor_id)
-                .await
-                .skill_result_output,
-            Some("First line\nSecond line with \"quotes\"".to_owned())
+            node_anchor_skill_result_row(&reopened, &anchor_id).await,
+            NodeAnchorSkillResultRow {
+                node_id: anchor_id,
+                skill_name: "compact".to_owned(),
+                output: "First line\nSecond line with \"quotes\"".to_owned(),
+            }
         );
     }
 
@@ -8499,6 +8559,7 @@ mod tests {
 
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert!(!node_anchor_has_kind_json_column(&reopened).await);
+        assert!(!node_anchor_has_skill_payload_columns(&reopened).await);
         for node in expected {
             assert_eq!(reopened.get_node(&node.id).await.unwrap(), node);
         }
@@ -9230,8 +9291,6 @@ mod tests {
                 provider: Some("openai".to_owned()),
                 model: Some("gpt-5.4".to_owned()),
                 prompt: Some("session prompt".to_owned()),
-                skill_name: None,
-                skill_invocation_mode: None,
             }
         );
         assert_eq!(node_content(&store, &session).await, None);
@@ -9243,8 +9302,6 @@ mod tests {
                 provider: None,
                 model: None,
                 prompt: Some("detached prompt".to_owned()),
-                skill_name: None,
-                skill_invocation_mode: None,
             }
         );
         assert_eq!(node_content(&store, &prompt).await, None);
@@ -9355,6 +9412,14 @@ mod tests {
         let expected = store.get_node(&anchor_id).await.unwrap();
 
         assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
+        assert_eq!(
+            node_anchor_skill_result_row(&store, &anchor_id).await,
+            NodeAnchorSkillResultRow {
+                node_id: anchor_id,
+                skill_name: "compact".to_owned(),
+                output: "First line\nSecond line with \"quotes\"".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]
