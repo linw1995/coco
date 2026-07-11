@@ -52,13 +52,12 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 10;
+const SQLITE_SCHEMA_VERSION: i32 = 11;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
 const NODE_ITEM_ROWS_BACKFILL_META_KEY: &str = "node_items_backfilled";
-const RELATIONAL_ANCHOR_KIND_JSON: &str = r#"{"Anchor":null}"#;
 const LEGACY_JSON_STORE_MARKERS: &[&str] = &["meta.json", "nodes.jsonl"];
 const STORE_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const SQLITE_POOL_MAX_SIZE: u32 = 4;
@@ -195,10 +194,10 @@ struct NodeRow {
     role: String,
     #[diesel(sql_type = Text)]
     kind: String,
-    #[diesel(sql_type = Text)]
-    kind_json: String,
     #[diesel(sql_type = Bool)]
     metadata_present: bool,
+    #[diesel(sql_type = Nullable<Text>)]
+    content: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
@@ -293,8 +292,8 @@ macro_rules! node_row_columns {
             nodes::created_at,
             nodes::role,
             nodes::kind,
-            nodes::kind_json,
             nodes::metadata_present,
+            nodes::content,
         )
     };
 }
@@ -1337,8 +1336,9 @@ async fn backfill_node_item_row(
         canonical_kind_json_and_tool_rows(path, &row.id, &row.kind_json)?;
     let metadata = metadata.into_node_metadata(tool_item_count);
 
-    diesel::update(nodes::table.filter(nodes::id.eq(&row.id)))
-        .set(nodes::kind_json.eq(kind_json))
+    diesel::sql_query("UPDATE nodes SET kind_json = ? WHERE id = ?")
+        .bind::<Text, _>(kind_json)
+        .bind::<Text, _>(&row.id)
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1453,7 +1453,7 @@ fn canonical_kind_json_and_tool_rows(
         let tool_uses =
             legacy_one_or_many_items::<ToolUse>(path, "nodes.kind_json.ToolUse", payload.clone())?;
         let kind = Kind::tool_use_items(tool_uses);
-        let kind_json = kind_residual_json(&kind, path)?;
+        let kind_json = legacy_node_kind_residual_json(&kind, path)?;
         let rows = expected_node_tool_use_rows(node_id, &kind, path)?;
         let item_count = rows.len();
         return Ok((kind_json, rows, Vec::new(), item_count));
@@ -1466,7 +1466,7 @@ fn canonical_kind_json_and_tool_rows(
             payload.clone(),
         )?;
         let kind = Kind::tool_result_items(tool_results);
-        let kind_json = kind_residual_json(&kind, path)?;
+        let kind_json = legacy_node_kind_residual_json(&kind, path)?;
         let rows = expected_node_tool_result_rows(node_id, &kind);
         let item_count = rows.len();
         return Ok((kind_json, Vec::new(), rows, item_count));
@@ -2168,7 +2168,7 @@ async fn persist_node_without_transaction(
     path: &Path,
     node: &Node,
 ) -> Result<()> {
-    let row = NodeRow::from_node(node, path)?;
+    let row = NodeRow::from_node(node);
     diesel::insert_into(nodes::table)
         .values((
             nodes::id.eq(row.id),
@@ -2176,8 +2176,8 @@ async fn persist_node_without_transaction(
             nodes::created_at.eq(row.created_at),
             nodes::role.eq(row.role),
             nodes::kind.eq(row.kind),
-            nodes::kind_json.eq(row.kind_json),
             nodes::metadata_present.eq(row.metadata_present),
+            nodes::content.eq(row.content),
         ))
         .execute(connection)
         .await
@@ -2211,7 +2211,7 @@ async fn upsert_node_without_transaction(
     path: &Path,
     node: &Node,
 ) -> Result<()> {
-    let row = NodeRow::from_node(node, path)?;
+    let row = NodeRow::from_node(node);
     diesel::insert_into(nodes::table)
         .values((
             nodes::id.eq(row.id),
@@ -2219,8 +2219,8 @@ async fn upsert_node_without_transaction(
             nodes::created_at.eq(row.created_at),
             nodes::role.eq(row.role),
             nodes::kind.eq(row.kind),
-            nodes::kind_json.eq(row.kind_json),
             nodes::metadata_present.eq(row.metadata_present),
+            nodes::content.eq(row.content),
         ))
         .on_conflict(nodes::id)
         .do_update()
@@ -2229,8 +2229,8 @@ async fn upsert_node_without_transaction(
             nodes::created_at.eq(diesel::upsert::excluded(nodes::created_at)),
             nodes::role.eq(diesel::upsert::excluded(nodes::role)),
             nodes::kind.eq(diesel::upsert::excluded(nodes::kind)),
-            nodes::kind_json.eq(diesel::upsert::excluded(nodes::kind_json)),
             nodes::metadata_present.eq(diesel::upsert::excluded(nodes::metadata_present)),
+            nodes::content.eq(diesel::upsert::excluded(nodes::content)),
         ))
         .execute(connection)
         .await
@@ -2492,21 +2492,21 @@ fn merge_parent_relation_kind(parent: &MergeParent) -> &'static str {
 }
 
 impl NodeRow {
-    fn from_node(node: &Node, path: &Path) -> Result<Self> {
+    fn from_node(node: &Node) -> Self {
         let kind = node.kind.tag().as_str().to_owned();
         let metadata_present = node.metadata.is_some();
-        Ok(Self {
+        Self {
             id: node.id.clone(),
             parent_id: node.parent.clone(),
             created_at: node.created_at.to_string(),
             role: role_name(&node.role).to_owned(),
             kind,
-            kind_json: match &node.kind {
-                Kind::Anchor(_) => RELATIONAL_ANCHOR_KIND_JSON.to_owned(),
-                _ => kind_residual_json(&node.kind, path)?,
+            content: match &node.kind {
+                Kind::Text(content) | Kind::Failure(content) => Some(content.clone()),
+                Kind::Anchor(_) | Kind::ToolUse(_) | Kind::ToolResult(_) => None,
             },
             metadata_present,
-        })
+        }
     }
 
     fn into_node(
@@ -2523,7 +2523,7 @@ impl NodeRow {
             CorruptedStoreSnafu {
                 path: path.to_owned(),
                 message: format!(
-                    "SQLite node kind column {:?} does not match kind_json",
+                    "SQLite node kind column {:?} does not match stored payload",
                     self.kind
                 ),
             }
@@ -2545,13 +2545,6 @@ impl NodeRow {
         })
     }
 
-    fn kind_from_residual_json(&self, path: &Path) -> Result<Kind> {
-        serde_json::from_str(&self.kind_json).context(ParseSqliteStoreValueSnafu {
-            path: path.to_owned(),
-            column: "nodes.kind_json".to_owned(),
-        })
-    }
-
     fn kind_from_storage(
         &self,
         path: &Path,
@@ -2559,59 +2552,77 @@ impl NodeRow {
         tool_use_rows: &[NodeToolUseRow],
         tool_result_rows: &[NodeToolResultRow],
     ) -> Result<Kind> {
-        if self.kind == "anchor" {
-            ensure_relational_anchor_kind_json(path, &self.id, &self.kind_json)?;
-            ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
-            ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
-            let anchor_row = anchor_row.context(CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!("missing SQLite node anchor row for {:?}", self.id),
-            })?;
-            return anchor_row.kind_from_storage(path, &self.id);
+        if self.kind != "anchor" {
+            ensure!(
+                anchor_row.is_none(),
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("SQLite non-anchor node {:?} has an anchor row", self.id),
+                }
+            );
         }
-        ensure!(
-            anchor_row.is_none(),
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: format!("SQLite non-anchor node {:?} has an anchor row", self.id),
+        match self.kind.as_str() {
+            "anchor" => {
+                self.ensure_no_content(path)?;
+                ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
+                ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
+                let anchor_row = anchor_row.context(CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("missing SQLite node anchor row for {:?}", self.id),
+                })?;
+                anchor_row.kind_from_storage(path, &self.id)
             }
-        );
-        match self.kind_from_residual_json(path)? {
-            Kind::ToolUse(items) => {
-                ensure!(
-                    items.is_empty(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!(
-                            "SQLite node kind_json for {:?} contains relational tool use payloads",
-                            self.id
-                        ),
-                    }
-                );
+            "tool_use" => {
+                self.ensure_no_content(path)?;
                 ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
                 node_tool_uses_from_rows(path, &self.id, tool_use_rows).map(Kind::tool_use_items)
             }
-            Kind::ToolResult(items) => {
-                ensure!(
-                    items.is_empty(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: format!(
-                            "SQLite node kind_json for {:?} contains relational tool result payloads",
-                            self.id
-                        ),
-                    }
-                );
+            "tool_result" => {
+                self.ensure_no_content(path)?;
                 ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
                 node_tool_results_from_rows(path, &self.id, tool_result_rows)
                     .map(Kind::tool_result_items)
             }
-            kind => {
+            "text" => {
                 ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
                 ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
-                Ok(kind)
+                self.required_content(path).map(Kind::Text)
             }
+            "failure" => {
+                ensure_no_tool_use_rows(path, &self.id, tool_use_rows)?;
+                ensure_no_tool_result_rows(path, &self.id, tool_result_rows)?;
+                self.required_content(path).map(Kind::Failure)
+            }
+            _ => CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!("invalid SQLite node kind {:?}", self.kind),
+            }
+            .fail(),
         }
+    }
+
+    fn ensure_no_content(&self, path: &Path) -> Result<()> {
+        ensure!(
+            self.content.is_none(),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite node {:?} of kind {:?} unexpectedly has content",
+                    self.id, self.kind
+                ),
+            }
+        );
+        Ok(())
+    }
+
+    fn required_content(&self, path: &Path) -> Result<String> {
+        self.content.clone().context(CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "missing SQLite node content for {:?} node {:?}",
+                self.kind, self.id
+            ),
+        })
     }
 }
 
@@ -2680,28 +2691,7 @@ impl NodeAnchorRow {
     }
 }
 
-fn ensure_relational_anchor_kind_json(path: &Path, node_id: &str, kind_json: &str) -> Result<()> {
-    let value: Value = serde_json::from_str(kind_json).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: "nodes.kind_json".to_owned(),
-    })?;
-    ensure!(
-        matches!(
-            value,
-            Value::Object(ref object)
-                if object.len() == 1 && object.get("Anchor") == Some(&Value::Null)
-        ),
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!(
-                "SQLite node kind_json for {node_id:?} is not a relational anchor marker"
-            ),
-        }
-    );
-    Ok(())
-}
-
-fn kind_residual_json(kind: &Kind, path: &Path) -> Result<String> {
+fn legacy_node_kind_residual_json(kind: &Kind, path: &Path) -> Result<String> {
     kind_residual_json_for_column(kind, path, "nodes.kind_json")
 }
 
@@ -5760,21 +5750,32 @@ mod tests {
         (kind, anchor_kind)
     }
 
-    async fn node_kind_json(store: &SqliteStore, node_id: &str) -> serde_json::Value {
+    async fn node_content(store: &SqliteStore, node_id: &str) -> Option<String> {
         let mut connection = store.connect().await.unwrap();
-        let kind_json = nodes::table
+        nodes::table
             .filter(nodes::id.eq(node_id))
-            .select(nodes::kind_json)
-            .get_result::<String>(&mut connection)
+            .select(nodes::content)
+            .get_result::<Option<String>>(&mut connection)
             .await
-            .unwrap();
-        serde_json::from_str(&kind_json).unwrap()
+            .unwrap()
     }
 
     async fn node_has_metadata_json_column(store: &SqliteStore) -> bool {
         let mut connection = store.connect().await.unwrap();
         diesel::sql_query(
             "SELECT COUNT(*) AS count FROM pragma_table_info('nodes') WHERE name = 'metadata_json'",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
+    }
+
+    async fn node_has_kind_json_column(store: &SqliteStore) -> bool {
+        let mut connection = store.connect().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('nodes') WHERE name = 'kind_json'",
         )
         .get_result::<ColumnCount>(&mut connection)
         .await
@@ -6020,8 +6021,9 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
         assert!(!nodes_have_anchor_columns(&store).await);
+        assert!(!node_has_kind_json_column(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
     }
 
@@ -6033,7 +6035,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -6072,11 +6074,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            node_kind_json(&store, "tool-use-node").await,
-            serde_json::json!({
-                "ToolUse": []
-            })
+            node_content(&store, "root").await.as_deref(),
+            Some("The Big Bang")
         );
+        assert_eq!(node_content(&store, "tool-use-node").await, None);
+        assert!(!node_has_kind_json_column(&store).await);
         assert!(!node_has_metadata_json_column(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
         assert_eq!(
@@ -6162,6 +6164,9 @@ mod tests {
         connection
             .revert_last_migration(super::STORE_MIGRATIONS)
             .unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
 
         let row = diesel::RunQueryDsl::get_result::<LegacyMetadataJson>(
             diesel::sql_query("SELECT metadata_json FROM nodes WHERE id = 'tool-use-node'"),
@@ -6195,6 +6200,9 @@ mod tests {
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
 
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
         connection
             .revert_last_migration(super::STORE_MIGRATIONS)
             .unwrap();
@@ -6272,6 +6280,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_content_migration_down_restores_kind_json() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        let failure_id = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Failure("boom".to_owned()),
+            })
+            .await
+            .unwrap();
+        let tool_use_id = store
+            .append(NewNode {
+                parent: failure_id.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_uses(Vec::new()),
+            })
+            .await
+            .unwrap();
+        let tool_result_id = store
+            .append(NewNode {
+                parent: tool_use_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::tool_results(Vec::new()),
+            })
+            .await
+            .unwrap();
+        let anchor_id = store
+            .append(session_anchor_node(&tool_result_id))
+            .await
+            .unwrap();
+        let node_ids = [
+            root_id.clone(),
+            failure_id.clone(),
+            tool_use_id.clone(),
+            tool_result_id.clone(),
+            anchor_id.clone(),
+        ];
+        let mut expected = Vec::new();
+        for node_id in &node_ids {
+            expected.push(store.get_node(node_id).await.unwrap());
+        }
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+
+        for (node_id, expected_json) in [
+            (&root_id, serde_json::json!({ "Text": "The Big Bang" })),
+            (&failure_id, serde_json::json!({ "Failure": "boom" })),
+            (&tool_use_id, serde_json::json!({ "ToolUse": [] })),
+            (&tool_result_id, serde_json::json!({ "ToolResult": [] })),
+            (&anchor_id, serde_json::json!({ "Anchor": null })),
+        ] {
+            let row = diesel::RunQueryDsl::get_result::<LegacyKindJson>(
+                diesel::sql_query("SELECT kind_json FROM nodes WHERE id = ?")
+                    .bind::<diesel::sql_types::Text, _>(node_id),
+                &mut connection,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&row.kind_json).unwrap(),
+                expected_json
+            );
+        }
+
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert!(!node_has_kind_json_column(&reopened).await);
+        for (node_id, expected) in node_ids.iter().zip(expected) {
+            assert_eq!(reopened.get_node(node_id).await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_content_migration_rejects_mismatched_kind_json() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query("UPDATE nodes SET kind_json = ? WHERE id = ?")
+                .bind::<diesel::sql_types::Text, _>(r#"{"Failure":"The Big Bang"}"#)
+                .bind::<diesel::sql_types::Text, _>(&root_id),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
     async fn node_anchor_migration_down_restores_node_columns() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -6286,6 +6411,9 @@ mod tests {
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
         connection
             .revert_last_migration(super::STORE_MIGRATIONS)
             .unwrap();
@@ -6320,6 +6448,9 @@ mod tests {
             None
         );
 
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
         connection
             .run_next_migration(super::STORE_MIGRATIONS)
             .unwrap();
@@ -6361,6 +6492,9 @@ mod tests {
         connection
             .revert_last_migration(super::STORE_MIGRATIONS)
             .unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
         let row = diesel::RunQueryDsl::get_result::<LegacyJobPayloadJson>(
             diesel::sql_query("SELECT payload_json FROM jobs WHERE job_id = 'job-test'"),
             &mut connection,
@@ -6396,6 +6530,9 @@ mod tests {
         let database_path = super::sqlite_database_path(&path);
         let mut connection =
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
         connection
             .revert_last_migration(super::STORE_MIGRATIONS)
             .unwrap();
@@ -6605,7 +6742,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
     }
 
     #[tokio::test]
@@ -6795,6 +6932,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_persists_text_and_failure_content() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        let text_id = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("line one\n\"line two\"".to_owned()),
+            })
+            .await
+            .unwrap();
+        let failure_id = store
+            .append(NewNode {
+                parent: text_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Failure(String::new()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            node_content(&store, &root_id).await.as_deref(),
+            Some("The Big Bang")
+        );
+        assert_eq!(
+            node_content(&store, &text_id).await.as_deref(),
+            Some("line one\n\"line two\"")
+        );
+        assert_eq!(node_content(&store, &failure_id).await.as_deref(), Some(""));
+        assert_eq!(
+            store.get_node(&text_id).await.unwrap().kind,
+            Kind::Text("line one\n\"line two\"".to_owned())
+        );
+        assert_eq!(
+            store.get_node(&failure_id).await.unwrap().kind,
+            Kind::Failure(String::new())
+        );
+    }
+
+    #[tokio::test]
     async fn append_persists_node_tool_item_rows() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -6875,14 +7056,8 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            node_kind_json(&store, &tool_use_node).await,
-            serde_json::json!({ "ToolUse": [] })
-        );
-        assert_eq!(
-            node_kind_json(&store, &tool_result_node).await,
-            serde_json::json!({ "ToolResult": [] })
-        );
+        assert_eq!(node_content(&store, &tool_use_node).await, None);
+        assert_eq!(node_content(&store, &tool_result_node).await, None);
     }
 
     #[tokio::test]
@@ -6944,10 +7119,7 @@ mod tests {
                 skill_invocation_mode: None,
             }
         );
-        assert_eq!(
-            node_kind_json(&store, &session).await,
-            serde_json::json!({ "Anchor": null })
-        );
+        assert_eq!(node_content(&store, &session).await, None);
         let session_kind_json = serde_json::from_str::<serde_json::Value>(
             &node_anchor_row(&store, &session).await.kind_json,
         )
@@ -6984,10 +7156,7 @@ mod tests {
                 skill_invocation_mode: None,
             }
         );
-        assert_eq!(
-            node_kind_json(&store, &prompt).await,
-            serde_json::json!({ "Anchor": null })
-        );
+        assert_eq!(node_content(&store, &prompt).await, None);
         let prompt_kind_json = serde_json::from_str::<serde_json::Value>(
             &node_anchor_row(&store, &prompt).await.kind_json,
         )
@@ -7021,6 +7190,44 @@ mod tests {
             crate::StoreError::CorruptedStore { message, .. }
                 if message.contains("missing SQLite node anchor row")
         ));
+    }
+
+    #[tokio::test]
+    async fn reading_nodes_validates_content_presence() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let root_id = store.root_id();
+        let tool_use_id = store
+            .append(NewNode {
+                parent: root_id.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_uses(Vec::new()),
+            })
+            .await
+            .unwrap();
+        let mut connection = store.connect().await.unwrap();
+        diesel::update(nodes::table.filter(nodes::id.eq(&root_id)))
+            .set(nodes::content.eq(None::<String>))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let error = store.get_node(&root_id).await.unwrap_err();
+        assert!(error.to_string().contains("missing SQLite node content"));
+
+        let mut connection = store.connect().await.unwrap();
+        diesel::update(nodes::table.filter(nodes::id.eq(&tool_use_id)))
+            .set(nodes::content.eq(Some("unexpected")))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let error = store.get_node(&tool_use_id).await.unwrap_err();
+        assert!(error.to_string().contains("unexpectedly has content"));
     }
 
     #[tokio::test]
@@ -7140,7 +7347,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
     }
 
     #[tokio::test]
@@ -7168,7 +7375,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=10")
+                .contains("unsupported SQLite schema version 5, expected 6..=11")
         );
     }
 
@@ -7183,7 +7390,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=10")
+                .contains("unsupported SQLite schema version 5, expected 6..=11")
         );
     }
 
@@ -7230,7 +7437,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 10);
+        assert_eq!(reopened.schema_version().await.unwrap(), 11);
     }
 
     #[tokio::test]

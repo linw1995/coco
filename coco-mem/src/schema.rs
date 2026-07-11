@@ -87,8 +87,8 @@ diesel::table! {
         created_at -> Text,
         role -> Text,
         kind -> Text,
-        kind_json -> Text,
         metadata_present -> Bool,
+        content -> Nullable<Text>,
     }
 }
 
