@@ -196,19 +196,21 @@ SET kind_json = json_object(
         json_object(
             'SkillInvocation',
             json_object(
-                'skill_name', anchor.skill_name,
-                'mode', json(CASE anchor.skill_invocation_mode
+                'skill_name', invocation.skill_name,
+                'mode', json(CASE invocation.mode
                     WHEN 'inherit_context' THEN json_object('kind', 'inherit_context')
                     WHEN 'handoff' THEN json_object(
                         'kind', 'handoff',
-                        'prompt', anchor.prompt
+                        'prompt', invocation.prompt
                     )
                 END)
             )
         )
     )
 )
-WHERE anchor.kind = 'skill_invocation';
+FROM node_anchor_skill_invocations AS invocation
+WHERE anchor.kind = 'skill_invocation'
+  AND invocation.node_id = anchor.node_id;
 
 UPDATE node_anchors AS anchor
 SET kind_json = json_object(

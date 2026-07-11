@@ -59,3 +59,31 @@ SELECT CASE
 END;
 
 DROP TABLE node_anchor_skill_invocation_migration_guard;
+
+CREATE TABLE node_anchor_skill_invocations (
+    node_id TEXT PRIMARY KEY NOT NULL,
+    skill_name TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    prompt TEXT,
+    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+);
+
+INSERT INTO node_anchor_skill_invocations (
+    node_id,
+    skill_name,
+    mode,
+    prompt
+)
+SELECT
+    node_id,
+    skill_name,
+    skill_invocation_mode,
+    prompt
+FROM node_anchors
+WHERE kind = 'skill_invocation';
+
+UPDATE node_anchors
+SET skill_name = NULL,
+    skill_invocation_mode = NULL,
+    prompt = NULL
+WHERE kind = 'skill_invocation';

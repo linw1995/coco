@@ -61,6 +61,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    node_anchor_skill_invocations (node_id) {
+        node_id -> Text,
+        skill_name -> Text,
+        mode -> Text,
+        prompt -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     node_anchor_session_patch_tools (node_id, ordinal) {
         node_id -> Text,
         ordinal -> Integer,
@@ -190,6 +199,7 @@ diesel::table! {
 diesel::joinable!(branches -> nodes (head_id));
 diesel::joinable!(node_anchors -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchors (node_id));
+diesel::joinable!(node_anchor_skill_invocations -> node_anchors (node_id));
 diesel::joinable!(node_anchor_prompt_attachments -> node_anchors (node_id));
 diesel::joinable!(node_anchor_session_patch_tools -> node_anchor_session_patches (node_id));
 diesel::joinable!(node_anchor_session_patches -> node_anchors (node_id));
@@ -206,6 +216,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     node_anchor_session_patch_tools,
     node_anchor_session_patches,
     node_anchor_session_tools,
+    node_anchor_skill_invocations,
     node_anchors,
     node_metadata,
     node_relations,

@@ -70,11 +70,9 @@ SELECT CASE
            OR (
                 kind = 'skill_invocation'
                 AND (
-                    skill_name IS NULL
-                    OR skill_invocation_mode IS NULL
-                    OR skill_invocation_mode NOT IN ('inherit_context', 'handoff')
-                    OR (skill_invocation_mode = 'inherit_context' AND prompt IS NOT NULL)
-                    OR (skill_invocation_mode = 'handoff' AND prompt IS NULL)
+                    prompt IS NOT NULL
+                    OR skill_name IS NOT NULL
+                    OR skill_invocation_mode IS NOT NULL
                     OR session_role IS NOT NULL
                     OR provider_profile IS NOT NULL
                     OR provider IS NOT NULL
@@ -182,6 +180,25 @@ SELECT CASE
         FROM node_anchor_prompt_attachments
         GROUP BY node_id
         HAVING MIN(ordinal) <> 0 OR MAX(ordinal) <> COUNT(*) - 1
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchors AS anchor
+        WHERE anchor.kind = 'skill_invocation'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM node_anchor_skill_invocations AS invocation
+              WHERE invocation.node_id = anchor.node_id
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchor_skill_invocations AS invocation
+        JOIN node_anchors AS anchor ON anchor.node_id = invocation.node_id
+        WHERE anchor.kind <> 'skill_invocation'
+           OR invocation.mode NOT IN ('inherit_context', 'handoff')
+           OR (invocation.mode = 'inherit_context' AND invocation.prompt IS NOT NULL)
+           OR (invocation.mode = 'handoff' AND invocation.prompt IS NULL)
     )
     AND NOT EXISTS (
         SELECT 1
