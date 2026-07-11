@@ -1,3 +1,17 @@
+ALTER TABLE node_anchors ADD COLUMN session_role TEXT;
+ALTER TABLE node_anchors ADD COLUMN provider_profile TEXT;
+ALTER TABLE node_anchors ADD COLUMN provider TEXT;
+ALTER TABLE node_anchors ADD COLUMN model TEXT;
+
+UPDATE node_anchors AS anchor
+SET session_role = session.role,
+    provider_profile = session.provider_profile,
+    provider = session.provider,
+    model = session.model,
+    prompt = session.prompt
+FROM node_anchor_sessions AS session
+WHERE anchor.node_id = session.node_id;
+
 UPDATE node_anchors
 SET kind_json = json_remove(
     kind_json,
@@ -10,11 +24,4 @@ SET kind_json = json_remove(
 WHERE kind = 'session';
 
 DROP TABLE node_anchor_session_tools;
-
-ALTER TABLE node_anchors DROP COLUMN session_active_skill_handoff;
-ALTER TABLE node_anchors DROP COLUMN session_active_skill_name;
-ALTER TABLE node_anchors DROP COLUMN session_enable_coco_shim;
-ALTER TABLE node_anchors DROP COLUMN session_additional_params_json;
-ALTER TABLE node_anchors DROP COLUMN session_max_tokens;
-ALTER TABLE node_anchors DROP COLUMN session_temperature;
-ALTER TABLE node_anchors DROP COLUMN session_system_prompt;
+DROP TABLE node_anchor_sessions;

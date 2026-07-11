@@ -24,10 +24,10 @@ SET kind_json = json_object(
             'Session',
             json(json_patch(
                 json_object(
-                    'role', anchor.session_role,
-                    'provider_profile', anchor.provider_profile,
-                    'provider', anchor.provider,
-                    'model', anchor.model,
+                    'role', session.role,
+                    'provider_profile', session.provider_profile,
+                    'provider', session.provider,
+                    'model', session.model,
                     'tools', json(COALESCE((
                         SELECT json_group_array(json(tool_json))
                         FROM (
@@ -41,20 +41,20 @@ SET kind_json = json_object(
                             ORDER BY tool.ordinal
                         )
                     ), '[]')),
-                    'system_prompt', anchor.session_system_prompt,
-                    'prompt', anchor.prompt,
-                    'temperature', anchor.session_temperature,
-                    'max_tokens', json(COALESCE(anchor.session_max_tokens, 'null')),
-                    'additional_params', json(COALESCE(anchor.session_additional_params_json, 'null')),
-                    'enable_coco_shim', json(CASE WHEN anchor.session_enable_coco_shim THEN 'true' ELSE 'false' END)
+                    'system_prompt', session.system_prompt,
+                    'prompt', session.prompt,
+                    'temperature', session.temperature,
+                    'max_tokens', json(COALESCE(session.max_tokens, 'null')),
+                    'additional_params', json(COALESCE(session.additional_params_json, 'null')),
+                    'enable_coco_shim', json(CASE WHEN session.enable_coco_shim THEN 'true' ELSE 'false' END)
                 ),
                 CASE
-                    WHEN anchor.session_active_skill_name IS NULL THEN '{}'
+                    WHEN session.active_skill_name IS NULL THEN '{}'
                     ELSE json_object(
                         'active_skill',
                         json_object(
-                            'name', anchor.session_active_skill_name,
-                            'handoff', anchor.session_active_skill_handoff
+                            'name', session.active_skill_name,
+                            'handoff', session.active_skill_handoff
                         )
                     )
                 END
@@ -62,7 +62,9 @@ SET kind_json = json_object(
         )
     )
 )
-WHERE anchor.kind = 'session';
+FROM node_anchor_sessions AS session
+WHERE anchor.kind = 'session'
+  AND session.node_id = anchor.node_id;
 
 UPDATE node_anchors AS anchor
 SET kind_json = json_object(

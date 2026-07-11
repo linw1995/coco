@@ -86,31 +86,62 @@ END;
 
 DROP TABLE node_anchor_session_migration_guard;
 
-ALTER TABLE node_anchors ADD COLUMN session_system_prompt TEXT;
-ALTER TABLE node_anchors ADD COLUMN session_temperature DOUBLE;
-ALTER TABLE node_anchors ADD COLUMN session_max_tokens TEXT;
-ALTER TABLE node_anchors ADD COLUMN session_additional_params_json TEXT;
-ALTER TABLE node_anchors ADD COLUMN session_enable_coco_shim BOOLEAN;
-ALTER TABLE node_anchors ADD COLUMN session_active_skill_name TEXT;
-ALTER TABLE node_anchors ADD COLUMN session_active_skill_handoff TEXT;
+CREATE TABLE node_anchor_sessions (
+    node_id TEXT PRIMARY KEY NOT NULL,
+    role TEXT NOT NULL,
+    provider_profile TEXT,
+    provider TEXT,
+    model TEXT NOT NULL,
+    system_prompt TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    temperature DOUBLE,
+    max_tokens TEXT,
+    additional_params_json TEXT,
+    enable_coco_shim BOOLEAN NOT NULL,
+    active_skill_name TEXT,
+    active_skill_handoff TEXT,
+    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+);
 
-UPDATE node_anchors
-SET session_system_prompt = json_extract(kind_json, '$.Anchor.payload.Session.system_prompt'),
-    session_temperature = json_extract(kind_json, '$.Anchor.payload.Session.temperature'),
-    session_max_tokens = CASE
+INSERT INTO node_anchor_sessions (
+    node_id,
+    role,
+    provider_profile,
+    provider,
+    model,
+    system_prompt,
+    prompt,
+    temperature,
+    max_tokens,
+    additional_params_json,
+    enable_coco_shim,
+    active_skill_name,
+    active_skill_handoff
+)
+SELECT
+    node_id,
+    session_role,
+    provider_profile,
+    provider,
+    model,
+    json_extract(kind_json, '$.Anchor.payload.Session.system_prompt'),
+    prompt,
+    json_extract(kind_json, '$.Anchor.payload.Session.temperature'),
+    CASE
         WHEN json_type(kind_json, '$.Anchor.payload.Session.max_tokens') = 'null' THEN NULL
         ELSE kind_json -> '$.Anchor.payload.Session.max_tokens'
     END,
-    session_additional_params_json = CASE
+    CASE
         WHEN json_type(kind_json, '$.Anchor.payload.Session.additional_params') = 'null' THEN NULL
         ELSE kind_json -> '$.Anchor.payload.Session.additional_params'
     END,
-    session_enable_coco_shim = COALESCE(
+    COALESCE(
         json_extract(kind_json, '$.Anchor.payload.Session.enable_coco_shim'),
         0
     ),
-    session_active_skill_name = json_extract(kind_json, '$.Anchor.payload.Session.active_skill.name'),
-    session_active_skill_handoff = json_extract(kind_json, '$.Anchor.payload.Session.active_skill.handoff')
+    json_extract(kind_json, '$.Anchor.payload.Session.active_skill.name'),
+    json_extract(kind_json, '$.Anchor.payload.Session.active_skill.handoff')
+FROM node_anchors
 WHERE kind = 'session';
 
 CREATE TABLE node_anchor_session_tools (
@@ -120,7 +151,7 @@ CREATE TABLE node_anchor_session_tools (
     description TEXT NOT NULL,
     input_schema_json TEXT NOT NULL,
     PRIMARY KEY (node_id, ordinal),
-    FOREIGN KEY (node_id) REFERENCES node_anchors(node_id) ON DELETE CASCADE
+    FOREIGN KEY (node_id) REFERENCES node_anchor_sessions(node_id) ON DELETE CASCADE
 );
 
 INSERT INTO node_anchor_session_tools (
@@ -139,3 +170,12 @@ SELECT
 FROM node_anchors AS anchor
 JOIN json_each(anchor.kind_json, '$.Anchor.payload.Session.tools') AS tool
 WHERE anchor.kind = 'session';
+
+UPDATE node_anchors
+SET prompt = NULL
+WHERE kind = 'session';
+
+ALTER TABLE node_anchors DROP COLUMN model;
+ALTER TABLE node_anchors DROP COLUMN provider;
+ALTER TABLE node_anchors DROP COLUMN provider_profile;
+ALTER TABLE node_anchors DROP COLUMN session_role;

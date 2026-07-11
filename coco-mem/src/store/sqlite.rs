@@ -43,9 +43,9 @@ use crate::error::{
 use crate::schema::{
     branches, jobs, message_queue_items, node_anchor_prompt_attachments,
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
-    node_anchor_skill_invocations, node_anchor_skill_results, node_anchors, node_metadata,
-    node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions, skills,
-    store_meta,
+    node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_anchors,
+    node_metadata, node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions,
+    skills, store_meta,
 };
 use crate::{
     Anchor, AnchorPayload, BackendMetadata, Job, JobStatus, Kind, MergeParent, MessageQueueItem,
@@ -209,18 +209,24 @@ struct NodeRow {
 struct NodeAnchorRow {
     node_id: String,
     kind: String,
-    session_role: Option<String>,
+    prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Queryable)]
+struct NodeAnchorSessionRow {
+    node_id: String,
+    role: String,
     provider_profile: Option<String>,
     provider: Option<String>,
-    model: Option<String>,
-    prompt: Option<String>,
-    session_system_prompt: Option<String>,
-    session_temperature: Option<f64>,
-    session_max_tokens: Option<String>,
-    session_additional_params_json: Option<String>,
-    session_enable_coco_shim: Option<bool>,
-    session_active_skill_name: Option<String>,
-    session_active_skill_handoff: Option<String>,
+    model: String,
+    system_prompt: String,
+    prompt: String,
+    temperature: Option<f64>,
+    max_tokens: Option<String>,
+    additional_params_json: Option<String>,
+    enable_coco_shim: bool,
+    active_skill_name: Option<String>,
+    active_skill_handoff: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
@@ -298,6 +304,7 @@ struct NodeRelationRow {
 
 struct NodeAnchorStorageRows<'a> {
     row: Option<&'a NodeAnchorRow>,
+    session: Option<&'a NodeAnchorSessionRow>,
     session_tools: &'a [NodeAnchorSessionToolRow],
     session_patch: Option<&'a NodeAnchorSessionPatchRow>,
     session_patch_tools: &'a [NodeAnchorSessionPatchToolRow],
@@ -1771,18 +1778,7 @@ async fn load_node_anchor_rows_for_ids(
         .select((
             node_anchors::node_id,
             node_anchors::kind,
-            node_anchors::session_role,
-            node_anchors::provider_profile,
-            node_anchors::provider,
-            node_anchors::model,
             node_anchors::prompt,
-            node_anchors::session_system_prompt,
-            node_anchors::session_temperature,
-            node_anchors::session_max_tokens,
-            node_anchors::session_additional_params_json,
-            node_anchors::session_enable_coco_shim,
-            node_anchors::session_active_skill_name,
-            node_anchors::session_active_skill_handoff,
         ))
         .into_boxed();
     if let Some(node_ids) = node_ids {
@@ -1793,6 +1789,47 @@ async fn load_node_anchor_rows_for_ids(
     }
     query
         .load::<NodeAnchorRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.node_id.clone(), row))
+                .collect()
+        })
+}
+
+async fn load_node_anchor_session_rows_for_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_ids: Option<&[String]>,
+) -> Result<HashMap<String, NodeAnchorSessionRow>> {
+    let mut query = node_anchor_sessions::table
+        .select((
+            node_anchor_sessions::node_id,
+            node_anchor_sessions::role,
+            node_anchor_sessions::provider_profile,
+            node_anchor_sessions::provider,
+            node_anchor_sessions::model,
+            node_anchor_sessions::system_prompt,
+            node_anchor_sessions::prompt,
+            node_anchor_sessions::temperature,
+            node_anchor_sessions::max_tokens,
+            node_anchor_sessions::additional_params_json,
+            node_anchor_sessions::enable_coco_shim,
+            node_anchor_sessions::active_skill_name,
+            node_anchor_sessions::active_skill_handoff,
+        ))
+        .into_boxed();
+    if let Some(node_ids) = node_ids {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        query = query.filter(node_anchor_sessions::node_id.eq_any(node_ids));
+    }
+    query
+        .load::<NodeAnchorSessionRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
@@ -2242,6 +2279,8 @@ async fn node_rows_into_nodes(
 ) -> Result<Vec<Node>> {
     let node_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
     let anchor_rows = load_node_anchor_rows_for_ids(connection, path, Some(&node_ids)).await?;
+    let anchor_session_rows =
+        load_node_anchor_session_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_session_tool_rows =
         load_node_anchor_session_tool_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_session_patch_rows =
@@ -2267,6 +2306,7 @@ async fn node_rows_into_nodes(
                 NodeStorageRows {
                     anchor: NodeAnchorStorageRows {
                         row: anchor_rows.get(&node_id),
+                        session: anchor_session_rows.get(&node_id),
                         session_tools: node_anchor_session_tool_slice(
                             &anchor_session_tool_rows,
                             &node_id,
@@ -2312,6 +2352,12 @@ async fn load_node_by_exact_id(
     let anchor_rows =
         load_node_anchor_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
             .await?;
+    let anchor_session_rows = load_node_anchor_session_rows_for_ids(
+        connection,
+        path,
+        Some(std::slice::from_ref(&node_id)),
+    )
+    .await?;
     let anchor_session_tool_rows = load_node_anchor_session_tool_rows_for_ids(
         connection,
         path,
@@ -2365,6 +2411,7 @@ async fn load_node_by_exact_id(
         NodeStorageRows {
             anchor: NodeAnchorStorageRows {
                 row: anchor_rows.get(&node_id),
+                session: anchor_session_rows.get(&node_id),
                 session_tools: node_anchor_session_tool_slice(&anchor_session_tool_rows, &node_id),
                 session_patch: anchor_session_patch_rows.get(&node_id),
                 session_patch_tools: node_anchor_session_patch_tool_slice(
@@ -2695,6 +2742,7 @@ async fn persist_node_without_transaction(
         })?;
 
     persist_node_anchor_row(connection, path, node).await?;
+    persist_node_anchor_session_row(connection, path, node).await?;
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
@@ -2785,6 +2833,7 @@ async fn upsert_node_without_transaction(
         })?;
 
     persist_node_anchor_row(connection, path, node).await?;
+    persist_node_anchor_session_row(connection, path, node).await?;
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
@@ -2816,25 +2865,46 @@ async fn persist_node_anchor_row(
     path: &Path,
     node: &Node,
 ) -> Result<()> {
-    let Some(row) = NodeAnchorRow::from_node(node, path)? else {
+    let Some(row) = NodeAnchorRow::from_node(node) else {
         return Ok(());
     };
     diesel::insert_into(node_anchors::table)
         .values((
             node_anchors::node_id.eq(row.node_id),
             node_anchors::kind.eq(row.kind),
-            node_anchors::session_role.eq(row.session_role),
-            node_anchors::provider_profile.eq(row.provider_profile),
-            node_anchors::provider.eq(row.provider),
-            node_anchors::model.eq(row.model),
             node_anchors::prompt.eq(row.prompt),
-            node_anchors::session_system_prompt.eq(row.session_system_prompt),
-            node_anchors::session_temperature.eq(row.session_temperature),
-            node_anchors::session_max_tokens.eq(row.session_max_tokens),
-            node_anchors::session_additional_params_json.eq(row.session_additional_params_json),
-            node_anchors::session_enable_coco_shim.eq(row.session_enable_coco_shim),
-            node_anchors::session_active_skill_name.eq(row.session_active_skill_name),
-            node_anchors::session_active_skill_handoff.eq(row.session_active_skill_handoff),
+        ))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
+async fn persist_node_anchor_session_row(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    let Some(row) = NodeAnchorSessionRow::from_node(node, path)? else {
+        return Ok(());
+    };
+    diesel::insert_into(node_anchor_sessions::table)
+        .values((
+            node_anchor_sessions::node_id.eq(row.node_id),
+            node_anchor_sessions::role.eq(row.role),
+            node_anchor_sessions::provider_profile.eq(row.provider_profile),
+            node_anchor_sessions::provider.eq(row.provider),
+            node_anchor_sessions::model.eq(row.model),
+            node_anchor_sessions::system_prompt.eq(row.system_prompt),
+            node_anchor_sessions::prompt.eq(row.prompt),
+            node_anchor_sessions::temperature.eq(row.temperature),
+            node_anchor_sessions::max_tokens.eq(row.max_tokens),
+            node_anchor_sessions::additional_params_json.eq(row.additional_params_json),
+            node_anchor_sessions::enable_coco_shim.eq(row.enable_coco_shim),
+            node_anchor_sessions::active_skill_name.eq(row.active_skill_name),
+            node_anchor_sessions::active_skill_handoff.eq(row.active_skill_handoff),
         ))
         .execute(connection)
         .await
@@ -3390,28 +3460,16 @@ impl NodeRow {
 }
 
 impl NodeAnchorRow {
-    fn from_node(node: &Node, path: &Path) -> Result<Option<Self>> {
+    fn from_node(node: &Node) -> Option<Self> {
         let Kind::Anchor(anchor) = &node.kind else {
-            return Ok(None);
+            return None;
         };
         let summary = NodeAnchorSummary::from_kind(&node.kind);
-        let session = NodeAnchorSessionColumns::from_kind(&node.kind, path)?;
-        Ok(Some(Self {
+        Some(Self {
             node_id: node.id.clone(),
             kind: anchor.payload_kind().as_str().to_owned(),
-            session_role: summary.session_role,
-            provider_profile: summary.provider_profile,
-            provider: summary.provider,
-            model: summary.model,
             prompt: summary.prompt,
-            session_system_prompt: session.system_prompt,
-            session_temperature: session.temperature,
-            session_max_tokens: session.max_tokens,
-            session_additional_params_json: session.additional_params_json,
-            session_enable_coco_shim: session.enable_coco_shim,
-            session_active_skill_name: session.active_skill_name,
-            session_active_skill_handoff: session.active_skill_handoff,
-        }))
+        })
     }
 
     fn kind_from_storage(
@@ -3446,7 +3504,11 @@ impl NodeAnchorRow {
                         ),
                     }
                 );
-                let kind = self.session_kind_from_storage(
+                let session_row = rows.session.context(CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("missing SQLite node anchor session row for {node_id:?}"),
+                })?;
+                let kind = session_row.kind_from_storage(
                     path,
                     node_id,
                     parent_id,
@@ -3457,7 +3519,8 @@ impl NodeAnchorRow {
             }
             "session_patch" => {
                 ensure!(
-                    rows.session_tools.is_empty()
+                    rows.session.is_none()
+                        && rows.session_tools.is_empty()
                         && rows.prompt_attachments.is_empty()
                         && rows.skill_invocation.is_none()
                         && rows.skill_result.is_none(),
@@ -3485,7 +3548,8 @@ impl NodeAnchorRow {
             }
             "prompt" => {
                 ensure!(
-                    rows.session_tools.is_empty()
+                    rows.session.is_none()
+                        && rows.session_tools.is_empty()
                         && rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
                         && rows.skill_invocation.is_none()
@@ -3508,7 +3572,8 @@ impl NodeAnchorRow {
             }
             "skill_invocation" => {
                 ensure!(
-                    rows.session_tools.is_empty()
+                    rows.session.is_none()
+                        && rows.session_tools.is_empty()
                         && rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
                         && rows.prompt_attachments.is_empty()
@@ -3532,7 +3597,8 @@ impl NodeAnchorRow {
             }
             "skill_result" => {
                 ensure!(
-                    rows.session_tools.is_empty()
+                    rows.session.is_none()
+                        && rows.session_tools.is_empty()
                         && rows.session_patch.is_none()
                         && rows.session_patch_tools.is_empty()
                         && rows.prompt_attachments.is_empty()
@@ -3560,83 +3626,6 @@ impl NodeAnchorRow {
         }
     }
 
-    fn session_kind_from_storage(
-        &self,
-        path: &Path,
-        node_id: &str,
-        parent_id: &str,
-        tool_rows: &[NodeAnchorSessionToolRow],
-        relation_rows: &[NodeRelationRow],
-    ) -> Result<Kind> {
-        let role = parse_session_role(
-            self.session_role.as_deref().context(CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: "missing SQLite node_anchors.session_role".to_owned(),
-            })?,
-            path,
-        )?;
-        let model = required_anchor_summary(path, "node_anchors.model", self.model.as_deref())?;
-        let prompt = required_anchor_summary(path, "node_anchors.prompt", self.prompt.as_deref())?;
-        let system_prompt = required_anchor_summary(
-            path,
-            "node_anchors.session_system_prompt",
-            self.session_system_prompt.as_deref(),
-        )?;
-        let max_tokens = self
-            .session_max_tokens
-            .as_deref()
-            .map(|value| parse_u64_column(path, "node_anchors.session_max_tokens", value))
-            .transpose()?;
-        let additional_params = self
-            .session_additional_params_json
-            .as_deref()
-            .map(|value| {
-                parse_json_column(path, "node_anchors.session_additional_params_json", value)
-            })
-            .transpose()?;
-        let enable_coco_shim = self.session_enable_coco_shim.context(CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: "missing SQLite node_anchors.session_enable_coco_shim".to_owned(),
-        })?;
-        let active_skill = match self.session_active_skill_name.as_deref() {
-            Some(name) => Some(SkillRuntimeContext {
-                name: name.to_owned(),
-                handoff: self.session_active_skill_handoff.clone(),
-            }),
-            None => {
-                ensure!(
-                    self.session_active_skill_handoff.is_none(),
-                    CorruptedStoreSnafu {
-                        path: path.to_owned(),
-                        message: "SQLite session active skill handoff is present without a name"
-                            .to_owned(),
-                    }
-                );
-                None
-            }
-        };
-        let merge_parents =
-            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
-        let tools = session_tools_from_rows(path, node_id, tool_rows)?;
-        Ok(Kind::Anchor(Anchor::session(
-            merge_parents,
-            SessionAnchor {
-                role,
-                provider_profile: self.provider_profile.clone(),
-                provider: self.provider.clone(),
-                model,
-                tools,
-                system_prompt,
-                prompt,
-                temperature: self.session_temperature,
-                max_tokens,
-                additional_params,
-                enable_coco_shim,
-                active_skill,
-            },
-        )))
-    }
-
     fn prompt_kind_from_storage(
         &self,
         path: &Path,
@@ -3661,6 +3650,119 @@ impl NodeAnchorRow {
     fn validate_relational_kind(&self, path: &Path, kind: Kind) -> Result<Kind> {
         validate_node_anchor_summary(path, self, &kind)?;
         Ok(kind)
+    }
+}
+
+impl NodeAnchorSessionRow {
+    fn from_node(node: &Node, path: &Path) -> Result<Option<Self>> {
+        let Kind::Anchor(Anchor {
+            payload: AnchorPayload::Session(session),
+            ..
+        }) = &node.kind
+        else {
+            return Ok(None);
+        };
+        let additional_params_json = session
+            .additional_params
+            .as_ref()
+            .map(|value| {
+                serde_json::to_string(value).context(ParseSqliteStoreValueSnafu {
+                    path: path.to_owned(),
+                    column: "node_anchor_sessions.additional_params_json".to_owned(),
+                })
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            node_id: node.id.clone(),
+            role: session.role.as_str().to_owned(),
+            provider_profile: session.provider_profile.clone(),
+            provider: session.provider.clone(),
+            model: session.model.clone(),
+            system_prompt: session.system_prompt.clone(),
+            prompt: session.prompt.clone(),
+            temperature: session.temperature,
+            max_tokens: session.max_tokens.map(|value| value.to_string()),
+            additional_params_json,
+            enable_coco_shim: session.enable_coco_shim,
+            active_skill_name: session
+                .active_skill
+                .as_ref()
+                .map(|skill| skill.name.clone()),
+            active_skill_handoff: session
+                .active_skill
+                .as_ref()
+                .and_then(|skill| skill.handoff.clone()),
+        }))
+    }
+
+    fn kind_from_storage(
+        &self,
+        path: &Path,
+        node_id: &str,
+        parent_id: &str,
+        tool_rows: &[NodeAnchorSessionToolRow],
+        relation_rows: &[NodeRelationRow],
+    ) -> Result<Kind> {
+        ensure!(
+            self.node_id == node_id,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "SQLite session row {:?} does not belong to node {node_id:?}",
+                    self.node_id
+                ),
+            }
+        );
+        let role = parse_session_role(&self.role, path)?;
+        let max_tokens = self
+            .max_tokens
+            .as_deref()
+            .map(|value| parse_u64_column(path, "node_anchor_sessions.max_tokens", value))
+            .transpose()?;
+        let additional_params = self
+            .additional_params_json
+            .as_deref()
+            .map(|value| {
+                parse_json_column(path, "node_anchor_sessions.additional_params_json", value)
+            })
+            .transpose()?;
+        let active_skill = match self.active_skill_name.as_deref() {
+            Some(name) => Some(SkillRuntimeContext {
+                name: name.to_owned(),
+                handoff: self.active_skill_handoff.clone(),
+            }),
+            None => {
+                ensure!(
+                    self.active_skill_handoff.is_none(),
+                    CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: "SQLite session active skill handoff is present without a name"
+                            .to_owned(),
+                    }
+                );
+                None
+            }
+        };
+        let merge_parents =
+            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
+        let tools = session_tools_from_rows(path, node_id, tool_rows)?;
+        Ok(Kind::Anchor(Anchor::session(
+            merge_parents,
+            SessionAnchor {
+                role,
+                provider_profile: self.provider_profile.clone(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                tools,
+                system_prompt: self.system_prompt.clone(),
+                prompt: self.prompt.clone(),
+                temperature: self.temperature,
+                max_tokens,
+                additional_params,
+                enable_coco_shim: self.enable_coco_shim,
+                active_skill,
+            },
+        )))
     }
 }
 
@@ -4142,56 +4244,7 @@ fn required_anchor_summary(path: &Path, column: &str, value: Option<&str>) -> Re
 
 #[derive(Default)]
 struct NodeAnchorSummary {
-    session_role: Option<String>,
-    provider_profile: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
     prompt: Option<String>,
-}
-
-#[derive(Default)]
-struct NodeAnchorSessionColumns {
-    system_prompt: Option<String>,
-    temperature: Option<f64>,
-    max_tokens: Option<String>,
-    additional_params_json: Option<String>,
-    enable_coco_shim: Option<bool>,
-    active_skill_name: Option<String>,
-    active_skill_handoff: Option<String>,
-}
-
-impl NodeAnchorSessionColumns {
-    fn from_kind(kind: &Kind, path: &Path) -> Result<Self> {
-        let Kind::Anchor(Anchor {
-            payload: AnchorPayload::Session(anchor),
-            ..
-        }) = kind
-        else {
-            return Ok(Self::default());
-        };
-        let additional_params_json = anchor
-            .additional_params
-            .as_ref()
-            .map(|value| {
-                serde_json::to_string(value).context(ParseSqliteStoreValueSnafu {
-                    path: path.to_owned(),
-                    column: "node_anchors.session_additional_params_json".to_owned(),
-                })
-            })
-            .transpose()?;
-        Ok(Self {
-            system_prompt: Some(anchor.system_prompt.clone()),
-            temperature: anchor.temperature,
-            max_tokens: anchor.max_tokens.map(|value| value.to_string()),
-            additional_params_json,
-            enable_coco_shim: Some(anchor.enable_coco_shim),
-            active_skill_name: anchor.active_skill.as_ref().map(|skill| skill.name.clone()),
-            active_skill_handoff: anchor
-                .active_skill
-                .as_ref()
-                .and_then(|skill| skill.handoff.clone()),
-        })
-    }
 }
 
 impl NodeAnchorSummary {
@@ -4200,17 +4253,10 @@ impl NodeAnchorSummary {
             return Self::default();
         };
         match &anchor.payload {
-            AnchorPayload::Session(anchor) => Self {
-                session_role: Some(anchor.role.as_str().to_owned()),
-                provider_profile: anchor.provider_profile.clone(),
-                provider: anchor.provider.clone(),
-                model: Some(anchor.model.clone()),
-                prompt: Some(anchor.prompt.clone()),
-            },
+            AnchorPayload::Session(_) => Self::default(),
             AnchorPayload::SessionPatch(_) => Self::default(),
             AnchorPayload::Prompt(anchor) => Self {
                 prompt: Some(anchor.prompt.clone()),
-                ..Self::default()
             },
             AnchorPayload::SkillInvocation(_) => Self::default(),
             AnchorPayload::SkillResult(_) => Self::default(),
@@ -4220,30 +4266,6 @@ impl NodeAnchorSummary {
 
 fn validate_node_anchor_summary(path: &Path, row: &NodeAnchorRow, kind: &Kind) -> Result<()> {
     let expected = NodeAnchorSummary::from_kind(kind);
-    validate_optional_text_summary(
-        path,
-        "node_anchors.session_role",
-        row.session_role.as_deref(),
-        expected.session_role.as_deref(),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "node_anchors.provider_profile",
-        row.provider_profile.as_deref(),
-        expected.provider_profile.as_deref(),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "node_anchors.provider",
-        row.provider.as_deref(),
-        expected.provider.as_deref(),
-    )?;
-    validate_optional_text_summary(
-        path,
-        "node_anchors.model",
-        row.model.as_deref(),
-        expected.model.as_deref(),
-    )?;
     validate_optional_text_summary(
         path,
         "node_anchors.prompt",
@@ -6794,15 +6816,15 @@ impl ProcessShareableStore for SqliteStore {
 mod tests {
     use super::{
         MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorSessionPatchRow,
-        NodeAnchorSessionPatchToolRow, NodeAnchorSessionToolRow, NodeAnchorSkillInvocationRow,
-        NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow, NodeToolUseRow,
-        SqliteGraphStore, SqliteStore,
+        NodeAnchorSessionPatchToolRow, NodeAnchorSessionRow, NodeAnchorSessionToolRow,
+        NodeAnchorSkillInvocationRow, NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow,
+        NodeToolUseRow, SqliteGraphStore, SqliteStore,
     };
     use crate::schema::{
         jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
-        node_anchor_session_patches, node_anchor_session_tools, node_anchor_skill_invocations,
-        node_anchor_skill_results, node_anchors, node_metadata, node_relations, node_tool_results,
-        node_tool_uses, nodes, sessions, store_meta,
+        node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
+        node_anchor_skill_invocations, node_anchor_skill_results, node_anchors, node_metadata,
+        node_relations, node_tool_results, node_tool_uses, nodes, sessions, store_meta,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
@@ -6829,10 +6851,6 @@ mod tests {
 
     #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
     struct NodeAnchorSummaryRow {
-        session_role: Option<String>,
-        provider_profile: Option<String>,
-        provider: Option<String>,
-        model: Option<String>,
         prompt: Option<String>,
     }
 
@@ -7143,6 +7161,30 @@ mod tests {
             .unwrap()
     }
 
+    async fn node_anchor_session_row(store: &SqliteStore, node_id: &str) -> NodeAnchorSessionRow {
+        let mut connection = store.connect().await.unwrap();
+        node_anchor_sessions::table
+            .filter(node_anchor_sessions::node_id.eq(node_id))
+            .select((
+                node_anchor_sessions::node_id,
+                node_anchor_sessions::role,
+                node_anchor_sessions::provider_profile,
+                node_anchor_sessions::provider,
+                node_anchor_sessions::model,
+                node_anchor_sessions::system_prompt,
+                node_anchor_sessions::prompt,
+                node_anchor_sessions::temperature,
+                node_anchor_sessions::max_tokens,
+                node_anchor_sessions::additional_params_json,
+                node_anchor_sessions::enable_coco_shim,
+                node_anchor_sessions::active_skill_name,
+                node_anchor_sessions::active_skill_handoff,
+            ))
+            .get_result::<NodeAnchorSessionRow>(&mut connection)
+            .await
+            .unwrap()
+    }
+
     async fn node_anchor_session_tool_rows(
         store: &SqliteStore,
         node_id: &str,
@@ -7387,18 +7429,13 @@ mod tests {
 
     async fn node_anchor_summary(store: &SqliteStore, node_id: &str) -> NodeAnchorSummaryRow {
         let mut connection = store.connect().await.unwrap();
-        node_anchors::table
+        let prompt = node_anchors::table
             .filter(node_anchors::node_id.eq(node_id))
-            .select((
-                node_anchors::session_role,
-                node_anchors::provider_profile,
-                node_anchors::provider,
-                node_anchors::model,
-                node_anchors::prompt,
-            ))
-            .get_result::<NodeAnchorSummaryRow>(&mut connection)
+            .select(node_anchors::prompt)
+            .get_result::<Option<String>>(&mut connection)
             .await
-            .unwrap()
+            .unwrap();
+        NodeAnchorSummaryRow { prompt }
     }
 
     async fn session_summary(store: &SqliteStore, branch: &str) -> SessionSummaryRow {
@@ -7968,6 +8005,28 @@ mod tests {
         let reopened = SqliteStore::open_read_only(&path).await.unwrap();
         assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
         assert_eq!(
+            node_anchor_session_row(&reopened, &anchor_id).await,
+            NodeAnchorSessionRow {
+                node_id: anchor_id.clone(),
+                role: "runner".to_owned(),
+                provider_profile: Some("runner-profile".to_owned()),
+                provider: Some("openai".to_owned()),
+                model: "gpt-5.4".to_owned(),
+                system_prompt: "system".to_owned(),
+                prompt: "session prompt".to_owned(),
+                temperature: Some(0.25),
+                max_tokens: Some(u64::MAX.to_string()),
+                additional_params_json: Some(r#"{"reasoning":{"effort":"high"}}"#.to_owned()),
+                enable_coco_shim: true,
+                active_skill_name: Some("compact".to_owned()),
+                active_skill_handoff: Some("Preserve the decisions".to_owned()),
+            }
+        );
+        assert_eq!(
+            node_anchor_summary(&reopened, &anchor_id).await,
+            NodeAnchorSummaryRow { prompt: None }
+        );
+        assert_eq!(
             node_anchor_session_tool_rows(&reopened, &anchor_id).await,
             vec![
                 NodeAnchorSessionToolRow {
@@ -8336,13 +8395,7 @@ mod tests {
         );
         assert_eq!(
             node_anchor_summary(&reopened, &anchor_id).await,
-            NodeAnchorSummaryRow {
-                session_role: None,
-                provider_profile: None,
-                provider: None,
-                model: None,
-                prompt: None,
-            }
+            NodeAnchorSummaryRow { prompt: None }
         );
     }
 
@@ -8614,10 +8667,8 @@ mod tests {
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
         revert_store_migrations_to(&mut connection, 16);
         diesel::RunQueryDsl::execute(
-            diesel::sql_query(
-                "UPDATE node_anchors SET session_system_prompt = NULL WHERE node_id = ?",
-            )
-            .bind::<diesel::sql_types::Text, _>(&anchor_id),
+            diesel::sql_query("DELETE FROM node_anchor_sessions WHERE node_id = ?")
+                .bind::<diesel::sql_types::Text, _>(&anchor_id),
             &mut connection,
         )
         .unwrap();
@@ -9318,22 +9369,30 @@ mod tests {
 
         assert_eq!(
             node_anchor_summary(&store, &session).await,
-            NodeAnchorSummaryRow {
-                session_role: Some("runner".to_owned()),
+            NodeAnchorSummaryRow { prompt: None }
+        );
+        assert_eq!(
+            node_anchor_session_row(&store, &session).await,
+            NodeAnchorSessionRow {
+                node_id: session.clone(),
+                role: "runner".to_owned(),
                 provider_profile: Some("runner-profile".to_owned()),
                 provider: Some("openai".to_owned()),
-                model: Some("gpt-5.4".to_owned()),
-                prompt: Some("session prompt".to_owned()),
+                model: "gpt-5.4".to_owned(),
+                system_prompt: "system".to_owned(),
+                prompt: "session prompt".to_owned(),
+                temperature: Some(0.1),
+                max_tokens: Some("64".to_owned()),
+                additional_params_json: None,
+                enable_coco_shim: false,
+                active_skill_name: None,
+                active_skill_handoff: None,
             }
         );
         assert_eq!(node_content(&store, &session).await, None);
         assert_eq!(
             node_anchor_summary(&store, &prompt).await,
             NodeAnchorSummaryRow {
-                session_role: None,
-                provider_profile: None,
-                provider: None,
-                model: None,
                 prompt: Some("detached prompt".to_owned()),
             }
         );

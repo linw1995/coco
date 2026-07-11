@@ -10,88 +10,47 @@ SELECT CASE
         WHERE kind NOT IN ('session', 'session_patch', 'prompt', 'skill_invocation', 'skill_result')
            OR (
                 kind = 'session'
-                AND (
-                    session_role NOT IN ('orchestrator', 'runner')
-                    OR model IS NULL
-                    OR prompt IS NULL
-                    OR session_system_prompt IS NULL
-                    OR session_enable_coco_shim IS NULL
-                    OR (session_max_tokens IS NOT NULL AND (
-                        json_valid(session_max_tokens) = 0
-                        OR json_type(session_max_tokens) <> 'integer'
-                    ))
-                    OR (session_additional_params_json IS NOT NULL AND json_valid(session_additional_params_json) = 0)
-                    OR (session_active_skill_name IS NULL AND session_active_skill_handoff IS NOT NULL)
-                )
+                AND prompt IS NOT NULL
            )
            OR (
                 kind = 'session_patch'
-                AND (
-                    session_role IS NOT NULL
-                    OR provider_profile IS NOT NULL
-                    OR provider IS NOT NULL
-                    OR model IS NOT NULL
-                    OR prompt IS NOT NULL
-                    OR session_system_prompt IS NOT NULL
-                    OR session_temperature IS NOT NULL
-                    OR session_max_tokens IS NOT NULL
-                    OR session_additional_params_json IS NOT NULL
-                    OR session_enable_coco_shim IS NOT NULL
-                    OR session_active_skill_name IS NOT NULL
-                    OR session_active_skill_handoff IS NOT NULL
-                )
+                AND prompt IS NOT NULL
            )
            OR (
                 kind = 'prompt'
-                AND (
-                    prompt IS NULL
-                    OR session_role IS NOT NULL
-                    OR provider_profile IS NOT NULL
-                    OR provider IS NOT NULL
-                    OR model IS NOT NULL
-                    OR session_system_prompt IS NOT NULL
-                    OR session_temperature IS NOT NULL
-                    OR session_max_tokens IS NOT NULL
-                    OR session_additional_params_json IS NOT NULL
-                    OR session_enable_coco_shim IS NOT NULL
-                    OR session_active_skill_name IS NOT NULL
-                    OR session_active_skill_handoff IS NOT NULL
-                )
+                AND prompt IS NULL
            )
            OR (
                 kind = 'skill_invocation'
-                AND (
-                    prompt IS NOT NULL
-                    OR session_role IS NOT NULL
-                    OR provider_profile IS NOT NULL
-                    OR provider IS NOT NULL
-                    OR model IS NOT NULL
-                    OR session_system_prompt IS NOT NULL
-                    OR session_temperature IS NOT NULL
-                    OR session_max_tokens IS NOT NULL
-                    OR session_additional_params_json IS NOT NULL
-                    OR session_enable_coco_shim IS NOT NULL
-                    OR session_active_skill_name IS NOT NULL
-                    OR session_active_skill_handoff IS NOT NULL
-                )
+                AND prompt IS NOT NULL
            )
            OR (
                 kind = 'skill_result'
-                AND (
-                    prompt IS NOT NULL
-                    OR session_role IS NOT NULL
-                    OR provider_profile IS NOT NULL
-                    OR provider IS NOT NULL
-                    OR model IS NOT NULL
-                    OR session_system_prompt IS NOT NULL
-                    OR session_temperature IS NOT NULL
-                    OR session_max_tokens IS NOT NULL
-                    OR session_additional_params_json IS NOT NULL
-                    OR session_enable_coco_shim IS NOT NULL
-                    OR session_active_skill_name IS NOT NULL
-                    OR session_active_skill_handoff IS NOT NULL
-                )
+                AND prompt IS NOT NULL
            )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchors AS anchor
+        WHERE anchor.kind = 'session'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM node_anchor_sessions AS session
+              WHERE session.node_id = anchor.node_id
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM node_anchor_sessions AS session
+        JOIN node_anchors AS anchor ON anchor.node_id = session.node_id
+        WHERE anchor.kind <> 'session'
+           OR session.role NOT IN ('orchestrator', 'runner')
+           OR (session.max_tokens IS NOT NULL AND (
+               json_valid(session.max_tokens) = 0
+               OR json_type(session.max_tokens) <> 'integer'
+           ))
+           OR (session.additional_params_json IS NOT NULL AND json_valid(session.additional_params_json) = 0)
+           OR (session.active_skill_name IS NULL AND session.active_skill_handoff IS NOT NULL)
     )
     AND NOT EXISTS (
         SELECT 1
