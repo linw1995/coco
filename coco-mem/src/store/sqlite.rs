@@ -45,7 +45,7 @@ use crate::schema::{
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
     node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_metadata,
     node_relations, node_tool_results, node_tool_uses, nodes, preset_version_tools,
-    preset_versions, presets, sessions, skills, store_meta,
+    preset_versions, presets, sessions, skill_version_scripts, skill_versions, skills, store_meta,
 };
 use crate::{
     Anchor, AnchorPayload, AnchorPayloadKind, BackendMetadata, Job, JobStatus, Kind, MergeParent,
@@ -53,12 +53,12 @@ use crate::{
     PresetRecord, PresetVersion, PromptAnchor, PromptAttachment, PromptImageAttachment, Role,
     SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
     SkillInvocationAnchor, SkillInvocationMode, SkillRecord, SkillResultAnchor,
-    SkillRuntimeContext, SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult, ToolUse,
-    default_skill_groups,
+    SkillRuntimeContext, SkillScript, SkillUpdatePatch, SkillVersion, SkillVersionSpec, Tool,
+    ToolResult, ToolUse, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 21;
+const SQLITE_SCHEMA_VERSION: i32 = 22;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -491,12 +491,33 @@ struct PresetVersionToolRow {
     input_schema_json: String,
 }
 
-#[derive(Queryable, QueryableByName)]
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
 struct SkillRow {
-    #[diesel(sql_type = Text)]
     role: String,
-    #[diesel(sql_type = Text)]
-    record_json: String,
+    name: String,
+    current_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct SkillVersionRow {
+    role: String,
+    skill_name: String,
+    version: String,
+    id: String,
+    created_at: String,
+    description: String,
+    body: String,
+    enable_coco_shim: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct SkillVersionScriptRow {
+    role: String,
+    skill_name: String,
+    version: String,
+    ordinal: i32,
+    path: String,
+    content: String,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -5992,22 +6013,94 @@ async fn load_skill_groups(
     path: &Path,
 ) -> Result<SkillGroups> {
     let mut groups = default_skill_groups();
-    let rows = skills::table
-        .select((skills::role, skills::record_json))
+    for (role, record) in query_skill_records(connection, path, None, None).await? {
+        groups
+            .for_role_mut(role)
+            .insert(record.name.clone(), record);
+    }
+    Ok(groups)
+}
+
+async fn query_skill_records(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    role: Option<SessionRole>,
+    name: Option<&str>,
+) -> Result<Vec<(SessionRole, SkillRecord)>> {
+    let mut skill_query = skills::table.into_boxed();
+    if let Some(role) = role {
+        skill_query = skill_query.filter(skills::role.eq(role.as_str()));
+    }
+    if let Some(name) = name {
+        skill_query = skill_query.filter(skills::name.eq(name));
+    }
+    let skill_rows = skill_query
+        .select((skills::role, skills::name, skills::current_version))
         .order((skills::role, skills::name))
         .load::<SkillRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
-    for row in rows {
-        let role = parse_session_role(&row.role, path)?;
-        let record = skill_record_from_json(path, &row.record_json)?;
-        groups
-            .for_role_mut(role)
-            .insert(record.name.clone(), record);
+
+    let mut version_query = skill_versions::table.into_boxed();
+    if let Some(role) = role {
+        version_query = version_query.filter(skill_versions::role.eq(role.as_str()));
     }
-    Ok(groups)
+    if let Some(name) = name {
+        version_query = version_query.filter(skill_versions::skill_name.eq(name));
+    }
+    let version_rows = version_query
+        .select((
+            skill_versions::role,
+            skill_versions::skill_name,
+            skill_versions::version,
+            skill_versions::id,
+            skill_versions::created_at,
+            skill_versions::description,
+            skill_versions::body,
+            skill_versions::enable_coco_shim,
+        ))
+        .order((
+            skill_versions::role,
+            skill_versions::skill_name,
+            skill_versions::version,
+        ))
+        .load::<SkillVersionRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    let mut script_query = skill_version_scripts::table.into_boxed();
+    if let Some(role) = role {
+        script_query = script_query.filter(skill_version_scripts::role.eq(role.as_str()));
+    }
+    if let Some(name) = name {
+        script_query = script_query.filter(skill_version_scripts::skill_name.eq(name));
+    }
+    let script_rows = script_query
+        .select((
+            skill_version_scripts::role,
+            skill_version_scripts::skill_name,
+            skill_version_scripts::version,
+            skill_version_scripts::ordinal,
+            skill_version_scripts::path,
+            skill_version_scripts::content,
+        ))
+        .order((
+            skill_version_scripts::role,
+            skill_version_scripts::skill_name,
+            skill_version_scripts::version,
+            skill_version_scripts::ordinal,
+        ))
+        .load::<SkillVersionScriptRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    skill_records_from_rows(path, skill_rows, version_rows, script_rows)
 }
 
 async fn load_skill_record(
@@ -6016,8 +6109,13 @@ async fn load_skill_record(
     role: SessionRole,
     name: &str,
 ) -> Result<SkillRecord> {
-    load_skill_groups(connection, path)
+    if let Some((_, record)) = query_skill_records(connection, path, Some(role), Some(name))
         .await?
+        .pop()
+    {
+        return Ok(record);
+    }
+    default_skill_groups()
         .for_role(role)
         .get(name)
         .cloned()
@@ -6027,11 +6125,190 @@ async fn load_skill_record(
         })
 }
 
-fn skill_record_from_json(path: &Path, record_json: &str) -> Result<SkillRecord> {
-    serde_json::from_str::<SkillRecord>(record_json).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: "skills.record_json".to_owned(),
-    })
+fn skill_records_from_rows(
+    path: &Path,
+    skill_rows: Vec<SkillRow>,
+    version_rows: Vec<SkillVersionRow>,
+    script_rows: Vec<SkillVersionScriptRow>,
+) -> Result<Vec<(SessionRole, SkillRecord)>> {
+    let mut scripts_by_version =
+        HashMap::<(String, String, String), Vec<SkillVersionScriptRow>>::new();
+    for row in script_rows {
+        scripts_by_version
+            .entry((
+                row.role.clone(),
+                row.skill_name.clone(),
+                row.version.clone(),
+            ))
+            .or_default()
+            .push(row);
+    }
+
+    let mut versions_by_skill = HashMap::<(String, String), BTreeMap<u64, SkillVersion>>::new();
+    for row in version_rows {
+        let role = row.role.clone();
+        let skill_name = row.skill_name.clone();
+        let version_text = row.version.clone();
+        let scripts = scripts_by_version
+            .remove(&(role.clone(), skill_name.clone(), version_text))
+            .unwrap_or_default();
+        let version = row.into_version(path, scripts)?;
+        let version_number = version.version;
+        let previous = versions_by_skill
+            .entry((role.clone(), skill_name.clone()))
+            .or_default()
+            .insert(version_number, version);
+        ensure!(
+            previous.is_none(),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "duplicate SQLite skill version {version_number} for {role:?}/{skill_name:?}"
+                ),
+            }
+        );
+    }
+    ensure!(
+        scripts_by_version.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "SQLite skill script rows have no matching version".to_owned(),
+        }
+    );
+
+    let mut records = Vec::with_capacity(skill_rows.len());
+    for row in skill_rows {
+        let role = parse_session_role(&row.role, path)?;
+        let current_version =
+            parse_u64_column(path, "skills.current_version", &row.current_version)?;
+        let versions = versions_by_skill
+            .remove(&(row.role.clone(), row.name.clone()))
+            .unwrap_or_default();
+        ensure!(
+            versions.contains_key(&current_version),
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "missing current SQLite skill version {current_version} for {:?}/{:?}",
+                    row.role, row.name
+                ),
+            }
+        );
+        records.push((
+            role,
+            SkillRecord {
+                name: row.name,
+                current_version,
+                versions,
+            },
+        ));
+    }
+    ensure!(
+        versions_by_skill.is_empty(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "SQLite skill versions have no matching skill".to_owned(),
+        }
+    );
+    Ok(records)
+}
+
+impl SkillVersionRow {
+    fn from_version(role: SessionRole, skill_name: &str, version: &SkillVersion) -> Self {
+        Self {
+            role: role.as_str().to_owned(),
+            skill_name: skill_name.to_owned(),
+            version: version.version.to_string(),
+            id: version.id.clone(),
+            created_at: version.created_at.to_string(),
+            description: version.description.clone(),
+            body: version.body.clone(),
+            enable_coco_shim: version.enable_coco_shim,
+        }
+    }
+
+    fn into_version(
+        self,
+        path: &Path,
+        script_rows: Vec<SkillVersionScriptRow>,
+    ) -> Result<SkillVersion> {
+        let version = parse_u64_column(path, "skill_versions.version", &self.version)?;
+        let created_at = self
+            .created_at
+            .parse()
+            .map_err(|source| StoreError::CorruptedStore {
+                path: path.to_owned(),
+                message: format!(
+                    "invalid SQLite skill timestamp in skill_versions.created_at: {source}"
+                ),
+            })?;
+        let scripts = skill_scripts_from_rows(
+            path,
+            &self.role,
+            &self.skill_name,
+            &self.version,
+            script_rows,
+        )?;
+        Ok(SkillVersion {
+            id: self.id,
+            version,
+            created_at,
+            description: self.description,
+            body: self.body,
+            scripts,
+            enable_coco_shim: self.enable_coco_shim,
+        })
+    }
+}
+
+fn skill_version_script_rows(
+    role: SessionRole,
+    skill_name: &str,
+    version: &SkillVersion,
+) -> Vec<SkillVersionScriptRow> {
+    version
+        .scripts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, script)| SkillVersionScriptRow {
+            role: role.as_str().to_owned(),
+            skill_name: skill_name.to_owned(),
+            version: version.version.to_string(),
+            ordinal: ordinal as i32,
+            path: script.path.clone(),
+            content: script.content.clone(),
+        })
+        .collect()
+}
+
+fn skill_scripts_from_rows(
+    path: &Path,
+    role: &str,
+    skill_name: &str,
+    version: &str,
+    rows: Vec<SkillVersionScriptRow>,
+) -> Result<Vec<SkillScript>> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            ensure!(
+                row.role == role
+                    && row.skill_name == skill_name
+                    && row.version == version
+                    && row.ordinal == ordinal as i32,
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "invalid SQLite skill script ordinal for {role:?}/{skill_name:?} version {version}"
+                    ),
+                }
+            );
+            Ok(SkillScript {
+                path: row.path,
+                content: row.content,
+            })
+        })
+        .collect()
 }
 
 async fn persist_skill(
@@ -6040,24 +6317,119 @@ async fn persist_skill(
     role: SessionRole,
     record: &SkillRecord,
 ) -> Result<()> {
-    let record_json = serde_json::to_string(record).context(ParseSqliteStoreValueSnafu {
+    let version = record.current().context(CorruptedStoreSnafu {
         path: path.to_owned(),
-        column: "skills.record_json".to_owned(),
+        message: format!(
+            "missing current skill version {} for {:?}/{:?}",
+            record.current_version,
+            role.as_str(),
+            record.name
+        ),
     })?;
+    ensure!(
+        version.version == record.current_version,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "skill version {} does not match current version {} for {:?}/{:?}",
+                version.version,
+                record.current_version,
+                role.as_str(),
+                record.name
+            ),
+        }
+    );
+    let skill_is_persisted = skills::table
+        .filter(skills::role.eq(role.as_str()))
+        .filter(skills::name.eq(&record.name))
+        .select(skills::name)
+        .first::<String>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .is_some();
+    // Built-in skills live in memory until their first update, so materialize their history too.
+    let versions = if skill_is_persisted {
+        vec![(record.current_version, version)]
+    } else {
+        record
+            .versions
+            .iter()
+            .map(|(version_number, version)| (*version_number, version))
+            .collect()
+    };
+    let mut rows = Vec::with_capacity(versions.len());
+    for (version_number, version) in versions {
+        ensure!(
+            version.version == version_number,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "skill version {} does not match version key {version_number} for {:?}/{:?}",
+                    version.version,
+                    role.as_str(),
+                    record.name
+                ),
+            }
+        );
+        rows.push((
+            SkillVersionRow::from_version(role, &record.name, version),
+            skill_version_script_rows(role, &record.name, version),
+        ));
+    }
+
     diesel::insert_into(skills::table)
         .values((
             skills::role.eq(role.as_str()),
             skills::name.eq(&record.name),
-            skills::record_json.eq(record_json),
+            skills::current_version.eq(record.current_version.to_string()),
         ))
         .on_conflict((skills::role, skills::name))
         .do_update()
-        .set(skills::record_json.eq(diesel::upsert::excluded(skills::record_json)))
+        .set(skills::current_version.eq(diesel::upsert::excluded(skills::current_version)))
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
+
+    for (version_row, script_rows) in rows {
+        diesel::insert_into(skill_versions::table)
+            .values((
+                skill_versions::role.eq(version_row.role),
+                skill_versions::skill_name.eq(version_row.skill_name),
+                skill_versions::version.eq(version_row.version),
+                skill_versions::id.eq(version_row.id),
+                skill_versions::created_at.eq(version_row.created_at),
+                skill_versions::description.eq(version_row.description),
+                skill_versions::body.eq(version_row.body),
+                skill_versions::enable_coco_shim.eq(version_row.enable_coco_shim),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+
+        for row in script_rows {
+            diesel::insert_into(skill_version_scripts::table)
+                .values((
+                    skill_version_scripts::role.eq(row.role),
+                    skill_version_scripts::skill_name.eq(row.skill_name),
+                    skill_version_scripts::version.eq(row.version),
+                    skill_version_scripts::ordinal.eq(row.ordinal),
+                    skill_version_scripts::path.eq(row.path),
+                    skill_version_scripts::content.eq(row.content),
+                ))
+                .execute(connection)
+                .await
+                .context(QuerySqliteStoreSnafu {
+                    path: path.to_owned(),
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -7054,15 +7426,15 @@ mod tests {
         node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
         node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_relations,
         node_tool_results, node_tool_uses, nodes, preset_version_tools, preset_versions, sessions,
-        store_meta,
+        skill_version_scripts, skill_versions, store_meta,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
         MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore,
         PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
         SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillInvocationAnchor,
-        SkillInvocationMode, SkillResultAnchor, SkillRuntimeContext, SkillStore, SkillUpdatePatch,
-        SkillVersionSpec, Tool, ToolResult, ToolUse,
+        SkillInvocationMode, SkillResultAnchor, SkillRuntimeContext, SkillScript, SkillStore,
+        SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult, ToolUse,
     };
     use diesel::connection::InstrumentationEvent;
     use diesel::prelude::*;
@@ -7155,6 +7527,12 @@ mod tests {
 
     #[derive(diesel::QueryableByName)]
     struct LegacyPresetRecordJson {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        record_json: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct LegacySkillRecordJson {
         #[diesel(sql_type = diesel::sql_types::Text)]
         record_json: String,
     }
@@ -7690,6 +8068,19 @@ mod tests {
             != 0
     }
 
+    async fn skill_has_record_json_column(store: &SqliteStore) -> bool {
+        let mut connection = store.connect().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('skills') \
+             WHERE name = 'record_json'",
+        )
+        .get_result::<ColumnCount>(&mut connection)
+        .await
+        .unwrap()
+        .count
+            != 0
+    }
+
     fn valid_job_row() -> super::JobRow {
         super::JobRow {
             job_id: "job-test".to_owned(),
@@ -7886,7 +8277,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!node_anchor_table_exists(&store).await);
@@ -7902,7 +8293,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -9237,6 +9628,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_migration_round_trips_records() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        store
+            .add_skill(
+                SessionRole::Runner,
+                "custom-runner",
+                SkillVersionSpec {
+                    description: "first".to_owned(),
+                    body: "body-v1".to_owned(),
+                    scripts: vec![SkillScript {
+                        path: "scripts/first.py".to_owned(),
+                        content: "print('first')".to_owned(),
+                    }],
+                    enable_coco_shim: false,
+                },
+            )
+            .await
+            .unwrap();
+        let expected = store
+            .update_skill(
+                SessionRole::Runner,
+                "custom-runner",
+                &SkillUpdatePatch {
+                    description: Some("second".to_owned()),
+                    body: Some("body-v2".to_owned()),
+                    scripts: Some(vec![
+                        SkillScript {
+                            path: "scripts/second.py".to_owned(),
+                            content: "print('second')".to_owned(),
+                        },
+                        SkillScript {
+                            path: "scripts/second.py.lock".to_owned(),
+                            content: "lock".to_owned(),
+                        },
+                    ]),
+                    enable_coco_shim: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        diesel::connection::SimpleConnection::batch_execute(
+            &mut connection,
+            "PRAGMA foreign_keys = ON",
+        )
+        .unwrap();
+        revert_store_migrations_to(&mut connection, 21);
+        let legacy = diesel::RunQueryDsl::get_result::<LegacySkillRecordJson>(
+            diesel::sql_query(
+                "SELECT record_json FROM skills \
+                 WHERE role = 'runner' AND name = 'custom-runner'",
+            ),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::SkillRecord>(&legacy.record_json).unwrap(),
+            expected
+        );
+
+        connection
+            .run_pending_migrations(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert!(!skill_has_record_json_column(&reopened).await);
+        assert!(table_exists(&reopened, "skill_versions").await);
+        assert!(table_exists(&reopened, "skill_version_scripts").await);
+        assert_eq!(
+            reopened
+                .get_skill(SessionRole::Runner, "custom-runner")
+                .await
+                .unwrap(),
+            expected
+        );
+        let mut connection = reopened.connect().await.unwrap();
+        assert_eq!(
+            skill_versions::table
+                .filter(skill_versions::role.eq("runner"))
+                .filter(skill_versions::skill_name.eq("custom-runner"))
+                .count()
+                .get_result::<i64>(&mut connection)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            skill_version_scripts::table
+                .filter(skill_version_scripts::role.eq("runner"))
+                .filter(skill_version_scripts::skill_name.eq("custom-runner"))
+                .count()
+                .get_result::<i64>(&mut connection)
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_migration_rejects_mismatched_record_name() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        store
+            .add_skill(
+                SessionRole::Runner,
+                "custom-runner",
+                SkillVersionSpec {
+                    description: "custom".to_owned(),
+                    body: "body".to_owned(),
+                    scripts: Vec::new(),
+                    enable_coco_shim: false,
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 21);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE skills \
+                 SET record_json = json_set(record_json, '$.name', 'other') \
+                 WHERE role = 'runner' AND name = 'custom-runner'",
+            ),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
     async fn node_anchor_prompt_content_migration_round_trips_payload() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -9564,7 +10102,7 @@ mod tests {
         assert_eq!(restored, states);
 
         connection
-            .run_next_migration(super::STORE_MIGRATIONS)
+            .run_pending_migrations(super::STORE_MIGRATIONS)
             .unwrap();
         drop(connection);
 
@@ -9844,7 +10382,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
     }
 
     #[tokio::test]
@@ -10604,7 +11142,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
     }
 
     #[tokio::test]
@@ -10632,7 +11170,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=21")
+                .contains("unsupported SQLite schema version 5, expected 6..=22")
         );
     }
 
@@ -10647,7 +11185,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=21")
+                .contains("unsupported SQLite schema version 5, expected 6..=22")
         );
     }
 
@@ -10694,7 +11232,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 21);
+        assert_eq!(reopened.schema_version().await.unwrap(), 22);
     }
 
     #[tokio::test]
@@ -11167,5 +11705,62 @@ mod tests {
 
         assert_eq!(record.current_version, 3);
         assert_eq!(record.current().unwrap().body, "run");
+    }
+
+    #[tokio::test]
+    async fn updating_builtin_skill_materializes_existing_history() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let original = store
+            .get_skill(SessionRole::Orchestrator, "cronjob")
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_skill(
+                SessionRole::Orchestrator,
+                "cronjob",
+                &SkillUpdatePatch {
+                    body: Some("updated body".to_owned()),
+                    ..SkillUpdatePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.versions.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).await.unwrap();
+        let record = reopened
+            .get_skill(SessionRole::Orchestrator, "cronjob")
+            .await
+            .unwrap();
+        assert_eq!(
+            record.versions.keys().copied().collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            record.versions.get(&1).unwrap().id,
+            original.versions.get(&1).unwrap().id
+        );
+        assert_eq!(record.current().unwrap().body, "updated body");
+
+        let rolled_back = reopened
+            .rollback_skill(SessionRole::Orchestrator, "cronjob", 1)
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.current_version, 3);
+        assert_eq!(
+            rolled_back.current().unwrap().body,
+            original.current().unwrap().body
+        );
+        assert_eq!(
+            rolled_back.current().unwrap().scripts,
+            original.current().unwrap().scripts
+        );
     }
 }

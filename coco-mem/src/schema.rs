@@ -216,7 +216,31 @@ diesel::table! {
     skills (role, name) {
         role -> Text,
         name -> Text,
-        record_json -> Text,
+        current_version -> Text,
+    }
+}
+
+diesel::table! {
+    skill_version_scripts (role, skill_name, version, ordinal) {
+        role -> Text,
+        skill_name -> Text,
+        version -> Text,
+        ordinal -> Integer,
+        path -> Text,
+        content -> Text,
+    }
+}
+
+diesel::table! {
+    skill_versions (role, skill_name, version) {
+        role -> Text,
+        skill_name -> Text,
+        version -> Text,
+        id -> Text,
+        created_at -> Text,
+        description -> Text,
+        body -> Text,
+        enable_coco_shim -> Bool,
     }
 }
 
@@ -260,6 +284,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     preset_versions,
     presets,
     sessions,
+    skill_version_scripts,
+    skill_versions,
     skills,
     store_meta,
 );
