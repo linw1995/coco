@@ -51,12 +51,12 @@ use crate::{
     NewNode, NewNodeContent, Node, NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor,
     PromptAttachment, PromptImageAttachment, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
     SessionState, SkillGroups, SkillInvocationAnchor, SkillInvocationMode, SkillRecord,
-    SkillRuntimeContext, SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult, ToolUse,
-    default_skill_groups,
+    SkillResultAnchor, SkillRuntimeContext, SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult,
+    ToolUse, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 15;
+const SQLITE_SCHEMA_VERSION: i32 = 16;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -223,6 +223,7 @@ struct NodeAnchorRow {
     session_enable_coco_shim: Option<bool>,
     session_active_skill_name: Option<String>,
     session_active_skill_handoff: Option<String>,
+    skill_result_output: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
@@ -1771,6 +1772,7 @@ async fn load_node_anchor_rows_for_ids(
             node_anchors::session_enable_coco_shim,
             node_anchors::session_active_skill_name,
             node_anchors::session_active_skill_handoff,
+            node_anchors::skill_result_output,
         ))
         .into_boxed();
     if let Some(node_ids) = node_ids {
@@ -2739,6 +2741,7 @@ async fn persist_node_anchor_row(
             node_anchors::session_enable_coco_shim.eq(row.session_enable_coco_shim),
             node_anchors::session_active_skill_name.eq(row.session_active_skill_name),
             node_anchors::session_active_skill_handoff.eq(row.session_active_skill_handoff),
+            node_anchors::skill_result_output.eq(row.skill_result_output),
         ))
         .execute(connection)
         .await
@@ -3273,6 +3276,13 @@ impl NodeAnchorRow {
             session_enable_coco_shim: session.enable_coco_shim,
             session_active_skill_name: session.active_skill_name,
             session_active_skill_handoff: session.active_skill_handoff,
+            skill_result_output: match &anchor.payload {
+                AnchorPayload::SkillResult(result) => Some(result.output.clone()),
+                AnchorPayload::Session(_)
+                | AnchorPayload::SessionPatch(_)
+                | AnchorPayload::Prompt(_)
+                | AnchorPayload::SkillInvocation(_) => None,
+            },
         }))
     }
 
@@ -3380,6 +3390,23 @@ impl NodeAnchorRow {
                     parent_id,
                     rows.relations,
                 )?;
+                return self.validate_relational_kind(path, kind);
+            }
+            "skill_result" => {
+                ensure!(
+                    rows.session_tools.is_empty()
+                        && rows.session_patch.is_none()
+                        && rows.session_patch_tools.is_empty()
+                        && rows.prompt_attachments.is_empty(),
+                    CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: format!(
+                            "SQLite skill result anchor {node_id:?} has rows for another payload kind"
+                        ),
+                    }
+                );
+                let kind =
+                    self.skill_result_kind_from_storage(path, node_id, parent_id, rows.relations)?;
                 return self.validate_relational_kind(path, kind);
             }
             _ => {}
@@ -3565,8 +3592,47 @@ impl NodeAnchorRow {
         )))
     }
 
+    fn skill_result_kind_from_storage(
+        &self,
+        path: &Path,
+        node_id: &str,
+        parent_id: &str,
+        relation_rows: &[NodeRelationRow],
+    ) -> Result<Kind> {
+        let skill_name =
+            required_anchor_summary(path, "node_anchors.skill_name", self.skill_name.as_deref())?;
+        let output = required_anchor_summary(
+            path,
+            "node_anchors.skill_result_output",
+            self.skill_result_output.as_deref(),
+        )?;
+        let merge_parents =
+            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
+        Ok(Kind::Anchor(Anchor::skill_result(
+            merge_parents,
+            SkillResultAnchor { skill_name, output },
+        )))
+    }
+
     fn validate_relational_kind(&self, path: &Path, kind: Kind) -> Result<Kind> {
         validate_node_anchor_summary(path, self, &kind)?;
+        let expected_output = match &kind {
+            Kind::Anchor(Anchor {
+                payload: AnchorPayload::SkillResult(result),
+                ..
+            }) => Some(result.output.as_str()),
+            Kind::Anchor(_)
+            | Kind::ToolUse(_)
+            | Kind::ToolResult(_)
+            | Kind::Text(_)
+            | Kind::Failure(_) => None,
+        };
+        validate_optional_text_summary(
+            path,
+            "node_anchors.skill_result_output",
+            self.skill_result_output.as_deref(),
+            expected_output,
+        )?;
         Ok(kind)
     }
 }
@@ -6794,8 +6860,8 @@ mod tests {
         MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore,
         PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
         SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillInvocationAnchor,
-        SkillInvocationMode, SkillRuntimeContext, SkillStore, SkillUpdatePatch, SkillVersionSpec,
-        Tool, ToolResult, ToolUse,
+        SkillInvocationMode, SkillResultAnchor, SkillRuntimeContext, SkillStore, SkillUpdatePatch,
+        SkillVersionSpec, Tool, ToolResult, ToolUse,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -7026,6 +7092,21 @@ mod tests {
                     mode: SkillInvocationMode::Handoff {
                         prompt: "Compact this branch".to_owned(),
                     },
+                },
+            )),
+        }
+    }
+
+    fn skill_result_anchor_node(parent: &str, merge_parents: Vec<MergeParent>) -> NewNode {
+        NewNode {
+            parent: parent.to_owned(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::skill_result(
+                merge_parents,
+                SkillResultAnchor {
+                    skill_name: "compact".to_owned(),
+                    output: "First line\nSecond line with \"quotes\"".to_owned(),
                 },
             )),
         }
@@ -7336,6 +7417,7 @@ mod tests {
                 node_anchors::session_enable_coco_shim,
                 node_anchors::session_active_skill_name,
                 node_anchors::session_active_skill_handoff,
+                node_anchors::skill_result_output,
             ))
             .get_result::<NodeAnchorRow>(&mut connection)
             .await
@@ -7526,7 +7608,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 16);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
@@ -7540,7 +7622,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 16);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -8185,7 +8267,7 @@ mod tests {
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
         revert_store_migrations_to(&mut connection, 14);
         connection
-            .run_next_migration(super::STORE_MIGRATIONS)
+            .run_pending_migrations(super::STORE_MIGRATIONS)
             .unwrap();
         drop(connection);
 
@@ -8223,6 +8305,81 @@ mod tests {
         diesel::RunQueryDsl::execute(
             diesel::sql_query(
                 "UPDATE node_anchors SET skill_invocation_mode = 'invalid' WHERE node_id = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(&anchor_id),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
+    async fn node_anchor_skill_result_migration_round_trips_relational_fields() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let merge_parent = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("merge parent".to_owned()),
+            })
+            .await
+            .unwrap();
+        let anchor_id = store
+            .append(skill_result_anchor_node(
+                &store.root_id(),
+                vec![MergeParent::merge(merge_parent)],
+            ))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 15);
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
+        assert_eq!(
+            node_anchor_row(&reopened, &anchor_id)
+                .await
+                .skill_result_output,
+            Some("First line\nSecond line with \"quotes\"".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn node_anchor_skill_result_migration_rejects_invalid_output() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(skill_result_anchor_node(&store.root_id(), vec![]))
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 15);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE node_anchors SET kind_json = json_set(\
+                 kind_json, '$.Anchor.payload.SkillResult.output', json('{}')) WHERE node_id = ?",
             )
             .bind::<diesel::sql_types::Text, _>(&anchor_id),
             &mut connection,
@@ -8558,7 +8715,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 16);
     }
 
     #[tokio::test]
@@ -9096,6 +9253,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_skill_result_anchor_uses_relational_payload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(skill_result_anchor_node(&store.root_id(), vec![]))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        let mut connection = store.connect().await.unwrap();
+        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
+            .set(node_anchors::kind_json.eq("not JSON"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
     async fn reading_anchor_node_requires_anchor_row() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -9275,7 +9453,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 16);
     }
 
     #[tokio::test]
@@ -9303,7 +9481,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=15")
+                .contains("unsupported SQLite schema version 5, expected 6..=16")
         );
     }
 
@@ -9318,7 +9496,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=15")
+                .contains("unsupported SQLite schema version 5, expected 6..=16")
         );
     }
 
@@ -9365,7 +9543,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 15);
+        assert_eq!(reopened.schema_version().await.unwrap(), 16);
     }
 
     #[tokio::test]

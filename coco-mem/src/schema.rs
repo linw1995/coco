@@ -47,6 +47,7 @@ diesel::table! {
         session_enable_coco_shim -> Nullable<Bool>,
         session_active_skill_name -> Nullable<Text>,
         session_active_skill_handoff -> Nullable<Text>,
+        skill_result_output -> Nullable<Text>,
     }
 }
 
