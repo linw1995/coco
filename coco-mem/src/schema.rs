@@ -29,6 +29,21 @@ diesel::table! {
 }
 
 diesel::table! {
+    node_anchors (node_id) {
+        node_id -> Text,
+        kind -> Text,
+        session_role -> Nullable<Text>,
+        provider_profile -> Nullable<Text>,
+        provider -> Nullable<Text>,
+        model -> Nullable<Text>,
+        prompt -> Nullable<Text>,
+        skill_name -> Nullable<Text>,
+        skill_invocation_mode -> Nullable<Text>,
+        kind_json -> Text,
+    }
+}
+
+diesel::table! {
     node_metadata (node_id, ordinal) {
         node_id -> Text,
         ordinal -> Integer,
@@ -72,14 +87,6 @@ diesel::table! {
         created_at -> Text,
         role -> Text,
         kind -> Text,
-        anchor_kind -> Nullable<Text>,
-        anchor_session_role -> Nullable<Text>,
-        anchor_provider_profile -> Nullable<Text>,
-        anchor_provider -> Nullable<Text>,
-        anchor_model -> Nullable<Text>,
-        anchor_prompt -> Nullable<Text>,
-        anchor_skill_name -> Nullable<Text>,
-        anchor_skill_invocation_mode -> Nullable<Text>,
         kind_json -> Text,
         metadata_present -> Bool,
     }
@@ -120,6 +127,7 @@ diesel::table! {
 }
 
 diesel::joinable!(branches -> nodes (head_id));
+diesel::joinable!(node_anchors -> nodes (node_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
 diesel::joinable!(node_tool_results -> nodes (node_id));
 diesel::joinable!(node_tool_uses -> nodes (node_id));
@@ -129,6 +137,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     branches,
     jobs,
     message_queue_items,
+    node_anchors,
     node_metadata,
     node_relations,
     node_tool_results,
