@@ -29,13 +29,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    node_anchor_prompts (node_id) {
-        node_id -> Text,
-        prompt -> Text,
-    }
-}
-
-diesel::table! {
     node_anchor_sessions (node_id) {
         node_id -> Text,
         role -> Text,
@@ -212,8 +205,7 @@ diesel::joinable!(node_anchor_sessions -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchor_sessions (node_id));
 diesel::joinable!(node_anchor_skill_invocations -> nodes (node_id));
 diesel::joinable!(node_anchor_skill_results -> nodes (node_id));
-diesel::joinable!(node_anchor_prompts -> nodes (node_id));
-diesel::joinable!(node_anchor_prompt_attachments -> node_anchor_prompts (node_id));
+diesel::joinable!(node_anchor_prompt_attachments -> nodes (node_id));
 diesel::joinable!(node_anchor_session_patch_tools -> node_anchor_session_patches (node_id));
 diesel::joinable!(node_anchor_session_patches -> nodes (node_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
@@ -226,7 +218,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     jobs,
     message_queue_items,
     node_anchor_prompt_attachments,
-    node_anchor_prompts,
     node_anchor_session_patch_tools,
     node_anchor_session_patches,
     node_anchor_sessions,
