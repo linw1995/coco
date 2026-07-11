@@ -71,6 +71,19 @@ diesel::table! {
 }
 
 diesel::table! {
+    node_anchor_prompt_attachments (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> Integer,
+        kind -> Text,
+        attachment_id -> Text,
+        width -> Nullable<BigInt>,
+        height -> Nullable<BigInt>,
+        file_size -> Nullable<Text>,
+        media_type -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     node_anchor_session_patches (node_id) {
         node_id -> Text,
         role -> Nullable<Text>,
@@ -177,6 +190,7 @@ diesel::table! {
 diesel::joinable!(branches -> nodes (head_id));
 diesel::joinable!(node_anchors -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchors (node_id));
+diesel::joinable!(node_anchor_prompt_attachments -> node_anchors (node_id));
 diesel::joinable!(node_anchor_session_patch_tools -> node_anchor_session_patches (node_id));
 diesel::joinable!(node_anchor_session_patches -> node_anchors (node_id));
 diesel::joinable!(node_metadata -> nodes (node_id));
@@ -188,6 +202,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     branches,
     jobs,
     message_queue_items,
+    node_anchor_prompt_attachments,
     node_anchor_session_patch_tools,
     node_anchor_session_patches,
     node_anchor_session_tools,

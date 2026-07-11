@@ -41,21 +41,21 @@ use crate::error::{
     StoreError, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::{
-    branches, jobs, message_queue_items, node_anchor_session_patch_tools,
-    node_anchor_session_patches, node_anchor_session_tools, node_anchors, node_metadata,
-    node_relations, node_tool_results, node_tool_uses, nodes, presets, sessions, skills,
-    store_meta,
+    branches, jobs, message_queue_items, node_anchor_prompt_attachments,
+    node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
+    node_anchors, node_metadata, node_relations, node_tool_results, node_tool_uses, nodes, presets,
+    sessions, skills, store_meta,
 };
 use crate::{
     Anchor, AnchorPayload, BackendMetadata, Job, JobStatus, Kind, MergeParent, MessageQueueItem,
     NewNode, NewNodeContent, Node, NodeMetadata, PauseReason, Preset, PresetRecord, PromptAnchor,
-    Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
-    SkillInvocationMode, SkillRecord, SkillRuntimeContext, SkillUpdatePatch, SkillVersionSpec,
-    Tool, ToolResult, ToolUse, default_skill_groups,
+    PromptAttachment, PromptImageAttachment, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
+    SessionState, SkillGroups, SkillInvocationMode, SkillRecord, SkillRuntimeContext,
+    SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult, ToolUse, default_skill_groups,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 13;
+const SQLITE_SCHEMA_VERSION: i32 = 14;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
@@ -263,6 +263,18 @@ struct NodeAnchorSessionPatchToolRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Queryable)]
+struct NodeAnchorPromptAttachmentRow {
+    node_id: String,
+    ordinal: i32,
+    kind: String,
+    attachment_id: String,
+    width: Option<i64>,
+    height: Option<i64>,
+    file_size: Option<String>,
+    media_type: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Queryable)]
 struct NodeRelationRow {
     child_node_id: String,
     parent_node_id: String,
@@ -275,6 +287,7 @@ struct NodeAnchorStorageRows<'a> {
     session_tools: &'a [NodeAnchorSessionToolRow],
     session_patch: Option<&'a NodeAnchorSessionPatchRow>,
     session_patch_tools: &'a [NodeAnchorSessionPatchToolRow],
+    prompt_attachments: &'a [NodeAnchorPromptAttachmentRow],
     relations: &'a [NodeRelationRow],
 }
 
@@ -1888,6 +1901,42 @@ async fn load_node_anchor_session_patch_tool_rows_for_ids(
     Ok(group_node_anchor_session_patch_tool_rows(rows))
 }
 
+async fn load_node_anchor_prompt_attachment_rows_for_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_ids: Option<&[String]>,
+) -> Result<HashMap<String, Vec<NodeAnchorPromptAttachmentRow>>> {
+    let mut query = node_anchor_prompt_attachments::table
+        .select((
+            node_anchor_prompt_attachments::node_id,
+            node_anchor_prompt_attachments::ordinal,
+            node_anchor_prompt_attachments::kind,
+            node_anchor_prompt_attachments::attachment_id,
+            node_anchor_prompt_attachments::width,
+            node_anchor_prompt_attachments::height,
+            node_anchor_prompt_attachments::file_size,
+            node_anchor_prompt_attachments::media_type,
+        ))
+        .into_boxed();
+    if let Some(node_ids) = node_ids {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        query = query.filter(node_anchor_prompt_attachments::node_id.eq_any(node_ids));
+    }
+    let rows = query
+        .order((
+            node_anchor_prompt_attachments::node_id,
+            node_anchor_prompt_attachments::ordinal,
+        ))
+        .load::<NodeAnchorPromptAttachmentRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(group_node_anchor_prompt_attachment_rows(rows))
+}
+
 async fn load_node_relation_rows_for_ids(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -1944,6 +1993,19 @@ fn group_node_anchor_session_tool_rows(
 fn group_node_anchor_session_patch_tool_rows(
     rows: Vec<NodeAnchorSessionPatchToolRow>,
 ) -> HashMap<String, Vec<NodeAnchorSessionPatchToolRow>> {
+    let mut grouped = HashMap::new();
+    for row in rows {
+        grouped
+            .entry(row.node_id.clone())
+            .or_insert_with(Vec::new)
+            .push(row);
+    }
+    grouped
+}
+
+fn group_node_anchor_prompt_attachment_rows(
+    rows: Vec<NodeAnchorPromptAttachmentRow>,
+) -> HashMap<String, Vec<NodeAnchorPromptAttachmentRow>> {
     let mut grouped = HashMap::new();
     for row in rows {
         grouped
@@ -2069,6 +2131,13 @@ fn node_anchor_session_patch_tool_slice<'a>(
     rows.get(node_id).map(Vec::as_slice).unwrap_or_default()
 }
 
+fn node_anchor_prompt_attachment_slice<'a>(
+    rows: &'a HashMap<String, Vec<NodeAnchorPromptAttachmentRow>>,
+    node_id: &str,
+) -> &'a [NodeAnchorPromptAttachmentRow] {
+    rows.get(node_id).map(Vec::as_slice).unwrap_or_default()
+}
+
 fn node_relation_slice<'a>(
     rows: &'a HashMap<String, Vec<NodeRelationRow>>,
     node_id: &str,
@@ -2103,6 +2172,8 @@ async fn node_rows_into_nodes(
         load_node_anchor_session_patch_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let anchor_session_patch_tool_rows =
         load_node_anchor_session_patch_tool_rows_for_ids(connection, path, Some(&node_ids)).await?;
+    let anchor_prompt_attachment_rows =
+        load_node_anchor_prompt_attachment_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let relation_rows = load_node_relation_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let metadata_rows = load_node_metadata_rows_for_ids(connection, path, Some(&node_ids)).await?;
     let tool_use_rows = load_node_tool_use_rows_for_ids(connection, path, Some(&node_ids)).await?;
@@ -2123,6 +2194,10 @@ async fn node_rows_into_nodes(
                         session_patch: anchor_session_patch_rows.get(&node_id),
                         session_patch_tools: node_anchor_session_patch_tool_slice(
                             &anchor_session_patch_tool_rows,
+                            &node_id,
+                        ),
+                        prompt_attachments: node_anchor_prompt_attachment_slice(
+                            &anchor_prompt_attachment_rows,
                             &node_id,
                         ),
                         relations: node_relation_slice(&relation_rows, &node_id),
@@ -2173,6 +2248,12 @@ async fn load_node_by_exact_id(
         Some(std::slice::from_ref(&node_id)),
     )
     .await?;
+    let anchor_prompt_attachment_rows = load_node_anchor_prompt_attachment_rows_for_ids(
+        connection,
+        path,
+        Some(std::slice::from_ref(&node_id)),
+    )
+    .await?;
     let relation_rows =
         load_node_relation_rows_for_ids(connection, path, Some(std::slice::from_ref(&node_id)))
             .await?;
@@ -2194,6 +2275,10 @@ async fn load_node_by_exact_id(
                 session_patch: anchor_session_patch_rows.get(&node_id),
                 session_patch_tools: node_anchor_session_patch_tool_slice(
                     &anchor_session_patch_tool_rows,
+                    &node_id,
+                ),
+                prompt_attachments: node_anchor_prompt_attachment_slice(
+                    &anchor_prompt_attachment_rows,
                     &node_id,
                 ),
                 relations: node_relation_slice(&relation_rows, &node_id),
@@ -2517,6 +2602,7 @@ async fn persist_node_without_transaction(
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
+    persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     for relation in node_relations(node) {
         diesel::insert_into(node_relations::table)
             .values((
@@ -2604,6 +2690,7 @@ async fn upsert_node_without_transaction(
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
     persist_node_anchor_session_patch_row(connection, path, node).await?;
     persist_node_anchor_session_patch_tool_rows(connection, path, node).await?;
+    persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     for relation in node_relations(node) {
         diesel::insert_into(node_relations::table)
             .values((
@@ -2732,6 +2819,32 @@ async fn persist_node_anchor_session_patch_tool_rows(
                 node_anchor_session_patch_tools::name.eq(row.name),
                 node_anchor_session_patch_tools::description.eq(row.description),
                 node_anchor_session_patch_tools::input_schema_json.eq(row.input_schema_json),
+            ))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })?;
+    }
+    Ok(())
+}
+
+async fn persist_node_anchor_prompt_attachment_rows(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node: &Node,
+) -> Result<()> {
+    for row in node_anchor_prompt_attachment_rows(node) {
+        diesel::insert_into(node_anchor_prompt_attachments::table)
+            .values((
+                node_anchor_prompt_attachments::node_id.eq(row.node_id),
+                node_anchor_prompt_attachments::ordinal.eq(row.ordinal),
+                node_anchor_prompt_attachments::kind.eq(row.kind),
+                node_anchor_prompt_attachments::attachment_id.eq(row.attachment_id),
+                node_anchor_prompt_attachments::width.eq(row.width),
+                node_anchor_prompt_attachments::height.eq(row.height),
+                node_anchor_prompt_attachments::file_size.eq(row.file_size),
+                node_anchor_prompt_attachments::media_type.eq(row.media_type),
             ))
             .execute(connection)
             .await
@@ -2881,6 +2994,33 @@ fn node_anchor_session_patch_tool_rows(
                     },
                 )?,
             })
+        })
+        .collect()
+}
+
+fn node_anchor_prompt_attachment_rows(node: &Node) -> Vec<NodeAnchorPromptAttachmentRow> {
+    let Kind::Anchor(Anchor {
+        payload: AnchorPayload::Prompt(prompt),
+        ..
+    }) = &node.kind
+    else {
+        return Vec::new();
+    };
+    prompt
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(ordinal, attachment)| match attachment {
+            PromptAttachment::Image(image) => NodeAnchorPromptAttachmentRow {
+                node_id: node.id.clone(),
+                ordinal: ordinal as i32,
+                kind: "image".to_owned(),
+                attachment_id: image.id.clone(),
+                width: image.width.map(i64::from),
+                height: image.height.map(i64::from),
+                file_size: image.file_size.map(|value| value.to_string()),
+                media_type: image.media_type.clone(),
+            },
         })
         .collect()
 }
@@ -3155,7 +3295,9 @@ impl NodeAnchorRow {
         match self.kind.as_str() {
             "session" => {
                 ensure!(
-                    rows.session_patch.is_none() && rows.session_patch_tools.is_empty(),
+                    rows.session_patch.is_none()
+                        && rows.session_patch_tools.is_empty()
+                        && rows.prompt_attachments.is_empty(),
                     CorruptedStoreSnafu {
                         path: path.to_owned(),
                         message: format!(
@@ -3173,7 +3315,7 @@ impl NodeAnchorRow {
             }
             "session_patch" => {
                 ensure!(
-                    rows.session_tools.is_empty(),
+                    rows.session_tools.is_empty() && rows.prompt_attachments.is_empty(),
                     CorruptedStoreSnafu {
                         path: path.to_owned(),
                         message: format!(
@@ -3195,12 +3337,33 @@ impl NodeAnchorRow {
                     rows.relations,
                 );
             }
+            "prompt" => {
+                ensure!(
+                    rows.session_tools.is_empty()
+                        && rows.session_patch.is_none()
+                        && rows.session_patch_tools.is_empty(),
+                    CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: format!(
+                            "SQLite prompt anchor {node_id:?} has rows for another payload kind"
+                        ),
+                    }
+                );
+                return self.prompt_kind_from_storage(
+                    path,
+                    node_id,
+                    parent_id,
+                    rows.prompt_attachments,
+                    rows.relations,
+                );
+            }
             _ => {}
         }
         ensure!(
             rows.session_tools.is_empty()
                 && rows.session_patch.is_none()
-                && rows.session_patch_tools.is_empty(),
+                && rows.session_patch_tools.is_empty()
+                && rows.prompt_attachments.is_empty(),
             CorruptedStoreSnafu {
                 path: path.to_owned(),
                 message: format!("SQLite anchor {node_id:?} has rows for another payload kind"),
@@ -3312,6 +3475,27 @@ impl NodeAnchorRow {
                 additional_params,
                 enable_coco_shim,
                 active_skill,
+            },
+        )))
+    }
+
+    fn prompt_kind_from_storage(
+        &self,
+        path: &Path,
+        node_id: &str,
+        parent_id: &str,
+        attachment_rows: &[NodeAnchorPromptAttachmentRow],
+        relation_rows: &[NodeRelationRow],
+    ) -> Result<Kind> {
+        let prompt = required_anchor_summary(path, "node_anchors.prompt", self.prompt.as_deref())?;
+        let attachments = prompt_attachments_from_rows(path, node_id, attachment_rows)?;
+        let merge_parents =
+            merge_parents_from_relation_rows(path, node_id, parent_id, relation_rows)?;
+        Ok(Kind::Anchor(Anchor::prompt(
+            merge_parents,
+            PromptAnchor {
+                prompt,
+                attachments,
             },
         )))
     }
@@ -3545,6 +3729,65 @@ fn session_patch_tools_from_rows(
             })
         })
         .collect()
+}
+
+fn prompt_attachments_from_rows(
+    path: &Path,
+    node_id: &str,
+    rows: &[NodeAnchorPromptAttachmentRow],
+) -> Result<Vec<PromptAttachment>> {
+    rows.iter()
+        .enumerate()
+        .map(|(ordinal, row)| {
+            ensure!(
+                row.node_id == node_id && row.ordinal == ordinal as i32,
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!(
+                        "invalid SQLite prompt attachment ordinal for node {node_id:?}"
+                    ),
+                }
+            );
+            ensure!(
+                row.kind == "image",
+                CorruptedStoreSnafu {
+                    path: path.to_owned(),
+                    message: format!("invalid SQLite prompt attachment kind {:?}", row.kind),
+                }
+            );
+            let width = row
+                .width
+                .map(|value| parse_u32_column(path, "node_anchor_prompt_attachments.width", value))
+                .transpose()?;
+            let height = row
+                .height
+                .map(|value| parse_u32_column(path, "node_anchor_prompt_attachments.height", value))
+                .transpose()?;
+            let file_size = row
+                .file_size
+                .as_deref()
+                .map(|value| {
+                    parse_u64_column(path, "node_anchor_prompt_attachments.file_size", value)
+                })
+                .transpose()?;
+            Ok(PromptAttachment::Image(PromptImageAttachment {
+                id: row.attachment_id.clone(),
+                width,
+                height,
+                file_size,
+                media_type: row.media_type.clone(),
+            }))
+        })
+        .collect()
+}
+
+fn parse_u32_column(path: &Path, column: &str, value: i64) -> Result<u32> {
+    value
+        .try_into()
+        .map_err(|source| StoreError::CorruptedStore {
+            path: path.to_owned(),
+            message: format!("invalid SQLite {column}: {source}"),
+        })
 }
 
 fn merge_parents_from_relation_rows(
@@ -6467,21 +6710,21 @@ impl ProcessShareableStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageQueueItem, NodeAnchorRow, NodeAnchorSessionPatchRow, NodeAnchorSessionPatchToolRow,
-        NodeAnchorSessionToolRow, NodeMetadataRow, NodeToolResultRow, NodeToolUseRow,
-        SqliteGraphStore, SqliteStore,
+        MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorRow, NodeAnchorSessionPatchRow,
+        NodeAnchorSessionPatchToolRow, NodeAnchorSessionToolRow, NodeMetadataRow,
+        NodeToolResultRow, NodeToolUseRow, SqliteGraphStore, SqliteStore,
     };
     use crate::schema::{
-        jobs, node_anchor_session_patch_tools, node_anchor_session_patches,
-        node_anchor_session_tools, node_anchors, node_metadata, node_relations, node_tool_results,
-        node_tool_uses, nodes, sessions, store_meta,
+        jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
+        node_anchor_session_patches, node_anchor_session_tools, node_anchors, node_metadata,
+        node_relations, node_tool_results, node_tool_uses, nodes, sessions, store_meta,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
-        MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore, Role,
-        SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
-        SkillRuntimeContext, SkillStore, SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult,
-        ToolUse,
+        MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore,
+        PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
+        SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillRuntimeContext,
+        SkillStore, SkillUpdatePatch, SkillVersionSpec, Tool, ToolResult, ToolUse,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -6670,6 +6913,36 @@ mod tests {
         }
     }
 
+    fn rich_prompt_anchor_node(parent: &str, merge_parents: Vec<MergeParent>) -> NewNode {
+        NewNode {
+            parent: parent.to_owned(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Anchor(Anchor::prompt(
+                merge_parents,
+                PromptAnchor {
+                    prompt: "Inspect these images".to_owned(),
+                    attachments: vec![
+                        PromptAttachment::Image(PromptImageAttachment {
+                            id: "image-a".to_owned(),
+                            width: Some(u32::MAX),
+                            height: Some(1080),
+                            file_size: Some(u64::MAX),
+                            media_type: Some("image/png".to_owned()),
+                        }),
+                        PromptAttachment::Image(PromptImageAttachment {
+                            id: "image-b".to_owned(),
+                            width: None,
+                            height: None,
+                            file_size: None,
+                            media_type: None,
+                        }),
+                    ],
+                },
+            )),
+        }
+    }
+
     fn preset(model: &str) -> Preset {
         Preset {
             role: SessionRole::Orchestrator,
@@ -6820,6 +7093,29 @@ mod tests {
             ))
             .order(node_anchor_session_patch_tools::ordinal)
             .load::<NodeAnchorSessionPatchToolRow>(&mut connection)
+            .await
+            .unwrap()
+    }
+
+    async fn node_anchor_prompt_attachment_rows(
+        store: &SqliteStore,
+        node_id: &str,
+    ) -> Vec<NodeAnchorPromptAttachmentRow> {
+        let mut connection = store.connect().await.unwrap();
+        node_anchor_prompt_attachments::table
+            .filter(node_anchor_prompt_attachments::node_id.eq(node_id))
+            .select((
+                node_anchor_prompt_attachments::node_id,
+                node_anchor_prompt_attachments::ordinal,
+                node_anchor_prompt_attachments::kind,
+                node_anchor_prompt_attachments::attachment_id,
+                node_anchor_prompt_attachments::width,
+                node_anchor_prompt_attachments::height,
+                node_anchor_prompt_attachments::file_size,
+                node_anchor_prompt_attachments::media_type,
+            ))
+            .order(node_anchor_prompt_attachments::ordinal)
+            .load::<NodeAnchorPromptAttachmentRow>(&mut connection)
             .await
             .unwrap()
     }
@@ -7142,7 +7438,7 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!job_has_payload_json_column(&store).await);
@@ -7156,7 +7452,7 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
@@ -7606,7 +7902,7 @@ mod tests {
             diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
         revert_store_migrations_to(&mut connection, 12);
         connection
-            .run_next_migration(super::STORE_MIGRATIONS)
+            .run_pending_migrations(super::STORE_MIGRATIONS)
             .unwrap();
         drop(connection);
 
@@ -7664,6 +7960,101 @@ mod tests {
             diesel::sql_query(
                 "UPDATE node_anchors SET kind_json = json_set(\
                  kind_json, '$.Anchor.payload.SessionPatch.role', 'invalid') WHERE node_id = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(&anchor_id),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[tokio::test]
+    async fn node_anchor_prompt_migration_round_trips_relational_fields() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let merge_parent = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("merge parent".to_owned()),
+            })
+            .await
+            .unwrap();
+        let anchor_id = store
+            .append(rich_prompt_anchor_node(
+                &store.root_id(),
+                vec![MergeParent::merge(merge_parent)],
+            ))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 13);
+        connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
+        assert_eq!(
+            node_anchor_prompt_attachment_rows(&reopened, &anchor_id).await,
+            vec![
+                NodeAnchorPromptAttachmentRow {
+                    node_id: anchor_id.clone(),
+                    ordinal: 0,
+                    kind: "image".to_owned(),
+                    attachment_id: "image-a".to_owned(),
+                    width: Some(i64::from(u32::MAX)),
+                    height: Some(1080),
+                    file_size: Some(u64::MAX.to_string()),
+                    media_type: Some("image/png".to_owned()),
+                },
+                NodeAnchorPromptAttachmentRow {
+                    node_id: anchor_id,
+                    ordinal: 1,
+                    kind: "image".to_owned(),
+                    attachment_id: "image-b".to_owned(),
+                    width: None,
+                    height: None,
+                    file_size: None,
+                    media_type: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn node_anchor_prompt_migration_rejects_invalid_attachment() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(rich_prompt_anchor_node(&store.root_id(), vec![]))
+            .await
+            .unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 13);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE node_anchors SET kind_json = json_set(\
+                 kind_json, '$.Anchor.payload.Prompt.attachments[0].kind', 'video') \
+                 WHERE node_id = ?",
             )
             .bind::<diesel::sql_types::Text, _>(&anchor_id),
             &mut connection,
@@ -7999,7 +8390,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
     }
 
     #[tokio::test]
@@ -8495,6 +8886,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_prompt_anchor_uses_relational_payload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(rich_prompt_anchor_node(&store.root_id(), vec![]))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        let mut connection = store.connect().await.unwrap();
+        diesel::update(node_anchors::table.filter(node_anchors::node_id.eq(&anchor_id)))
+            .set(node_anchors::kind_json.eq("not JSON"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(store.get_node(&anchor_id).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
     async fn reading_anchor_node_requires_anchor_row() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
@@ -8674,7 +9086,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
     }
 
     #[tokio::test]
@@ -8702,7 +9114,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=13")
+                .contains("unsupported SQLite schema version 5, expected 6..=14")
         );
     }
 
@@ -8717,7 +9129,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=13")
+                .contains("unsupported SQLite schema version 5, expected 6..=14")
         );
     }
 
@@ -8764,7 +9176,7 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 13);
+        assert_eq!(reopened.schema_version().await.unwrap(), 14);
     }
 
     #[tokio::test]
