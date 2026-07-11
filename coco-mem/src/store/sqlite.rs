@@ -4206,7 +4206,6 @@ impl NodeAnchorSummary {
                 provider: anchor.provider.clone(),
                 model: Some(anchor.model.clone()),
                 prompt: Some(anchor.prompt.clone()),
-                ..Self::default()
             },
             AnchorPayload::SessionPatch(_) => Self::default(),
             AnchorPayload::Prompt(anchor) => Self {
