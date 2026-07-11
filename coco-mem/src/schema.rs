@@ -209,7 +209,6 @@ diesel::table! {
         base_head_id -> Nullable<Text>,
         pause_reason -> Nullable<Text>,
         merged_anchor_id -> Nullable<Text>,
-        state_json -> Text,
     }
 }
 
