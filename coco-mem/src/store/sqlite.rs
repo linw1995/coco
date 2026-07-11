@@ -8075,6 +8075,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_anchor_session_migration_accepts_missing_additional_params() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        let anchor_id = store
+            .append(session_anchor_node(&store.root_id()))
+            .await
+            .unwrap();
+        let expected = store.get_node(&anchor_id).await.unwrap();
+        drop(store);
+
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        revert_store_migrations_to(&mut connection, 11);
+        diesel::RunQueryDsl::execute(
+            diesel::sql_query(
+                "UPDATE node_anchors SET kind_json = json_remove(\
+                 kind_json, '$.Anchor.payload.Session.additional_params') WHERE node_id = ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(&anchor_id),
+            &mut connection,
+        )
+        .unwrap();
+        connection
+            .run_pending_migrations(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open_read_only(&path).await.unwrap();
+        assert_eq!(reopened.get_node(&anchor_id).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
     async fn node_anchor_session_migration_rejects_invalid_payload() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");

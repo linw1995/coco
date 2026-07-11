@@ -21,7 +21,6 @@ SELECT CASE
               OR json_type(kind_json, '$.Anchor.payload.Session.system_prompt') <> 'text'
               OR json_type(kind_json, '$.Anchor.payload.Session.temperature') NOT IN ('null', 'integer', 'real')
               OR json_type(kind_json, '$.Anchor.payload.Session.max_tokens') NOT IN ('null', 'integer')
-              OR json_type(kind_json, '$.Anchor.payload.Session.additional_params') IS NULL
               OR json_type(kind_json, '$.Anchor.payload.Session.enable_coco_shim') NOT IN ('true', 'false')
               OR json_type(kind_json, '$.Anchor.payload.Session.active_skill') NOT IN ('null', 'object')
           )
