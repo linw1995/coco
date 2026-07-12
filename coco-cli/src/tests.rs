@@ -971,6 +971,22 @@ where
 }
 
 #[tokio::test]
+async fn run_with_backend_composes_local_command_runtime() {
+    let (_tempdir, store_path) = temp_store_path();
+
+    let output = crate::app::run_with_backend(
+        session_list_cli(store_path),
+        &mut Cursor::new(""),
+        FakeBackend::with_responses(&[]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(output, "[]");
+}
+
+#[tokio::test]
 async fn prompt_uses_main_branch_by_default() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
