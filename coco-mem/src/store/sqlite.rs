@@ -74,7 +74,6 @@ pub struct SqliteStore {
     database: SqliteDatabase,
     root_id: String,
     access: StoreAccess,
-    _lock_file: Option<Arc<std::fs::File>>,
     _owned_directory: Option<Arc<OwnedStoreDirectory>>,
 }
 
