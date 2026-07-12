@@ -7,6 +7,8 @@ use diesel::result::OptionalExtension;
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
+#[cfg(any(test, feature = "test-utils"))]
+use super::OwnedStoreDirectory;
 use super::database::{configure_writable_connection, sqlite_database_path};
 use super::node::{
     load_node_by_exact_id, load_node_by_prefix_or_branch, load_root_id, node_count,
@@ -16,9 +18,8 @@ use super::transaction::{
     begin_deferred_transaction, commit_deferred_transaction, rollback_deferred_transaction,
 };
 use super::{
-    AsyncSqliteConnection, AsyncSqliteConnectionGuard, OwnedStoreDirectory, SqliteDatabase,
-    SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore, SqliteTransactionError,
-    StoreAccess, migration,
+    AsyncSqliteConnection, AsyncSqliteConnectionGuard, SqliteDatabase, SqliteGraphConnectionFuture,
+    SqliteGraphStore, SqliteStore, SqliteTransactionError, StoreAccess, migration,
 };
 use crate::StoreResult as Result;
 use crate::error::{
@@ -39,6 +40,7 @@ impl std::fmt::Debug for SqliteGraphStore {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl Drop for OwnedStoreDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -84,6 +86,8 @@ impl SqliteStore {
         Ok(store)
     }
 
+    /// Opens a test store that is removed after its last cloned handle is dropped.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn open_temporary() -> Result<Self> {
         let directory = Arc::new(create_temporary_store_directory());
         let mut store = Self::open(&directory.path).await?;
@@ -140,6 +144,7 @@ impl SqliteStore {
             database,
             root_id: String::new(),
             access,
+            #[cfg(any(test, feature = "test-utils"))]
             _owned_directory: None,
         })
     }
@@ -382,6 +387,7 @@ fn initial_root_node() -> Node {
     )
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn create_temporary_store_directory() -> OwnedStoreDirectory {
     let base = std::env::temp_dir();
     loop {

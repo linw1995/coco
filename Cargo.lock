@@ -548,6 +548,7 @@ dependencies = [
  "async-trait",
  "coco-channel",
  "coco-llm",
+ "coco-mem",
  "futures",
  "indoc",
  "jiff",

@@ -71,6 +71,7 @@ snafu.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Host server tests.
+coco-mem = { path = "../coco-mem", features = ["test-utils"] }
 tracing-subscriber.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
