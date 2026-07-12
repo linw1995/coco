@@ -1,0 +1,453 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use diesel::prelude::*;
+use diesel::result::OptionalExtension;
+use diesel_async::RunQueryDsl;
+use snafu::prelude::*;
+
+use super::database::{configure_writable_connection, sqlite_database_path};
+use super::node::{
+    load_node_by_exact_id, load_node_by_prefix_or_branch, load_root_id, node_count,
+    persist_node_without_transaction,
+};
+use super::transaction::{
+    begin_deferred_transaction, commit_deferred_transaction, rollback_deferred_transaction,
+};
+use super::{
+    AsyncSqliteConnection, AsyncSqliteConnectionGuard, OwnedStoreDirectory, SqliteDatabase,
+    SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore, SqliteTransactionError,
+    StoreAccess, migration,
+};
+use crate::StoreResult as Result;
+use crate::error::{
+    AcquireSqliteConnectionSnafu, CorruptedStoreSnafu, QuerySqliteStoreSnafu,
+    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+};
+use crate::schema::branches;
+use crate::store::ProcessShareableStore;
+use crate::{Kind, Node, Role};
+
+impl std::fmt::Debug for SqliteGraphStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteGraphStore")
+            .field("dir", &self.dir)
+            .field("database_path", &self.database_path)
+            .field("root_id", &self.root_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OwnedStoreDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+impl std::fmt::Debug for SqliteStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqliteStore")
+            .field("dir", &self.dir)
+            .field("database_path", &self.database_path)
+            .field("access", &self.access)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SqliteStore {
+    pub async fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if sqlite_database_path(path).is_file() {
+            if Self::sqlite_schema_requires_migration(path).await? {
+                drop(Self::open(path).await?);
+            }
+            return Self::open_read_only(path).await;
+        }
+        Self::open_read_only(path).await
+    }
+
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        prepare_store_directory(path)?;
+        migration::reject_incomplete_legacy_json_store(path).await?;
+        let mut store = Self::new(path, StoreAccess::ReadWrite).await?;
+        let root_id = store
+            .database
+            .with_initialization_lock(|| async {
+                store.run_migrations().await?;
+                store.load_or_initialize_state().await
+            })
+            .await?;
+        store.root_id = root_id;
+        Ok(store)
+    }
+
+    pub async fn open_temporary() -> Result<Self> {
+        let directory = Arc::new(create_temporary_store_directory());
+        let mut store = Self::open(&directory.path).await?;
+        store._owned_directory = Some(directory);
+        Ok(store)
+    }
+
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        ensure_existing_store_directory(path)?;
+        migration::reject_incomplete_legacy_json_store(path).await?;
+        ensure_existing_database_file(&sqlite_database_path(path))?;
+        let mut store = Self::new(path, StoreAccess::ReadOnly).await?;
+        let root_id = store
+            .database
+            .with_initialization_lock(|| async {
+                store.ensure_current_schema().await?;
+                store.ensure_root_exists().await
+            })
+            .await?;
+        store.root_id = root_id;
+        Ok(store)
+    }
+
+    pub fn store_path(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    pub async fn schema_version(&self) -> Result<i32> {
+        let mut connection = self.connect().await?;
+        migration::existing_schema_version(&mut connection, &self.database_path).await
+    }
+
+    pub(super) async fn new(path: &Path, access: StoreAccess) -> Result<Self> {
+        Self::new_with_database_path(path, sqlite_database_path(path), access).await
+    }
+
+    async fn new_with_database_path(
+        path: &Path,
+        database_path: PathBuf,
+        access: StoreAccess,
+    ) -> Result<Self> {
+        let database = match access {
+            StoreAccess::ReadWrite => SqliteDatabase::open(database_path.clone(), true).await?,
+            StoreAccess::ReadOnly => SqliteDatabase::open(database_path.clone(), false).await?,
+        };
+        let lock_file = if access == StoreAccess::ReadWrite {
+            Some(super::super::lock::open_store_lock(path)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            dir: path.to_owned(),
+            database_path: database_path.clone(),
+            database,
+            root_id: String::new(),
+            access,
+            _lock_file: lock_file,
+            _owned_directory: None,
+        })
+    }
+
+    async fn run_migrations(&self) -> Result<()> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        configure_writable_connection(&mut connection, &self.database_path).await?;
+        migration::run(&mut connection, &self.database_path).await
+    }
+
+    async fn ensure_current_schema(&self) -> Result<()> {
+        let mut connection = self.connect().await?;
+        migration::ensure_current_schema(&mut connection, &self.database_path).await
+    }
+
+    async fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
+        ensure_existing_store_directory(path)?;
+        let store = Self::new(path, StoreAccess::ReadOnly).await?;
+        ensure_existing_database_file(&store.database_path)?;
+        let requires_migration = store
+            .database
+            .with_initialization_lock(|| async {
+                let mut connection = store.connect().await?;
+                migration::requires_migration(&mut connection, &store.database_path).await
+            })
+            .await?;
+        Ok(requires_migration)
+    }
+
+    pub(super) fn ensure_writable(&self) -> Result<()> {
+        if self.access == StoreAccess::ReadWrite {
+            return Ok(());
+        }
+
+        StoreReadOnlySnafu {
+            path: self.dir.clone(),
+        }
+        .fail()
+    }
+
+    async fn load_or_initialize_state(&self) -> Result<String> {
+        let mut connection = self.connect().await?;
+        if node_count(&mut connection, &self.database_path).await? == 0 {
+            self.ensure_writable()?;
+            let root = initial_root_node();
+            let root_id = root.id.clone();
+            connection
+                .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+                    persist_node_without_transaction(connection, &self.database_path, &root)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)
+                })
+                .await
+                .map_err(|error| error.into_store_error(&self.database_path))?;
+            return Ok(root_id);
+        }
+        load_root_id(&mut connection, &self.database_path).await
+    }
+
+    async fn ensure_root_exists(&self) -> Result<String> {
+        let mut connection = self.connect().await?;
+        let root_id = load_root_id(&mut connection, &self.database_path).await?;
+        load_node_by_exact_id(&mut connection, &self.database_path, &root_id).await?;
+        Ok(root_id)
+    }
+
+    pub(super) async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
+        self.database.connection().await
+    }
+}
+
+impl SqliteGraphStore {
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        ensure_existing_store_directory(path)?;
+        ensure_existing_database_file(&sqlite_database_path(path))?;
+        let store = Self::new(path).await?;
+        let root_id = store
+            .database
+            .with_initialization_lock(|| async {
+                store.ensure_current_schema().await?;
+                let mut connection = store.connect().await?;
+                load_root_id(&mut connection, &store.database_path).await
+            })
+            .await?;
+        Ok(Self { root_id, ..store })
+    }
+
+    pub fn store_path(&self) -> &Path {
+        &self.dir
+    }
+
+    async fn new(path: &Path) -> Result<Self> {
+        let database_path = sqlite_database_path(path);
+        let database = SqliteDatabase::open(database_path.clone(), false).await?;
+        Ok(Self {
+            dir: path.to_owned(),
+            database_path,
+            database,
+            root_id: String::new(),
+            read_transaction: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    async fn ensure_current_schema(&self) -> Result<()> {
+        let mut connection = self.connect().await?;
+        migration::ensure_current_schema(&mut connection, &self.database_path).await
+    }
+
+    pub(super) async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
+        self.database.connection().await
+    }
+
+    pub(super) async fn with_connection<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send,
+        F: for<'a> FnOnce(&'a mut AsyncSqliteConnection) -> SqliteGraphConnectionFuture<'a, T>
+            + Send,
+    {
+        let mut read_transaction = self.read_transaction.lock().await;
+        if let Some(connection) = read_transaction.as_mut() {
+            return operation(&mut *connection).await;
+        }
+        drop(read_transaction);
+
+        let mut connection = self.connect().await?;
+        operation(&mut connection).await
+    }
+
+    pub async fn begin_read_transaction(&self) -> Result<()> {
+        let transaction_is_inactive = self.read_transaction.lock().await.is_none();
+        ensure!(
+            transaction_is_inactive,
+            CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: "SQLite graph read transaction already active".to_owned(),
+            }
+        );
+
+        let mut connection =
+            self.database
+                .inner
+                .pool
+                .get_owned()
+                .await
+                .context(AcquireSqliteConnectionSnafu {
+                    path: self.database_path.clone(),
+                })?;
+        begin_deferred_transaction(&mut connection, &self.database_path).await?;
+        let mut connection = Some(connection);
+        let transaction_already_active = {
+            let mut read_transaction = self.read_transaction.lock().await;
+            if read_transaction.is_some() {
+                true
+            } else {
+                *read_transaction = connection.take();
+                false
+            }
+        };
+        if transaction_already_active {
+            let mut connection = connection.expect("pending graph read connection is missing");
+            rollback_deferred_transaction(&mut connection, &self.database_path).await?;
+            return CorruptedStoreSnafu {
+                path: self.database_path.clone(),
+                message: "SQLite graph read transaction already active".to_owned(),
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
+    pub async fn commit_read_transaction(&self) -> Result<()> {
+        let mut connection =
+            self.read_transaction
+                .lock()
+                .await
+                .take()
+                .context(CorruptedStoreSnafu {
+                    path: self.database_path.clone(),
+                    message: "SQLite graph read transaction is not active".to_owned(),
+                })?;
+
+        commit_deferred_transaction(&mut connection, &self.database_path).await
+    }
+
+    pub async fn rollback_read_transaction(&self) -> Result<()> {
+        let Some(mut connection) = self.read_transaction.lock().await.take() else {
+            return Ok(());
+        };
+
+        rollback_deferred_transaction(&mut connection, &self.database_path).await
+    }
+
+    pub(super) fn ensure_read_only<T>(&self) -> Result<T> {
+        StoreReadOnlySnafu {
+            path: self.dir.clone(),
+        }
+        .fail()
+    }
+
+    pub(super) async fn branch_head(&self, name: &str) -> Result<Option<String>> {
+        let name = name.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                branches::table
+                    .filter(branches::name.eq(name))
+                    .select(branches::head_id)
+                    .get_result::<String>(connection)
+                    .await
+                    .optional()
+                    .context(QuerySqliteStoreSnafu { path })
+            })
+        })
+        .await
+    }
+
+    pub(super) async fn get_node_by_prefix_or_branch(&self, reference: &str) -> Result<Node> {
+        let reference = reference.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(
+                async move { load_node_by_prefix_or_branch(connection, &path, &reference).await },
+            )
+        })
+        .await
+    }
+}
+
+fn initial_root_node() -> Node {
+    Node::new(
+        String::new(),
+        Role::System,
+        None,
+        Kind::Text("The Big Bang".to_owned()),
+        "1970-01-01T00:00:00Z"
+            .parse()
+            .expect("root timestamp should parse"),
+    )
+}
+
+fn create_temporary_store_directory() -> OwnedStoreDirectory {
+    let base = std::env::temp_dir();
+    loop {
+        let path = base.join(format!("coco-mem-{}", nanoid::nanoid!()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return OwnedStoreDirectory { path },
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!(
+                "failed to create temporary SQLite store at {:?}: {error}",
+                path
+            ),
+        }
+    }
+}
+
+fn prepare_store_directory(path: &Path) -> Result<()> {
+    if path.exists() {
+        let metadata = fs::metadata(path).context(WriteStoreDirectorySnafu {
+            path: path.to_owned(),
+        })?;
+        ensure!(
+            metadata.is_dir(),
+            StorePathIsNotDirectorySnafu {
+                path: path.to_owned(),
+            }
+        );
+    } else {
+        fs::create_dir_all(path).context(WriteStoreDirectorySnafu {
+            path: path.to_owned(),
+        })?;
+    }
+    Ok(())
+}
+
+fn ensure_existing_store_directory(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path).context(WriteStoreDirectorySnafu {
+        path: path.to_owned(),
+    })?;
+    ensure!(
+        metadata.is_dir(),
+        StorePathIsNotDirectorySnafu {
+            path: path.to_owned(),
+        }
+    );
+    Ok(())
+}
+
+fn ensure_existing_database_file(path: &Path) -> Result<()> {
+    ensure!(
+        path.is_file(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "missing SQLite database file".to_owned(),
+        }
+    );
+    Ok(())
+}
+
+impl ProcessShareableStore for SqliteStore {
+    fn store_path(&self) -> &Path {
+        &self.dir
+    }
+}

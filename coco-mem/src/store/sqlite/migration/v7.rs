@@ -13,10 +13,11 @@ use crate::error::{CorruptedStoreSnafu, ParseSqliteStoreValueSnafu, QuerySqliteS
 use crate::schema::{node_metadata, node_tool_results, node_tool_uses, nodes};
 use crate::{BackendMetadata, Kind, NodeMetadata, ToolResult, ToolUse};
 
-use super::super::{
-    AsyncSqliteConnection, NodeToolResultRow, NodeToolUseRow, SqliteTransactionError,
-    expected_node_metadata_rows, expected_node_tool_result_rows, expected_node_tool_use_rows,
+use super::super::node::{
+    NodeToolResultRow, NodeToolUseRow, expected_node_metadata_rows, expected_node_tool_result_rows,
+    expected_node_tool_use_rows,
 };
+use super::super::{AsyncSqliteConnection, SqliteTransactionError};
 
 pub const VERSION: i32 = 7;
 
