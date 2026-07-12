@@ -1,13 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use diesel::sqlite::SqliteConnection;
 use diesel_async::pooled_connection::bb8::{
     Pool as AsyncSqlitePool, PooledConnection as AsyncSqlitePooledConnection,
 };
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
-use tokio::runtime::Runtime;
 
 use crate::StoreResult as Result;
 use crate::error::StoreError;
@@ -54,17 +52,14 @@ enum SqliteTransactionError {
 }
 
 #[derive(Clone)]
-pub struct SqliteDatabase {
+struct SqliteDatabase {
     inner: Arc<SqliteDatabaseInner>,
 }
 
 struct SqliteDatabaseInner {
     database_path: PathBuf,
-    runtime: &'static Runtime,
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
-    ensure_wal: Arc<AtomicBool>,
-    initialization: tokio::sync::Mutex<()>,
-    write: tokio::sync::Mutex<()>,
+    initialized_root_id: tokio::sync::OnceCell<String>,
 }
 
 #[derive(Clone)]

@@ -524,6 +524,7 @@ dependencies = [
  "axum",
  "coco-mem",
  "diesel",
+ "diesel-async",
  "diesel_migrations",
  "futures-util",
  "jiff",

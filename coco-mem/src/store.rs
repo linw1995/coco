@@ -8,7 +8,7 @@ mod sqlite;
 #[cfg(test)]
 mod tests;
 
-pub use sqlite::{SqliteDatabase, SqliteGraphStore, SqliteStore};
+pub use sqlite::{SqliteGraphStore, SqliteStore};
 
 use crate::{
     Job, JobStatus, MergeParent, MessageQueueItem, NewNode, NewNodeContent, Node, Preset,

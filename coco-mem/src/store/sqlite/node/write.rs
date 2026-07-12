@@ -1,20 +1,5 @@
 use super::*;
 
-pub async fn persist_node(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    node: &Node,
-) -> Result<()> {
-    connection
-        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
-            persist_node_without_transaction(connection, path, node)
-                .await
-                .map_err(SqliteTransactionError::Operation)
-        })
-        .await
-        .map_err(|error| error.into_store_error(path))
-}
-
 pub async fn persist_node_without_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,

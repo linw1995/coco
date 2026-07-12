@@ -40,14 +40,29 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to manage console graph snapshot store {}: {source}", path.display()))]
-    ManageGraphSnapshotStore { path: PathBuf, source: io::Error },
-
-    #[snafu(display("Failed to connect console graph snapshot store {}: {source}", path.display()))]
-    ConnectGraphSnapshotStore {
+    #[snafu(display(
+        "Failed to create console graph snapshot store pool {}: {source}",
+        path.display()
+    ))]
+    CreateGraphSnapshotPool {
         path: PathBuf,
-        source: diesel::ConnectionError,
+        source: diesel_async::pooled_connection::PoolError,
     },
+
+    #[snafu(display(
+        "Failed to acquire console graph snapshot store connection {}: {source}",
+        path.display()
+    ))]
+    AcquireGraphSnapshotConnection {
+        path: PathBuf,
+        source: diesel_async::pooled_connection::bb8::RunError,
+    },
+
+    #[snafu(display(
+        "Failed to configure console graph snapshot store {}: {message}",
+        path.display()
+    ))]
+    ConfigureGraphSnapshotStore { path: PathBuf, message: String },
 
     #[snafu(display("Failed to parse console graph snapshot store value {column}: {source}"))]
     ParseGraphSnapshotStoreValue {

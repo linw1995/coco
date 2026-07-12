@@ -151,9 +151,6 @@ pub enum StoreError {
         source: serde_json::Error,
     },
 
-    #[snafu(display("Failed to start SQLite store runtime: {source}"))]
-    StartSqliteRuntime { source: std::io::Error },
-
     #[snafu(display("Failed to connect to SQLite store {path:?}: {source}"))]
     ConnectSqliteStore {
         path: PathBuf,

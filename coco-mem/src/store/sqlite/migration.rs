@@ -51,7 +51,7 @@ diesel::table! {
     }
 }
 
-pub async fn run(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
+pub async fn run_in_transaction(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<()> {
     reject_unsupported_schema_version(connection, path).await?;
     let before_version = current_schema_version(connection, path).await?;
     let needs_migration = before_version != Some(CURRENT_VERSION);
@@ -65,7 +65,7 @@ pub async fn run(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<
     }
 
     run_embedded_migrations_through(connection, path, v7::VERSION).await?;
-    v7::backfill_node_item_rows(connection, path).await?;
+    v7::backfill_node_item_rows_in_transaction(connection, path).await?;
     run_embedded_migrations_through(connection, path, CURRENT_VERSION).await?;
 
     if needs_migration {

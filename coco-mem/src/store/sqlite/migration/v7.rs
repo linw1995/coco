@@ -13,11 +13,11 @@ use crate::error::{CorruptedStoreSnafu, ParseSqliteStoreValueSnafu, QuerySqliteS
 use crate::schema::{node_metadata, node_tool_results, node_tool_uses, nodes};
 use crate::{BackendMetadata, Kind, NodeMetadata, ToolResult, ToolUse};
 
+use super::super::AsyncSqliteConnection;
 use super::super::node::{
     NodeToolResultRow, NodeToolUseRow, expected_node_metadata_rows, expected_node_tool_result_rows,
     expected_node_tool_use_rows,
 };
-use super::super::{AsyncSqliteConnection, SqliteTransactionError};
 
 pub const VERSION: i32 = 7;
 
@@ -39,7 +39,7 @@ enum LegacyNodeMetadata {
     Many(NodeMetadata),
 }
 
-pub async fn backfill_node_item_rows(
+pub async fn backfill_node_item_rows_in_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
@@ -63,50 +63,47 @@ pub async fn backfill_node_item_rows(
         "starting SQLite node item row backfill"
     );
 
-    connection
-        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
-            diesel::delete(node_tool_uses::table)
-                .execute(connection)
-                .await
-                .map_err(SqliteTransactionError::Query)?;
-            diesel::delete(node_tool_results::table)
-                .execute(connection)
-                .await
-                .map_err(SqliteTransactionError::Query)?;
-            diesel::delete(node_metadata::table)
-                .execute(connection)
-                .await
-                .map_err(SqliteTransactionError::Query)?;
-
-            let rows =
-                diesel::sql_query("SELECT id, metadata_json, kind_json FROM nodes ORDER BY id")
-                    .load::<NodeItemBackfillRow>(connection)
-                    .await
-                    .map_err(SqliteTransactionError::Query)?;
-
-            let mut processed = 0usize;
-            for row in rows {
-                backfill_node_item_row(connection, path, row)
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
-                processed += 1;
-                if processed.is_multiple_of(1000) {
-                    tracing::info!(
-                        path = %path.display(),
-                        processed_nodes = processed,
-                        total_nodes = total,
-                        "backfilled SQLite node item rows"
-                    );
-                }
-            }
-
-            persist_store_meta_bool(connection, path, NODE_ITEM_ROWS_BACKFILL_META_KEY, true)
-                .await
-                .map_err(SqliteTransactionError::Operation)?;
-            Ok(())
-        })
+    diesel::delete(node_tool_uses::table)
+        .execute(connection)
         .await
-        .map_err(|error| error.into_store_error(path))?;
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    diesel::delete(node_tool_results::table)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    diesel::delete(node_metadata::table)
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    let rows = diesel::sql_query("SELECT id, metadata_json, kind_json FROM nodes ORDER BY id")
+        .load::<NodeItemBackfillRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+
+    let mut processed = 0usize;
+    for row in rows {
+        backfill_node_item_row(connection, path, row).await?;
+        processed += 1;
+        if processed.is_multiple_of(1000) {
+            tracing::info!(
+                path = %path.display(),
+                processed_nodes = processed,
+                total_nodes = total,
+                "backfilled SQLite node item rows"
+            );
+        }
+    }
+
+    persist_store_meta_bool(connection, path, NODE_ITEM_ROWS_BACKFILL_META_KEY, true).await?;
 
     tracing::info!(
         path = %path.display(),
