@@ -10406,6 +10406,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_read_only_rejects_invalid_root_count() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let missing_path = tempdir.path().join("missing-root");
+        let missing_store = SqliteStore::open(&missing_path).await.unwrap();
+        let mut connection = missing_store.connect().await.unwrap();
+        diesel::update(nodes::table.filter(nodes::id.eq(missing_store.root_id())))
+            .set(nodes::parent_id.eq("missing"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+        drop(missing_store);
+
+        let error = SqliteStore::open_read_only(&missing_path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing SQLite root node"));
+
+        let multiple_path = tempdir.path().join("multiple-roots");
+        let multiple_store = SqliteStore::open(&multiple_path).await.unwrap();
+        let child_id = multiple_store
+            .append(NewNode {
+                parent: multiple_store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("second root".to_owned()),
+            })
+            .await
+            .unwrap();
+        let mut connection = multiple_store.connect().await.unwrap();
+        diesel::update(nodes::table.filter(nodes::id.eq(child_id)))
+            .set(nodes::parent_id.eq(""))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+        drop(multiple_store);
+
+        let error = SqliteStore::open_read_only(&multiple_path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("multiple SQLite root nodes"));
+    }
+
+    #[tokio::test]
     async fn append_persists_node_relations() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
