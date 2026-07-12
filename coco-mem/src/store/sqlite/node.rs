@@ -43,7 +43,7 @@ pub use row::*;
 pub use write::node_storage_kind;
 pub use write::{
     expected_node_metadata_rows, expected_node_tool_result_rows, expected_node_tool_use_rows,
-    persist_node, persist_node_without_transaction, upsert_node_without_transaction,
+    persist_node_without_transaction, upsert_node_without_transaction,
 };
 
 const NODE_KIND_ANCHOR_SESSION: &str = "anchor_session";
@@ -110,10 +110,18 @@ impl NodeStore for SqliteStore {
             node.kind,
             jiff::Timestamp::now(),
         );
-        let _write = self.database.inner.write.lock().await;
         let mut connection = self.connect().await?;
-        validate_new_node(&mut connection, &self.database_path, &node).await?;
-        persist_node(&mut connection, &self.database_path, &node).await?;
+        connection
+            .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+                validate_new_node(connection, &self.database_path, &node)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                persist_node_without_transaction(connection, &self.database_path, &node)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))?;
         Ok(node.id)
     }
 

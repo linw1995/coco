@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
-use diesel_async::RunQueryDsl;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use snafu::prelude::*;
 
 #[cfg(any(test, feature = "test-utils"))]
 use super::OwnedStoreDirectory;
-use super::database::{configure_writable_connection, sqlite_database_path};
+use super::database::sqlite_database_path;
 use super::node::{
     load_node_by_exact_id, load_node_by_prefix_or_branch, load_root_id, node_count,
     persist_node_without_transaction,
@@ -61,11 +61,10 @@ impl std::fmt::Debug for SqliteStore {
 impl SqliteStore {
     pub async fn open_read_only_or_upgrade_schema(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if sqlite_database_path(path).is_file() {
-            if Self::sqlite_schema_requires_migration(path).await? {
-                drop(Self::open(path).await?);
-            }
-            return Self::open_read_only(path).await;
+        if sqlite_database_path(path).is_file()
+            && Self::sqlite_schema_requires_migration(path).await?
+        {
+            drop(Self::open(path).await?);
         }
         Self::open_read_only(path).await
     }
@@ -77,10 +76,7 @@ impl SqliteStore {
         let mut store = Self::new(path, StoreAccess::ReadWrite).await?;
         let root_id = store
             .database
-            .with_initialization_lock(|| async {
-                store.run_migrations().await?;
-                store.load_or_initialize_state().await
-            })
+            .initialized_root_id(|| store.initialize_writable())
             .await?;
         store.root_id = root_id;
         Ok(store)
@@ -103,10 +99,7 @@ impl SqliteStore {
         let mut store = Self::new(path, StoreAccess::ReadOnly).await?;
         let root_id = store
             .database
-            .with_initialization_lock(|| async {
-                store.ensure_current_schema().await?;
-                store.ensure_root_exists().await
-            })
+            .initialized_root_id(|| store.initialize_read_only())
             .await?;
         store.root_id = root_id;
         Ok(store)
@@ -149,30 +142,38 @@ impl SqliteStore {
         })
     }
 
-    async fn run_migrations(&self) -> Result<()> {
+    async fn initialize_writable(&self) -> Result<String> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
-        configure_writable_connection(&mut connection, &self.database_path).await?;
-        migration::run(&mut connection, &self.database_path).await
-    }
-
-    async fn ensure_current_schema(&self) -> Result<()> {
-        let mut connection = self.connect().await?;
-        migration::ensure_current_schema(&mut connection, &self.database_path).await
+        connection
+            .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
+                migration::run_in_transaction(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                if node_count(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?
+                    == 0
+                {
+                    let root = initial_root_node();
+                    persist_node_without_transaction(connection, &self.database_path, &root)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                }
+                load_root_id(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
     }
 
     async fn sqlite_schema_requires_migration(path: &Path) -> Result<bool> {
         ensure_existing_store_directory(path)?;
         let store = Self::new(path, StoreAccess::ReadOnly).await?;
         ensure_existing_database_file(&store.database_path)?;
-        let requires_migration = store
-            .database
-            .with_initialization_lock(|| async {
-                let mut connection = store.connect().await?;
-                migration::requires_migration(&mut connection, &store.database_path).await
-            })
-            .await?;
-        Ok(requires_migration)
+        let mut connection = store.connect().await?;
+        migration::requires_migration(&mut connection, &store.database_path).await
     }
 
     pub(super) fn ensure_writable(&self) -> Result<()> {
@@ -186,34 +187,27 @@ impl SqliteStore {
         .fail()
     }
 
-    async fn load_or_initialize_state(&self) -> Result<String> {
+    async fn initialize_read_only(&self) -> Result<String> {
         let mut connection = self.connect().await?;
-        if node_count(&mut connection, &self.database_path).await? == 0 {
-            self.ensure_writable()?;
-            let root = initial_root_node();
-            let root_id = root.id.clone();
-            connection
-                .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
-                    persist_node_without_transaction(connection, &self.database_path, &root)
-                        .await
-                        .map_err(SqliteTransactionError::Operation)
-                })
-                .await
-                .map_err(|error| error.into_store_error(&self.database_path))?;
-            return Ok(root_id);
-        }
-        load_root_id(&mut connection, &self.database_path).await
-    }
-
-    async fn ensure_root_exists(&self) -> Result<String> {
-        let mut connection = self.connect().await?;
-        let root_id = load_root_id(&mut connection, &self.database_path).await?;
-        load_node_by_exact_id(&mut connection, &self.database_path, &root_id).await?;
-        Ok(root_id)
+        connection
+            .transaction::<String, SqliteTransactionError, _>(async |connection| {
+                migration::ensure_current_schema(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                let root_id = load_root_id(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                load_node_by_exact_id(connection, &self.database_path, &root_id)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                Ok(root_id)
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
     }
 
     pub(super) async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
-        self.database.connection().await
+        self.database.acquire().await
     }
 }
 
@@ -225,11 +219,7 @@ impl SqliteGraphStore {
         let store = Self::new(path).await?;
         let root_id = store
             .database
-            .with_initialization_lock(|| async {
-                store.ensure_current_schema().await?;
-                let mut connection = store.connect().await?;
-                load_root_id(&mut connection, &store.database_path).await
-            })
+            .initialized_root_id(|| store.initialize_read_only())
             .await?;
         Ok(Self { root_id, ..store })
     }
@@ -250,13 +240,27 @@ impl SqliteGraphStore {
         })
     }
 
-    async fn ensure_current_schema(&self) -> Result<()> {
+    async fn initialize_read_only(&self) -> Result<String> {
         let mut connection = self.connect().await?;
-        migration::ensure_current_schema(&mut connection, &self.database_path).await
+        connection
+            .transaction::<String, SqliteTransactionError, _>(async |connection| {
+                migration::ensure_current_schema(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                let root_id = load_root_id(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                load_node_by_exact_id(connection, &self.database_path, &root_id)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                Ok(root_id)
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
     }
 
     pub(super) async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
-        self.database.connection().await
+        self.database.acquire().await
     }
 
     pub(super) async fn with_connection<T, F>(&self, operation: F) -> Result<T>

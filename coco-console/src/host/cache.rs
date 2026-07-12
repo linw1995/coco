@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::snapshot_store::ConsoleGraphSnapshotStore;
+#[cfg(test)]
+use super::snapshot_store::SnapshotDatabase;
 use crate::api::{GraphViewportDiffResponse, GraphViewportResponse};
 use crate::graph::{
     GraphMode, GraphNode, GraphSnapshot, build_graph_snapshot_with_mode_and_progress,
@@ -155,7 +157,7 @@ where
             .await
             .context(crate::error::StoreSnafu)?;
         let snapshots = ConsoleGraphSnapshotStore::open(&path).await?;
-        let persisted_version = latest_persistent_materialization_version(&snapshots)?;
+        let persisted_version = latest_persistent_materialization_version(&snapshots).await?;
         let ready = ConsolePublisher::new();
         if let Some(version) = persisted_version {
             ready.advance_to(version);
@@ -182,10 +184,11 @@ where
         self.ready.current_version()
     }
 
-    pub fn current_viewport_version(&self, mode: GraphMode) -> u64 {
+    pub async fn current_viewport_version(&self, mode: GraphMode) -> u64 {
         match self.snapshots.as_ref() {
             Some(snapshots) => snapshots
                 .latest_materialization_version(mode)
+                .await
                 .ok()
                 .flatten()
                 .unwrap_or(0),
@@ -251,9 +254,9 @@ where
             .context(crate::error::JoinConsoleServerSnafu)
     }
 
-    pub fn rebuild_requested_modes(&self) {
+    pub async fn rebuild_requested_modes(&self) {
         for mode in [GraphMode::Anchors, GraphMode::All] {
-            self.ensure_viewport_current(mode);
+            self.ensure_viewport_current(mode).await;
         }
     }
 
@@ -363,15 +366,15 @@ where
                         })
                 }));
         };
-        self.ensure_viewport_current(mode);
-        let reference = snapshots.materialized_node_reference(mode, target)?;
+        self.ensure_viewport_current(mode).await;
+        let reference = snapshots.materialized_node_reference(mode, target).await?;
         let (node_id, labels) = match reference {
             Some(reference) => (reference.node_id, reference.labels),
             None => {
                 let Some(node_id) = node_id_from_graph_target(target) else {
                     return Ok(None);
                 };
-                if snapshots.has_materialization(mode)?
+                if snapshots.has_materialization(mode).await?
                     && !self
                         .node_is_in_materialized_provider_context(snapshots, mode, &node_id)
                         .await?
@@ -408,7 +411,8 @@ where
             .map(|node| node.id.clone())
             .collect::<BTreeSet<_>>();
         Ok(!snapshots
-            .materialized_node_points(mode, &node_ids)?
+            .materialized_node_points(mode, &node_ids)
+            .await?
             .is_empty())
     }
 
@@ -421,8 +425,8 @@ where
         let Some(snapshots) = &self.snapshots else {
             return Ok(None);
         };
-        self.ensure_viewport_current(mode);
-        let materialized_reference = snapshots.materialized_node_reference(mode, target)?;
+        self.ensure_viewport_current(mode).await;
+        let materialized_reference = snapshots.materialized_node_reference(mode, target).await?;
         let target_was_materialized = materialized_reference.is_some();
         let Some(target_node_id) = materialized_reference
             .map(|reference| reference.node_id)
@@ -445,7 +449,7 @@ where
             .iter()
             .map(|node| node.id.clone())
             .collect::<BTreeSet<_>>();
-        let points = snapshots.materialized_node_points(mode, &node_ids)?;
+        let points = snapshots.materialized_node_points(mode, &node_ids).await?;
         if points.is_empty() {
             return Ok(None);
         }
@@ -476,8 +480,8 @@ where
         let Some(snapshots) = &self.snapshots else {
             return Ok(None);
         };
-        self.ensure_viewport_current(mode);
-        let Some(facts) = snapshots.materialized_shell_facts(mode)? else {
+        self.ensure_viewport_current(mode).await;
+        let Some(facts) = snapshots.materialized_shell_facts(mode).await? else {
             return Ok(None);
         };
         let branches = self
@@ -527,20 +531,24 @@ where
                     if changed.is_err() {
                         continue;
                     }
-                    self.ensure_viewport_current(mode);
+                    self.ensure_viewport_current(mode).await;
                 }
             }
         }
     }
 
-    pub fn viewport_current_ready_or_schedule(
+    pub async fn viewport_current_ready_or_schedule(
         &self,
         mode: GraphMode,
         request: GraphViewportRequest,
     ) -> Option<GraphViewportResponse> {
         if let Some(snapshots) = &self.snapshots {
-            self.ensure_viewport_current(mode);
-            return snapshots.latest_viewport(mode, request).ok().flatten();
+            self.ensure_viewport_current(mode).await;
+            return snapshots
+                .latest_viewport(mode, request)
+                .await
+                .ok()
+                .flatten();
         }
         self.snapshot_current_ready_or_schedule(mode)
             .map(|snapshot| layout_graph_viewport(&snapshot, request))
@@ -560,7 +568,7 @@ where
             let mut rx = self.ready.subscribe();
             let mut invalidations = self.invalidations.subscribe();
             let mut progress = self.progress.subscribe();
-            if let Some(response) = self.viewport_current_ready_or_schedule(mode, request)
+            if let Some(response) = self.viewport_current_ready_or_schedule(mode, request).await
                 && response.version > observed_version
             {
                 return Ok(response);
@@ -581,20 +589,24 @@ where
                     if changed.is_err() {
                         continue;
                     }
-                    self.ensure_viewport_current(mode);
+                    self.ensure_viewport_current(mode).await;
                 }
             }
         }
     }
 
-    pub fn viewport_diff_current_ready_or_schedule(
+    pub async fn viewport_diff_current_ready_or_schedule(
         &self,
         mode: GraphMode,
         request: GraphViewportDiffRequest,
     ) -> Option<GraphViewportDiffResponse> {
         if let Some(snapshots) = &self.snapshots {
-            self.ensure_viewport_current(mode);
-            return snapshots.latest_viewport_diff(mode, request).ok().flatten();
+            self.ensure_viewport_current(mode).await;
+            return snapshots
+                .latest_viewport_diff(mode, request)
+                .await
+                .ok()
+                .flatten();
         }
         self.snapshot_current_ready_or_schedule(mode)
             .map(|snapshot| layout_graph_viewport_diff(&snapshot, request))
@@ -614,8 +626,9 @@ where
             let mut rx = self.ready.subscribe();
             let mut invalidations = self.invalidations.subscribe();
             let mut progress = self.progress.subscribe();
-            if let Some(response) =
-                self.viewport_diff_current_ready_or_schedule(mode, request.clone())
+            if let Some(response) = self
+                .viewport_diff_current_ready_or_schedule(mode, request.clone())
+                .await
                 && response.version > observed_version
             {
                 return Ok(response);
@@ -636,7 +649,7 @@ where
                     if changed.is_err() {
                         continue;
                     }
-                    self.ensure_viewport_current(mode);
+                    self.ensure_viewport_current(mode).await;
                 }
             }
         }
@@ -658,9 +671,9 @@ where
         if self.snapshots.is_none() {
             return;
         }
-        self.ensure_viewport_current(mode);
+        self.ensure_viewport_current(mode).await;
         for _ in 0..50 {
-            if self.materialization_current(mode, source_version) {
+            if self.materialization_current(mode, source_version).await {
                 return;
             }
             if self.rebuild_statuses().iter().any(|status| {
@@ -753,10 +766,10 @@ where
         });
     }
 
-    fn ensure_viewport_current(&self, mode: GraphMode) {
+    async fn ensure_viewport_current(&self, mode: GraphMode) {
         let source_version = self.invalidations.current_version();
         if (self.snapshots.is_none() && self.cached_snapshot(mode, source_version).is_some())
-            || self.materialization_current(mode, source_version)
+            || self.materialization_current(mode, source_version).await
         {
             set_rebuild_status!(
                 self,
@@ -801,7 +814,7 @@ where
             )
         );
         if let Some(snapshots) = self.snapshots.clone() {
-            let has_non_empty_materialization = snapshots.has_non_empty_materialization(mode);
+            let has_non_empty_materialization = snapshots.has_non_empty_materialization(mode).await;
             let source = self.source.clone();
             let incremental_result = source
                 .try_append_linear_materialization(snapshots, mode, source_version)
@@ -909,11 +922,13 @@ where
                 .await?;
             if let Some(snapshots) = snapshots {
                 let branch_labels = visible_full_layout_branch_labels(&snapshot);
-                snapshots.replace_materialization_from_viewport(
-                    mode,
-                    materialize_graph_viewport(&snapshot),
-                    branch_labels,
-                )?;
+                snapshots
+                    .replace_materialization_from_viewport(
+                        mode,
+                        materialize_graph_viewport(&snapshot),
+                        branch_labels,
+                    )
+                    .await?;
             }
             crate::Result::Ok(snapshot)
         }
@@ -952,13 +967,16 @@ where
         }
     }
 
-    fn materialization_current(&self, mode: GraphMode, source_version: u64) -> bool {
-        self.snapshots.as_ref().and_then(|snapshots| {
-            snapshots
-                .latest_materialization_version(mode)
-                .ok()
-                .flatten()
-        }) == Some(source_version)
+    async fn materialization_current(&self, mode: GraphMode, source_version: u64) -> bool {
+        let Some(snapshots) = self.snapshots.as_ref() else {
+            return false;
+        };
+        snapshots
+            .latest_materialization_version(mode)
+            .await
+            .ok()
+            .flatten()
+            == Some(source_version)
     }
 
     fn fail_if_materialization_failed(
@@ -1118,19 +1136,16 @@ fn rebuild_status(
     }
 }
 
-fn latest_persistent_materialization_version(
+async fn latest_persistent_materialization_version(
     snapshots: &ConsoleGraphSnapshotStore,
 ) -> crate::Result<Option<u64>> {
-    [GraphMode::Anchors, GraphMode::All]
-        .into_iter()
-        .map(|mode| snapshots.latest_materialization_version(mode))
-        .try_fold(None, |latest: Option<u64>, version| {
-            version.map(|version| match (latest, version) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                (Some(left), None) => Some(left),
-                (None, right) => right,
-            })
-        })
+    let mut latest = None;
+    for mode in [GraphMode::Anchors, GraphMode::All] {
+        if let Some(version) = snapshots.latest_materialization_version(mode).await? {
+            latest = Some(latest.map_or(version, |current: u64| current.max(version)));
+        }
+    }
+    Ok(latest)
 }
 
 fn visible_full_layout_branch_labels(snapshot: &GraphSnapshot) -> BTreeSet<String> {
@@ -1687,10 +1702,10 @@ mod tests {
 
         assert_eq!(viewport.version, target_version);
         assert_eq!(
-            cache.current_viewport_version(GraphMode::All),
+            cache.current_viewport_version(GraphMode::All).await,
             target_version
         );
-        assert_eq!(cache.current_viewport_version(GraphMode::Anchors), 0);
+        assert_eq!(cache.current_viewport_version(GraphMode::Anchors).await, 0);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -1868,6 +1883,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut materialized = None;
@@ -1879,6 +1895,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -1929,6 +1946,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap();
         let reopened_materialized = reopened_cache
             .viewport_after(
@@ -1967,13 +1985,10 @@ mod tests {
         ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let graph_database_path = crate::host::snapshot_store::database_path(&path);
-        let graph_database =
-            coco_mem::SqliteDatabase::open_unshared_file_path(&graph_database_path)
-                .await
-                .unwrap();
-        let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
-        let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
-        let transaction = std::thread::spawn(move || {
+        let graph_database = SnapshotDatabase::open(&graph_database_path).await.unwrap();
+        let (transaction_started_tx, transaction_started_rx) = oneshot::channel();
+        let (release_transaction_tx, release_transaction_rx) = oneshot::channel();
+        let transaction = tokio::spawn(async move {
             use crate::schema::console_graph_materializations::dsl as materializations;
             use diesel::Connection;
             use diesel::prelude::*;
@@ -1988,15 +2003,17 @@ mod tests {
                             0,
                         );
                         transaction_started_tx.send(()).unwrap();
-                        release_transaction_rx.recv().unwrap();
+                        release_transaction_rx.blocking_recv().unwrap();
                         Ok(())
                     })
                     .unwrap();
-            });
+            })
+            .await;
         });
-        transaction_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("graph materialization preflight read should start");
+        tokio::time::timeout(Duration::from_secs(1), transaction_started_rx)
+            .await
+            .expect("graph materialization preflight read should start")
+            .unwrap();
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();
@@ -2016,7 +2033,7 @@ mod tests {
 
         let written = tokio::time::timeout(Duration::from_secs(1), write_rx).await;
         release_transaction_tx.send(()).unwrap();
-        transaction.join().unwrap();
+        transaction.await.unwrap();
         write.await.unwrap();
         let written = written
             .expect("store write should not wait for graph transaction release")
@@ -2034,26 +2051,25 @@ mod tests {
         ConsoleGraphSnapshotStore::open(&path).await.unwrap();
 
         let graph_database_path = crate::host::snapshot_store::database_path(&path);
-        let graph_database =
-            coco_mem::SqliteDatabase::open_unshared_file_path(&graph_database_path)
-                .await
-                .unwrap();
-        let (transaction_started_tx, transaction_started_rx) = mpsc::channel();
-        let (release_transaction_tx, release_transaction_rx) = mpsc::channel();
-        let transaction = std::thread::spawn(move || {
+        let graph_database = SnapshotDatabase::open(&graph_database_path).await.unwrap();
+        let (transaction_started_tx, transaction_started_rx) = oneshot::channel();
+        let (release_transaction_tx, release_transaction_rx) = oneshot::channel();
+        let transaction = tokio::spawn(async move {
             with_sqlite_test_connection(graph_database, move |connection| {
                 connection
                     .immediate_transaction::<(), diesel::result::Error, _>(|_| {
                         transaction_started_tx.send(()).unwrap();
-                        release_transaction_rx.recv().unwrap();
+                        release_transaction_rx.blocking_recv().unwrap();
                         Ok(())
                     })
                     .unwrap();
-            });
+            })
+            .await;
         });
-        transaction_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("graph materialization write transaction should start");
+        tokio::time::timeout(Duration::from_secs(1), transaction_started_rx)
+            .await
+            .expect("graph materialization write transaction should start")
+            .unwrap();
 
         let writer_for_thread = writer.clone();
         let root = writer.root_id();
@@ -2076,7 +2092,7 @@ mod tests {
             .expect("store write should not wait for graph transaction release")
             .unwrap();
         release_transaction_tx.send(()).unwrap();
-        transaction.join().unwrap();
+        transaction.await.unwrap();
         write.await.unwrap();
         assert_eq!(writer.get_node(&written).await.unwrap().id, written);
 
@@ -2163,6 +2179,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut materialized = None;
@@ -2174,6 +2191,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -4037,6 +4055,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -4044,10 +4063,12 @@ mod tests {
             {
                 break;
             }
-            let _ = cache.viewport_current_ready_or_schedule(
-                GraphMode::All,
-                crate::host::api::GraphViewportRequest::default(),
-            );
+            let _ = cache
+                .viewport_current_ready_or_schedule(
+                    GraphMode::All,
+                    crate::host::api::GraphViewportRequest::default(),
+                )
+                .await;
             sleep(Duration::from_millis(10)).await;
         }
         let materialized = materialized.expect("materialization should append incrementally");
@@ -4196,6 +4217,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut materialized = None;
@@ -4207,6 +4229,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -4317,6 +4340,7 @@ mod tests {
             .await
             .unwrap()
             .replace_materialization_from_viewport(GraphMode::All, viewport, branch_labels)
+            .await
             .unwrap();
         let materialized = ConsoleGraphSnapshotStore::open(&path)
             .await
@@ -4325,6 +4349,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap()
             .unwrap();
 
@@ -4428,6 +4453,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut materialized = None;
@@ -4439,6 +4465,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -4562,6 +4589,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut materialized = None;
@@ -4573,6 +4601,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -4675,6 +4704,7 @@ mod tests {
                     GraphMode::Anchors,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut materialized = None;
@@ -4686,6 +4716,7 @@ mod tests {
                     GraphMode::Anchors,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -5012,6 +5043,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut materialized = None;
@@ -5023,6 +5055,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if materialized
                 .as_ref()
@@ -5043,6 +5076,7 @@ mod tests {
                 .await
                 .unwrap()
                 .has_non_empty_materialization(GraphMode::All)
+                .await
                 .unwrap()
         );
         assert!(
@@ -5089,6 +5123,7 @@ mod tests {
                 .await
                 .unwrap()
                 .has_non_empty_materialization(GraphMode::All)
+                .await
                 .unwrap()
         );
 
@@ -5591,6 +5626,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap();
         for _ in 0..50 {
             if cache.rebuild_statuses().iter().any(|status| {
@@ -5609,6 +5645,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap()
             .unwrap();
 
@@ -8654,6 +8691,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap();
         for _ in 0..50 {
             if cache.rebuild_statuses().iter().any(|status| {
@@ -8672,6 +8710,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap()
             .unwrap();
 
@@ -9549,6 +9588,7 @@ mod tests {
             .await
             .unwrap()
             .materialized_node_reference(GraphMode::All, &crate::graph::node_target_id(&session))
+            .await
             .unwrap()
             .unwrap();
 
@@ -9966,6 +10006,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap();
         for _ in 0..50 {
             if cache.rebuild_statuses().iter().any(|status| {
@@ -9984,6 +10025,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap()
             .unwrap();
 
@@ -10177,8 +10219,8 @@ mod tests {
         let snapshot = ConsoleGraphSnapshotStore::open(&path).await.unwrap();
         let base = root.clone();
 
-        let (started_tx, started_rx) = mpsc::channel();
-        let transaction = std::thread::spawn(move || {
+        let (started_tx, started_rx) = oneshot::channel();
+        let transaction = tokio::spawn(async move {
             snapshot
                 .with_connection_for_tests(move |connection| {
                     connection
@@ -10190,12 +10232,16 @@ mod tests {
                         .unwrap();
                     Ok(())
                 })
+                .await
                 .unwrap();
         });
-        started_rx.recv().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("snapshot write transaction should start")
+            .unwrap();
 
         writer.submit_job("main", &base).await.unwrap();
-        transaction.join().unwrap();
+        transaction.await.unwrap();
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -10209,17 +10255,14 @@ mod tests {
         }
     }
 
-    fn with_sqlite_test_connection<T, F>(database: coco_mem::SqliteDatabase, operation: F) -> T
+    async fn with_sqlite_test_connection<T, F>(database: SnapshotDatabase, operation: F) -> T
     where
         T: Send + 'static,
         F: FnOnce(&mut diesel::sqlite::SqliteConnection) -> T + Send + 'static,
     {
         database
-            .with_sync_connection(
-                |connection| Ok(operation(connection)),
-                |source| panic!("{source}"),
-                std::convert::identity,
-            )
+            .with_connection(|connection| Ok(operation(connection)))
+            .await
             .unwrap()
     }
 
@@ -10269,9 +10312,7 @@ mod tests {
             use crate::schema::{console_graph_edge_routes, console_graph_node_locations};
             use diesel::prelude::*;
 
-            let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
-                .await
-                .unwrap();
+            let database = SnapshotDatabase::open(database_path).await.unwrap();
             with_sqlite_test_connection(database, |connection| {
                 let nodes = console_graph_node_locations::table
                     .select((
@@ -10435,6 +10476,7 @@ mod tests {
                     .collect();
                 Self { nodes, edges }
             })
+            .await
         }
 
         async fn row_count(&self, database_path: &std::path::Path, kind: &str) -> i64 {
@@ -10473,9 +10515,7 @@ mod tests {
         use diesel::prelude::*;
 
         let table = table.to_owned();
-        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
-            .await
-            .unwrap();
+        let database = SnapshotDatabase::open(database_path).await.unwrap();
         with_sqlite_test_connection(database, move |connection| {
             sqlite_master::table
                 .filter(sqlite_master::object_type.eq("table"))
@@ -10485,6 +10525,7 @@ mod tests {
                 .unwrap()
                 > 0
         })
+        .await
     }
 
     async fn sqlite_table_has_column(
@@ -10499,9 +10540,7 @@ mod tests {
 
         let table = table.to_owned();
         let column = column.to_owned();
-        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
-            .await
-            .unwrap();
+        let database = SnapshotDatabase::open(database_path).await.unwrap();
         with_sqlite_test_connection(database, move |connection| {
             match (table.as_str(), column.as_str()) {
                 ("console_graph_materializations", "source_version") => {
@@ -10526,6 +10565,7 @@ mod tests {
                 _ => false,
             }
         })
+        .await
     }
 
     async fn sqlite_table_row_count(database_path: &std::path::Path, table: &str) -> i64 {
@@ -10535,9 +10575,7 @@ mod tests {
         use diesel::prelude::*;
 
         let table = table.to_owned();
-        let database = coco_mem::SqliteDatabase::open_unshared_file_path(database_path)
-            .await
-            .unwrap();
+        let database = SnapshotDatabase::open(database_path).await.unwrap();
         with_sqlite_test_connection(database, move |connection| match table.as_str() {
             "console_graph_materializations" => console_graph_materializations::table
                 .count()
@@ -10553,6 +10591,7 @@ mod tests {
                 .unwrap(),
             table => panic!("unsupported test table {table}"),
         })
+        .await
     }
 
     #[tokio::test]
@@ -10586,6 +10625,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .is_none()
         );
         let mut first_materialized = None;
@@ -10597,6 +10637,7 @@ mod tests {
                     GraphMode::All,
                     crate::host::api::GraphViewportRequest::default(),
                 )
+                .await
                 .unwrap();
             if first_materialized
                 .as_ref()
@@ -10632,6 +10673,7 @@ mod tests {
                 GraphMode::All,
                 crate::host::api::GraphViewportRequest::default(),
             )
+            .await
             .unwrap()
             .unwrap();
 

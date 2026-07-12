@@ -236,7 +236,7 @@ where
     let mode = graph_mode_from_query(&query);
     html_response(render_loading_index_page(
         mode,
-        state.cache.current_viewport_version(mode),
+        state.cache.current_viewport_version(mode).await,
     ))
 }
 
@@ -257,9 +257,10 @@ where
     if state.cache.has_materialized_viewports() {
         let _ = state
             .cache
-            .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+            .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default())
+            .await;
         return json_response(
-            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
             "graph",
         );
     }
@@ -267,7 +268,7 @@ where
     match state.cache.snapshot_current_ready_or_schedule(mode) {
         Some(snapshot) => json_response(&snapshot, "graph"),
         None => json_response(
-            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
             "graph",
         ),
     }
@@ -288,12 +289,13 @@ where
         None => match state
             .cache
             .viewport_current_ready_or_schedule(mode, request)
+            .await
         {
             Some(response) => response,
             None => {
                 return json_response(
                     &empty_graph_viewport_response(
-                        state.cache.current_viewport_version(mode),
+                        state.cache.current_viewport_version(mode).await,
                         request,
                     ),
                     "graph viewport",
@@ -373,11 +375,12 @@ where
     let response = match state
         .cache
         .viewport_diff_current_ready_or_schedule(mode, request.clone())
+        .await
     {
         Some(response) => response,
         None => {
             return empty_graph_viewport_diff_pending_response(
-                state.cache.current_viewport_version(mode),
+                state.cache.current_viewport_version(mode).await,
                 request,
             );
         }
@@ -492,7 +495,8 @@ where
             None => {
                 let _ = state
                     .cache
-                    .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+                    .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default())
+                    .await;
             }
         }
         return match state
@@ -503,7 +507,7 @@ where
             Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
             Ok(None) => html_response(render_loading_fragment(
                 mode,
-                state.cache.current_viewport_version(mode),
+                state.cache.current_viewport_version(mode).await,
             )),
             Err(error) => plain_error(error.to_string()),
         };
@@ -536,10 +540,11 @@ where
             }
             let _ = state
                 .cache
-                .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default());
+                .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default())
+                .await;
             html_response(render_loading_fragment(
                 mode,
-                state.cache.current_viewport_version(mode),
+                state.cache.current_viewport_version(mode).await,
             ))
         }
     }
@@ -554,7 +559,7 @@ where
     if state.cache.has_materialized_viewports() {
         let Some(target) = query.get("target") else {
             return html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
                 None,
             ));
         };
@@ -565,7 +570,7 @@ where
         {
             Ok(Some(node)) => html_response(render_graph_node_detail_fragment(&node)),
             Ok(None) => html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
                 Some(target),
             )),
             Err(error) => plain_error(error.to_string()),
@@ -575,7 +580,7 @@ where
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             return html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
                 query.get("target"),
             ));
         }
@@ -595,7 +600,7 @@ where
     let mode = graph_mode_from_query(&query);
     if query.get("target").is_none() {
         return html_response(render_provider_context_fragment(
-            &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+            &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
             None,
             query.get("context"),
         ));
@@ -618,7 +623,7 @@ where
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             return html_response(render_provider_context_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode)),
+                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
                 query.get("target"),
                 query.get("context"),
             ));
@@ -683,7 +688,7 @@ where
                         if changed.is_err() {
                             return None;
                         }
-                        cache.rebuild_requested_modes();
+                        cache.rebuild_requested_modes().await;
                     }
                 }
             }
@@ -1767,10 +1772,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            state.cache.current_viewport_version(GraphMode::All),
+            state.cache.current_viewport_version(GraphMode::All).await,
             all.version
         );
-        assert_eq!(state.cache.current_viewport_version(GraphMode::Anchors), 0);
+        assert_eq!(
+            state
+                .cache
+                .current_viewport_version(GraphMode::Anchors)
+                .await,
+            0
+        );
 
         let response = index_page(
             State(state.clone()),

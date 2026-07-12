@@ -818,7 +818,6 @@ impl BranchStore for SqliteStore {
         new_head: &str,
     ) -> Result<()> {
         self.ensure_writable()?;
-        let _write = self.database.inner.write.lock().await;
         let mut connection = self.connect().await?;
         update_branch_head_checked(
             &mut connection,
@@ -838,7 +837,6 @@ impl BranchStore for SqliteStore {
         nodes: Vec<NewNodeContent>,
     ) -> Result<String> {
         self.ensure_writable()?;
-        let _write = self.database.inner.write.lock().await;
         let mut connection = self.connect().await?;
         connection
             .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
@@ -866,7 +864,6 @@ impl BranchStore for SqliteStore {
         nodes: Vec<NewNodeContent>,
     ) -> Result<String> {
         self.ensure_writable()?;
-        let _write = self.database.inner.write.lock().await;
         let mut connection = self.connect().await?;
         connection
             .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
@@ -890,7 +887,6 @@ impl BranchStore for SqliteStore {
         update: BranchAppendSessionState,
     ) -> Result<String> {
         self.ensure_writable()?;
-        let _write = self.database.inner.write.lock().await;
         let mut connection = self.connect().await?;
         connection
             .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {

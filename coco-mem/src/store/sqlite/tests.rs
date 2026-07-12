@@ -24,7 +24,7 @@ use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{Barrier, oneshot};
 
 mod migration;
 
@@ -616,6 +616,44 @@ async fn reopened_sqlite_handles_share_database_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn concurrent_first_opens_share_one_initialized_database() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                SqliteStore::open(path).await.unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut stores = Vec::new();
+    for handle in handles {
+        stores.push(handle.await.unwrap());
+    }
+
+    let root_id = stores[0].root_id();
+    assert!(stores.iter().all(|store| store.root_id() == root_id));
+    assert!(stores.iter().all(|store| std::ptr::eq(
+        stores[0].database.shared_pool(),
+        store.database.shared_pool()
+    )));
+    let mut connection = stores[0].connect().await.unwrap();
+    assert_eq!(
+        nodes::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn graph_store_connection_contention_does_not_block_writer() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
@@ -625,7 +663,7 @@ async fn graph_store_connection_contention_does_not_block_writer() {
     let (graph_locked_tx, graph_locked_rx) = mpsc::channel();
     let (release_graph_tx, release_graph_rx) = oneshot::channel();
     let graph_lock = tokio::spawn(async move {
-        let _connection = graph_connection_database.connection().await.unwrap();
+        let _connection = graph_connection_database.acquire().await.unwrap();
         graph_locked_tx.send(()).unwrap();
         release_graph_rx.await.unwrap();
     });
@@ -660,7 +698,7 @@ async fn graph_store_connection_contention_does_not_block_writer() {
 }
 
 #[tokio::test]
-async fn sqlite_store_serializes_concurrent_writes_on_shared_database() {
+async fn sqlite_store_handles_concurrent_writes_with_transactions() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
     let store = SqliteStore::open(&path).await.unwrap();
