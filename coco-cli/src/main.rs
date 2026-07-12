@@ -1,4 +1,4 @@
-use std::io::{ErrorKind, IsTerminal, Read};
+use std::io::{IsTerminal, Read};
 
 use clap::Parser;
 use coco_llm::{
@@ -237,22 +237,6 @@ fn is_local_daemon_command(args: &[String]) -> bool {
     matches!(command_tokens.as_slice(), ["daemon", "serve" | "profile"])
 }
 
-fn should_fallback_to_local(source: DaemonSocketSource, error: &ForwardSocketError) -> bool {
-    matches!(
-        (source, error),
-        (
-            DaemonSocketSource::Implicit,
-            ForwardSocketError::Connect {
-                source,
-                ..
-            }
-        ) if matches!(
-            source.kind(),
-            ErrorKind::ConnectionRefused | ErrorKind::NotFound
-        )
-    )
-}
-
 async fn forward_cli_command(args: &[String]) -> Result<(), String> {
     match resolve_forwarding_target(args) {
         Ok(Some(ForwardingTarget::RuntimeSocket { socket_path })) => {
@@ -296,21 +280,12 @@ async fn forward_daemon_socket(
         source = ?source,
         "forwarding cli command to daemon socket"
     );
-    let Err(error) = forward_to_socket(socket_path, forwarded_args, true).await else {
-        return Ok(());
-    };
-    if should_fallback_to_local(source, &error) {
-        tracing::info!(
-            socket_path = %socket_path,
-            error = %error,
-            "daemon socket unavailable; falling back to local execution"
-        );
-        let _ = std::fs::remove_file(socket_path);
-        return Ok(());
-    }
-
-    tracing::warn!(socket_path = %socket_path, error = %error, "daemon socket forwarding failed");
-    Err(error.to_string())
+    forward_to_socket(socket_path, forwarded_args, true)
+        .await
+        .map_err(|error| {
+            tracing::warn!(socket_path = %socket_path, error = %error, "daemon socket forwarding failed");
+            error.to_string()
+        })
 }
 
 async fn forward_to_socket(
@@ -468,14 +443,14 @@ fn should_forward_runtime_stdin(args: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::os::unix::net::UnixListener as StdUnixListener;
     use std::sync::OnceLock;
 
     use super::{
         DaemonSocketSource, ForwardSocketError, ForwardingTarget, build_forward_socket_request,
         collect_forward_socket_stdin, collect_forwarded_stdin, exchange_forward_socket_request,
         forward_cli_command, forward_daemon_socket, forward_runtime_socket,
-        is_local_daemon_command, resolve_forwarding_target, should_fallback_to_local,
-        should_forward_runtime_stdin,
+        is_local_daemon_command, resolve_forwarding_target, should_forward_runtime_stdin,
     };
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
     use coco_llm::{
@@ -645,6 +620,24 @@ mod tests {
     }
 
     #[test]
+    fn missing_default_daemon_socket_keeps_local_mode() {
+        let runtime_dir = tempdir().unwrap();
+        let xdg_runtime_dir = runtime_dir.path().to_string_lossy().into_owned();
+
+        let target = with_env_vars(
+            &[
+                ("XDG_RUNTIME_DIR", Some(xdg_runtime_dir.as_str())),
+                (COCO_CLI_RUNTIME_SOCKET_ENV, None),
+                (COCO_DAEMON_SOCKET_ENV, None),
+            ],
+            || resolve_forwarding_target(&["session".to_owned(), "list".to_owned()]),
+        )
+        .unwrap();
+
+        assert_eq!(target, None);
+    }
+
+    #[test]
     fn store_path_keeps_local_mode_even_when_default_daemon_socket_exists() {
         let runtime_dir = tempdir().unwrap();
         let socket_dir = runtime_dir.path().join("coco");
@@ -758,20 +751,6 @@ mod tests {
         ]));
     }
 
-    #[test]
-    fn implicit_daemon_socket_falls_back_on_connection_refused() {
-        let error = ForwardSocketError::Connect {
-            socket_path: "/tmp/coco.sock".to_owned(),
-            source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-        };
-
-        assert!(should_fallback_to_local(
-            DaemonSocketSource::Implicit,
-            &error
-        ));
-        assert!(!should_fallback_to_local(DaemonSocketSource::Env, &error));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn forward_cli_command_reports_resolution_errors() {
         let error = with_env_vars_async(
@@ -823,19 +802,32 @@ mod tests {
         assert!(error.contains("missing-daemon.sock"));
     }
 
-    #[tokio::test]
-    async fn forward_daemon_socket_falls_back_for_implicit_connect_failure() {
-        let dir = tempdir().unwrap();
-        let socket_path = dir.path().join("missing-implicit.sock");
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_implicit_daemon_socket_does_not_fallback_to_local() {
+        let runtime_dir = tempdir().unwrap();
+        let socket_dir = runtime_dir.path().join("coco");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("coco-daemon.sock");
+        drop(StdUnixListener::bind(&socket_path).unwrap());
+        let xdg_runtime_dir = runtime_dir.path().to_string_lossy().into_owned();
 
-        let result = forward_daemon_socket(
-            socket_path.to_str().unwrap(),
-            &["session".to_owned(), "list".to_owned()],
-            DaemonSocketSource::Implicit,
+        let error = with_env_vars_async(
+            &[
+                ("XDG_RUNTIME_DIR", Some(xdg_runtime_dir.as_str())),
+                (COCO_CLI_RUNTIME_SOCKET_ENV, None),
+                (COCO_DAEMON_SOCKET_ENV, None),
+            ],
+            || async {
+                forward_cli_command(&["session".to_owned(), "list".to_owned()])
+                    .await
+                    .unwrap_err()
+            },
         )
         .await;
 
-        assert!(result.is_ok());
+        assert!(error.contains("failed to connect to coco-cli daemon socket"));
+        assert!(error.contains("coco-daemon.sock"));
+        assert!(socket_path.exists());
     }
 
     #[test]
