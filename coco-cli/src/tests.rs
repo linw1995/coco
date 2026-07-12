@@ -34,7 +34,7 @@ use crate::{
             DaemonServerOptions, ensure_initial_session, resume_incomplete_jobs,
             start_daemon_server,
         },
-        resolve_session_config, run_forwarded_with_services, run_with_backend,
+        resolve_session_config, run_forwarded_with_services,
         runtime::{ForwardedRuntimeInputs, RuntimeServices},
     },
     cli::{
@@ -674,7 +674,21 @@ fn llm_with_test_provider_config<B, S>(store: S, backend: B) -> Arc<coco_llm::Ll
     )
 }
 
-async fn run_with_backend_and_provider_profiles<B, R>(
+async fn run_command_with_backend<B, R>(
+    cli: Cli,
+    reader: &mut R,
+    backend: B,
+) -> crate::Result<Option<String>>
+where
+    B: CompletionBackend + 'static,
+    R: std::io::Read,
+{
+    // Command tests inject every runtime dependency instead of exercising the
+    // production composition root or daemon forwarding policy.
+    run_command_with_provider_profiles(cli, reader, backend, test_provider_profiles()).await
+}
+
+async fn run_command_with_provider_profiles<B, R>(
     cli: Cli,
     reader: &mut R,
     backend: B,
@@ -962,7 +976,7 @@ async fn prompt_uses_main_branch_by_default() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), None),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -973,7 +987,7 @@ async fn prompt_uses_main_branch_by_default() {
     )
     .await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         prompt_cli(store_path, None, &["hello"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("world")])]),
@@ -990,7 +1004,7 @@ async fn prompt_supports_explicit_branch_override() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("draft")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1001,7 +1015,7 @@ async fn prompt_supports_explicit_branch_override() {
     )
     .await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         prompt_cli(store_path, Some("draft"), &["hello"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("draft", &[Ok("world")])]),
@@ -1018,7 +1032,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1034,7 +1048,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
         .get_branch_head("main")
         .await
         .unwrap();
-    run_with_backend(
+    run_command_with_backend(
         session_fork_cli(store_path.clone(), "runner", Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1042,7 +1056,7 @@ async fn prompt_role_and_tool_flags_append_session_patch_anchor() {
     .await
     .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -1093,7 +1107,7 @@ async fn prompt_enable_all_tools_appends_all_tool_patch() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1103,7 +1117,7 @@ async fn prompt_enable_all_tools_appends_all_tool_patch() {
         },
     )
     .await;
-    run_with_backend(
+    run_command_with_backend(
         session_fork_cli(store_path.clone(), "runner", Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1111,7 +1125,7 @@ async fn prompt_enable_all_tools_appends_all_tool_patch() {
     .await
     .unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -1149,7 +1163,7 @@ async fn prompt_reads_text_from_stdin() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), None),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1160,7 +1174,7 @@ async fn prompt_reads_text_from_stdin() {
     )
     .await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         prompt_cli(store_path, None, &[]),
         &mut Cursor::new("hello from stdin\n"),
         FakeBackend::with_responses(&[("main", &[Ok("world")])]),
@@ -1175,7 +1189,7 @@ async fn prompt_reads_text_from_stdin() {
 async fn prompt_returns_missing_session_when_branch_does_not_exist() {
     let (_tempdir, store_path) = temp_store_path();
 
-    let error = run_with_backend(
+    let error = run_command_with_backend(
         prompt_cli(store_path, None, &["hello"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1194,7 +1208,7 @@ async fn prompt_persists_single_job_even_without_async() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1205,7 +1219,7 @@ async fn prompt_persists_single_job_even_without_async() {
     )
     .await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         prompt_cli(store_path.clone(), Some("main"), &["hello"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("done")])]),
@@ -1224,7 +1238,7 @@ async fn prompt_persists_single_job_even_without_async() {
         .unwrap();
     assert_eq!(jobs.len(), 1);
     let job_id = jobs.keys().next().unwrap().clone();
-    let status_text_output = run_with_backend(
+    let status_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -1246,7 +1260,7 @@ async fn prompt_persists_single_job_even_without_async() {
     assert!(status_text_output.contains("status: Finished"));
     assert!(status_text_output.contains("prompt: hello"));
 
-    let status_output = run_with_backend(
+    let status_output = run_command_with_backend(
         prompt_status_cli(store_path.clone(), &job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1263,7 +1277,7 @@ async fn prompt_persists_single_job_even_without_async() {
     assert!(value["base_node"]["node_id"].is_string());
     assert!(value["job"]["head"].is_string());
 
-    let list_output = run_with_backend(
+    let list_output = run_command_with_backend(
         prompt_list_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1284,14 +1298,14 @@ async fn prompt_async_defaults_to_text_and_supports_json() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("json")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1471,7 +1485,7 @@ async fn forwarded_runtime_async_prompt_without_daemon_worker_drives_in_process(
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1546,7 +1560,7 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1560,7 +1574,7 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     let store = open_store(&store_path).await.unwrap();
     let job = submit_prompt_job(&store, "main", "hello").await;
 
-    run_with_backend(
+    run_command_with_backend(
         prompt_worker_cli(store_path.clone(), &job.job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("main done")])]),
@@ -1568,7 +1582,7 @@ async fn prompt_worker_persists_job_results_and_status_queries() {
     .await
     .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         prompt_status_cli(store_path.clone(), &job.job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1593,7 +1607,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1625,7 +1639,7 @@ async fn prompt_status_json_preserves_shadow_parent_kind() {
         .unwrap();
     let job = store.submit_job("main", &prompt_anchor_id).await.unwrap();
 
-    let status_output = run_with_backend(
+    let status_output = run_command_with_backend(
         prompt_status_cli(store_path, &job.job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1647,7 +1661,7 @@ async fn prompt_status_reports_running_task_progress() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1673,7 +1687,7 @@ async fn prompt_status_reports_running_task_progress() {
         let backend = backend.clone();
         let job_id = job_id.clone();
         async move {
-            run_with_backend(
+            run_command_with_backend(
                 prompt_worker_cli(store_path, &job_id),
                 &mut Cursor::new(""),
                 backend,
@@ -1685,7 +1699,7 @@ async fn prompt_status_reports_running_task_progress() {
 
     started.notified().await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         prompt_status_cli(store_path.clone(), &job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1701,7 +1715,7 @@ async fn prompt_status_reports_running_task_progress() {
     release.notify_waiters();
     worker.await.unwrap();
 
-    let status_output = run_with_backend(
+    let status_output = run_command_with_backend(
         prompt_status_cli(store_path, &job_id),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1720,7 +1734,7 @@ async fn session_create_persists_branch_for_future_prompt_calls() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1734,7 +1748,7 @@ async fn session_create_persists_branch_for_future_prompt_calls() {
     let store = open_store(&store_path).await.unwrap();
     assert_eq!(store.get_branch_head("main").await.unwrap().len(), 64);
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         prompt_cli(store_path, Some("main"), &["hello"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("persisted")])]),
@@ -1751,7 +1765,7 @@ async fn session_fork_creates_active_branch_from_reference() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1769,7 +1783,7 @@ async fn session_fork_creates_active_branch_from_reference() {
         .await
         .unwrap();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -1793,7 +1807,7 @@ async fn session_fork_creates_active_branch_from_reference() {
     assert!(text_output.contains("branch: draft"));
     assert!(text_output.contains("state: active"));
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_fork_cli(store_path.clone(), "json-draft", Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1833,14 +1847,14 @@ async fn session_list_returns_sorted_branches_with_states() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("draft")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1854,7 +1868,7 @@ async fn session_list_returns_sorted_branches_with_states() {
     let store = open_store(&store_path).await.unwrap();
     let base_head_id = store.get_branch_head("main").await.unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         session_pr_cli(store_path.clone(), Some("draft"), "main"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1862,7 +1876,7 @@ async fn session_list_returns_sorted_branches_with_states() {
     .await
     .unwrap();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -1882,7 +1896,7 @@ async fn session_list_returns_sorted_branches_with_states() {
     assert!(text_output.contains("draft role=orchestrator"));
     assert!(text_output.contains("state=attached target=main"));
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_list_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -1922,7 +1936,7 @@ async fn session_get_returns_state_and_visible_anchor() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -1933,7 +1947,7 @@ async fn session_get_returns_state_and_visible_anchor() {
     )
     .await;
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -1955,7 +1969,7 @@ async fn session_get_returns_state_and_visible_anchor() {
     assert!(text_output.contains("branch: main"));
     assert!(text_output.contains("role: orchestrator"));
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_get_cli(store_path.clone(), Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2015,14 +2029,14 @@ async fn session_create_persists_additional_params() {
                 }),
             };
 
-            run_with_backend(cli, &mut Cursor::new(""), FakeBackend::with_responses(&[]))
+            run_command_with_backend(cli, &mut Cursor::new(""), FakeBackend::with_responses(&[]))
                 .await
                 .unwrap();
         },
     )
     .await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_get_cli(store_path, Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2046,7 +2060,7 @@ async fn session_create_uses_single_provider_profile_when_env_is_absent() {
     let (_tempdir, store_path) = temp_store_path();
 
     without_coco_env_async(&["COCO_PROVIDER", "COCO_MODEL"], || async {
-        run_with_backend(
+        run_command_with_backend(
             session_create_cli(store_path.clone(), Some("main")),
             &mut Cursor::new(""),
             FakeBackend::with_responses(&[]),
@@ -2056,7 +2070,7 @@ async fn session_create_uses_single_provider_profile_when_env_is_absent() {
     })
     .await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_get_cli(store_path, Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2074,7 +2088,7 @@ async fn session_create_uses_single_provider_profile_when_env_is_absent() {
 async fn session_graph_reports_empty_store() {
     let (_tempdir, store_path) = temp_store_path();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2085,7 +2099,7 @@ async fn session_graph_reports_empty_store() {
 
     assert_eq!(output, "No sessions found.");
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2114,7 +2128,7 @@ async fn session_graph_shows_branch_labels_on_head_node() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2125,7 +2139,7 @@ async fn session_graph_shows_branch_labels_on_head_node() {
     )
     .await;
 
-    run_with_backend(
+    run_command_with_backend(
         prompt_cli(store_path.clone(), Some("main"), &["hello", "world"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("assistant reply")])]),
@@ -2133,7 +2147,7 @@ async fn session_graph_shows_branch_labels_on_head_node() {
     .await
     .unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         session_fork_cli(store_path.clone(), "draft", Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2141,7 +2155,7 @@ async fn session_graph_shows_branch_labels_on_head_node() {
     .await
     .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2154,7 +2168,7 @@ async fn session_graph_shows_branch_labels_on_head_node() {
     assert!(!output.contains("assistant reply"));
     assert!(output.contains("* "));
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         session_graph_json_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2185,21 +2199,21 @@ async fn session_delete_removes_branch_and_session_state() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_fork_cli(store_path.clone(), "draft", Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_fork_cli(store_path.clone(), "json-draft", Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2210,7 +2224,7 @@ async fn session_delete_removes_branch_and_session_state() {
     )
     .await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_delete_cli(store_path.clone(), Some("draft")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2222,7 +2236,7 @@ async fn session_delete_removes_branch_and_session_state() {
     assert!(serde_json::from_str::<Value>(&output).is_err());
     assert_eq!(output, "deleted branch: draft");
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2261,7 +2275,7 @@ async fn session_rebase_updates_visible_session_config() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2279,7 +2293,7 @@ async fn session_rebase_updates_visible_session_config() {
         .await
         .unwrap();
 
-    let rebase_text_output = run_with_backend(
+    let rebase_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2313,7 +2327,7 @@ async fn session_rebase_updates_visible_session_config() {
     assert!(rebase_text_output.contains("branch: main"));
     assert!(rebase_text_output.contains("head_id: "));
 
-    let rebase_output = run_with_backend(
+    let rebase_output = run_command_with_backend(
         session_rebase_cli(store_path.clone(), Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2326,7 +2340,7 @@ async fn session_rebase_updates_visible_session_config() {
     assert_eq!(rebase_value["branch"], "main");
     assert_ne!(rebase_value["head_id"], json!(original_head));
 
-    let get_output = run_with_backend(
+    let get_output = run_command_with_backend(
         session_get_cli(store_path.clone(), Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2347,7 +2361,7 @@ async fn session_rebase_updates_visible_session_config() {
     assert_eq!(value["anchor"]["tools"], json!([]));
     assert_eq!(value["anchor"]["enable_coco_shim"], true);
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2366,7 +2380,7 @@ async fn session_rebase_updates_visible_session_config() {
     .await
     .unwrap();
 
-    let disabled_output = run_with_backend(
+    let disabled_output = run_command_with_backend(
         session_get_cli(store_path, Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2384,7 +2398,7 @@ async fn session_handoff_appends_inherited_session_anchor() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2394,7 +2408,7 @@ async fn session_handoff_appends_inherited_session_anchor() {
         },
     )
     .await;
-    run_with_backend(
+    run_command_with_backend(
         prompt_cli(store_path.clone(), Some("main"), &["round one"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("first")])]),
@@ -2408,7 +2422,7 @@ async fn session_handoff_appends_inherited_session_anchor() {
         .await
         .unwrap();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2431,7 +2445,7 @@ async fn session_handoff_appends_inherited_session_anchor() {
     assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
     assert!(text_output.starts_with("head: "));
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_handoff_cli(store_path.clone(), Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2465,7 +2479,7 @@ async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2490,7 +2504,7 @@ async fn session_handoff_refreshes_inherited_builtin_tool_definitions_by_default
         .await
         .unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2525,7 +2539,7 @@ async fn session_handoff_can_preserve_inherited_tool_definitions() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2550,7 +2564,7 @@ async fn session_handoff_can_preserve_inherited_tool_definitions() {
         .await
         .unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2585,14 +2599,14 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("json")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2605,7 +2619,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
 
     let store = open_store(&store_path).await.unwrap();
 
-    let pr_text_output = run_with_backend(
+    let pr_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2630,7 +2644,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
     assert!(pr_text_output.contains("state: attached target=main"));
 
     let json_base_head_id = store.get_branch_head("main").await.unwrap();
-    let pr_output = run_with_backend(
+    let pr_output = run_command_with_backend(
         session_pr_cli(store_path.clone(), Some("json"), "main"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2653,7 +2667,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
         })
     );
 
-    let close_output = run_with_backend(
+    let close_output = run_command_with_backend(
         session_close_cli(store_path.clone(), Some("main"), "main"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2668,7 +2682,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
         "branch: main\nstate: paused target=main reason=closed"
     );
 
-    let reopen_output = run_with_backend(
+    let reopen_output = run_command_with_backend(
         session_reopen_cli(store_path.clone(), Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2690,7 +2704,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
         SessionState::Active
     );
 
-    let close_json_output = run_with_backend(
+    let close_json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2724,7 +2738,7 @@ async fn session_pr_close_and_reopen_commands_update_persisted_state() {
         })
     );
 
-    let reopen_json_output = run_with_backend(
+    let reopen_json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2758,21 +2772,21 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("base")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("text")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -2783,14 +2797,14 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     )
     .await;
 
-    run_with_backend(
+    run_command_with_backend(
         session_pr_cli(store_path.clone(), Some("main"), "base"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
     .await
     .unwrap();
-    run_with_backend(
+    run_command_with_backend(
         session_pr_cli(store_path.clone(), Some("text"), "base"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2801,7 +2815,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
     let store = open_store(&store_path).await.unwrap();
     let source_head_id = store.get_branch_head("main").await.unwrap();
 
-    let merge_text_output = run_with_backend(
+    let merge_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2832,7 +2846,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         .await
         .unwrap();
 
-    let merge_output = run_with_backend(
+    let merge_output = run_command_with_backend(
         session_merge_cli(store_path.clone(), Some("main"), None, "handoff to base"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -2890,7 +2904,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         .unwrap();
 
     let main_head_before_feedback = store.get_branch_head("main").await.unwrap();
-    let feedback_output = run_with_backend(
+    let feedback_output = run_command_with_backend(
         session_feedback_cli(
             store_path.clone(),
             Some("main"),
@@ -2964,7 +2978,7 @@ async fn session_merge_and_feedback_commands_create_handoff_anchors() {
         .await
         .unwrap();
 
-    let feedback_text_output = run_with_backend(
+    let feedback_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -2998,14 +3012,14 @@ async fn session_graph_renders_global_dag_with_non_anchor_merge_parent() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("base")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3016,7 +3030,7 @@ async fn session_graph_renders_global_dag_with_non_anchor_merge_parent() {
     )
     .await;
 
-    run_with_backend(
+    run_command_with_backend(
         prompt_cli(store_path.clone(), Some("main"), &["hello", "world"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("assistant reply")])]),
@@ -3024,14 +3038,14 @@ async fn session_graph_renders_global_dag_with_non_anchor_merge_parent() {
     .await
     .unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         session_pr_cli(store_path.clone(), Some("main"), "base"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
     )
     .await
     .unwrap();
-    run_with_backend(
+    run_command_with_backend(
         session_merge_cli(store_path.clone(), Some("main"), None, "handoff to base"),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3039,7 +3053,7 @@ async fn session_graph_renders_global_dag_with_non_anchor_merge_parent() {
     .await
     .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_all_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3060,14 +3074,14 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_fork_cli(store_path.clone(), "draft", Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3095,7 +3109,7 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
         .await
         .unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         session_delete_cli(store_path.clone(), Some("draft")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3112,7 +3126,7 @@ async fn session_graph_keeps_merge_parent_visible_after_source_branch_delete() {
         .await
         .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3132,7 +3146,7 @@ async fn session_graph_shows_tool_and_failure_nodes() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3161,7 +3175,7 @@ async fn session_graph_shows_tool_and_failure_nodes() {
         .await
         .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3176,7 +3190,7 @@ async fn session_graph_shows_tool_and_failure_nodes() {
     assert!(!output.contains("tool_result"));
     assert!(!output.contains("command failed"));
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         session_graph_json_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3191,7 +3205,7 @@ async fn session_graph_shows_tool_and_failure_nodes() {
     assert!(graph_entry_has_label(session_entry, "main"));
     assert_eq!(session_entry["primary_parent"], Value::Null);
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         session_graph_all_json_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3217,7 +3231,7 @@ async fn session_graph_shows_tool_and_failure_nodes() {
         "Failure"
     );
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_all_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3237,7 +3251,7 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3261,7 +3275,7 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
         .await
         .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3286,7 +3300,7 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     .to_owned();
     assert_eq!(output, expected_output);
 
-    let all_output = run_with_backend(
+    let all_output = run_command_with_backend(
         session_graph_all_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3322,7 +3336,7 @@ async fn session_graph_defaults_to_last_provider_context_and_all_preserves_full_
     .to_owned();
     assert_eq!(all_output, expected_all_output);
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         session_graph_all_json_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3355,14 +3369,14 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_fork_cli(store_path.clone(), "draft", Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3394,7 +3408,7 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
         .await
         .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3427,7 +3441,7 @@ async fn session_graph_anchor_only_renders_connectors_through_hidden_nodes() {
     .to_owned();
     assert_eq!(output, expected_output);
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         session_graph_json_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3457,7 +3471,7 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3465,7 +3479,7 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
             .await
             .unwrap();
             for branch in ["alpha", "beta", "gamma"] {
-                run_with_backend(
+                run_command_with_backend(
                     session_fork_cli(store_path.clone(), branch, Some("main")),
                     &mut Cursor::new(""),
                     FakeBackend::with_responses(&[]),
@@ -3517,7 +3531,7 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
         .await
         .unwrap();
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3557,7 +3571,7 @@ async fn session_graph_anchor_only_renders_multi_branch_fanin_through_hidden_nod
     .to_owned();
     assert_eq!(output, expected_output);
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         session_graph_json_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3597,7 +3611,7 @@ async fn session_graph_and_show_render_skill_result_anchor() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3628,7 +3642,7 @@ async fn session_graph_and_show_render_skill_result_anchor() {
         .await
         .unwrap();
 
-    let graph_output = run_with_backend(
+    let graph_output = run_command_with_backend(
         session_graph_all_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3648,7 +3662,7 @@ async fn session_graph_and_show_render_skill_result_anchor() {
         .expect("expected tool_use line");
     assert!(skill_result_line < tool_use_line);
 
-    let show_output = run_with_backend(
+    let show_output = run_command_with_backend(
         session_show_cli(store_path, "main", false),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3667,7 +3681,7 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3708,7 +3722,7 @@ async fn session_graph_places_skill_child_branch_on_the_right() {
         .await
         .unwrap();
 
-    let graph_output = run_with_backend(
+    let graph_output = run_command_with_backend(
         session_graph_all_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3735,7 +3749,7 @@ async fn session_show_resolves_branch_to_head_node_text_output() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3746,7 +3760,7 @@ async fn session_show_resolves_branch_to_head_node_text_output() {
     )
     .await;
 
-    run_with_backend(
+    run_command_with_backend(
         prompt_cli(store_path.clone(), Some("main"), &["hello"]),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[("main", &[Ok("assistant reply")])]),
@@ -3760,7 +3774,7 @@ async fn session_show_resolves_branch_to_head_node_text_output() {
         .get_branch_head("main")
         .await
         .unwrap();
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_show_cli(store_path, "main", false),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3782,7 +3796,7 @@ async fn session_show_outputs_json_for_node_id_reference() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3800,7 +3814,7 @@ async fn session_show_outputs_json_for_node_id_reference() {
         .await
         .unwrap();
     let prefix = &head_id[..12];
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_show_cli(store_path, prefix, true),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3823,7 +3837,7 @@ async fn session_show_outputs_children_ids_for_primary_and_merge_edges() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3840,7 +3854,7 @@ async fn session_show_outputs_children_ids_for_primary_and_merge_edges() {
     let merge_child_id =
         append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_show_cli(store_path, &session_id, false),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3858,7 +3872,7 @@ async fn session_show_json_includes_children_ids() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3875,7 +3889,7 @@ async fn session_show_json_includes_children_ids() {
     let merge_child_id =
         append_prompt_anchor(&store, &primary_child_id, "merge child", &[&session_id]).await;
 
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_show_cli(store_path, &session_id[..12], true),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3894,7 +3908,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -3929,7 +3943,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
         .await
         .unwrap();
 
-    let show_text = run_with_backend(
+    let show_text = run_command_with_backend(
         session_show_cli(store_path.clone(), &shadow_anchor_id, false),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3939,7 +3953,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     .unwrap();
     assert!(show_text.contains(&format!("merge_parents: [shadow:{shadow_parent}]")));
 
-    let show_json = run_with_backend(
+    let show_json = run_command_with_backend(
         session_show_cli(store_path.clone(), &shadow_anchor_id, true),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3953,7 +3967,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
         json!([{"kind": "shadow", "node_id": shadow_parent}])
     );
 
-    let graph_text = run_with_backend(
+    let graph_text = run_command_with_backend(
         session_graph_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3965,7 +3979,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     assert!(!graph_text.contains("shadow=["));
     assert!(!graph_text.contains("exec_command"));
 
-    let graph_json = run_with_backend(
+    let graph_json = run_command_with_backend(
         session_graph_json_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3987,7 +4001,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     assert_eq!(shadow_anchor_entry["primary_parent"], session_id);
     assert_eq!(shadow_anchor_entry["merge_parents"], json!([]));
 
-    let graph_text = run_with_backend(
+    let graph_text = run_command_with_backend(
         session_graph_all_cli(store_path.clone()),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -3997,7 +4011,7 @@ async fn session_show_and_graph_preserve_shadow_parent_kind() {
     .unwrap();
     assert!(graph_text.contains("shadow=["));
 
-    let graph_json = run_with_backend(
+    let graph_json = run_command_with_backend(
         session_graph_all_json_cli(store_path),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -4017,14 +4031,14 @@ async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
             )
             .await
             .unwrap();
-            run_with_backend(
+            run_command_with_backend(
                 session_fork_cli(store_path.clone(), "draft", Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -4043,7 +4057,7 @@ async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
         .await
         .unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         session_delete_cli(store_path.clone(), Some("draft")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -4052,7 +4066,7 @@ async fn session_show_resolves_short_node_prefix_after_source_branch_delete() {
     .unwrap();
 
     let prefix = &draft_node_id[..8];
-    let output = run_with_backend(
+    let output = run_command_with_backend(
         session_show_cli(store_path, prefix, false),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -4087,7 +4101,7 @@ async fn session_show_reports_ambiguous_short_node_prefix() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -4123,7 +4137,7 @@ async fn session_show_reports_ambiguous_short_node_prefix() {
         .find_map(|(prefix, matches)| (matches.len() > 1).then_some((prefix, matches)))
         .expect("expected at least one ambiguous one-character prefix");
 
-    let err = run_with_backend(
+    let err = run_command_with_backend(
         session_show_cli(store_path, &prefix, false),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -4259,7 +4273,7 @@ async fn skill_add_defaults_to_text_and_supports_json() {
     let skill_file = store_path.with_file_name("skill-add.md");
     fs::write(&skill_file, "# skill\n").unwrap();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4287,7 +4301,7 @@ async fn skill_add_defaults_to_text_and_supports_json() {
     assert!(text_output.contains("name: text-skill"));
     assert!(text_output.contains("current_version: 1"));
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4331,7 +4345,7 @@ async fn skill_add_and_update_manage_script_assets() {
     .unwrap();
     fs::write(scripts_dir.join("inspect.py.lock"), "version = 1\n").unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4356,7 +4370,7 @@ async fn skill_add_and_update_manage_script_assets() {
     .await
     .unwrap();
 
-    let show_output = run_with_backend(
+    let show_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4392,7 +4406,7 @@ async fn skill_add_and_update_manage_script_assets() {
         "scripts/inspect.py.lock"
     );
 
-    let update_output = run_with_backend(
+    let update_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4424,7 +4438,7 @@ async fn skill_commands_manage_versions_in_store() {
     let skill_name = "custom-orchestrator";
     fs::write(&skill_file, "# v1\n").unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4449,7 +4463,7 @@ async fn skill_commands_manage_versions_in_store() {
     .unwrap();
 
     fs::write(&skill_file, "# v2\n").unwrap();
-    let update_output = run_with_backend(
+    let update_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4477,7 +4491,7 @@ async fn skill_commands_manage_versions_in_store() {
     assert_eq!(update_json["current_version"], 2);
     assert_eq!(update_json["available_versions"], json!([1, 2]));
 
-    let rollback_output = run_with_backend(
+    let rollback_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4503,7 +4517,7 @@ async fn skill_commands_manage_versions_in_store() {
     assert_eq!(rollback_json["current_version"], 3);
     assert_eq!(rollback_json["available_versions"], json!([1, 2, 3]));
 
-    let show_output = run_with_backend(
+    let show_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4534,7 +4548,7 @@ async fn skill_update_defaults_to_text_and_supports_json() {
     let skill_file = store_path.with_file_name("skill-update.md");
     fs::write(&skill_file, "# v1\n").unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4558,7 +4572,7 @@ async fn skill_update_defaults_to_text_and_supports_json() {
     .unwrap();
 
     fs::write(&skill_file, "# v2\n").unwrap();
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4586,7 +4600,7 @@ async fn skill_update_defaults_to_text_and_supports_json() {
     assert!(text_output.contains("name: update-skill"));
     assert!(text_output.contains("current_version: 2"));
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4620,7 +4634,7 @@ async fn skill_rollback_defaults_to_text_and_supports_json() {
     let skill_file = store_path.with_file_name("skill-rollback.md");
     fs::write(&skill_file, "# v1\n").unwrap();
 
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4644,7 +4658,7 @@ async fn skill_rollback_defaults_to_text_and_supports_json() {
     .unwrap();
 
     fs::write(&skill_file, "# v2\n").unwrap();
-    run_with_backend(
+    run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4667,7 +4681,7 @@ async fn skill_rollback_defaults_to_text_and_supports_json() {
     .await
     .unwrap();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4693,7 +4707,7 @@ async fn skill_rollback_defaults_to_text_and_supports_json() {
     assert!(text_output.contains("name: rollback-skill"));
     assert!(text_output.contains("current_version: 3"));
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4725,7 +4739,7 @@ async fn skill_rollback_defaults_to_text_and_supports_json() {
 async fn skill_show_reads_default_initialized_skill() {
     let (_tempdir, store_path) = temp_store_path();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4749,7 +4763,7 @@ async fn skill_show_reads_default_initialized_skill() {
     assert!(text_output.contains("name: coco-runner"));
     assert!(text_output.contains("current_version: 1"));
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4779,7 +4793,7 @@ async fn skill_show_reads_default_initialized_skill() {
 async fn skill_list_defaults_to_text_and_supports_json() {
     let (_tempdir, store_path) = temp_store_path();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4800,7 +4814,7 @@ async fn skill_list_defaults_to_text_and_supports_json() {
     assert!(text_output.contains("new-skill"));
     assert!(text_output.contains("coco-runner"));
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -4985,7 +4999,7 @@ async fn preset_can_reference_provider_profile_id() {
         Some("gpt-4.1-mini"),
     )]));
 
-    let text_output = run_with_backend_and_provider_profiles(
+    let text_output = run_command_with_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5015,7 +5029,7 @@ async fn preset_can_reference_provider_profile_id() {
     assert!(text_output.contains("profile=work-openai"));
     assert!(text_output.contains("model=gpt-4.1-mini"));
 
-    let json_output = run_with_backend_and_provider_profiles(
+    let json_output = run_command_with_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5060,7 +5074,7 @@ async fn preset_commands_manage_versions_in_store() {
         provider_profile("anthropic", "anthropic", "${ANTHROPIC_API_KEY}", None, None),
     ]));
 
-    let first_output = run_with_backend_and_provider_profiles(
+    let first_output = run_command_with_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5107,7 +5121,7 @@ async fn preset_commands_manage_versions_in_store() {
     );
     assert_eq!(first_json["config"]["tools"][0]["name"], "exec_command");
 
-    let second_output = run_with_backend_and_provider_profiles(
+    let second_output = run_command_with_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5158,7 +5172,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(persisted.max_tokens, None);
     assert_eq!(persisted.additional_params, None);
 
-    let list_text_output = run_with_backend(
+    let list_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5177,7 +5191,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert!(serde_json::from_str::<serde_json::Value>(&list_text_output).is_err());
     assert!(list_text_output.contains("coding current=2"));
 
-    let list_output = run_with_backend(
+    let list_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5197,7 +5211,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(list_json.as_array().unwrap().len(), 1);
     assert_eq!(list_json[0]["name"], preset_name);
 
-    let show_text_output = run_with_backend(
+    let show_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5219,7 +5233,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert!(show_text_output.contains("name: coding"));
     assert!(show_text_output.contains("current_version: 2"));
 
-    let show_output = run_with_backend(
+    let show_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5244,7 +5258,7 @@ async fn preset_commands_manage_versions_in_store() {
         "claude-sonnet-4-20250514"
     );
 
-    let rollback_text_output = run_with_backend(
+    let rollback_text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5268,7 +5282,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert!(rollback_text_output.contains("name: coding"));
     assert!(rollback_text_output.contains("current_version: 3"));
 
-    let rollback_output = run_with_backend(
+    let rollback_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5292,7 +5306,7 @@ async fn preset_commands_manage_versions_in_store() {
     assert_eq!(rollback_json["current_version"], 4);
     assert_eq!(rollback_json["config"]["model"], "claude-sonnet-4-20250514");
 
-    let delete_output = run_with_backend(
+    let delete_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5336,7 +5350,7 @@ async fn preset_delete_defaults_to_text_and_supports_json() {
         Some("gpt-4.1-mini"),
     )]));
 
-    run_with_backend_and_provider_profiles(
+    run_command_with_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5360,7 +5374,7 @@ async fn preset_delete_defaults_to_text_and_supports_json() {
     .await
     .unwrap();
 
-    let text_output = run_with_backend(
+    let text_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5381,7 +5395,7 @@ async fn preset_delete_defaults_to_text_and_supports_json() {
     assert!(serde_json::from_str::<serde_json::Value>(&text_output).is_err());
     assert_eq!(text_output, "deleted preset: delete-text");
 
-    run_with_backend_and_provider_profiles(
+    run_command_with_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5405,7 +5419,7 @@ async fn preset_delete_defaults_to_text_and_supports_json() {
     .await
     .unwrap();
 
-    let json_output = run_with_backend(
+    let json_output = run_command_with_backend(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5436,7 +5450,7 @@ async fn session_rebase_applies_preset_patch() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -5455,7 +5469,7 @@ async fn session_rebase_applies_preset_patch() {
         None,
     )]));
 
-    run_with_backend_and_provider_profiles(
+    run_command_with_provider_profiles(
         Cli {
             daemon_socket: None,
             store_path: store_path.clone(),
@@ -5485,7 +5499,7 @@ async fn session_rebase_applies_preset_patch() {
     .await
     .unwrap();
 
-    let output = run_with_backend_and_provider_profiles(
+    let output = run_command_with_provider_profiles(
         Cli::try_parse_from([
             "coco-cli",
             "--store-path",
@@ -5510,7 +5524,7 @@ async fn session_rebase_applies_preset_patch() {
     assert_eq!(value["branch"], "main");
     assert!(value["head_id"].as_str().is_some());
 
-    let session_output = run_with_backend(
+    let session_output = run_command_with_backend(
         session_get_cli(store_path, Some("main")),
         &mut Cursor::new(""),
         FakeBackend::with_responses(&[]),
@@ -5541,7 +5555,7 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("draft")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -5587,7 +5601,7 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("draft")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -5655,7 +5669,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -5778,7 +5792,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -5893,7 +5907,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -5944,7 +5958,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -6270,7 +6284,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
@@ -6503,7 +6517,7 @@ async fn daemon_startup_resumes_incomplete_jobs() {
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
         || async {
-            run_with_backend(
+            run_command_with_backend(
                 session_create_cli(store_path.clone(), Some("main")),
                 &mut Cursor::new(""),
                 FakeBackend::with_responses(&[]),
