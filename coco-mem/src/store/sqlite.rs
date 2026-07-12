@@ -45,7 +45,7 @@ use crate::schema::{
     node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
     node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_metadata,
     node_relations, node_tool_results, node_tool_uses, nodes, preset_version_tools,
-    preset_versions, presets, sessions, skill_version_scripts, skill_versions, skills, store_meta,
+    preset_versions, presets, sessions, skill_version_scripts, skill_versions, skills,
 };
 use crate::{
     Anchor, AnchorPayload, AnchorPayloadKind, BackendMetadata, Job, JobStatus, Kind, MergeParent,
@@ -58,9 +58,10 @@ use crate::{
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "store.sqlite3";
-const SQLITE_SCHEMA_VERSION: i32 = 22;
+const SQLITE_SCHEMA_VERSION: i32 = 23;
 const MIN_SUPPORTED_SQLITE_SCHEMA_VERSION: i32 = 6;
 const NODE_ITEM_EXPANSION_SCHEMA_VERSION: i32 = 7;
+const STORE_META_REMOVAL_SCHEMA_VERSION: i32 = 23;
 const DIESEL_MIGRATION_TABLE_NAME: &str = "__diesel_schema_migrations";
 const FS_MIGRATION_COMPLETE_META_KEY: &str = "fs_migration_complete";
 const NODE_ITEM_ROWS_BACKFILL_META_KEY: &str = "node_items_backfilled";
@@ -77,6 +78,14 @@ diesel::table! {
     __diesel_schema_migrations (version) {
         version -> Text,
         run_on -> Text,
+    }
+}
+
+diesel::table! {
+    #[sql_name = "store_meta"]
+    legacy_store_meta (key) {
+        key -> Text,
+        value_json -> Text,
     }
 }
 
@@ -796,14 +805,7 @@ impl SqliteStore {
         configure_writable_connection(&mut connection, &self.database_path).await?;
         reject_unsupported_schema_version(&mut connection, &self.database_path).await?;
         let before_version = current_schema_version(&mut connection, &self.database_path).await?;
-        let backfill_complete = if before_version
-            .is_some_and(|version| version >= NODE_ITEM_EXPANSION_SCHEMA_VERSION)
-        {
-            node_item_rows_backfill_complete(&mut connection, &self.database_path).await?
-        } else {
-            false
-        };
-        let needs_migration = before_version != Some(SQLITE_SCHEMA_VERSION) || !backfill_complete;
+        let needs_migration = before_version != Some(SQLITE_SCHEMA_VERSION);
         if needs_migration {
             tracing::info!(
                 path = %self.database_path.display(),
@@ -847,13 +849,6 @@ impl SqliteStore {
                 ),
             }
         );
-        ensure!(
-            node_item_rows_backfill_complete(&mut connection, &self.database_path).await?,
-            CorruptedStoreSnafu {
-                path: self.database_path.clone(),
-                message: "SQLite node item row migration is incomplete; open the store writable to finish migration".to_owned(),
-            }
-        );
         Ok(())
     }
 
@@ -869,11 +864,7 @@ impl SqliteStore {
             })
             .await?;
         ensure_supported_schema_version(version, &store.database_path)?;
-        if version < SQLITE_SCHEMA_VERSION {
-            return Ok(true);
-        }
-        let mut connection = store.connect().await?;
-        Ok(!node_item_rows_backfill_complete(&mut connection, &store.database_path).await?)
+        Ok(version < SQLITE_SCHEMA_VERSION)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -895,9 +886,6 @@ impl SqliteStore {
             let root_id = root.id.clone();
             connection
                 .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
-                    persist_root_metadata(connection, &self.database_path, &root_id)
-                        .await
-                        .map_err(SqliteTransactionError::Operation)?;
                     persist_node_without_transaction(connection, &self.database_path, &root)
                         .await
                         .map_err(SqliteTransactionError::Operation)
@@ -964,13 +952,6 @@ impl SqliteGraphStore {
                 message: format!(
                     "unsupported SQLite schema version {version}, expected {SQLITE_SCHEMA_VERSION}"
                 ),
-            }
-        );
-        ensure!(
-            node_item_rows_backfill_complete(&mut connection, &self.database_path).await?,
-            CorruptedStoreSnafu {
-                path: self.database_path.clone(),
-                message: "SQLite node item row migration is incomplete; open the store writable to finish migration".to_owned(),
             }
         );
         Ok(())
@@ -1215,7 +1196,7 @@ async fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
     }
 
     let database_path = sqlite_database_path(path);
-    if database_path.is_file() && fs_migration_complete_marker_exists(path).await? {
+    if database_path.is_file() && sqlite_store_replaces_legacy_json_store(path).await? {
         return Ok(());
     }
 
@@ -1225,9 +1206,15 @@ async fn reject_incomplete_legacy_json_store(path: &Path) -> Result<()> {
     .fail()
 }
 
-async fn fs_migration_complete_marker_exists(path: &Path) -> Result<bool> {
+async fn sqlite_store_replaces_legacy_json_store(path: &Path) -> Result<bool> {
     let store = SqliteStore::new(path, StoreAccess::ReadOnly).await?;
     let mut connection = store.connect().await?;
+    if current_schema_version(&mut connection, &store.database_path)
+        .await?
+        .is_some_and(|version| version >= STORE_META_REMOVAL_SCHEMA_VERSION)
+    {
+        return Ok(true);
+    }
     load_store_meta_bool(
         &mut connection,
         &store.database_path,
@@ -1455,16 +1442,11 @@ async fn backfill_node_item_rows_with_progress(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
-    if node_item_rows_backfill_complete(connection, path).await? {
+    if current_schema_version(connection, path).await? != Some(NODE_ITEM_EXPANSION_SCHEMA_VERSION) {
         return Ok(());
     }
-    if current_schema_version(connection, path).await? > Some(NODE_ITEM_EXPANSION_SCHEMA_VERSION) {
-        return CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: "missing node item backfill marker after legacy columns were removed"
-                .to_owned(),
-        }
-        .fail();
+    if node_item_rows_backfill_complete(connection, path).await? {
+        return Ok(());
     }
 
     let total = nodes::table
@@ -1733,31 +1715,6 @@ async fn node_count(connection: &mut AsyncSqliteConnection, path: &Path) -> Resu
         })
 }
 
-async fn persist_root_metadata(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    root_id: &str,
-) -> Result<()> {
-    let root_json = serde_json::to_string(root_id).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: "store_meta.root_id".to_owned(),
-    })?;
-    diesel::insert_into(store_meta::table)
-        .values((
-            store_meta::key.eq("root_id"),
-            store_meta::value_json.eq(root_json),
-        ))
-        .on_conflict(store_meta::key)
-        .do_update()
-        .set(store_meta::value_json.eq(diesel::upsert::excluded(store_meta::value_json)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-    Ok(())
-}
-
 async fn persist_store_meta_bool(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -1768,14 +1725,17 @@ async fn persist_store_meta_bool(
         path: path.to_owned(),
         column: format!("store_meta.{key}"),
     })?;
-    diesel::insert_into(store_meta::table)
+    diesel::insert_into(legacy_store_meta::table)
         .values((
-            store_meta::key.eq(key),
-            store_meta::value_json.eq(value_json),
+            legacy_store_meta::key.eq(key),
+            legacy_store_meta::value_json.eq(value_json),
         ))
-        .on_conflict(store_meta::key)
+        .on_conflict(legacy_store_meta::key)
         .do_update()
-        .set(store_meta::value_json.eq(diesel::upsert::excluded(store_meta::value_json)))
+        .set(
+            legacy_store_meta::value_json
+                .eq(diesel::upsert::excluded(legacy_store_meta::value_json)),
+        )
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -1799,9 +1759,9 @@ async fn load_store_meta_bool(
     if table_count(connection, path, "store_meta").await? == 0 {
         return Ok(false);
     }
-    let Some(value) = store_meta::table
-        .filter(store_meta::key.eq(key))
-        .select(store_meta::value_json)
+    let Some(value) = legacy_store_meta::table
+        .filter(legacy_store_meta::key.eq(key))
+        .select(legacy_store_meta::value_json)
         .first::<String>(connection)
         .await
         .optional()
@@ -1818,26 +1778,28 @@ async fn load_store_meta_bool(
 }
 
 async fn load_root_id(connection: &mut AsyncSqliteConnection, path: &Path) -> Result<String> {
-    let Some(value) = store_meta::table
-        .filter(store_meta::key.eq("root_id"))
-        .select(store_meta::value_json)
-        .first::<String>(connection)
+    let root_ids = nodes::table
+        .filter(nodes::parent_id.eq(""))
+        .select(nodes::id)
+        .limit(2)
+        .load::<String>(connection)
         .await
-        .optional()
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
-        })?
-    else {
-        return CorruptedStoreSnafu {
+        })?;
+    match root_ids.as_slice() {
+        [root_id] => Ok(root_id.clone()),
+        [] => CorruptedStoreSnafu {
             path: path.to_owned(),
-            message: "missing SQLite root metadata".to_owned(),
+            message: "missing SQLite root node".to_owned(),
         }
-        .fail();
-    };
-    serde_json::from_str(&value).context(ParseSqliteStoreValueSnafu {
-        path: path.to_owned(),
-        column: "store_meta.root_id".to_owned(),
-    })
+        .fail(),
+        _ => CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "multiple SQLite root nodes".to_owned(),
+        }
+        .fail(),
+    }
 }
 
 async fn load_node_metadata_rows_for_ids(
@@ -7419,14 +7381,14 @@ mod tests {
         MessageQueueItem, NodeAnchorPromptAttachmentRow, NodeAnchorSessionPatchRow,
         NodeAnchorSessionPatchToolRow, NodeAnchorSessionRow, NodeAnchorSessionToolRow,
         NodeAnchorSkillInvocationRow, NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow,
-        NodeToolUseRow, SqliteGraphStore, SqliteStore,
+        NodeToolUseRow, SqliteGraphStore, SqliteStore, legacy_store_meta,
     };
     use crate::schema::{
         jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
         node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
         node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_relations,
         node_tool_results, node_tool_uses, nodes, preset_version_tools, preset_versions, sessions,
-        skill_version_scripts, skill_versions, store_meta,
+        skill_version_scripts, skill_versions,
     };
     use crate::{
         Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
@@ -8126,22 +8088,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn persist_store_meta_bool_for_test(store: &SqliteStore, key: &str, value: bool) {
-        let value_json = serde_json::to_string(&value).unwrap();
-        let mut connection = store.connect().await.unwrap();
-        diesel::insert_into(store_meta::table)
-            .values((
-                store_meta::key.eq(key),
-                store_meta::value_json.eq(value_json),
-            ))
-            .on_conflict(store_meta::key)
-            .do_update()
-            .set(store_meta::value_json.eq(diesel::upsert::excluded(store_meta::value_json)))
-            .execute(&mut connection)
-            .await
-            .unwrap();
-    }
-
     fn create_diesel_migration_metadata_for_test(path: &std::path::Path, version: &str) {
         use diesel::connection::SimpleConnection;
 
@@ -8277,12 +8223,13 @@ mod tests {
         let store = SqliteStore::open(&path).await.unwrap();
 
         assert!(store.database_path().is_file());
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
         assert!(!nodes_have_anchor_columns(&store).await);
         assert!(!node_has_kind_json_column(&store).await);
         assert!(!node_anchor_table_exists(&store).await);
         assert!(!table_exists(&store, "node_anchor_prompts").await);
         assert!(!job_has_payload_json_column(&store).await);
+        assert!(!table_exists(&store, "store_meta").await);
     }
 
     #[tokio::test]
@@ -8293,8 +8240,9 @@ mod tests {
 
         let store = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
         assert!(!nodes_have_anchor_columns(&store).await);
+        assert!(!table_exists(&store, "store_meta").await);
         assert_eq!(
             node_tool_use_rows(&store, "tool-use-node").await,
             vec![
@@ -8400,6 +8348,78 @@ mod tests {
         )
         .unwrap();
         assert!(row.metadata_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn open_upgrades_v22_without_node_item_backfill_marker() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        drop(store);
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        let marker = diesel::RunQueryDsl::get_result::<String>(
+            legacy_store_meta::table
+                .filter(legacy_store_meta::key.eq(super::NODE_ITEM_ROWS_BACKFILL_META_KEY))
+                .select(legacy_store_meta::value_json),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(marker, "true");
+        diesel::RunQueryDsl::execute(
+            diesel::delete(
+                legacy_store_meta::table
+                    .filter(legacy_store_meta::key.eq(super::NODE_ITEM_ROWS_BACKFILL_META_KEY)),
+            ),
+            &mut connection,
+        )
+        .unwrap();
+        drop(connection);
+
+        let reopened = SqliteStore::open(&path).await.unwrap();
+
+        assert_eq!(reopened.schema_version().await.unwrap(), 23);
+        assert!(!table_exists(&reopened, "store_meta").await);
+    }
+
+    #[tokio::test]
+    async fn store_meta_migration_requires_matching_root_id() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
+        drop(store);
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        diesel::RunQueryDsl::execute(
+            diesel::update(legacy_store_meta::table.filter(legacy_store_meta::key.eq("root_id")))
+                .set(legacy_store_meta::value_json.eq(r#""missing""#)),
+            &mut connection,
+        )
+        .unwrap();
+
+        let error = connection
+            .run_next_migration(super::STORE_MIGRATIONS)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("CHECK constraint failed"));
+        let root_id = diesel::RunQueryDsl::get_result::<String>(
+            legacy_store_meta::table
+                .filter(legacy_store_meta::key.eq("root_id"))
+                .select(legacy_store_meta::value_json),
+            &mut connection,
+        )
+        .unwrap();
+        assert_eq!(root_id, r#""missing""#);
     }
 
     #[tokio::test]
@@ -10382,7 +10402,52 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
+    }
+
+    #[tokio::test]
+    async fn open_read_only_rejects_invalid_root_count() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let missing_path = tempdir.path().join("missing-root");
+        let missing_store = SqliteStore::open(&missing_path).await.unwrap();
+        let mut connection = missing_store.connect().await.unwrap();
+        diesel::update(nodes::table.filter(nodes::id.eq(missing_store.root_id())))
+            .set(nodes::parent_id.eq("missing"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+        drop(missing_store);
+
+        let error = SqliteStore::open_read_only(&missing_path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing SQLite root node"));
+
+        let multiple_path = tempdir.path().join("multiple-roots");
+        let multiple_store = SqliteStore::open(&multiple_path).await.unwrap();
+        let child_id = multiple_store
+            .append(NewNode {
+                parent: multiple_store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("second root".to_owned()),
+            })
+            .await
+            .unwrap();
+        let mut connection = multiple_store.connect().await.unwrap();
+        diesel::update(nodes::table.filter(nodes::id.eq(child_id)))
+            .set(nodes::parent_id.eq(""))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        drop(connection);
+        drop(multiple_store);
+
+        let error = SqliteStore::open_read_only(&multiple_path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("multiple SQLite root nodes"));
     }
 
     #[tokio::test]
@@ -11142,7 +11207,7 @@ mod tests {
 
         let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
     }
 
     #[tokio::test]
@@ -11170,7 +11235,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=22")
+                .contains("unsupported SQLite schema version 5, expected 6..=23")
         );
     }
 
@@ -11185,7 +11250,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("unsupported SQLite schema version 5, expected 6..=22")
+                .contains("unsupported SQLite schema version 5, expected 6..=23")
         );
     }
 
@@ -11209,7 +11274,23 @@ mod tests {
     async fn open_rejects_legacy_json_store_with_unmarked_sqlite_database() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
-        SqliteStore::open(&path).await.unwrap();
+        let store = SqliteStore::open(&path).await.unwrap();
+        drop(store);
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        diesel::RunQueryDsl::execute(
+            diesel::delete(
+                legacy_store_meta::table
+                    .filter(legacy_store_meta::key.eq(super::FS_MIGRATION_COMPLETE_META_KEY)),
+            ),
+            &mut connection,
+        )
+        .unwrap();
+        drop(connection);
         std::fs::write(path.join("meta.json"), "{}").unwrap();
         std::fs::write(path.join("nodes.jsonl"), "").unwrap();
 
@@ -11225,14 +11306,36 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("store");
         let store = SqliteStore::open(&path).await.unwrap();
-        persist_store_meta_bool_for_test(&store, super::FS_MIGRATION_COMPLETE_META_KEY, true).await;
+        drop(store);
+        let database_path = super::sqlite_database_path(&path);
+        let mut connection =
+            diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+        connection
+            .revert_last_migration(super::STORE_MIGRATIONS)
+            .unwrap();
+        drop(connection);
+        std::fs::write(path.join("meta.json"), "{}").unwrap();
+        std::fs::write(path.join("nodes.jsonl"), "").unwrap();
+
+        let reopened = SqliteStore::open(&path).await.unwrap();
+
+        assert_eq!(reopened.schema_version().await.unwrap(), 23);
+        assert!(!table_exists(&reopened, "store_meta").await);
+    }
+
+    #[tokio::test]
+    async fn open_accepts_legacy_json_files_with_current_sqlite_schema() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("store");
+        let store = SqliteStore::open(&path).await.unwrap();
         drop(store);
         std::fs::write(path.join("meta.json"), "{}").unwrap();
         std::fs::write(path.join("nodes.jsonl"), "").unwrap();
 
         let reopened = SqliteStore::open(&path).await.unwrap();
 
-        assert_eq!(reopened.schema_version().await.unwrap(), 22);
+        assert_eq!(reopened.schema_version().await.unwrap(), 23);
+        assert!(!table_exists(&reopened, "store_meta").await);
     }
 
     #[tokio::test]

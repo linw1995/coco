@@ -244,13 +244,6 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    store_meta (key) {
-        key -> Text,
-        value_json -> Text,
-    }
-}
-
 diesel::joinable!(branches -> nodes (head_id));
 diesel::joinable!(node_anchor_sessions -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchor_sessions (node_id));
@@ -287,5 +280,4 @@ diesel::allow_tables_to_appear_in_same_query!(
     skill_version_scripts,
     skill_versions,
     skills,
-    store_meta,
 );
