@@ -43,5 +43,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # Test fixtures.
+coco-mem = { path = "../coco-mem", features = ["test-utils"] }
 indoc = "2.0.6"
 tempfile = "3.23.0"

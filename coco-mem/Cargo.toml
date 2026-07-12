@@ -3,6 +3,10 @@ name = "coco-mem"
 edition.workspace = true
 version.workspace = true
 
+[features]
+# Test support.
+test-utils = []
+
 [dependencies]
 # Storage.
 async-trait.workspace = true

@@ -34,4 +34,5 @@ nanoid = "0.5.0"
 
 [dev-dependencies]
 # Test fixtures.
+coco-mem = { path = "../coco-mem", features = ["test-utils"] }
 tempfile = "3.20.0"

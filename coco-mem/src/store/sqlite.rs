@@ -74,6 +74,8 @@ pub struct SqliteStore {
     database: SqliteDatabase,
     root_id: String,
     access: StoreAccess,
+    #[cfg(any(test, feature = "test-utils"))]
+    // Keeps a temporary store alive until the last cloned handle is dropped.
     _owned_directory: Option<Arc<OwnedStoreDirectory>>,
 }
 
@@ -92,6 +94,7 @@ enum StoreAccess {
     ReadOnly,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 struct OwnedStoreDirectory {
     path: PathBuf,
 }
