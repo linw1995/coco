@@ -134,18 +134,12 @@ impl SqliteStore {
             StoreAccess::ReadWrite => SqliteDatabase::open(database_path.clone(), true).await?,
             StoreAccess::ReadOnly => SqliteDatabase::open(database_path.clone(), false).await?,
         };
-        let lock_file = if access == StoreAccess::ReadWrite {
-            Some(super::super::lock::open_store_lock(path)?)
-        } else {
-            None
-        };
         Ok(Self {
             dir: path.to_owned(),
             database_path: database_path.clone(),
             database,
             root_id: String::new(),
             access,
-            _lock_file: lock_file,
             _owned_directory: None,
         })
     }

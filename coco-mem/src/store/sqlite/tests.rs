@@ -1473,50 +1473,6 @@ async fn open_read_only_rejects_writes() {
 }
 
 #[tokio::test]
-async fn open_rejects_store_locked_by_another_owner() {
-    use std::os::fd::AsRawFd;
-
-    let tempdir = tempfile::tempdir().unwrap();
-    let path = tempdir.path().join("store");
-    std::fs::create_dir(&path).unwrap();
-    let lock_path = path.join("store.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .unwrap();
-    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_eq!(result, 0);
-
-    let err = SqliteStore::open(&path).await.unwrap_err();
-
-    assert!(matches!(err, crate::StoreError::StoreLocked { path: locked } if locked == path));
-}
-
-#[tokio::test]
-async fn open_read_only_allows_store_locked_by_another_owner() {
-    use std::os::fd::AsRawFd;
-
-    let tempdir = tempfile::tempdir().unwrap();
-    let path = tempdir.path().join("store");
-    SqliteStore::open(&path).await.unwrap();
-    let lock_path = path.join("store.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .unwrap();
-    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_eq!(result, 0);
-
-    let store = SqliteStore::open_read_only(&path).await.unwrap();
-
-    assert_eq!(store.schema_version().await.unwrap(), 23);
-}
-
-#[tokio::test]
 async fn graph_open_read_only_rejects_missing_schema_without_creating_database() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
