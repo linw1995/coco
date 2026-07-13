@@ -16,6 +16,7 @@ version = "0.1.0"
 [workspace.dependencies]
 # Async runtime and traits.
 async-trait = "0.1.89"
+backon = { version = "1.6.0", default-features = false, features = ["std"] }
 tokio = { version = "1.52.1", features = [
   "io-util",
   "macros",

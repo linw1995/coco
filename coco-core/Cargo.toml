@@ -10,6 +10,7 @@ coco-llm = { path = "../coco-llm" }
 
 # Async runtime and traits.
 async-trait.workspace = true
+backon.workspace = true
 futures = "0.3.31"
 tokio.workspace = true
 

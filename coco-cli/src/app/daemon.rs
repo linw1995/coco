@@ -2810,8 +2810,19 @@ mod tests {
             .await
             .unwrap();
         let active_job_id = active_job.job_id.clone();
-        let failed = engine.drive_job(&active_job_id).await.unwrap();
-        assert_eq!(failed.status, JobStatus::Running);
+        store
+            .set_job_status(&active_job_id, JobStatus::Queued, JobStatus::Running)
+            .await
+            .unwrap();
+        store
+            .append(NewNode {
+                parent: active_job.base.clone(),
+                role: Role::System,
+                metadata: BackendMetadata::builder().build(),
+                kind: Kind::Failure("backend failed".to_owned()),
+            })
+            .await
+            .unwrap();
 
         store
             .enqueue_message(
@@ -2835,7 +2846,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(100), worker.drain_once()).await;
 
         assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Running
