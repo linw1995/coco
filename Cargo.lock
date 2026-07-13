@@ -556,7 +556,6 @@ name = "coco-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "backon",
  "coco-channel",
  "coco-llm",
  "coco-mem",
@@ -577,6 +576,7 @@ name = "coco-llm"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "backon",
  "base64",
  "coco-mem",
  "futures",

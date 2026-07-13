@@ -12,10 +12,16 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+#[cfg(test)]
+use backon::BackoffBuilder;
+use backon::{ExponentialBuilder, Retryable};
 #[cfg(test)]
 use coco_mem::PauseReason;
 use coco_mem::{
@@ -52,6 +58,15 @@ pub const COCO_SKILL_NAME_ENV: &str = "COCO_SKILL_NAME";
 pub const COCO_SKILL_DIR_ENV: &str = "COCO_SKILL_DIR";
 pub const COCO_SKILL_PERSIST_DIR_ENV: &str = "COCO_SKILL_PERSIST_DIR";
 pub const COCO_SKILL_PERSIST_ROOT_ENV: &str = "COCO_SKILL_PERSIST_ROOT";
+pub const BACKEND_STEP_RETRY_LIMIT: usize = 5;
+pub const DEFAULT_BACKEND_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+fn backend_step_retry_backoff(initial_delay: Duration) -> ExponentialBuilder {
+    ExponentialBuilder::new()
+        .with_min_delay(initial_delay)
+        .with_factor(2.0)
+        .with_max_times(BACKEND_STEP_RETRY_LIMIT)
+}
 
 pub type CompletionMessage = rig::completion::message::Message;
 pub type CompletionToolCall = rig::completion::message::ToolCall;
@@ -311,6 +326,7 @@ pub struct ResolvedCompletionRequest {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
+    backend_retry_initial_delay: Duration,
     runtime: RuntimeCapabilities,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
     trace_node_store: Option<Arc<TraceNodeStore>>,
@@ -1613,22 +1629,34 @@ where
             has_session_patch = request.session_patch.is_some(),
             "received prompt request"
         );
-        self.run_locked(CompletionRequest {
-            branch: request.branch,
-            origin: CompletionOrigin::BranchHead,
-            input: CompletionInput::Prompt {
-                text: request.prompt,
-                attachments: request.attachments,
-                merge_parents: request.merge_parents,
-                session_patch: request.session_patch.map(Box::new),
+        self.run_locked(
+            CompletionRequest {
+                branch: request.branch,
+                origin: CompletionOrigin::BranchHead,
+                input: CompletionInput::Prompt {
+                    text: request.prompt,
+                    attachments: request.attachments,
+                    merge_parents: request.merge_parents,
+                    session_patch: request.session_patch.map(Box::new),
+                },
+                overrides: CompletionOverrides::default(),
+                active_skill_runtime: None,
             },
-            overrides: CompletionOverrides::default(),
-            active_skill_runtime: None,
-        })
+            DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
+        )
         .await
     }
 
     pub async fn run(&self, request: CompletionRequest) -> Result<CompletionResult> {
+        self.run_with_backend_retry_initial_delay(request, DEFAULT_BACKEND_RETRY_INITIAL_DELAY)
+            .await
+    }
+
+    pub async fn run_with_backend_retry_initial_delay(
+        &self,
+        request: CompletionRequest,
+        backend_retry_initial_delay: Duration,
+    ) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
         tracing::debug!(
             branch = %request.branch,
@@ -1636,11 +1664,17 @@ where
             input = completion_input_kind(&request.input),
             "received completion request"
         );
-        self.run_locked(request).await
+        self.run_locked(request, backend_retry_initial_delay).await
     }
 
-    async fn run_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
-        let prepared = self.prepare_completion_run(request).await?;
+    async fn run_locked(
+        &self,
+        request: CompletionRequest,
+        backend_retry_initial_delay: Duration,
+    ) -> Result<CompletionResult> {
+        let prepared = self
+            .prepare_completion_run(request, backend_retry_initial_delay)
+            .await?;
         let completed = self
             .backend
             .complete(prepared.session.clone(), prepared.resolved.clone())
@@ -1651,6 +1685,7 @@ where
     async fn prepare_completion_run(
         &self,
         request: CompletionRequest,
+        backend_retry_initial_delay: Duration,
     ) -> Result<PreparedCompletionRun> {
         let branch = request.branch.clone();
         let origin_kind = completion_origin_kind(&request.origin);
@@ -1729,6 +1764,7 @@ where
             request.clone(),
             Some(trace_node_appender),
             Some(trace_node_store),
+            backend_retry_initial_delay,
         );
 
         Ok(PreparedCompletionRun {
@@ -2762,6 +2798,7 @@ impl<B, S> LlmService<B, S> {
         request: CompletionRequest,
         trace_node_appender: Option<TraceNodeAppenderHandle>,
         trace_node_store: Option<Arc<TraceNodeStore>>,
+        backend_retry_initial_delay: Duration,
     ) -> ResolvedCompletionRequest {
         let CompletionOverrides {
             provider,
@@ -2797,6 +2834,7 @@ impl<B, S> LlmService<B, S> {
             temperature: temperature.or(session.config.temperature),
             max_tokens: max_tokens.or(session.config.max_tokens),
             additional_params,
+            backend_retry_initial_delay,
             runtime: self.runtime.clone(),
             trace_node_appender,
             trace_node_store,
@@ -4056,11 +4094,59 @@ impl CompletionRunner {
         }
     }
 
-    async fn execute_step<B>(&self, backend: &B) -> std::result::Result<BackendTurn, BackendError>
+    async fn execute_step<B>(
+        &self,
+        backend: &B,
+        execution: &ExecutionMetadata,
+    ) -> std::result::Result<BackendTurn, BackendError>
     where
         B: CompletionBackend + ?Sized,
     {
-        backend.step(self.step_context()).await
+        let retry_attempts = AtomicUsize::new(0);
+        let result = (|| backend.step(self.step_context()))
+            .retry(backend_step_retry_backoff(
+                self.request.backend_retry_initial_delay,
+            ))
+            .sleep(tokio::time::sleep)
+            .notify(|source, delay| {
+                let retry_attempt = retry_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    branch = %self.request.branch,
+                    provider = %self.request.provider.as_str(),
+                    model = %self.request.model,
+                    execution_id = %execution.execution_id,
+                    retry_attempt,
+                    max_retries = BACKEND_STEP_RETRY_LIMIT,
+                    delay_ms = delay.as_millis(),
+                    error = %source,
+                    "retrying backend step after failure"
+                );
+            })
+            .await;
+
+        let retry_attempts = retry_attempts.load(Ordering::Relaxed);
+        match &result {
+            Ok(_) if retry_attempts > 0 => tracing::info!(
+                branch = %self.request.branch,
+                provider = %self.request.provider.as_str(),
+                model = %self.request.model,
+                execution_id = %execution.execution_id,
+                retry_attempts,
+                "backend step succeeded after local retry"
+            ),
+            Err(source) if retry_attempts == BACKEND_STEP_RETRY_LIMIT => tracing::warn!(
+                branch = %self.request.branch,
+                provider = %self.request.provider.as_str(),
+                model = %self.request.model,
+                execution_id = %execution.execution_id,
+                retry_attempts,
+                error = %source,
+                "backend step retries exhausted"
+            ),
+            _ => {}
+        }
+
+        result
     }
 
     async fn record_turn_events(
@@ -4304,7 +4390,7 @@ impl CompletionRunner {
     {
         for _ in 0..DEFAULT_AGENT_MAX_TURNS {
             let mut state = self.begin_step();
-            let turn = match self.execute_step(backend).await {
+            let turn = match self.execute_step(backend, &state.execution).await {
                 Ok(turn) => turn,
                 Err(source) => return Ok(self.fail_current_run(state, source)),
             };
@@ -4837,6 +4923,22 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CountingSkillExecutor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SkillSearchExecutor for CountingSkillExecutor {
+        async fn search_skill(
+            &self,
+            _request: SkillSearchRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(r#"{"skills":[]}"#.to_owned())
+        }
+    }
+
     #[derive(Debug)]
     struct StagedSkillExecutor {
         first_done: Arc<Notify>,
@@ -5173,6 +5275,7 @@ mod tests {
             temperature,
             max_tokens,
             additional_params,
+            backend_retry_initial_delay: Duration::ZERO,
             runtime: RuntimeCapabilities::default(),
             trace_node_appender: None,
             trace_node_store: None,
@@ -5244,6 +5347,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             additional_params: None,
+            backend_retry_initial_delay: Duration::ZERO,
             runtime: RuntimeCapabilities::default(),
             trace_node_appender: None,
             trace_node_store: None,
@@ -5309,6 +5413,17 @@ mod tests {
 
     fn exec_command_tool() -> Tool {
         crate::builtin_tool_definition("exec_command").expect("builtin tool should exist")
+    }
+
+    #[test]
+    fn backend_step_retry_backoff_uses_five_exponential_delays() {
+        assert_eq!(BACKEND_STEP_RETRY_LIMIT, 5);
+        assert_eq!(
+            backend_step_retry_backoff(DEFAULT_BACKEND_RETRY_INITIAL_DELAY)
+                .build()
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16].map(Duration::from_secs)
+        );
     }
 
     #[tokio::test]
@@ -5562,6 +5677,51 @@ mod tests {
 
         let final_result_nodes = tool_result_nodes(&store, &initial_head).await;
         assert_eq!(final_result_nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn backend_step_retries_do_not_replay_completed_tool_calls() {
+        let tool_call = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "rust"}),
+        );
+        let tool_turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::one(tool_call),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![
+                Ok(tool_turn),
+                Err(BackendError::failed("rate limited once")),
+                Err(BackendError::failed("rate limited twice")),
+                Ok(BackendTurn::finished("done")),
+            ],
+        )]);
+        let backend_calls = backend.calls.clone();
+        let skill_executor = Arc::new(CountingSkillExecutor::default());
+        let store = test_store().await;
+        let service = LlmService::builder(store, backend)
+            .with_skill_search_executor(skill_executor.clone())
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = service
+            .run_with_backend_retry_initial_delay(request("main"), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "done");
+        assert_eq!(backend_calls.lock().await.len(), 4);
+        assert_eq!(skill_executor.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -7403,9 +7563,12 @@ mod tests {
     #[tokio::test]
     async fn run_can_retry_reference_with_latest_branch_session() {
         let store = test_store().await;
-        let backend = FakeBackend::with_responses(&[(
+        let backend = FakeBackend::with_completions(&[(
             "main",
-            &[Err(BackendError::failed("rate limited")), Ok("recovered")],
+            &[
+                Ok(BackendRun::failed("rate limited", vec![])),
+                Ok(BackendRun::succeeded("recovered", vec![])),
+            ],
         )]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store.clone(), backend);

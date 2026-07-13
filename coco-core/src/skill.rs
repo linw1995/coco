@@ -360,17 +360,13 @@ where
                 source: Box::new(source),
             })?;
         let prompt_result = self
-            .run_completion_with_local_backend_retries(
-                &request.base_branch,
-                &child_branch,
-                CompletionRequest {
-                    branch: child_branch.clone(),
-                    origin: CompletionOrigin::BranchHead,
-                    input: CompletionInput::Continue,
-                    overrides: CompletionOverrides::default(),
-                    active_skill_runtime: runtime.context.clone(),
-                },
-            )
+            .run_completion_with_backend_retries(CompletionRequest {
+                branch: child_branch.clone(),
+                origin: CompletionOrigin::BranchHead,
+                input: CompletionInput::Continue,
+                overrides: CompletionOverrides::default(),
+                active_skill_runtime: runtime.context.clone(),
+            })
             .await;
         let cleanup_result = service.delete_session_branch(&child_branch).await;
 

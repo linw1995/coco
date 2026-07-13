@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use backon::BackoffBuilder;
 use coco_llm::coco_mem::{
     Anchor, BackendMetadata, BranchStore, ExecutionMetadata, JobStatus, JobStore, Kind,
     MessageQueueStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role, SessionRole,
@@ -13,14 +12,15 @@ use coco_llm::coco_mem::{
     SkillVersionSpec, SqliteStore, ToolResult, ToolUse,
 };
 use coco_llm::{
-    BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
-    LlmService, Provider, SessionConfig, SessionConfigPatch, StepContext, builtin_tool_definition,
+    BACKEND_STEP_RETRY_LIMIT, BackendError, BackendEventPayload, BackendTurn, CompletionBackend,
+    CompletionMessage, LlmService, Provider, SessionConfig, SessionConfigPatch, StepContext,
+    builtin_tool_definition,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
 
-use crate::engine::{DEFAULT_BACKEND_RETRY_BACKOFF, LOCAL_BACKEND_RETRY_LIMIT, SYSTEM_EVENT_QUEUE};
+use crate::engine::SYSTEM_EVENT_QUEUE;
 use crate::{
     BatchPromptRequest, BranchPromptRequest, BranchPromptStatus, BranchResolveError,
     BranchResolver, ChannelKind, ConversationEngine, CoreService, EngineError, Error,
@@ -37,14 +37,11 @@ async fn test_store() -> SqliteStore {
 }
 
 fn test_engine<B>(llm: Arc<LlmService<B, SqliteStore>>) -> ConversationEngine<B, SqliteStore> {
-    ConversationEngine::with_backend_retry_backoff(
-        llm,
-        DEFAULT_BACKEND_RETRY_BACKOFF.with_min_delay(Duration::ZERO),
-    )
+    ConversationEngine::with_backend_retry_initial_delay(llm, Duration::ZERO)
 }
 
 fn failed_backend_responses(message: &str) -> Vec<std::result::Result<&'static str, BackendError>> {
-    (0..=LOCAL_BACKEND_RETRY_LIMIT)
+    (0..=BACKEND_STEP_RETRY_LIMIT)
         .map(|_| {
             Err(BackendError::Failed {
                 message: message.to_owned(),
@@ -154,6 +151,13 @@ impl CompletionBackend for FakeBackend {
 
 #[derive(Debug, Clone)]
 struct BlockingBackend {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone)]
+struct BlockingFailBackend {
     started: Arc<Notify>,
     release: Arc<Notify>,
     calls: Arc<AtomicUsize>,
@@ -275,6 +279,20 @@ impl CompletionBackend for BlockingBackend {
         self.started.notify_waiters();
         self.release.notified().await;
         Ok(FakeBackend::finished_turn("done"))
+    }
+}
+
+#[async_trait]
+impl CompletionBackend for BlockingFailBackend {
+    async fn step(&self, _ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Err(BackendError::Failed {
+            message: "backend failed".to_owned(),
+        })
     }
 }
 
@@ -865,6 +883,46 @@ async fn llm_engine_join_job_waits_for_inflight_job() {
 }
 
 #[tokio::test]
+async fn llm_engine_wait_for_inflight_job_returns_when_recovery_is_queued() {
+    let store = test_store().await;
+    let backend = BlockingFailBackend {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let started = backend.started.clone();
+    let release = backend.release.clone();
+    let calls = backend.calls.clone();
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = test_engine(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.drive_job(&job_id).await }
+    });
+    started.notified().await;
+
+    let waiter = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.wait_for_inflight_job(&job_id).await }
+    });
+    sleep(Duration::from_millis(20)).await;
+    assert!(!waiter.is_finished());
+
+    release.notify_waiters();
+    let waited = waiter.await.unwrap().unwrap().unwrap();
+    let driven = driver.await.unwrap().unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), BACKEND_STEP_RETRY_LIMIT + 1);
+    assert_eq!(waited.status, JobStatus::Running);
+    assert_eq!(driven.status, JobStatus::Running);
+}
+
+#[tokio::test]
 async fn llm_engine_retries_backend_failure_locally_before_recovery() {
     let store = test_store().await;
     let backend = FakeBackend::with_responses(&[(
@@ -899,15 +957,6 @@ async fn llm_engine_retries_backend_failure_locally_before_recovery() {
     assert_eq!(
         store.get_node(&snapshot.head).await.unwrap().kind,
         Kind::Text("recovered locally".to_owned())
-    );
-}
-
-#[test]
-fn backend_retry_backoff_uses_five_exponential_delays() {
-    assert_eq!(LOCAL_BACKEND_RETRY_LIMIT, 5);
-    assert_eq!(
-        DEFAULT_BACKEND_RETRY_BACKOFF.build().collect::<Vec<_>>(),
-        [1, 2, 4, 8, 16].map(Duration::from_secs)
     );
 }
 
@@ -1013,9 +1062,9 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
         Kind::Text("recovered".to_owned())
     );
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), LOCAL_BACKEND_RETRY_LIMIT + 2);
+    assert_eq!(calls.len(), BACKEND_STEP_RETRY_LIMIT + 2);
     assert!(
-        calls[..=LOCAL_BACKEND_RETRY_LIMIT]
+        calls[..=BACKEND_STEP_RETRY_LIMIT]
             .iter()
             .all(|model| model == "bad-model")
     );
@@ -1358,7 +1407,7 @@ async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() 
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    assert_eq!(calls.lock().await.len(), LOCAL_BACKEND_RETRY_LIMIT + 1);
+    assert_eq!(calls.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -1862,7 +1911,7 @@ async fn llm_engine_retries_skill_backend_before_cleaning_up_failed_child_branch
 
     assert!(matches!(error, EngineError::EngineFailed { .. }));
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), LOCAL_BACKEND_RETRY_LIMIT + 1);
+    assert_eq!(calls.len(), BACKEND_STEP_RETRY_LIMIT + 1);
     let child_branch = calls[0].clone();
     drop(calls);
 

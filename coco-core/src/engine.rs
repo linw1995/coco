@@ -1,22 +1,13 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use backon::{ExponentialBuilder, Retryable};
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, Node, NodeStore,
     PromptAnchor, PromptAttachment, SessionStore, SkillStore, SqliteStore,
 };
 use coco_llm::{
     BackendError, BackendFailureContext, CompletionBackend, CompletionInput, CompletionOrigin,
-    CompletionOverrides, CompletionRequest, CompletionResult, Error as LlmError, LlmService,
-    RigBackend, SessionConfigPatch,
+    CompletionOverrides, CompletionRequest, CompletionResult, DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
+    Error as LlmError, LlmService, RigBackend, SessionConfigPatch,
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
@@ -33,12 +24,6 @@ pub type BranchLockGuard = coco_llm::BranchLockGuard;
 pub const SYSTEM_EVENT_QUEUE: &str = "system";
 const LLM_BACKEND_FAILURE_RECOVERY_REQUESTED: &str = "llm.backend_failure.recovery_requested";
 const SYSTEM_EVENT_VERSION: u64 = 1;
-pub(crate) const LOCAL_BACKEND_RETRY_LIMIT: usize = 5;
-const LOCAL_BACKEND_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
-pub(crate) const DEFAULT_BACKEND_RETRY_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
-    .with_min_delay(LOCAL_BACKEND_RETRY_INITIAL_DELAY)
-    .with_factor(2.0)
-    .with_max_times(LOCAL_BACKEND_RETRY_LIMIT);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JobStatusSnapshot {
@@ -63,7 +48,7 @@ struct PromptReply {
 pub struct ConversationEngine<B = RigBackend, S = SqliteStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
-    backend_retry_backoff: ExponentialBuilder,
+    backend_retry_initial_delay: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -99,7 +84,7 @@ impl<B, S> Clone for ConversationEngine<B, S> {
         Self {
             service: self.service.clone(),
             inflight_jobs: self.inflight_jobs.clone(),
-            backend_retry_backoff: self.backend_retry_backoff,
+            backend_retry_initial_delay: self.backend_retry_initial_delay,
         }
     }
 }
@@ -112,17 +97,17 @@ impl ConversationEngine<RigBackend, SqliteStore> {
 
 impl<B, S> ConversationEngine<B, S> {
     pub fn new(service: Arc<LlmService<B, S>>) -> Self {
-        Self::with_backend_retry_backoff(service, DEFAULT_BACKEND_RETRY_BACKOFF)
+        Self::with_backend_retry_initial_delay(service, DEFAULT_BACKEND_RETRY_INITIAL_DELAY)
     }
 
-    pub(crate) fn with_backend_retry_backoff(
+    pub(crate) fn with_backend_retry_initial_delay(
         service: Arc<LlmService<B, S>>,
-        backend_retry_backoff: ExponentialBuilder,
+        backend_retry_initial_delay: Duration,
     ) -> Self {
         Self {
             service,
             inflight_jobs: Arc::new(AsyncMutex::new(HashMap::new())),
-            backend_retry_backoff,
+            backend_retry_initial_delay,
         }
     }
 
@@ -157,82 +142,13 @@ where
     B: CompletionBackend,
     S: NodeStore + BranchStore + SessionStore + SkillStore + Clone + Send + Sync + 'static,
 {
-    pub(crate) async fn run_completion_with_local_backend_retries(
+    pub(crate) async fn run_completion_with_backend_retries(
         &self,
-        branch: &str,
-        work_branch: &str,
         request: CompletionRequest,
     ) -> std::result::Result<CompletionResult, LlmError> {
-        let request = Arc::new(AsyncMutex::new(request));
-        let retry_attempts = AtomicUsize::new(0);
-
-        let result = (|| {
-            let request = request.clone();
-            async move {
-                let current_request = request.lock().await.clone();
-                let result = self.service.run(current_request).await;
-                if let Err(LlmError::Backend { context, .. }) = &result {
-                    let mut request = request.lock().await;
-                    request.origin = CompletionOrigin::ReferenceWithBranchSession(
-                        context.retry_from_node_id.clone(),
-                    );
-                    request.input = CompletionInput::Continue;
-                }
-                result
-            }
-        })
-        .retry(self.backend_retry_backoff)
-        .sleep(tokio::time::sleep)
-        .when(|source| matches!(source, LlmError::Backend { .. }))
-        .notify(|source, delay| {
-            let retry_attempt = retry_attempts.fetch_add(1, Ordering::Relaxed) + 1;
-            let LlmError::Backend {
-                source: backend_source,
-                context,
-            } = source
-            else {
-                return;
-            };
-            tracing::warn!(
-                branch,
-                work_branch,
-                retry_attempt,
-                max_retries = LOCAL_BACKEND_RETRY_LIMIT,
-                delay_ms = delay.as_millis(),
-                execution_id = %context.execution_id,
-                error_node_id = %context.error_node_id,
-                retry_from_node_id = %context.retry_from_node_id,
-                error = %backend_source,
-                "retrying completion locally after backend failure"
-            );
-        })
-        .await;
-
-        let retry_attempts = retry_attempts.load(Ordering::Relaxed);
-        match &result {
-            Ok(_) if retry_attempts > 0 => tracing::info!(
-                branch,
-                work_branch,
-                retry_attempts,
-                "completion succeeded after local backend retry"
-            ),
-            Err(LlmError::Backend {
-                source: backend_source,
-                context,
-            }) if retry_attempts == LOCAL_BACKEND_RETRY_LIMIT => tracing::warn!(
-                branch,
-                work_branch,
-                retry_attempts,
-                execution_id = %context.execution_id,
-                error_node_id = %context.error_node_id,
-                retry_from_node_id = %context.retry_from_node_id,
-                error = %backend_source,
-                "local backend retries exhausted"
-            ),
-            _ => {}
-        }
-
-        result
+        self.service
+            .run_with_backend_retry_initial_delay(request, self.backend_retry_initial_delay)
+            .await
     }
 }
 
@@ -622,8 +538,17 @@ where
         }
     }
 
-    pub async fn has_inflight_job(&self, job_id: &str) -> bool {
-        self.inflight_jobs.lock().await.contains_key(job_id)
+    pub async fn wait_for_inflight_job(
+        &self,
+        job_id: &str,
+    ) -> std::result::Result<Option<JobStatusSnapshot>, EngineError> {
+        let inflight_job = self.inflight_jobs.lock().await.get(job_id).cloned();
+        let Some(inflight_job) = inflight_job else {
+            return Ok(None);
+        };
+
+        let _ = inflight_job.await;
+        self.get_job(job_id).await.map(Some)
     }
 
     pub async fn drive_job_with_merge_parents(
@@ -815,10 +740,7 @@ where
             active_skill_runtime: None,
         };
 
-        match self
-            .run_completion_with_local_backend_retries(&job.branch, &job.work_branch, request)
-            .await
-        {
+        match self.run_completion_with_backend_retries(request).await {
             Ok(_) => Ok(JobRunOutcome::Completed),
             Err(source) => {
                 self.handle_completion_error(job, source, !is_retrying_failure)
