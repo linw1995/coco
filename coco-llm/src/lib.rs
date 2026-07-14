@@ -863,6 +863,9 @@ pub enum BackendError {
     Failed { message: String },
 
     #[snafu(display("{message}"))]
+    InvalidConfiguration { message: String },
+
+    #[snafu(display("{message}"))]
     UnifiedExecTool { message: String },
 }
 
@@ -871,6 +874,16 @@ impl BackendError {
         Self::Failed {
             message: message.into(),
         }
+    }
+
+    fn invalid_configuration(message: impl Into<String>) -> Self {
+        Self::InvalidConfiguration {
+            message: message.into(),
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Failed { .. })
     }
 }
 
@@ -4094,6 +4107,7 @@ impl CompletionRunner {
             .retry(backend_step_retry_backoff(
                 self.request.runtime.backend_retry_initial_delay,
             ))
+            .when(BackendError::is_retryable)
             .sleep(tokio::time::sleep)
             .notify(|source, delay| {
                 let retry_attempt = retry_attempts.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4413,12 +4427,30 @@ where
     )
     .send()
     .await
-    .map_err(|source| BackendError::failed(source.to_string()))?;
+    .map_err(backend_error_from_completion_error)?;
 
     Ok(BackendTurn::from_assistant_choice(
         response.message_id,
         response.choice,
     ))
+}
+
+fn backend_error_from_completion_error(source: rig::completion::CompletionError) -> BackendError {
+    let invalid_configuration = matches!(
+        &source,
+        rig::completion::CompletionError::UrlError(_)
+            | rig::completion::CompletionError::RequestError(_)
+            | rig::completion::CompletionError::HttpError(
+                rig::http_client::Error::Protocol(_)
+                    | rig::http_client::Error::InvalidHeaderValue(_)
+                    | rig::http_client::Error::NoHeaders
+            )
+    );
+    if invalid_configuration {
+        BackendError::invalid_configuration(source.to_string())
+    } else {
+        BackendError::failed(source.to_string())
+    }
 }
 
 fn resolve_provider_api_key(
@@ -4428,7 +4460,7 @@ fn resolve_provider_api_key(
 ) -> std::result::Result<String, BackendError> {
     if let Some(env) = secrets.get("api_key") {
         return std::env::var(env).map_err(|_| {
-            BackendError::failed(format!(
+            BackendError::invalid_configuration(format!(
                 "missing API key for provider {} in environment variable {}",
                 provider.as_str(),
                 env
@@ -4440,7 +4472,7 @@ fn resolve_provider_api_key(
     let provider_specific = std::env::var(provider_env).ok();
 
     generic.or(provider_specific).ok_or_else(|| {
-        BackendError::failed(format!(
+        BackendError::invalid_configuration(format!(
             "missing API key for provider {}",
             provider.as_str()
         ))
@@ -4463,7 +4495,7 @@ fn resolve_chatgpt_auth(
     }
 
     if resolve_env_value("COCO_API_KEY").is_some() {
-        return Err(BackendError::failed(
+        return Err(BackendError::invalid_configuration(
             "COCO_API_KEY must not be set when provider is chatgpt",
         ));
     }
@@ -4506,7 +4538,7 @@ fn resolve_secret_env(
 ) -> std::result::Result<Option<String>, BackendError> {
     std::env::var(name)
         .map(|value| (!value.trim().is_empty()).then_some(value))
-        .map_err(|_| BackendError::failed(missing_message))
+        .map_err(|_| BackendError::invalid_configuration(missing_message))
 }
 
 fn resolve_env_value(name: &str) -> Option<String> {
@@ -4525,12 +4557,15 @@ fn resolve_base_url(base_url: Option<&str>) -> std::result::Result<Option<String
 fn resolve_base_url_value(base_url: &str) -> std::result::Result<String, BackendError> {
     if let Some(env) = parse_env_placeholder(base_url) {
         return resolve_env_value(env).ok_or_else(|| {
-            BackendError::failed(format!("missing base URL in environment variable {}", env))
+            BackendError::invalid_configuration(format!(
+                "missing base URL in environment variable {}",
+                env
+            ))
         });
     }
 
     if base_url.starts_with("${") {
-        return Err(BackendError::failed(format!(
+        return Err(BackendError::invalid_configuration(format!(
             "invalid base URL environment reference {base_url:?}"
         )));
     }
@@ -4557,7 +4592,7 @@ fn build_chatgpt_client(
     }
     builder
         .build()
-        .map_err(|source| BackendError::failed(source.to_string()))
+        .map_err(|source| BackendError::invalid_configuration(source.to_string()))
 }
 
 impl RigBackend {
@@ -4689,7 +4724,7 @@ async fn send_openai_completion_turn(
     }
     let client = builder
         .build()
-        .map_err(|source| BackendError::failed(source.to_string()))?;
+        .map_err(|source| BackendError::invalid_configuration(source.to_string()))?;
     send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
 }
 
@@ -4710,7 +4745,7 @@ async fn send_anthropic_completion_turn(
     }
     let client = builder
         .build()
-        .map_err(|source| BackendError::failed(source.to_string()))?;
+        .map_err(|source| BackendError::invalid_configuration(source.to_string()))?;
     send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
 }
 
@@ -5708,6 +5743,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_step_does_not_retry_invalid_configuration() {
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![
+                Err(BackendError::invalid_configuration("missing API key")),
+                Ok(BackendTurn::finished("unexpected retry")),
+            ],
+        )]);
+        let backend_calls = backend.calls.clone();
+        let store = test_store().await;
+        let service = LlmService::builder(store, backend)
+            .with_backend_retry_initial_delay(Duration::ZERO)
+            .build();
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let error = service.run(request("main")).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Backend call failed: missing API key");
+        assert_eq!(backend_calls.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn reopened_store_reconstructs_staged_tool_results_as_grouped_turn() {
         let temp_dir = tempfile::tempdir().unwrap();
         let store_path = temp_dir.path().join("store");
@@ -6208,6 +6268,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(error.to_string(), "missing API key for provider openai");
     }
 
@@ -6225,6 +6286,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(error.to_string(), "missing API key for provider anthropic");
     }
 
@@ -6245,6 +6307,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(
             error.to_string(),
             "invalid base URL environment reference \"${COCO_OPENAI_BASE_URL\""
@@ -6265,7 +6328,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert!(!error.to_string().is_empty());
     }
 
@@ -6287,6 +6350,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(
             error.to_string(),
             "missing base URL in environment variable COCO_ANTHROPIC_BASE_URL"
@@ -6307,7 +6371,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert!(!error.to_string().is_empty());
     }
 
@@ -6324,6 +6388,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(
             error.to_string(),
             "COCO_API_KEY must not be set when provider is chatgpt"
@@ -6351,7 +6416,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert!(!error.to_string().is_empty());
     }
 
