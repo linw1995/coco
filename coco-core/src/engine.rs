@@ -513,8 +513,17 @@ where
         }
     }
 
-    pub async fn has_inflight_job(&self, job_id: &str) -> bool {
-        self.inflight_jobs.lock().await.contains_key(job_id)
+    pub async fn wait_for_inflight_job(
+        &self,
+        job_id: &str,
+    ) -> std::result::Result<Option<JobStatusSnapshot>, EngineError> {
+        let inflight_job = self.inflight_jobs.lock().await.get(job_id).cloned();
+        let Some(inflight_job) = inflight_job else {
+            return Ok(None);
+        };
+
+        let _ = inflight_job.await;
+        self.get_job(job_id).await.map(Some)
     }
 
     pub async fn drive_job_with_merge_parents(

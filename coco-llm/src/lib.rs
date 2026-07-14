@@ -12,10 +12,16 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+#[cfg(test)]
+use backon::BackoffBuilder;
+use backon::{ExponentialBuilder, Retryable};
 #[cfg(test)]
 use coco_mem::PauseReason;
 use coco_mem::{
@@ -52,6 +58,15 @@ pub const COCO_SKILL_NAME_ENV: &str = "COCO_SKILL_NAME";
 pub const COCO_SKILL_DIR_ENV: &str = "COCO_SKILL_DIR";
 pub const COCO_SKILL_PERSIST_DIR_ENV: &str = "COCO_SKILL_PERSIST_DIR";
 pub const COCO_SKILL_PERSIST_ROOT_ENV: &str = "COCO_SKILL_PERSIST_ROOT";
+pub const BACKEND_STEP_RETRY_LIMIT: usize = 5;
+pub const DEFAULT_BACKEND_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+fn backend_step_retry_backoff(initial_delay: Duration) -> ExponentialBuilder {
+    ExponentialBuilder::new()
+        .with_min_delay(initial_delay)
+        .with_factor(2.0)
+        .with_max_times(BACKEND_STEP_RETRY_LIMIT)
+}
 
 pub type CompletionMessage = rig::completion::message::Message;
 pub type CompletionToolCall = rig::completion::message::ToolCall;
@@ -848,6 +863,9 @@ pub enum BackendError {
     Failed { message: String },
 
     #[snafu(display("{message}"))]
+    InvalidConfiguration { message: String },
+
+    #[snafu(display("{message}"))]
     UnifiedExecTool { message: String },
 }
 
@@ -856,6 +874,16 @@ impl BackendError {
         Self::Failed {
             message: message.into(),
         }
+    }
+
+    fn invalid_configuration(message: impl Into<String>) -> Self {
+        Self::InvalidConfiguration {
+            message: message.into(),
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Failed { .. })
     }
 }
 
@@ -934,6 +962,7 @@ pub struct RuntimeCapabilities {
     pub unified_exec_cli_bridge: UnifiedExecCliBridgeHandle,
     pub skill_search_executor: SkillSearchExecutorHandle,
     pub store_path: Option<PathBuf>,
+    backend_retry_initial_delay: Duration,
     unified_exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
 }
 
@@ -943,6 +972,7 @@ impl Default for RuntimeCapabilities {
             unified_exec_cli_bridge: UnifiedExecCliBridgeHandle::default(),
             skill_search_executor: SkillSearchExecutorHandle::default(),
             store_path: None,
+            backend_retry_initial_delay: DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
             unified_exec_sessions: unified_exec_tool::session_store(),
         }
     }
@@ -961,6 +991,7 @@ pub struct LlmService<B = RigBackend, S = SqliteStore> {
 pub struct LlmServiceBuilder<B, S> {
     store: S,
     backend: B,
+    backend_retry_initial_delay: Duration,
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
     unified_exec_cli_bridge: Option<UnifiedExecCliBridgeHandle>,
     skill_search_executor: Option<SkillSearchExecutorHandle>,
@@ -1138,6 +1169,11 @@ impl LlmService<RigBackend, SqliteStore> {
 }
 
 impl<B, S> LlmServiceBuilder<B, S> {
+    pub fn with_backend_retry_initial_delay(mut self, initial_delay: Duration) -> Self {
+        self.backend_retry_initial_delay = initial_delay;
+        self
+    }
+
     pub fn with_provider_configs(
         mut self,
         provider_configs: HashMap<String, ProviderRuntimeConfig>,
@@ -1175,6 +1211,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
                 unified_exec_cli_bridge: self.unified_exec_cli_bridge.unwrap_or_default(),
                 skill_search_executor: self.skill_search_executor.unwrap_or_default(),
                 store_path: self.store_path,
+                backend_retry_initial_delay: self.backend_retry_initial_delay,
                 unified_exec_sessions: unified_exec_tool::session_store(),
             },
             branch_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -1189,6 +1226,7 @@ impl<B, S> LlmService<B, S> {
         LlmServiceBuilder {
             store,
             backend,
+            backend_retry_initial_delay: DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
             provider_configs: HashMap::new(),
             unified_exec_cli_bridge: None,
             skill_search_executor: None,
@@ -4056,11 +4094,60 @@ impl CompletionRunner {
         }
     }
 
-    async fn execute_step<B>(&self, backend: &B) -> std::result::Result<BackendTurn, BackendError>
+    async fn execute_step<B>(
+        &self,
+        backend: &B,
+        execution: &ExecutionMetadata,
+    ) -> std::result::Result<BackendTurn, BackendError>
     where
         B: CompletionBackend + ?Sized,
     {
-        backend.step(self.step_context()).await
+        let retry_attempts = AtomicUsize::new(0);
+        let result = (|| backend.step(self.step_context()))
+            .retry(backend_step_retry_backoff(
+                self.request.runtime.backend_retry_initial_delay,
+            ))
+            .when(BackendError::is_retryable)
+            .sleep(tokio::time::sleep)
+            .notify(|source, delay| {
+                let retry_attempt = retry_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    branch = %self.request.branch,
+                    provider = %self.request.provider.as_str(),
+                    model = %self.request.model,
+                    execution_id = %execution.execution_id,
+                    retry_attempt,
+                    max_retries = BACKEND_STEP_RETRY_LIMIT,
+                    delay_ms = delay.as_millis(),
+                    error = %source,
+                    "retrying backend step after failure"
+                );
+            })
+            .await;
+
+        let retry_attempts = retry_attempts.load(Ordering::Relaxed);
+        match &result {
+            Ok(_) if retry_attempts > 0 => tracing::info!(
+                branch = %self.request.branch,
+                provider = %self.request.provider.as_str(),
+                model = %self.request.model,
+                execution_id = %execution.execution_id,
+                retry_attempts,
+                "backend step succeeded after local retry"
+            ),
+            Err(source) if retry_attempts == BACKEND_STEP_RETRY_LIMIT => tracing::warn!(
+                branch = %self.request.branch,
+                provider = %self.request.provider.as_str(),
+                model = %self.request.model,
+                execution_id = %execution.execution_id,
+                retry_attempts,
+                error = %source,
+                "backend step retries exhausted"
+            ),
+            _ => {}
+        }
+
+        result
     }
 
     async fn record_turn_events(
@@ -4304,7 +4391,7 @@ impl CompletionRunner {
     {
         for _ in 0..DEFAULT_AGENT_MAX_TURNS {
             let mut state = self.begin_step();
-            let turn = match self.execute_step(backend).await {
+            let turn = match self.execute_step(backend, &state.execution).await {
                 Ok(turn) => turn,
                 Err(source) => return Ok(self.fail_current_run(state, source)),
             };
@@ -4340,12 +4427,30 @@ where
     )
     .send()
     .await
-    .map_err(|source| BackendError::failed(source.to_string()))?;
+    .map_err(backend_error_from_completion_error)?;
 
     Ok(BackendTurn::from_assistant_choice(
         response.message_id,
         response.choice,
     ))
+}
+
+fn backend_error_from_completion_error(source: rig::completion::CompletionError) -> BackendError {
+    let invalid_configuration = matches!(
+        &source,
+        rig::completion::CompletionError::UrlError(_)
+            | rig::completion::CompletionError::RequestError(_)
+            | rig::completion::CompletionError::HttpError(
+                rig::http_client::Error::Protocol(_)
+                    | rig::http_client::Error::InvalidHeaderValue(_)
+                    | rig::http_client::Error::NoHeaders
+            )
+    );
+    if invalid_configuration {
+        BackendError::invalid_configuration(source.to_string())
+    } else {
+        BackendError::failed(source.to_string())
+    }
 }
 
 fn resolve_provider_api_key(
@@ -4355,7 +4460,7 @@ fn resolve_provider_api_key(
 ) -> std::result::Result<String, BackendError> {
     if let Some(env) = secrets.get("api_key") {
         return std::env::var(env).map_err(|_| {
-            BackendError::failed(format!(
+            BackendError::invalid_configuration(format!(
                 "missing API key for provider {} in environment variable {}",
                 provider.as_str(),
                 env
@@ -4367,7 +4472,7 @@ fn resolve_provider_api_key(
     let provider_specific = std::env::var(provider_env).ok();
 
     generic.or(provider_specific).ok_or_else(|| {
-        BackendError::failed(format!(
+        BackendError::invalid_configuration(format!(
             "missing API key for provider {}",
             provider.as_str()
         ))
@@ -4390,7 +4495,7 @@ fn resolve_chatgpt_auth(
     }
 
     if resolve_env_value("COCO_API_KEY").is_some() {
-        return Err(BackendError::failed(
+        return Err(BackendError::invalid_configuration(
             "COCO_API_KEY must not be set when provider is chatgpt",
         ));
     }
@@ -4433,7 +4538,7 @@ fn resolve_secret_env(
 ) -> std::result::Result<Option<String>, BackendError> {
     std::env::var(name)
         .map(|value| (!value.trim().is_empty()).then_some(value))
-        .map_err(|_| BackendError::failed(missing_message))
+        .map_err(|_| BackendError::invalid_configuration(missing_message))
 }
 
 fn resolve_env_value(name: &str) -> Option<String> {
@@ -4452,12 +4557,15 @@ fn resolve_base_url(base_url: Option<&str>) -> std::result::Result<Option<String
 fn resolve_base_url_value(base_url: &str) -> std::result::Result<String, BackendError> {
     if let Some(env) = parse_env_placeholder(base_url) {
         return resolve_env_value(env).ok_or_else(|| {
-            BackendError::failed(format!("missing base URL in environment variable {}", env))
+            BackendError::invalid_configuration(format!(
+                "missing base URL in environment variable {}",
+                env
+            ))
         });
     }
 
     if base_url.starts_with("${") {
-        return Err(BackendError::failed(format!(
+        return Err(BackendError::invalid_configuration(format!(
             "invalid base URL environment reference {base_url:?}"
         )));
     }
@@ -4484,7 +4592,7 @@ fn build_chatgpt_client(
     }
     builder
         .build()
-        .map_err(|source| BackendError::failed(source.to_string()))
+        .map_err(|source| BackendError::invalid_configuration(source.to_string()))
 }
 
 impl RigBackend {
@@ -4616,7 +4724,7 @@ async fn send_openai_completion_turn(
     }
     let client = builder
         .build()
-        .map_err(|source| BackendError::failed(source.to_string()))?;
+        .map_err(|source| BackendError::invalid_configuration(source.to_string()))?;
     send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
 }
 
@@ -4637,7 +4745,7 @@ async fn send_anthropic_completion_turn(
     }
     let client = builder
         .build()
-        .map_err(|source| BackendError::failed(source.to_string()))?;
+        .map_err(|source| BackendError::invalid_configuration(source.to_string()))?;
     send_completion_turn(client.completion_model(&ctx.request.model), ctx).await
 }
 
@@ -4833,6 +4941,22 @@ mod tests {
             &self,
             _request: SkillSearchRequest,
         ) -> std::result::Result<String, ExecutorError> {
+            Ok(r#"{"skills":[]}"#.to_owned())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingSkillExecutor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SkillSearchExecutor for CountingSkillExecutor {
+        async fn search_skill(
+            &self,
+            _request: SkillSearchRequest,
+        ) -> std::result::Result<String, ExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(r#"{"skills":[]}"#.to_owned())
         }
     }
@@ -5311,6 +5435,17 @@ mod tests {
         crate::builtin_tool_definition("exec_command").expect("builtin tool should exist")
     }
 
+    #[test]
+    fn backend_step_retry_backoff_uses_five_exponential_delays() {
+        assert_eq!(BACKEND_STEP_RETRY_LIMIT, 5);
+        assert_eq!(
+            backend_step_retry_backoff(DEFAULT_BACKEND_RETRY_INITIAL_DELAY)
+                .build()
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16].map(Duration::from_secs)
+        );
+    }
+
     #[tokio::test]
     async fn builder_test_model_rejects_unused_send_paths() {
         let model = BuilderTestModel::make(&(), "test-model");
@@ -5562,6 +5697,74 @@ mod tests {
 
         let final_result_nodes = tool_result_nodes(&store, &initial_head).await;
         assert_eq!(final_result_nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn backend_step_retries_do_not_replay_completed_tool_calls() {
+        let tool_call = rig_tool_call_content(
+            "tool-call-1",
+            Some("call-1".to_owned()),
+            "search_skill",
+            serde_json::json!({"query": "rust"}),
+        );
+        let tool_turn = BackendTurn::from_assistant_choice(
+            Some("assistant-1".to_owned()),
+            rig::OneOrMany::one(tool_call),
+        );
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![
+                Ok(tool_turn),
+                Err(BackendError::failed("rate limited once")),
+                Err(BackendError::failed("rate limited twice")),
+                Ok(BackendTurn::finished("done")),
+            ],
+        )]);
+        let backend_calls = backend.calls.clone();
+        let skill_executor = Arc::new(CountingSkillExecutor::default());
+        let store = test_store().await;
+        let service = LlmService::builder(store, backend)
+            .with_backend_retry_initial_delay(Duration::ZERO)
+            .with_skill_search_executor(skill_executor.clone())
+            .build();
+        service
+            .create_session(SessionConfig {
+                tools: vec![crate::builtin_tool_definition("search_skill").unwrap()],
+                ..session_config("main")
+            })
+            .await
+            .unwrap();
+
+        let result = service.run(request("main")).await.unwrap();
+
+        assert_eq!(result.text, "done");
+        assert_eq!(backend_calls.lock().await.len(), 4);
+        assert_eq!(skill_executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn backend_step_does_not_retry_invalid_configuration() {
+        let backend = FakeBackend::with_turns(vec![(
+            "main",
+            vec![
+                Err(BackendError::invalid_configuration("missing API key")),
+                Ok(BackendTurn::finished("unexpected retry")),
+            ],
+        )]);
+        let backend_calls = backend.calls.clone();
+        let store = test_store().await;
+        let service = LlmService::builder(store, backend)
+            .with_backend_retry_initial_delay(Duration::ZERO)
+            .build();
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+
+        let error = service.run(request("main")).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Backend call failed: missing API key");
+        assert_eq!(backend_calls.lock().await.len(), 1);
     }
 
     #[tokio::test]
@@ -6065,6 +6268,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(error.to_string(), "missing API key for provider openai");
     }
 
@@ -6082,6 +6286,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(error.to_string(), "missing API key for provider anthropic");
     }
 
@@ -6102,6 +6307,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(
             error.to_string(),
             "invalid base URL environment reference \"${COCO_OPENAI_BASE_URL\""
@@ -6122,7 +6328,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert!(!error.to_string().is_empty());
     }
 
@@ -6144,6 +6350,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(
             error.to_string(),
             "missing base URL in environment variable COCO_ANTHROPIC_BASE_URL"
@@ -6164,7 +6371,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert!(!error.to_string().is_empty());
     }
 
@@ -6181,6 +6388,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert_eq!(
             error.to_string(),
             "COCO_API_KEY must not be set when provider is chatgpt"
@@ -6208,7 +6416,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(error, BackendError::Failed { .. }));
+        assert!(matches!(error, BackendError::InvalidConfiguration { .. }));
         assert!(!error.to_string().is_empty());
     }
 
@@ -7403,9 +7611,12 @@ mod tests {
     #[tokio::test]
     async fn run_can_retry_reference_with_latest_branch_session() {
         let store = test_store().await;
-        let backend = FakeBackend::with_responses(&[(
+        let backend = FakeBackend::with_completions(&[(
             "main",
-            &[Err(BackendError::failed("rate limited")), Ok("recovered")],
+            &[
+                Ok(BackendRun::failed("rate limited", vec![])),
+                Ok(BackendRun::succeeded("recovered", vec![])),
+            ],
         )]);
         let calls = backend.calls.clone();
         let service = LlmService::new(store.clone(), backend);

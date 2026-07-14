@@ -12,8 +12,9 @@ use coco_llm::coco_mem::{
     SkillVersionSpec, SqliteStore, ToolResult, ToolUse,
 };
 use coco_llm::{
-    BackendError, BackendEventPayload, BackendTurn, CompletionBackend, CompletionMessage,
-    LlmService, Provider, SessionConfig, SessionConfigPatch, StepContext, builtin_tool_definition,
+    BACKEND_STEP_RETRY_LIMIT, BackendError, BackendEventPayload, BackendTurn, CompletionBackend,
+    CompletionMessage, LlmService, Provider, SessionConfig, SessionConfigPatch, StepContext,
+    builtin_tool_definition,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
@@ -33,6 +34,24 @@ async fn test_store() -> SqliteStore {
     SqliteStore::open_temporary()
         .await
         .expect("temporary SQLite store should open")
+}
+
+fn test_llm<B>(store: SqliteStore, backend: B) -> Arc<LlmService<B, SqliteStore>> {
+    Arc::new(
+        LlmService::builder(store, backend)
+            .with_backend_retry_initial_delay(Duration::ZERO)
+            .build(),
+    )
+}
+
+fn failed_backend_responses(message: &str) -> Vec<std::result::Result<&'static str, BackendError>> {
+    (0..=BACKEND_STEP_RETRY_LIMIT)
+        .map(|_| {
+            Err(BackendError::Failed {
+                message: message.to_owned(),
+            })
+        })
+        .collect()
 }
 
 async fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
@@ -82,6 +101,7 @@ impl BranchResolver for FailingResolver {
 #[derive(Debug, Clone)]
 struct FakeBackend {
     responses: FakeResponseQueue,
+    calls: Arc<AtomicUsize>,
 }
 
 impl FakeBackend {
@@ -116,6 +136,7 @@ impl FakeBackend {
 
         Self {
             responses: Arc::new(Mutex::new(responses)),
+            calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -123,6 +144,7 @@ impl FakeBackend {
 #[async_trait]
 impl CompletionBackend for FakeBackend {
     async fn step(&self, ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let mut responses = self.responses.lock().unwrap();
         let queue = responses
             .get_mut(&ctx.request.branch)
@@ -133,6 +155,13 @@ impl CompletionBackend for FakeBackend {
 
 #[derive(Debug, Clone)]
 struct BlockingBackend {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone)]
+struct BlockingFailBackend {
     started: Arc<Notify>,
     release: Arc<Notify>,
     calls: Arc<AtomicUsize>,
@@ -254,6 +283,20 @@ impl CompletionBackend for BlockingBackend {
         self.started.notify_waiters();
         self.release.notified().await;
         Ok(FakeBackend::finished_turn("done"))
+    }
+}
+
+#[async_trait]
+impl CompletionBackend for BlockingFailBackend {
+    async fn step(&self, _ctx: StepContext<'_>) -> std::result::Result<BackendTurn, BackendError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Err(BackendError::Failed {
+            message: "backend failed".to_owned(),
+        })
     }
 }
 
@@ -844,15 +887,90 @@ async fn llm_engine_join_job_waits_for_inflight_job() {
 }
 
 #[tokio::test]
-async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
+async fn llm_engine_wait_for_inflight_job_returns_when_recovery_is_queued() {
+    let store = test_store().await;
+    let backend = BlockingFailBackend {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let started = backend.started.clone();
+    let release = backend.release.clone();
+    let calls = backend.calls.clone();
+    let llm = test_llm(store.clone(), backend);
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.drive_job(&job_id).await }
+    });
+    started.notified().await;
+
+    let waiter = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.wait_for_inflight_job(&job_id).await }
+    });
+    sleep(Duration::from_millis(20)).await;
+    assert!(!waiter.is_finished());
+
+    release.notify_waiters();
+    let waited = waiter.await.unwrap().unwrap().unwrap();
+    let driven = driver.await.unwrap().unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), BACKEND_STEP_RETRY_LIMIT + 1);
+    assert_eq!(waited.status, JobStatus::Running);
+    assert_eq!(driven.status, JobStatus::Running);
+}
+
+#[tokio::test]
+async fn llm_engine_retries_backend_failure_locally_before_recovery() {
     let store = test_store().await;
     let backend = FakeBackend::with_responses(&[(
         "main",
-        &[Err(BackendError::Failed {
-            message: "backend failed".to_owned(),
-        })],
+        &[
+            Err(BackendError::Failed {
+                message: "backend failed once".to_owned(),
+            }),
+            Err(BackendError::Failed {
+                message: "backend failed twice".to_owned(),
+            }),
+            Ok("recovered locally"),
+        ],
     )]);
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let calls = backend.calls.clone();
+    let llm = test_llm(store.clone(), backend);
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+
+    let snapshot = engine.drive_job(&job.job_id).await.unwrap();
+
+    assert_eq!(snapshot.status, JobStatus::Finished);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(
+        store
+            .list_queue_messages(SYSTEM_EVENT_QUEUE)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.get_node(&snapshot.head).await.unwrap().kind,
+        Kind::Text("recovered locally".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn llm_engine_queues_recovery_after_local_backend_retries_are_exhausted() {
+    let store = test_store().await;
+    let responses = failed_backend_responses("backend failed");
+    let backend = FakeBackend::with_responses(&[("main", responses.as_slice())]);
+    let calls = backend.calls.clone();
+    let llm = test_llm(store.clone(), backend);
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
@@ -860,6 +978,7 @@ async fn llm_engine_drive_job_returns_snapshot_after_backend_failure() {
     let snapshot = engine.drive_job(&job.job_id).await.unwrap();
 
     assert_eq!(snapshot.status, JobStatus::Running);
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     assert_eq!(snapshot.branch, "main");
     assert_eq!(snapshot.work_branch, "main");
     let events = store.list_queue_messages(SYSTEM_EVENT_QUEUE).await.unwrap();
@@ -918,7 +1037,7 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
     let store = test_store().await;
     let backend = ModelGateBackend::new("good-model");
     let calls = backend.calls.clone();
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let llm = test_llm(store.clone(), backend);
     let mut config = session_config("main");
     config.model = "bad-model".to_owned();
     llm.create_session(config).await.unwrap();
@@ -946,22 +1065,22 @@ async fn llm_engine_retries_disconnected_rebased_job_with_latest_branch_session(
         store.get_node(&recovered.head).await.unwrap().kind,
         Kind::Text("recovered".to_owned())
     );
-    assert_eq!(
-        calls.lock().await.as_slice(),
-        ["bad-model".to_owned(), "good-model".to_owned()]
+    let calls = calls.lock().await;
+    assert_eq!(calls.len(), BACKEND_STEP_RETRY_LIMIT + 2);
+    assert!(
+        calls[..=BACKEND_STEP_RETRY_LIMIT]
+            .iter()
+            .all(|model| model == "bad-model")
     );
+    assert_eq!(calls.last().unwrap(), "good-model");
 }
 
 #[tokio::test]
 async fn llm_engine_retrying_failure_node_requeues_missing_recovery_event() {
     let store = test_store().await;
-    let backend = FakeBackend::with_responses(&[(
-        "main",
-        &[Err(BackendError::Failed {
-            message: "backend still failed".to_owned(),
-        })],
-    )]);
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let responses = failed_backend_responses("backend still failed");
+    let backend = FakeBackend::with_responses(&[("main", responses.as_slice())]);
+    let llm = test_llm(store.clone(), backend);
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
@@ -991,13 +1110,9 @@ async fn llm_engine_retrying_failure_node_requeues_missing_recovery_event() {
 #[tokio::test]
 async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_event() {
     let store = test_store().await;
-    let backend = FakeBackend::with_responses(&[(
-        "main",
-        &[Err(BackendError::Failed {
-            message: "backend still failed".to_owned(),
-        })],
-    )]);
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let responses = failed_backend_responses("backend still failed");
+    let backend = FakeBackend::with_responses(&[("main", responses.as_slice())]);
+    let llm = test_llm(store.clone(), backend);
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
@@ -1077,22 +1192,14 @@ async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
 #[tokio::test]
 async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root_branch() {
     let store = test_store().await;
+    let main_responses = failed_backend_responses("main failed");
+    let recovery_b_responses = failed_backend_responses("recovery b failed");
     let backend = FakeBackend::with_responses(&[
-        (
-            "main",
-            &[Err(BackendError::Failed {
-                message: "main failed".to_owned(),
-            })],
-        ),
-        (
-            "recovery-b",
-            &[Err(BackendError::Failed {
-                message: "recovery b failed".to_owned(),
-            })],
-        ),
+        ("main", main_responses.as_slice()),
+        ("recovery-b", recovery_b_responses.as_slice()),
         ("recovery-c", &[Ok("recovered by c")]),
     ]);
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let llm = test_llm(store.clone(), backend);
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
@@ -1188,16 +1295,12 @@ async fn llm_engine_keeps_recovery_branch_as_current_work_until_it_recovers_root
 #[tokio::test]
 async fn llm_engine_finishes_job_when_recovery_restore_fails() {
     let store = test_store().await;
+    let main_responses = failed_backend_responses("main failed");
     let backend = FakeBackend::with_responses(&[
-        (
-            "main",
-            &[Err(BackendError::Failed {
-                message: "main failed".to_owned(),
-            })],
-        ),
+        ("main", main_responses.as_slice()),
         ("recovery-b", &[Ok("recovered by b")]),
     ]);
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let llm = test_llm(store.clone(), backend);
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
@@ -1260,7 +1363,7 @@ async fn llm_engine_maps_missing_session_error() {
 async fn llm_engine_reply_surfaces_backend_failure_message() {
     let store = test_store().await;
     let backend = AlwaysFailBackend::new();
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let llm = test_llm(store.clone(), backend);
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
 
@@ -1293,7 +1396,8 @@ async fn llm_engine_reply_surfaces_backend_failure_message() {
 async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() {
     let store = test_store().await;
     let backend = MissingFinalTextBackend::new();
-    let llm = Arc::new(LlmService::new(store, backend));
+    let calls = backend.calls.clone();
+    let llm = test_llm(store, backend);
     llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
 
@@ -1307,6 +1411,7 @@ async fn llm_engine_reply_rejects_intermediate_text_without_terminal_response() 
         }
         other => panic!("unexpected error: {other:?}"),
     }
+    assert_eq!(calls.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -1773,11 +1878,11 @@ async fn llm_engine_cleans_up_skill_runtime_when_materialization_fails() {
 }
 
 #[tokio::test]
-async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
+async fn llm_engine_retries_skill_backend_before_cleaning_up_failed_child_branch() {
     let store = test_store().await;
     let backend = AlwaysFailBackend::new();
     let calls = backend.calls.clone();
-    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    let llm = test_llm(store.clone(), backend);
     let base_session = llm.create_session(session_config("main")).await.unwrap();
     let engine = ConversationEngine::new(llm);
     store
@@ -1810,7 +1915,7 @@ async fn llm_engine_cleans_up_child_branch_when_skill_fails() {
 
     assert!(matches!(error, EngineError::EngineFailed { .. }));
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), 1);
+    assert_eq!(calls.len(), BACKEND_STEP_RETRY_LIMIT + 1);
     let child_branch = calls[0].clone();
     drop(calls);
 

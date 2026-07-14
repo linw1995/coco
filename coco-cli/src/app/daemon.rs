@@ -1297,20 +1297,6 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL));
         }
 
-        if !self.engine.has_inflight_job(&active_job.job_id).await {
-            tracing::debug!(
-                message_id = %item.message_id,
-                queue = %self.queue,
-                branch = %request.branch,
-                job_id = %request.job_id,
-                active_job_id = %active_job.job_id,
-                active_job_status = ?active_job.status,
-                wait_ms = ACTIVE_JOB_RECHECK_INTERVAL.as_millis(),
-                "active branch prompt job has no inflight drive; queued request will wait"
-            );
-            return Ok(PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL));
-        }
-
         tracing::info!(
             message_id = %item.message_id,
             queue = %self.queue,
@@ -1318,40 +1304,55 @@ impl<B, S> PromptJobMessageQueueWorker<B, S> {
             job_id = %request.job_id,
             active_job_id = %active_job.job_id,
             active_job_status = ?active_job.status,
-            "joining active branch prompt job before handling queued request"
+            "waiting for active branch prompt job drive before handling queued request"
         );
 
-        Ok(match self.engine.join_job(&active_job.job_id).await {
-            Ok(snapshot) if matches!(snapshot.status, JobStatus::Finished) => {
-                PromptQueueHeadResult::Continue
-            }
-            Ok(snapshot) => {
-                tracing::info!(
-                    message_id = %item.message_id,
-                    queue = %self.queue,
-                    branch = %request.branch,
-                    job_id = %request.job_id,
-                    active_job_id = %active_job.job_id,
-                    active_job_status = ?snapshot.status,
-                    wait_ms = ACTIVE_JOB_RECHECK_INTERVAL.as_millis(),
-                    "active branch prompt job still blocks queued request"
-                );
-                PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    message_id = %item.message_id,
-                    queue = %self.queue,
-                    branch = %request.branch,
-                    job_id = %request.job_id,
-                    active_job_id = %active_job.job_id,
-                    error = %error,
-                    wait_ms = ACTIVE_JOB_RECHECK_INTERVAL.as_millis(),
-                    "failed to join active branch prompt job before materializing queued request"
-                );
-                PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL)
-            }
-        })
+        Ok(
+            match self.engine.wait_for_inflight_job(&active_job.job_id).await {
+                Ok(Some(snapshot)) if matches!(snapshot.status, JobStatus::Finished) => {
+                    PromptQueueHeadResult::Continue
+                }
+                Ok(Some(snapshot)) => {
+                    tracing::info!(
+                        message_id = %item.message_id,
+                        queue = %self.queue,
+                        branch = %request.branch,
+                        job_id = %request.job_id,
+                        active_job_id = %active_job.job_id,
+                        active_job_status = ?snapshot.status,
+                        wait_ms = ACTIVE_JOB_RECHECK_INTERVAL.as_millis(),
+                        "active branch prompt job still blocks queued request"
+                    );
+                    PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL)
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        message_id = %item.message_id,
+                        queue = %self.queue,
+                        branch = %request.branch,
+                        job_id = %request.job_id,
+                        active_job_id = %active_job.job_id,
+                        active_job_status = ?active_job.status,
+                        wait_ms = ACTIVE_JOB_RECHECK_INTERVAL.as_millis(),
+                        "active branch prompt job has no inflight drive; queued request will wait"
+                    );
+                    PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        message_id = %item.message_id,
+                        queue = %self.queue,
+                        branch = %request.branch,
+                        job_id = %request.job_id,
+                        active_job_id = %active_job.job_id,
+                        error = %error,
+                        wait_ms = ACTIVE_JOB_RECHECK_INTERVAL.as_millis(),
+                        "failed to wait for active branch prompt job drive before materializing queued request"
+                    );
+                    PromptQueueHeadResult::Wait(ACTIVE_JOB_RECHECK_INTERVAL)
+                }
+            },
+        )
     }
 
     async fn handle_item(&self, item: MessageQueueItem)
@@ -2810,8 +2811,19 @@ mod tests {
             .await
             .unwrap();
         let active_job_id = active_job.job_id.clone();
-        let failed = engine.drive_job(&active_job_id).await.unwrap();
-        assert_eq!(failed.status, JobStatus::Running);
+        store
+            .set_job_status(&active_job_id, JobStatus::Queued, JobStatus::Running)
+            .await
+            .unwrap();
+        store
+            .append(NewNode {
+                parent: active_job.base.clone(),
+                role: Role::System,
+                metadata: BackendMetadata::builder().build(),
+                kind: Kind::Failure("backend failed".to_owned()),
+            })
+            .await
+            .unwrap();
 
         store
             .enqueue_message(
@@ -2835,7 +2847,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(100), worker.drain_once()).await;
 
         assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             engine.get_job(&active_job_id).await.unwrap().status,
             JobStatus::Running
