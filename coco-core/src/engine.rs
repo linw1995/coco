@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use coco_llm::coco_mem::{
     BranchStore, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, Node, NodeStore,
@@ -6,8 +6,8 @@ use coco_llm::coco_mem::{
 };
 use coco_llm::{
     BackendError, BackendFailureContext, CompletionBackend, CompletionInput, CompletionOrigin,
-    CompletionOverrides, CompletionRequest, CompletionResult, DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
-    Error as LlmError, LlmService, RigBackend, SessionConfigPatch,
+    CompletionOverrides, CompletionRequest, Error as LlmError, LlmService, RigBackend,
+    SessionConfigPatch,
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jiff::Timestamp;
@@ -48,7 +48,6 @@ struct PromptReply {
 pub struct ConversationEngine<B = RigBackend, S = SqliteStore> {
     service: Arc<LlmService<B, S>>,
     inflight_jobs: InflightJobTable,
-    backend_retry_initial_delay: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -84,7 +83,6 @@ impl<B, S> Clone for ConversationEngine<B, S> {
         Self {
             service: self.service.clone(),
             inflight_jobs: self.inflight_jobs.clone(),
-            backend_retry_initial_delay: self.backend_retry_initial_delay,
         }
     }
 }
@@ -97,17 +95,9 @@ impl ConversationEngine<RigBackend, SqliteStore> {
 
 impl<B, S> ConversationEngine<B, S> {
     pub fn new(service: Arc<LlmService<B, S>>) -> Self {
-        Self::with_backend_retry_initial_delay(service, DEFAULT_BACKEND_RETRY_INITIAL_DELAY)
-    }
-
-    pub(crate) fn with_backend_retry_initial_delay(
-        service: Arc<LlmService<B, S>>,
-        backend_retry_initial_delay: Duration,
-    ) -> Self {
         Self {
             service,
             inflight_jobs: Arc::new(AsyncMutex::new(HashMap::new())),
-            backend_retry_initial_delay,
         }
     }
 
@@ -134,21 +124,6 @@ where
         tool_name: &str,
     ) -> std::result::Result<bool, LlmError> {
         self.service.session_supports_tool(branch, tool_name).await
-    }
-}
-
-impl<B, S> ConversationEngine<B, S>
-where
-    B: CompletionBackend,
-    S: NodeStore + BranchStore + SessionStore + SkillStore + Clone + Send + Sync + 'static,
-{
-    pub(crate) async fn run_completion_with_backend_retries(
-        &self,
-        request: CompletionRequest,
-    ) -> std::result::Result<CompletionResult, LlmError> {
-        self.service
-            .run_with_backend_retry_initial_delay(request, self.backend_retry_initial_delay)
-            .await
     }
 }
 
@@ -740,7 +715,7 @@ where
             active_skill_runtime: None,
         };
 
-        match self.run_completion_with_backend_retries(request).await {
+        match self.service.run(request).await {
             Ok(_) => Ok(JobRunOutcome::Completed),
             Err(source) => {
                 self.handle_completion_error(job, source, !is_retrying_failure)

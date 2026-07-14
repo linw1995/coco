@@ -326,7 +326,6 @@ pub struct ResolvedCompletionRequest {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub additional_params: Option<Value>,
-    backend_retry_initial_delay: Duration,
     runtime: RuntimeCapabilities,
     trace_node_appender: Option<TraceNodeAppenderHandle>,
     trace_node_store: Option<Arc<TraceNodeStore>>,
@@ -950,6 +949,7 @@ pub struct RuntimeCapabilities {
     pub unified_exec_cli_bridge: UnifiedExecCliBridgeHandle,
     pub skill_search_executor: SkillSearchExecutorHandle,
     pub store_path: Option<PathBuf>,
+    backend_retry_initial_delay: Duration,
     unified_exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
 }
 
@@ -959,6 +959,7 @@ impl Default for RuntimeCapabilities {
             unified_exec_cli_bridge: UnifiedExecCliBridgeHandle::default(),
             skill_search_executor: SkillSearchExecutorHandle::default(),
             store_path: None,
+            backend_retry_initial_delay: DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
             unified_exec_sessions: unified_exec_tool::session_store(),
         }
     }
@@ -977,6 +978,7 @@ pub struct LlmService<B = RigBackend, S = SqliteStore> {
 pub struct LlmServiceBuilder<B, S> {
     store: S,
     backend: B,
+    backend_retry_initial_delay: Duration,
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
     unified_exec_cli_bridge: Option<UnifiedExecCliBridgeHandle>,
     skill_search_executor: Option<SkillSearchExecutorHandle>,
@@ -1154,6 +1156,11 @@ impl LlmService<RigBackend, SqliteStore> {
 }
 
 impl<B, S> LlmServiceBuilder<B, S> {
+    pub fn with_backend_retry_initial_delay(mut self, initial_delay: Duration) -> Self {
+        self.backend_retry_initial_delay = initial_delay;
+        self
+    }
+
     pub fn with_provider_configs(
         mut self,
         provider_configs: HashMap<String, ProviderRuntimeConfig>,
@@ -1191,6 +1198,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
                 unified_exec_cli_bridge: self.unified_exec_cli_bridge.unwrap_or_default(),
                 skill_search_executor: self.skill_search_executor.unwrap_or_default(),
                 store_path: self.store_path,
+                backend_retry_initial_delay: self.backend_retry_initial_delay,
                 unified_exec_sessions: unified_exec_tool::session_store(),
             },
             branch_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -1205,6 +1213,7 @@ impl<B, S> LlmService<B, S> {
         LlmServiceBuilder {
             store,
             backend,
+            backend_retry_initial_delay: DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
             provider_configs: HashMap::new(),
             unified_exec_cli_bridge: None,
             skill_search_executor: None,
@@ -1629,34 +1638,22 @@ where
             has_session_patch = request.session_patch.is_some(),
             "received prompt request"
         );
-        self.run_locked(
-            CompletionRequest {
-                branch: request.branch,
-                origin: CompletionOrigin::BranchHead,
-                input: CompletionInput::Prompt {
-                    text: request.prompt,
-                    attachments: request.attachments,
-                    merge_parents: request.merge_parents,
-                    session_patch: request.session_patch.map(Box::new),
-                },
-                overrides: CompletionOverrides::default(),
-                active_skill_runtime: None,
+        self.run_locked(CompletionRequest {
+            branch: request.branch,
+            origin: CompletionOrigin::BranchHead,
+            input: CompletionInput::Prompt {
+                text: request.prompt,
+                attachments: request.attachments,
+                merge_parents: request.merge_parents,
+                session_patch: request.session_patch.map(Box::new),
             },
-            DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
-        )
+            overrides: CompletionOverrides::default(),
+            active_skill_runtime: None,
+        })
         .await
     }
 
     pub async fn run(&self, request: CompletionRequest) -> Result<CompletionResult> {
-        self.run_with_backend_retry_initial_delay(request, DEFAULT_BACKEND_RETRY_INITIAL_DELAY)
-            .await
-    }
-
-    pub async fn run_with_backend_retry_initial_delay(
-        &self,
-        request: CompletionRequest,
-        backend_retry_initial_delay: Duration,
-    ) -> Result<CompletionResult> {
         let _guard = self.lock_branch(&request.branch).await;
         tracing::debug!(
             branch = %request.branch,
@@ -1664,17 +1661,11 @@ where
             input = completion_input_kind(&request.input),
             "received completion request"
         );
-        self.run_locked(request, backend_retry_initial_delay).await
+        self.run_locked(request).await
     }
 
-    async fn run_locked(
-        &self,
-        request: CompletionRequest,
-        backend_retry_initial_delay: Duration,
-    ) -> Result<CompletionResult> {
-        let prepared = self
-            .prepare_completion_run(request, backend_retry_initial_delay)
-            .await?;
+    async fn run_locked(&self, request: CompletionRequest) -> Result<CompletionResult> {
+        let prepared = self.prepare_completion_run(request).await?;
         let completed = self
             .backend
             .complete(prepared.session.clone(), prepared.resolved.clone())
@@ -1685,7 +1676,6 @@ where
     async fn prepare_completion_run(
         &self,
         request: CompletionRequest,
-        backend_retry_initial_delay: Duration,
     ) -> Result<PreparedCompletionRun> {
         let branch = request.branch.clone();
         let origin_kind = completion_origin_kind(&request.origin);
@@ -1764,7 +1754,6 @@ where
             request.clone(),
             Some(trace_node_appender),
             Some(trace_node_store),
-            backend_retry_initial_delay,
         );
 
         Ok(PreparedCompletionRun {
@@ -2798,7 +2787,6 @@ impl<B, S> LlmService<B, S> {
         request: CompletionRequest,
         trace_node_appender: Option<TraceNodeAppenderHandle>,
         trace_node_store: Option<Arc<TraceNodeStore>>,
-        backend_retry_initial_delay: Duration,
     ) -> ResolvedCompletionRequest {
         let CompletionOverrides {
             provider,
@@ -2834,7 +2822,6 @@ impl<B, S> LlmService<B, S> {
             temperature: temperature.or(session.config.temperature),
             max_tokens: max_tokens.or(session.config.max_tokens),
             additional_params,
-            backend_retry_initial_delay,
             runtime: self.runtime.clone(),
             trace_node_appender,
             trace_node_store,
@@ -4105,7 +4092,7 @@ impl CompletionRunner {
         let retry_attempts = AtomicUsize::new(0);
         let result = (|| backend.step(self.step_context()))
             .retry(backend_step_retry_backoff(
-                self.request.backend_retry_initial_delay,
+                self.request.runtime.backend_retry_initial_delay,
             ))
             .sleep(tokio::time::sleep)
             .notify(|source, delay| {
@@ -5275,7 +5262,6 @@ mod tests {
             temperature,
             max_tokens,
             additional_params,
-            backend_retry_initial_delay: Duration::ZERO,
             runtime: RuntimeCapabilities::default(),
             trace_node_appender: None,
             trace_node_store: None,
@@ -5347,7 +5333,6 @@ mod tests {
             temperature: None,
             max_tokens: None,
             additional_params: None,
-            backend_retry_initial_delay: Duration::ZERO,
             runtime: RuntimeCapabilities::default(),
             trace_node_appender: None,
             trace_node_store: None,
@@ -5704,6 +5689,7 @@ mod tests {
         let skill_executor = Arc::new(CountingSkillExecutor::default());
         let store = test_store().await;
         let service = LlmService::builder(store, backend)
+            .with_backend_retry_initial_delay(Duration::ZERO)
             .with_skill_search_executor(skill_executor.clone())
             .build();
         service
@@ -5714,10 +5700,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = service
-            .run_with_backend_retry_initial_delay(request("main"), Duration::ZERO)
-            .await
-            .unwrap();
+        let result = service.run(request("main")).await.unwrap();
 
         assert_eq!(result.text, "done");
         assert_eq!(backend_calls.lock().await.len(), 4);

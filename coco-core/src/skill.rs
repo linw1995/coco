@@ -359,8 +359,8 @@ where
             .map_err(|source| LlmError::Memory {
                 source: Box::new(source),
             })?;
-        let prompt_result = self
-            .run_completion_with_backend_retries(CompletionRequest {
+        let prompt_result = service
+            .run(CompletionRequest {
                 branch: child_branch.clone(),
                 origin: CompletionOrigin::BranchHead,
                 input: CompletionInput::Continue,
