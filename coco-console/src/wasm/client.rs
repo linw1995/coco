@@ -2763,7 +2763,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_progress_reports_typed_states() {
+    fn graph_items_progress_reports_typed_states() {
         let building = [progress_status(
             "anchors",
             "building",
@@ -2794,7 +2794,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn node_label_limits_heads_and_character_count() {
+    fn graph_items_node_label_limits_heads_and_character_count() {
         let mut node = graph_node("aaaaaaaa", 56, 56);
         node.labels = vec![
             "abcdefghijklmnop".to_owned(),
@@ -2809,7 +2809,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn viewport_updates_reuse_stable_node_and_edge_elements() {
+    fn graph_items_viewport_updates_reuse_stable_node_and_edge_elements() {
         let fixture = GraphFixture::new();
         let initial_route = route((74, 56), (104, 56), (120, 128), (150, 128));
         let updated_route = route((298, 162), (326, 162), (350, 90), (374, 90));
@@ -2920,7 +2920,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn time_scale_targets_nodes_and_navigates_by_tick() {
+    fn graph_items_time_scale_targets_nodes_and_navigates_by_tick() {
         let fixture = GraphFixture::new();
         let ticks = {
             let graph = fixture.graph.borrow();
