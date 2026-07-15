@@ -26,7 +26,6 @@ pub struct GraphViewportResponse {
     pub version: u64,
     pub canvas: GraphCanvas,
     pub viewport: GraphViewport,
-    pub lanes: Vec<GraphViewportLane>,
     pub nodes: Vec<GraphViewportNode>,
     pub edges: Vec<GraphViewportEdge>,
 }
@@ -44,7 +43,6 @@ pub struct GraphViewportDiffResponse {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct GraphViewportItems {
-    pub lanes: Vec<GraphViewportLane>,
     pub nodes: Vec<GraphViewportNode>,
     pub edges: Vec<GraphViewportEdge>,
 }
@@ -52,7 +50,6 @@ pub struct GraphViewportItems {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphViewportItemKind {
-    Lane,
     Node,
     Edge,
 }
@@ -61,19 +58,6 @@ pub enum GraphViewportItemKind {
 pub struct GraphViewportRemovedItem {
     pub kind: GraphViewportItemKind,
     pub key: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct GraphViewportLane {
-    pub key: String,
-    pub label: String,
-    pub y: i32,
-}
-
-impl GraphViewportLane {
-    pub fn fingerprint(&self) -> String {
-        graph_viewport_item_fingerprint(self)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -96,11 +80,31 @@ impl GraphViewportNode {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum GraphViewportEdgeKind {
-    PrimaryParent,
-    Fork,
-    MergeParent,
+    #[serde(rename = "primary_parent")]
+    Primary,
+    #[serde(rename = "merge_parent")]
+    Merge,
+    #[serde(rename = "shadow_parent")]
+    Shadow,
+}
+
+impl GraphViewportEdgeKind {
+    pub fn key_part(self) -> &'static str {
+        match self {
+            Self::Primary => "primary_parent",
+            Self::Merge => "merge_parent",
+            Self::Shadow => "shadow_parent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GraphBezierRoute {
+    pub source: Point,
+    pub control_1: Point,
+    pub control_2: Point,
+    pub target: Point,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -109,10 +113,7 @@ pub struct GraphViewportEdge {
     pub kind: GraphViewportEdgeKind,
     pub source_id: String,
     pub target_id: String,
-    pub source: Point,
-    pub target: Point,
-    pub route_slot: i32,
-    pub target_port_offset: f64,
+    pub route: GraphBezierRoute,
 }
 
 impl GraphViewportEdge {
@@ -137,16 +138,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphViewportEdge, GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, Point,
+        GraphBezierRoute, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode, Point,
     };
 
     #[test]
     fn fingerprints_change_when_item_payload_changes() {
-        let lane = GraphViewportLane {
-            key: "lane:main".to_owned(),
-            label: "main".to_owned(),
-            y: 0,
-        };
         let mut node = GraphViewportNode {
             key: "node:1".to_owned(),
             id: "1".to_owned(),
@@ -160,22 +156,22 @@ mod tests {
         };
         let mut edge = GraphViewportEdge {
             key: "edge:primary:1:2".to_owned(),
-            kind: GraphViewportEdgeKind::PrimaryParent,
+            kind: GraphViewportEdgeKind::Primary,
             source_id: "1".to_owned(),
             target_id: "2".to_owned(),
-            source: Point { x: 0, y: 0 },
-            target: Point { x: 100, y: 100 },
-            route_slot: 0,
-            target_port_offset: 0.0,
+            route: GraphBezierRoute {
+                source: Point { x: 0, y: 0 },
+                control_1: Point { x: 30, y: 0 },
+                control_2: Point { x: 70, y: 100 },
+                target: Point { x: 100, y: 100 },
+            },
         };
 
-        let lane_fingerprint = lane.fingerprint();
         let node_fingerprint = node.fingerprint();
         let edge_fingerprint = edge.fingerprint();
         node.labels.push("draft".to_owned());
-        edge.route_slot = 1;
+        edge.route.control_1.y = 10;
 
-        assert_eq!(lane_fingerprint, lane.fingerprint());
         assert_ne!(node_fingerprint, node.fingerprint());
         assert_ne!(edge_fingerprint, edge.fingerprint());
     }

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::str::{FromStr, Split};
@@ -17,9 +17,9 @@ use super::refresh::{
     pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
 use crate::api::{
-    GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
-    GraphViewportEdgeKind, GraphViewportItems, GraphViewportLane, GraphViewportNode,
-    GraphViewportRemovedItem, GraphViewportResponse, Point,
+    GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
+    GraphViewportEdgeKind, GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem,
+    GraphViewportResponse, Point,
 };
 use crate::viewport::{
     MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
@@ -29,11 +29,7 @@ const ROOT_ID: &str = "console-root";
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const VIEWPORT_KEY: &str = "coco-console:viewport";
 const AUTO_FOLLOW_KEY: &str = "coco-console:auto-follow";
-const NODE_RADIUS: f64 = 26.0;
-const EDGE_NODE_EXIT: f64 = 42.0;
-const EDGE_TARGET_APPROACH: f64 = 48.0;
-const EDGE_ROUTE_STEP: f64 = 12.0;
-const GRAPH_LANE_HEIGHT: i32 = 140;
+const NODE_RADIUS: f64 = 18.0;
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
 const MAX_SHORT_CANVAS_AUTO_ZOOM: f64 = 2.6;
@@ -63,12 +59,6 @@ enum GraphProgressAction {
     Ignore,
 }
 
-#[derive(Clone, Copy)]
-struct LaneDisplay {
-    y: i32,
-    visible: bool,
-}
-
 type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
 
 struct GraphRootElements {
@@ -78,7 +68,6 @@ struct GraphRootElements {
 }
 
 struct GraphLayerElements {
-    lane_group: Element,
     edge_group: Element,
     node_group: Element,
 }
@@ -220,7 +209,6 @@ impl From<GraphViewport> for ViewportState {
 }
 
 struct RenderedKeys {
-    lanes: BTreeMap<String, String>,
     nodes: BTreeMap<String, String>,
     edges: BTreeMap<String, String>,
 }
@@ -228,26 +216,15 @@ struct RenderedKeys {
 impl RenderedKeys {
     fn new() -> Self {
         Self {
-            lanes: BTreeMap::new(),
             nodes: BTreeMap::new(),
             edges: BTreeMap::new(),
         }
     }
 
     fn known_query(&self) -> String {
-        self.lanes
+        self.nodes
             .iter()
             .flat_map(|(key, fingerprint)| {
-                [
-                    format!("known_lane={}", percent_encode(key)),
-                    format!(
-                        "known_lane_fingerprint={}:{}",
-                        percent_encode(key),
-                        fingerprint
-                    ),
-                ]
-            })
-            .chain(self.nodes.iter().flat_map(|(key, fingerprint)| {
                 [
                     format!("known_node={}", percent_encode(key)),
                     format!(
@@ -256,7 +233,7 @@ impl RenderedKeys {
                         fingerprint
                     ),
                 ]
-            }))
+            })
             .chain(self.edges.iter().flat_map(|(key, fingerprint)| {
                 [
                     format!("known_edge={}", percent_encode(key)),
@@ -279,7 +256,6 @@ struct VirtualGraph {
     graph_wrap: Element,
     graph_bg: Element,
     follow_toggle: Element,
-    lane_group: Element,
     edge_group: Element,
     node_group: Element,
     time_scale: Element,
@@ -322,7 +298,6 @@ impl VirtualGraph {
             graph_wrap: elements.root.graph_wrap,
             graph_bg: elements.root.graph_bg,
             follow_toggle: elements.root.follow_toggle,
-            lane_group: elements.layers.lane_group,
             edge_group: elements.layers.edge_group,
             node_group: elements.layers.node_group,
             time_scale: elements.time_scale.time_scale,
@@ -441,23 +416,14 @@ impl VirtualGraph {
             version,
             canvas,
             viewport,
-            lanes,
             nodes,
             edges,
         } = response;
-        clear_children(&self.lane_group);
         clear_children(&self.edge_group);
         clear_children(&self.node_group);
         self.rendered = RenderedKeys::new();
         self.apply_response_viewport(version, canvas, viewport)?;
-        self.upsert_graph_items(
-            GraphViewportItems {
-                lanes,
-                nodes,
-                edges,
-            },
-            false,
-        )?;
+        self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
         self.sync_branch_visibility();
         self.sync_selected_graph_node();
         self.hide_status();
@@ -547,7 +513,7 @@ impl VirtualGraph {
             &self.time_scale,
             &self.time_scale_cursor,
             &self.time_scale_label,
-            self.viewport,
+            &self.window,
         )?;
         self.sync_branch_visibility();
         Ok(())
@@ -573,21 +539,9 @@ impl VirtualGraph {
         items: GraphViewportItems,
         nodes_are_new: bool,
     ) -> Result<(), JsValue> {
-        let GraphViewportItems {
-            lanes,
-            nodes,
-            edges,
-        } = items;
-        self.upsert_lanes(lanes)?;
+        let GraphViewportItems { nodes, edges } = items;
         self.upsert_edges(edges)?;
         self.upsert_nodes(nodes, nodes_are_new)
-    }
-
-    fn upsert_lanes(&mut self, lanes: Vec<GraphViewportLane>) -> Result<(), JsValue> {
-        for lane in lanes {
-            self.upsert_lane(lane)?;
-        }
-        Ok(())
     }
 
     fn upsert_edges(&mut self, edges: Vec<GraphViewportEdge>) -> Result<(), JsValue> {
@@ -623,49 +577,34 @@ impl VirtualGraph {
         }
     }
 
-    fn upsert_lane(&mut self, lane: GraphViewportLane) -> Result<(), JsValue> {
-        self.remove_key(&lane.key);
-        let element = svg_element(&self.document, "text")?;
-        set_attributes(
-            &element,
-            [
-                ("id", render_element_id(&lane.key)),
-                ("data-render-key", lane.key.clone()),
-                ("data-lane-y", lane.y.to_string()),
-                ("class", "lane-label".to_owned()),
-                ("x", "64".to_owned()),
-                ("y", lane.y.to_string()),
-            ],
-        )?;
-        element.set_text_content(Some(&lane.label));
-        self.lane_group.append_child(&element)?;
-        self.rendered
-            .lanes
-            .insert(lane.key.clone(), lane.fingerprint());
-        Ok(())
-    }
-
     fn upsert_edge(&mut self, edge: GraphViewportEdge) -> Result<(), JsValue> {
-        self.remove_key(&edge.key);
-        let element = self.edge_element(&edge)?;
+        let element = self
+            .document
+            .get_element_by_id(&render_element_id(&edge.key))
+            .map_or_else(|| self.edge_element(&edge), Ok)?;
+        let (class, marker) = edge_style(edge.kind);
         set_attributes(
             &element,
             [
                 ("id", render_element_id(&edge.key)),
                 ("data-render-key", edge.key.clone()),
-                ("data-source-x", edge.source.x.to_string()),
-                ("data-source-y", edge.source.y.to_string()),
-                ("data-target-x", edge.target.x.to_string()),
-                ("data-target-y", edge.target.y.to_string()),
-                ("data-edge-kind", edge_kind_data(edge.kind).to_owned()),
-                ("data-route-slot", edge.route_slot.to_string()),
-                (
-                    "data-target-port-offset",
-                    edge.target_port_offset.to_string(),
-                ),
+                ("class", class.to_owned()),
+                ("marker-end", marker.to_owned()),
+                ("d", bezier_path(edge.route)),
+                ("data-source-x", edge.route.source.x.to_string()),
+                ("data-source-y", edge.route.source.y.to_string()),
+                ("data-control-1-x", edge.route.control_1.x.to_string()),
+                ("data-control-1-y", edge.route.control_1.y.to_string()),
+                ("data-control-2-x", edge.route.control_2.x.to_string()),
+                ("data-control-2-y", edge.route.control_2.y.to_string()),
+                ("data-target-x", edge.route.target.x.to_string()),
+                ("data-target-y", edge.route.target.y.to_string()),
+                ("data-edge-kind", edge.kind.key_part().to_owned()),
             ],
         )?;
-        self.edge_group.append_child(&element)?;
+        if element.parent_element().is_none() {
+            self.edge_group.append_child(&element)?;
+        }
         self.rendered
             .edges
             .insert(edge.key.clone(), edge.fingerprint());
@@ -673,56 +612,31 @@ impl VirtualGraph {
     }
 
     fn edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
-        match edge.kind {
-            GraphViewportEdgeKind::PrimaryParent => self.primary_edge_element(edge),
-            GraphViewportEdgeKind::Fork | GraphViewportEdgeKind::MergeParent => {
-                self.routed_edge_element(edge)
-            }
-        }
-    }
-
-    fn primary_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
-        let element = svg_element(&self.document, "line")?;
-        let (x1, y1, x2, y2) = line_points(edge.source, edge.target, edge.target_port_offset);
-        set_attributes(
-            &element,
-            [
-                ("class", "edge primary-parent".to_string()),
-                ("marker-end", "url(#arrowhead)".to_string()),
-                ("x1", x1),
-                ("y1", y1),
-                ("x2", x2),
-                ("y2", y2),
-            ],
-        )?;
-        Ok(element)
-    }
-
-    fn routed_edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
-        let element = svg_element(&self.document, "polyline")?;
-        let (class, marker) = routed_edge_style(edge.kind);
+        let element = svg_element(&self.document, "path")?;
+        let (class, marker) = edge_style(edge.kind);
         set_attributes(
             &element,
             [
                 ("class", class.to_string()),
                 ("marker-end", marker.to_string()),
-                (
-                    "points",
-                    routed_elbow_points(
-                        edge.source,
-                        edge.target,
-                        edge.route_slot,
-                        edge.target_port_offset,
-                    ),
-                ),
+                ("d", bezier_path(edge.route)),
             ],
         )?;
         Ok(element)
     }
 
     fn upsert_node(&mut self, node: GraphViewportNode, is_new: bool) -> Result<(), JsValue> {
-        self.remove_key(&node.key);
         let fingerprint = node.fingerprint();
+        if let Some(link) = self
+            .document
+            .get_element_by_id(&render_element_id(&node.key))
+        {
+            set_node_link_attributes(&link, &node, false)?;
+            clear_children(&link);
+            self.append_node_group_to_link(&link, &node)?;
+            self.rendered.nodes.insert(node.key, fingerprint);
+            return Ok(());
+        }
         let link = self.node_link_element(&node, is_new)?;
         self.append_node(&node.key, &link, fingerprint)
     }
@@ -830,7 +744,7 @@ impl VirtualGraph {
     }
 
     fn node_label_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
-        self.node_text_element("node-label", "44", node_label(node))
+        self.node_text_element("node-label", "31", node_label(node))
     }
 
     fn append_node_kind(&self, group: &Element, node: &GraphViewportNode) -> Result<(), JsValue> {
@@ -840,7 +754,7 @@ impl VirtualGraph {
     }
 
     fn node_kind_element(&self, node: &GraphViewportNode) -> Result<Element, JsValue> {
-        self.node_text_element("node-kind", "58", node.kind.clone())
+        self.node_text_element("node-kind", "44", node.kind.clone())
     }
 
     fn node_text_element(&self, class: &str, y: &str, text: String) -> Result<Element, JsValue> {
@@ -865,7 +779,6 @@ impl VirtualGraph {
         if let Some(element) = self.document.get_element_by_id(&render_element_id(key)) {
             element.remove();
         }
-        self.rendered.lanes.remove(key);
         self.rendered.nodes.remove(key);
         self.rendered.edges.remove(key);
     }
@@ -1002,7 +915,6 @@ fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, J
 
 fn query_graph_layer_elements(document: &Document) -> Result<GraphLayerElements, JsValue> {
     Ok(GraphLayerElements {
-        lane_group: query_required(document, ".graph-lanes")?,
         edge_group: query_required(document, ".graph-edges")?,
         node_group: query_required(document, ".graph-nodes")?,
     })
@@ -1160,19 +1072,11 @@ fn update_auto_follow(graph: Rc<RefCell<VirtualGraph>>, enabled: bool) {
     request_viewport_update(graph, pending_update);
 }
 
-fn routed_edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
+fn edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
     match kind {
-        GraphViewportEdgeKind::Fork => ("edge fork", "url(#fork-arrowhead)"),
-        GraphViewportEdgeKind::MergeParent => ("edge merge-parent", "url(#merge-arrowhead)"),
-        GraphViewportEdgeKind::PrimaryParent => unreachable!("primary edges use line elements"),
-    }
-}
-
-fn edge_kind_data(kind: GraphViewportEdgeKind) -> &'static str {
-    match kind {
-        GraphViewportEdgeKind::PrimaryParent => "primary_parent",
-        GraphViewportEdgeKind::Fork => "fork",
-        GraphViewportEdgeKind::MergeParent => "merge_parent",
+        GraphViewportEdgeKind::Primary => ("edge primary-parent", "url(#arrowhead)"),
+        GraphViewportEdgeKind::Merge => ("edge merge-parent", "url(#merge-arrowhead)"),
+        GraphViewportEdgeKind::Shadow => ("edge shadow-parent", "url(#shadow-arrowhead)"),
     }
 }
 
@@ -1214,37 +1118,38 @@ fn apply_time_scale_cursor(
     time_scale: &Element,
     time_scale_cursor: &Element,
     time_scale_label: &Element,
-    viewport: ViewportState,
+    window: &Window,
 ) -> Result<(), JsValue> {
     let ticks = time_scale_ticks(time_scale)?;
-    if ticks.is_empty() {
+    let selected = selected_node_target(window);
+    let Some(tick) = selected
+        .as_deref()
+        .and_then(|target| ticks.iter().find(|tick| tick.node_target == target))
+    else {
+        time_scale_cursor.set_attribute("hidden", "hidden")?;
+        apply_time_scale_tick_focus(&ticks, -100.0)?;
         return Ok(());
-    }
-    let graph_x = viewport.x + viewport.width / 2.0;
-    let cursor = time_scale_cursor_for_graph_x(&ticks, graph_x);
-    let label_shift = time_scale_label_shift(cursor.position);
+    };
+    time_scale_cursor.remove_attribute("hidden")?;
+    let label_shift = time_scale_label_shift(tick.position);
     set_attributes(
         time_scale_cursor,
         [
-            ("style", format!("left: {:.4}%;", cursor.position)),
-            ("data-time-label", cursor.label.clone()),
+            ("style", format!("left: {:.4}%;", tick.position)),
+            ("data-time-label", tick.label.clone()),
         ],
     )?;
-    time_scale_label.set_text_content(Some(&cursor.label));
+    time_scale_label.set_text_content(Some(&tick.label));
     time_scale_label.set_attribute("style", &format!("--label-shift: {label_shift};"))?;
-    apply_time_scale_tick_focus(&ticks, cursor.position)
+    apply_time_scale_tick_focus(&ticks, tick.position)
 }
 
 #[derive(Clone)]
 struct TimeScaleTick {
     element: Element,
     position: f64,
-    graph_x: f64,
-    label: String,
-}
-
-struct TimeScaleCursor {
-    position: f64,
+    node_target: String,
+    point: Point,
     label: String,
 }
 
@@ -1261,7 +1166,13 @@ fn time_scale_ticks(time_scale: &Element) -> Result<Vec<TimeScaleTick>, JsValue>
         let Some(position) = numeric_attribute(&element, "data-position") else {
             continue;
         };
-        let Some(graph_x) = numeric_attribute(&element, "data-graph-x") else {
+        let Some(node_target) = element.get_attribute("data-node-target") else {
+            continue;
+        };
+        let Some(x) = numeric_attribute(&element, "data-node-x") else {
+            continue;
+        };
+        let Some(y) = numeric_attribute(&element, "data-node-y") else {
             continue;
         };
         let label = element
@@ -1270,7 +1181,11 @@ fn time_scale_ticks(time_scale: &Element) -> Result<Vec<TimeScaleTick>, JsValue>
         ticks.push(TimeScaleTick {
             element,
             position,
-            graph_x,
+            node_target,
+            point: Point {
+                x: rounded_i32(x),
+                y: rounded_i32(y),
+            },
             label,
         });
     }
@@ -1279,51 +1194,6 @@ fn time_scale_ticks(time_scale: &Element) -> Result<Vec<TimeScaleTick>, JsValue>
 
 fn numeric_attribute(element: &Element, name: &str) -> Option<f64> {
     element.get_attribute(name)?.parse::<f64>().ok()
-}
-
-fn time_scale_cursor_for_graph_x(ticks: &[TimeScaleTick], graph_x: f64) -> TimeScaleCursor {
-    let mut by_graph_x = ticks.to_vec();
-    by_graph_x.sort_by(|left, right| left.graph_x.total_cmp(&right.graph_x));
-    let position = interpolate_timeline_position(&by_graph_x, graph_x);
-    let label = nearest_tick_label(&by_graph_x, graph_x);
-    TimeScaleCursor { position, label }
-}
-
-fn interpolate_timeline_position(ticks: &[TimeScaleTick], graph_x: f64) -> f64 {
-    let Some(first) = ticks.first() else {
-        return 0.0;
-    };
-    if graph_x <= first.graph_x {
-        return first.position;
-    }
-    for window in ticks.windows(2) {
-        let left = &window[0];
-        let right = &window[1];
-        if graph_x <= right.graph_x {
-            let span = right.graph_x - left.graph_x;
-            if span.abs() < f64::EPSILON {
-                return right.position;
-            }
-            let ratio = ((graph_x - left.graph_x) / span).clamp(0.0, 1.0);
-            return left.position + (right.position - left.position) * ratio;
-        }
-    }
-    ticks
-        .last()
-        .map(|tick| tick.position)
-        .unwrap_or(first.position)
-}
-
-fn nearest_tick_label(ticks: &[TimeScaleTick], graph_x: f64) -> String {
-    ticks
-        .iter()
-        .min_by(|left, right| {
-            (left.graph_x - graph_x)
-                .abs()
-                .total_cmp(&(right.graph_x - graph_x).abs())
-        })
-        .map(|tick| tick.label.clone())
-        .unwrap_or_else(|| "-".to_owned())
 }
 
 fn apply_time_scale_tick_focus(
@@ -1418,7 +1288,15 @@ fn node_group_class(node: &GraphViewportNode) -> String {
 }
 
 fn node_title_text(node: &GraphViewportNode) -> String {
-    format!("{}: {}", node.short_id, node.summary)
+    let labels = if node.labels.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", node.labels.join(", "))
+    };
+    format!(
+        "{} · {}{}: {}",
+        node.short_id, node.kind, labels, node.summary
+    )
 }
 
 async fn drain_viewport_patches(graph: Rc<RefCell<VirtualGraph>>) {
@@ -1876,384 +1754,20 @@ fn refresh_inner_html(
 }
 
 fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
-    let lane_ys = graph_lane_ys(document)?;
-    let visible_lanes = stabilized_visible_graph_item_lanes(document, viewport, &lane_ys)?;
-    let lane_display = compact_lane_display_map(&lane_ys, &visible_lanes);
-    sync_canvas_lane_visibility(document, viewport, &lane_display)?;
-    let branches = document.query_selector_all(".branch[data-lane-y]")?;
-    for index in 0..branches.length() {
-        let branch = branches
-            .item(index)
-            .expect("query selector index should exist")
-            .unchecked_into::<Element>();
-        sync_branch_visibility_element(&branch, &lane_display)?;
-    }
-    Ok(())
-}
-
-fn stabilized_visible_graph_item_lanes(
-    document: &Document,
-    viewport: ViewportState,
-    lane_ys: &BTreeSet<i32>,
-) -> Result<BTreeSet<i32>, JsValue> {
-    let identity_display = BTreeMap::new();
-    let mut visible_lanes = visible_graph_item_lanes(document, viewport, &identity_display)?;
-    for _ in 0..=lane_ys.len() {
-        let lane_display = compact_lane_display_map(lane_ys, &visible_lanes);
-        let display_viewport = ViewportState {
-            y: collapsed_viewport_y(viewport.y, &lane_display),
-            ..viewport
-        };
-        let next_visible_lanes =
-            visible_graph_item_lanes(document, display_viewport, &lane_display)?;
-        if next_visible_lanes == visible_lanes {
-            return Ok(visible_lanes);
-        }
-        visible_lanes = next_visible_lanes;
-    }
-    Ok(visible_lanes)
-}
-
-fn graph_lane_ys(document: &Document) -> Result<BTreeSet<i32>, JsValue> {
-    let mut lane_ys = BTreeSet::new();
-    collect_lane_y_attributes(document, ".branch[data-lane-y]", &mut lane_ys)?;
-    collect_lane_y_attributes(document, ".lane-label[data-lane-y]", &mut lane_ys)?;
-    collect_item_lane_y_attributes(
-        document,
-        ".node-link[data-node-y]",
-        "data-node-y",
-        &mut lane_ys,
-    )?;
-    collect_item_lane_y_attributes(
-        document,
-        ".edge[data-source-y]",
-        "data-source-y",
-        &mut lane_ys,
-    )?;
-    collect_item_lane_y_attributes(
-        document,
-        ".edge[data-target-y]",
-        "data-target-y",
-        &mut lane_ys,
-    )?;
-    Ok(lane_ys)
-}
-
-fn collect_lane_y_attributes(
-    document: &Document,
-    selector: &str,
-    lane_ys: &mut BTreeSet<i32>,
-) -> Result<(), JsValue> {
-    collect_item_lane_y_attributes(document, selector, "data-lane-y", lane_ys)
-}
-
-fn collect_item_lane_y_attributes(
-    document: &Document,
-    selector: &str,
-    attribute: &str,
-    lane_ys: &mut BTreeSet<i32>,
-) -> Result<(), JsValue> {
-    let items = document.query_selector_all(selector)?;
-    for index in 0..items.length() {
-        let item = items
-            .item(index)
-            .expect("query selector index should exist")
-            .unchecked_into::<Element>();
-        if let Some(y) = graph_item_i32(&item, attribute) {
-            lane_ys.insert(y);
-        }
-    }
-    Ok(())
-}
-
-fn compact_lane_display_map(
-    lane_ys: &BTreeSet<i32>,
-    visible_lanes: &BTreeSet<i32>,
-) -> BTreeMap<i32, LaneDisplay> {
-    let mut hidden_before = 0;
-    lane_ys
-        .iter()
-        .map(|lane_y| {
-            let visible = visible_lanes.contains(lane_y);
-            let display = LaneDisplay {
-                y: *lane_y - hidden_before * GRAPH_LANE_HEIGHT,
-                visible,
-            };
-            if !visible {
-                hidden_before += 1;
-            }
-            (*lane_y, display)
-        })
-        .collect()
-}
-
-fn sync_canvas_lane_visibility(
-    document: &Document,
-    viewport: ViewportState,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-) -> Result<(), JsValue> {
-    sync_canvas_viewport(document, viewport, lane_display)?;
-    sync_canvas_lane_labels(document, lane_display)?;
-    sync_canvas_nodes(document, lane_display)?;
-    sync_canvas_edges(document, viewport, lane_display)
-}
-
-fn sync_canvas_viewport(
-    document: &Document,
-    viewport: ViewportState,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-) -> Result<(), JsValue> {
-    let Some(graph_svg) = document.query_selector(".graph")? else {
-        return Ok(());
-    };
-    let display_y = collapsed_viewport_y(viewport.y, lane_display);
-    set_attributes(
-        &graph_svg,
-        [(
-            "viewBox",
-            format!(
-                "{} {} {} {}",
-                rounded_i32(viewport.x),
-                rounded_i32(display_y),
-                rounded_i32(viewport.width),
-                rounded_i32(viewport.height)
-            ),
-        )],
-    )
-}
-
-fn sync_canvas_lane_labels(
-    document: &Document,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-) -> Result<(), JsValue> {
-    let labels = document.query_selector_all(".lane-label[data-lane-y]")?;
-    for index in 0..labels.length() {
-        let label = labels
-            .item(index)
-            .expect("query selector index should exist")
-            .unchecked_into::<Element>();
-        let Some(y) = graph_item_i32(&label, "data-lane-y") else {
-            continue;
-        };
-        let display = lane_display_for_y(lane_display, y);
+    if let Some(graph_svg) = document.query_selector(".graph")? {
         set_attributes(
-            &label,
-            [
-                ("y", display.y.to_string()),
-                ("data-display-y", display.y.to_string()),
-            ],
+            &graph_svg,
+            [(
+                "viewBox",
+                format!(
+                    "{} {} {} {}",
+                    rounded_i32(viewport.x),
+                    rounded_i32(viewport.y),
+                    rounded_i32(viewport.width),
+                    rounded_i32(viewport.height)
+                ),
+            )],
         )?;
-        label
-            .class_list()
-            .toggle_with_force("lane-viewport-hidden", !display.visible)?;
-    }
-    Ok(())
-}
-
-fn sync_canvas_nodes(
-    document: &Document,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-) -> Result<(), JsValue> {
-    let nodes = document.query_selector_all(".node-link[data-node-x][data-node-y]")?;
-    for index in 0..nodes.length() {
-        let node = nodes
-            .item(index)
-            .expect("query selector index should exist")
-            .unchecked_into::<Element>();
-        let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y") else {
-            continue;
-        };
-        let display = lane_display_for_y(lane_display, y);
-        if let Some(group) = node.query_selector("g")? {
-            set_attributes(
-                &group,
-                [("transform", format!("translate({x} {})", display.y))],
-            )?;
-        }
-        apply_node_display_visibility(&node, display.visible)?;
-        node.set_attribute("data-display-y", &display.y.to_string())?;
-    }
-    Ok(())
-}
-
-fn sync_canvas_edges(
-    document: &Document,
-    viewport: ViewportState,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-) -> Result<(), JsValue> {
-    let display_viewport = ViewportState {
-        y: collapsed_viewport_y(viewport.y, lane_display),
-        ..viewport
-    };
-    let edges = document
-        .query_selector_all(".edge[data-source-x][data-source-y][data-target-x][data-target-y]")?;
-    for index in 0..edges.length() {
-        let edge = edges
-            .item(index)
-            .expect("query selector index should exist")
-            .unchecked_into::<Element>();
-        let Some((source_x, source_y)) = graph_item_point(&edge, "data-source-x", "data-source-y")
-        else {
-            continue;
-        };
-        let Some((target_x, target_y)) = graph_item_point(&edge, "data-target-x", "data-target-y")
-        else {
-            continue;
-        };
-        let source = lane_display_for_y(lane_display, source_y);
-        let target = lane_display_for_y(lane_display, target_y);
-        let visible = graph_edge_visible_in_viewport(
-            &edge,
-            display_viewport,
-            source_x,
-            source.y,
-            target_x,
-            target.y,
-        );
-        set_edge_display_geometry(&edge, source_x, source.y, target_x, target.y)?;
-        edge.class_list()
-            .toggle_with_force("edge-viewport-hidden", !visible)?;
-        edge.set_attribute("data-display-source-y", &source.y.to_string())?;
-        edge.set_attribute("data-display-target-y", &target.y.to_string())?;
-    }
-    Ok(())
-}
-
-fn set_edge_display_geometry(
-    edge: &Element,
-    source_x: i32,
-    source_y: i32,
-    target_x: i32,
-    target_y: i32,
-) -> Result<(), JsValue> {
-    match edge.get_attribute("data-edge-kind").as_deref() {
-        Some("primary_parent") => set_primary_edge_display_geometry(
-            edge,
-            Point {
-                x: source_x,
-                y: source_y,
-            },
-            Point {
-                x: target_x,
-                y: target_y,
-            },
-        ),
-        Some("fork") | Some("merge_parent") => set_routed_edge_display_geometry(
-            edge,
-            Point {
-                x: source_x,
-                y: source_y,
-            },
-            Point {
-                x: target_x,
-                y: target_y,
-            },
-        ),
-        _ => Ok(()),
-    }
-}
-
-fn set_primary_edge_display_geometry(
-    edge: &Element,
-    source: Point,
-    target: Point,
-) -> Result<(), JsValue> {
-    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
-    let (x1, y1, x2, y2) = line_points(source, target, target_port_offset);
-    set_attributes(edge, [("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)])
-}
-
-fn set_routed_edge_display_geometry(
-    edge: &Element,
-    source: Point,
-    target: Point,
-) -> Result<(), JsValue> {
-    let route_slot = graph_item_i32(edge, "data-route-slot").unwrap_or_default();
-    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
-    set_attributes(
-        edge,
-        [(
-            "points",
-            routed_elbow_points(source, target, route_slot, target_port_offset),
-        )],
-    )
-}
-
-fn apply_node_display_visibility(node: &Element, visible: bool) -> Result<(), JsValue> {
-    node.class_list()
-        .toggle_with_force("node-viewport-hidden", !visible)?;
-    if visible {
-        node.remove_attribute("aria-hidden")?;
-        node.remove_attribute("tabindex")?;
-        node.remove_attribute("focusable")
-    } else {
-        node.set_attribute("aria-hidden", "true")?;
-        node.set_attribute("tabindex", "-1")?;
-        node.set_attribute("focusable", "false")
-    }
-}
-
-fn visible_graph_item_lanes(
-    document: &Document,
-    viewport: ViewportState,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-) -> Result<BTreeSet<i32>, JsValue> {
-    let mut lanes = BTreeSet::new();
-    collect_visible_node_lanes(document, viewport, lane_display, &mut lanes)?;
-    collect_visible_edge_lanes(document, viewport, lane_display, &mut lanes)?;
-    Ok(lanes)
-}
-
-fn collect_visible_node_lanes(
-    document: &Document,
-    viewport: ViewportState,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-    lanes: &mut BTreeSet<i32>,
-) -> Result<(), JsValue> {
-    let nodes = document.query_selector_all(".node-link[data-node-x][data-node-y]")?;
-    for index in 0..nodes.length() {
-        let node = nodes
-            .item(index)
-            .expect("query selector index should exist")
-            .unchecked_into::<Element>();
-        let Some((x, y)) = graph_item_point(&node, "data-node-x", "data-node-y") else {
-            continue;
-        };
-        let display = lane_display_for_y(lane_display, y);
-        if graph_node_visible_in_viewport(viewport, x, display.y) {
-            lanes.insert(y);
-        }
-    }
-    Ok(())
-}
-
-fn collect_visible_edge_lanes(
-    document: &Document,
-    viewport: ViewportState,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-    lanes: &mut BTreeSet<i32>,
-) -> Result<(), JsValue> {
-    let edges = document
-        .query_selector_all(".edge[data-source-x][data-source-y][data-target-x][data-target-y]")?;
-    for index in 0..edges.length() {
-        let edge = edges
-            .item(index)
-            .expect("query selector index should exist")
-            .unchecked_into::<Element>();
-        let Some((source_x, source_y)) = graph_item_point(&edge, "data-source-x", "data-source-y")
-        else {
-            continue;
-        };
-        let Some((target_x, target_y)) = graph_item_point(&edge, "data-target-x", "data-target-y")
-        else {
-            continue;
-        };
-        let source = lane_display_for_y(lane_display, source_y);
-        let target = lane_display_for_y(lane_display, target_y);
-        if graph_edge_visible_in_viewport(&edge, viewport, source_x, source.y, target_x, target.y) {
-            lanes.insert(source_y);
-            lanes.insert(target_y);
-        }
     }
     Ok(())
 }
@@ -2268,126 +1782,6 @@ fn graph_item_point(element: &Element, x_attr: &str, y_attr: &str) -> Option<(i3
 fn graph_item_i32(element: &Element, attr: &str) -> Option<i32> {
     element.get_attribute(attr)?.parse().ok()
 }
-
-fn graph_item_f64(element: &Element, attr: &str) -> Option<f64> {
-    element.get_attribute(attr)?.parse().ok()
-}
-
-fn lane_display_for_y(lane_display: &BTreeMap<i32, LaneDisplay>, y: i32) -> LaneDisplay {
-    lane_display
-        .get(&y)
-        .copied()
-        .unwrap_or(LaneDisplay { y, visible: true })
-}
-
-fn collapsed_viewport_y(viewport_y: f64, lane_display: &BTreeMap<i32, LaneDisplay>) -> f64 {
-    let collapsed_offset = lane_display
-        .iter()
-        .filter(|(_, display)| !display.visible)
-        .map(|(lane_y, _)| collapsed_lane_offset(viewport_y, *lane_y))
-        .sum::<f64>();
-    viewport_y - collapsed_offset
-}
-
-fn collapsed_lane_offset(viewport_y: f64, lane_y: i32) -> f64 {
-    let lane_height = f64::from(GRAPH_LANE_HEIGHT);
-    let lane_top = f64::from(lane_y) - lane_height / 2.0;
-    (viewport_y - lane_top).clamp(0.0, lane_height)
-}
-
-fn graph_edge_bounds(
-    edge: &Element,
-    source_x: i32,
-    source_y: i32,
-    target_x: i32,
-    target_y: i32,
-) -> (f64, f64, f64, f64) {
-    let source = Point {
-        x: source_x,
-        y: source_y,
-    };
-    let target = Point {
-        x: target_x,
-        y: target_y,
-    };
-    let target_port_offset = graph_item_f64(edge, "data-target-port-offset").unwrap_or_default();
-    let points = match edge.get_attribute("data-edge-kind").as_deref() {
-        Some("fork") | Some("merge_parent") => {
-            let route_slot = graph_item_i32(edge, "data-route-slot").unwrap_or_default();
-            routed_elbow_point_values(source, target, route_slot, target_port_offset)
-        }
-        _ => {
-            let (start_x, start_y, end_x, end_y) =
-                line_point_values(source, target, target_port_offset);
-            vec![(start_x, start_y), (end_x, end_y)]
-        }
-    };
-    point_bounds(&points)
-}
-
-fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
-    let mut left = f64::INFINITY;
-    let mut top = f64::INFINITY;
-    let mut right = f64::NEG_INFINITY;
-    let mut bottom = f64::NEG_INFINITY;
-    for (x, y) in points {
-        left = left.min(*x);
-        top = top.min(*y);
-        right = right.max(*x);
-        bottom = bottom.max(*y);
-    }
-    (left, top, right, bottom)
-}
-
-fn graph_node_visible_in_viewport(viewport: ViewportState, x: i32, y: i32) -> bool {
-    let padding = NODE_RADIUS.ceil();
-    crate::viewport::bounds_visible_in_viewport(
-        viewport,
-        f64::from(x) - padding,
-        f64::from(y) - padding,
-        f64::from(x) + padding,
-        f64::from(y) + padding,
-    )
-}
-
-fn graph_edge_visible_in_viewport(
-    edge: &Element,
-    viewport: ViewportState,
-    source_x: i32,
-    source_y: i32,
-    target_x: i32,
-    target_y: i32,
-) -> bool {
-    let padding = (NODE_RADIUS + EDGE_TARGET_APPROACH).ceil();
-    let (left, top, right, bottom) =
-        graph_edge_bounds(edge, source_x, source_y, target_x, target_y);
-    crate::viewport::bounds_visible_in_viewport(
-        viewport,
-        left - padding,
-        top - padding,
-        right + padding,
-        bottom + padding,
-    )
-}
-
-fn sync_branch_visibility_element(
-    branch: &Element,
-    lane_display: &BTreeMap<i32, LaneDisplay>,
-) -> Result<(), JsValue> {
-    let Some(lane_y) = branch_lane_y(branch) else {
-        return Ok(());
-    };
-    apply_branch_visibility(branch, lane_display_for_y(lane_display, lane_y).visible)
-}
-
-#[rustfmt::skip]
-fn branch_lane_y(branch: &Element) -> Option<i32> { branch.get_attribute("data-lane-y")?.parse().ok() }
-
-#[rustfmt::skip]
-fn apply_branch_visibility(branch: &Element, visible: bool) -> Result<(), JsValue> { branch.class_list().toggle_with_force("branch-viewport-hidden", !visible)?; set_branch_aria_hidden(branch, !visible) }
-
-#[rustfmt::skip]
-fn set_branch_aria_hidden(branch: &Element, hidden: bool) -> Result<(), JsValue> { if hidden { branch.set_attribute("aria-hidden", "true") } else { branch.remove_attribute("aria-hidden") } }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let installers: [GraphListenerInstaller; 7] = [
@@ -2973,9 +2367,13 @@ fn center_viewport_from_time_scale(graph: &mut VirtualGraph, event: &MouseEvent)
     }
     let local_x = f64::from(event.client_x()) - rect.left();
     let position = (local_x / rect.width() * 100.0).clamp(0.0, 100.0);
-    let graph_x = graph_x_for_time_scale_position(&ticks, position);
-    graph.viewport.x = graph_x - graph.viewport.width / 2.0;
-    graph.clamp_viewport();
+    if let Some(tick) = ticks.into_iter().min_by(|left, right| {
+        (left.position - position)
+            .abs()
+            .total_cmp(&(right.position - position).abs())
+    }) {
+        select_time_scale_tick(graph, &tick);
+    }
 }
 
 fn center_viewport_from_time_scale_key(graph: &mut VirtualGraph, direction: i32) {
@@ -2985,13 +2383,35 @@ fn center_viewport_from_time_scale_key(graph: &mut VirtualGraph, direction: i32)
     if ticks.is_empty() {
         return;
     }
-    let graph_x = graph.viewport.x + graph.viewport.width / 2.0;
-    let cursor = time_scale_cursor_for_graph_x(&ticks, graph_x);
-    let Some(tick) = adjacent_time_scale_tick(&ticks, cursor.position, direction) else {
+    let selected_position = selected_node_target(&graph.window).and_then(|target| {
+        ticks
+            .iter()
+            .find(|tick| tick.node_target == target)
+            .map(|tick| tick.position)
+    });
+    let Some(tick) = adjacent_time_scale_tick(&ticks, selected_position, direction) else {
         return;
     };
-    graph.viewport.x = tick.graph_x - graph.viewport.width / 2.0;
-    graph.clamp_viewport();
+    let tick = tick.clone();
+    select_time_scale_tick(graph, &tick);
+}
+
+fn select_time_scale_tick(graph: &mut VirtualGraph, tick: &TimeScaleTick) {
+    if let Err(error) = graph.set_auto_follow(false) {
+        web_sys::console::error_1(&error);
+    }
+    center_viewport_on_graph_point(graph, tick.point);
+    if let Err(error) = graph.window.location().set_hash(&tick.node_target) {
+        web_sys::console::error_1(&error);
+    }
+    if let Err(error) = apply_time_scale_cursor(
+        &graph.time_scale,
+        &graph.time_scale_cursor,
+        &graph.time_scale_label,
+        &graph.window,
+    ) {
+        web_sys::console::error_1(&error);
+    }
 }
 
 fn center_viewport_on_graph_point(graph: &mut VirtualGraph, point: Point) {
@@ -3002,11 +2422,18 @@ fn center_viewport_on_graph_point(graph: &mut VirtualGraph, point: Point) {
 
 fn adjacent_time_scale_tick(
     ticks: &[TimeScaleTick],
-    position: f64,
+    position: Option<f64>,
     direction: i32,
 ) -> Option<&TimeScaleTick> {
     let mut by_position = ticks.iter().collect::<Vec<_>>();
     by_position.sort_by(|left, right| left.position.total_cmp(&right.position));
+    let Some(position) = position else {
+        return if direction < 0 {
+            by_position.last().copied()
+        } else {
+            by_position.first().copied()
+        };
+    };
     if direction < 0 {
         by_position
             .iter()
@@ -3021,37 +2448,6 @@ fn adjacent_time_scale_tick(
             .find(|tick| tick.position > position + f64::EPSILON)
             .or_else(|| by_position.last().copied())
     }
-}
-
-fn graph_x_for_time_scale_position(ticks: &[TimeScaleTick], position: f64) -> f64 {
-    let mut by_position = ticks.to_vec();
-    by_position.sort_by(|left, right| {
-        left.position
-            .total_cmp(&right.position)
-            .then_with(|| left.graph_x.total_cmp(&right.graph_x))
-    });
-    let Some(first) = by_position.first() else {
-        return 0.0;
-    };
-    if position <= first.position {
-        return first.graph_x;
-    }
-    for window in by_position.windows(2) {
-        let left = &window[0];
-        let right = &window[1];
-        if position <= right.position {
-            let span = right.position - left.position;
-            if span.abs() < f64::EPSILON {
-                return right.graph_x;
-            }
-            let ratio = ((position - left.position) / span).clamp(0.0, 1.0);
-            return left.graph_x + (right.graph_x - left.graph_x) * ratio;
-        }
-    }
-    by_position
-        .last()
-        .map(|tick| tick.graph_x)
-        .unwrap_or(first.graph_x)
 }
 
 fn browser_window() -> Result<Window, JsValue> {
@@ -3194,101 +2590,48 @@ fn node_label(node: &GraphViewportNode) -> String {
     if node.labels.is_empty() {
         node.short_id.clone()
     } else {
-        format!("{} {}", node.short_id, node.labels.join(", "))
+        let mut labels = node
+            .labels
+            .iter()
+            .take(2)
+            .map(|label| truncate_label(label, 12))
+            .collect::<Vec<_>>();
+        if node.labels.len() > labels.len() {
+            labels.push(format!("+{}", node.labels.len() - labels.len()));
+        }
+        format!("{} {}", node.short_id, labels.join(" · "))
     }
 }
 
-fn line_points(
-    source: Point,
-    target: Point,
-    target_port_offset: f64,
-) -> (String, String, String, String) {
-    let (start_x, start_y, end_x, end_y) = line_point_values(source, target, target_port_offset);
-    (
-        format!("{start_x:.1}"),
-        format!("{start_y:.1}"),
-        format!("{end_x:.1}"),
-        format!("{end_y:.1}"),
-    )
-}
-
-fn line_point_values(
-    source: Point,
-    target: Point,
-    target_port_offset: f64,
-) -> (f64, f64, f64, f64) {
-    let dx = f64::from(target.x - source.x);
-    let target_y = f64::from(target.y) + target_port_offset;
-    let dy = target_y - f64::from(source.y);
-    let distance = (dx * dx + dy * dy).sqrt();
-    if distance <= NODE_RADIUS * 2.0 {
-        return (
-            f64::from(source.x),
-            f64::from(source.y),
-            f64::from(target.x),
-            target_y,
-        );
+fn truncate_label(label: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
     }
-
-    let ux = dx / distance;
-    let uy = dy / distance;
-    let start_x = f64::from(source.x) + ux * (NODE_RADIUS + 2.0);
-    let start_y = f64::from(source.y) + uy * (NODE_RADIUS + 2.0);
-    let end_x = f64::from(target.x) - ux * (NODE_RADIUS + 8.0);
-    let end_y = target_y - uy * (NODE_RADIUS + 8.0);
-
-    (start_x, start_y, end_x, end_y)
-}
-
-fn routed_elbow_points(
-    source: Point,
-    target: Point,
-    route_slot: i32,
-    target_port_offset: f64,
-) -> String {
-    routed_elbow_point_values(source, target, route_slot, target_port_offset)
-        .into_iter()
-        .map(|(x, y)| format!("{x:.1},{y:.1}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn routed_elbow_point_values(
-    source: Point,
-    target: Point,
-    route_slot: i32,
-    target_port_offset: f64,
-) -> Vec<(f64, f64)> {
-    let start_x = f64::from(source.x) + NODE_RADIUS + 2.0;
-    let start_y = f64::from(source.y);
-    let end_x = if target.x > source.x {
-        f64::from(target.x) - NODE_RADIUS - 8.0
+    let mut chars = label.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        let truncated = prefix
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        format!("{truncated}…")
     } else {
-        f64::from(target.x) + NODE_RADIUS + 8.0
-    };
-    let end_y = f64::from(target.y) + target_port_offset;
-    let exit_x = (start_x + EDGE_NODE_EXIT).min(end_x - EDGE_TARGET_APPROACH);
-    let approach_x = (end_x - EDGE_TARGET_APPROACH).max(exit_x + EDGE_TARGET_APPROACH);
-    let corridor_y = edge_corridor_y(source.y, target.y, route_slot);
-
-    vec![
-        (start_x, start_y),
-        (exit_x, start_y),
-        (exit_x, corridor_y),
-        (approach_x, corridor_y),
-        (approach_x, end_y),
-        (end_x, end_y),
-    ]
+        prefix
+    }
 }
 
-fn edge_corridor_y(source_y: i32, target_y: i32, route_slot: i32) -> f64 {
-    let base_y = match target_y.cmp(&source_y) {
-        std::cmp::Ordering::Less => source_y - 70,
-        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => source_y + 70,
-    };
-    let magnitude = (route_slot + 1) / 2;
-    let direction = if route_slot % 2 == 0 { 1.0 } else { -1.0 };
-    (f64::from(base_y) + f64::from(magnitude.min(4)) * EDGE_ROUTE_STEP * direction).max(16.0)
+fn bezier_path(route: GraphBezierRoute) -> String {
+    format!(
+        "M {} {} C {} {}, {} {}, {} {}",
+        route.source.x,
+        route.source.y,
+        route.control_1.x,
+        route.control_1.y,
+        route.control_2.x,
+        route.control_2.y,
+        route.target.x,
+        route.target.y,
+    )
 }
 
 fn css_token(value: &str) -> String {
@@ -3323,451 +2666,25 @@ fn session_storage(window: &Window) -> Option<web_sys::Storage> {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+
     use wasm_bindgen::UnwrapThrowExt;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
-
-    struct ConsoleErrorGuard {
-        console: JsValue,
-        original: JsValue,
-        _closure: Closure<dyn FnMut(JsValue)>,
-    }
-
-    impl Drop for ConsoleErrorGuard {
-        fn drop(&mut self) {
-            let _ =
-                js_sys::Reflect::set(&self.console, &JsValue::from_str("error"), &self.original);
-        }
-    }
 
     struct GraphFixture {
         graph: Rc<RefCell<VirtualGraph>>,
         root: Element,
     }
 
-    impl Drop for GraphFixture {
-        fn drop(&mut self) {
-            if let Some(window) = web_sys::window()
-                && let Some(storage) = session_storage(&window)
-            {
-                let _ = storage.remove_item(AUTO_FOLLOW_KEY);
-                let _ = storage.remove_item(VIEWPORT_KEY);
-            }
-            self.root.remove();
-        }
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_progress_action_formats_active_status() {
-        let statuses = [progress_status(
-            "primary",
-            "building",
-            9,
-            12,
-            "Building graph entries",
-        )];
-
-        let action = graph_progress_action("primary", &statuses);
-
-        assert_eq!(
-            action,
-            GraphProgressAction::Active("Building graph entries (9/12)".to_owned())
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_progress_action_clamps_processed_count() {
-        let statuses = [progress_status(
-            "primary",
-            "scheduled",
-            15,
-            12,
-            "Queued graph build",
-        )];
-
-        let action = graph_progress_action("primary", &statuses);
-
-        assert_eq!(
-            action,
-            GraphProgressAction::Active("Queued graph build (12/12)".to_owned())
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_progress_action_maps_terminal_statuses() {
-        let failed = [progress_status(
-            "primary",
-            "failed",
-            0,
-            0,
-            "Graph build failed",
-        )];
-        let ready = [progress_status("primary", "ready", 0, 0, "Graph ready")];
-
-        assert_eq!(
-            graph_progress_action("primary", &failed),
-            GraphProgressAction::Failed("Graph build failed".to_owned())
-        );
-        assert_eq!(
-            graph_progress_action("primary", &ready),
-            GraphProgressAction::Ready
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_progress_action_ignores_unmatched_or_unknown_statuses() {
-        let statuses = [
-            progress_status("other", "building", 1, 4, "Building other graph"),
-            progress_status("primary", "mystery", 0, 0, "Unknown status"),
-        ];
-
-        assert_eq!(
-            graph_progress_action("primary", &statuses),
-            GraphProgressAction::Ignore
-        );
-        assert_eq!(
-            graph_progress_action("missing", &statuses),
-            GraphProgressAction::Ignore
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_abort_error_does_not_log_to_console() {
-        let fixture = GraphFixture::new();
-        let (console_error_calls, _guard) = install_console_error_counter();
-        let error = abort_error();
-
-        handle_graph_items_error(fixture.graph.clone(), error);
-
-        assert_eq!(console_error_calls.get(), 0);
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_non_abort_error_logs_to_console_when_idle() {
-        let fixture = GraphFixture::new();
-        let (console_error_calls, _guard) = install_console_error_counter();
-
-        handle_graph_items_error(fixture.graph.clone(), JsValue::from_str("network failed"));
-
-        assert_eq!(console_error_calls.get(), 1);
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_loading_provider_context_renders_selection_state() {
-        let fixture = GraphFixture::new();
-        let document = fixture.graph.borrow().document.clone();
-
-        let empty = loading_provider_context(&document, None)
-            .expect_throw("empty provider context loading state should render");
-        assert_eq!(
-            empty.text_content().as_deref(),
-            Some("Provider ContextSelect a node to inspect its provider context.")
-        );
-
-        let loading = loading_provider_context(&document, Some("detail-node"))
-            .expect_throw("selected provider context loading state should render");
-        assert_eq!(
-            loading.text_content().as_deref(),
-            Some("Provider ContextLoading provider context...")
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_selected_node_detail_request_uses_context_hash() {
-        let fixture = GraphFixture::new();
-        let (window, document) = {
-            let graph = fixture.graph.borrow();
-            (graph.window.clone(), graph.document.clone())
-        };
-        let detail_slot = classed_element(&document, "div", "node-detail-slot")
-            .expect_throw("node detail slot should be created");
-        let provider_context_slot = classed_element(&document, "div", "provider-context-slot")
-            .expect_throw("provider context slot should be created");
-        fixture
-            .root
-            .append_child(&detail_slot)
-            .expect_throw("node detail slot should be mounted");
-        fixture
-            .root
-            .append_child(&provider_context_slot)
-            .expect_throw("provider context slot should be mounted");
-
-        window
-            .location()
-            .set_hash("detail-node?context=detail-head")
-            .expect_throw("hash should be set");
-
-        let request = selected_node_detail_request(&window, &document)
-            .expect_throw("selected node detail request should be created");
-        window
-            .location()
-            .set_hash("")
-            .expect_throw("hash should be cleared");
-
-        assert_eq!(request.target.as_deref(), Some("detail-node"));
-        assert_eq!(request.context.as_deref(), Some("detail-head"));
-        assert_eq!(
-            request.detail_url,
-            "/api/node-detail?target=detail-node&mode=anchors"
-        );
-        assert_eq!(
-            request.provider_context_url,
-            "/api/provider-context?mode=anchors&target=detail-node&context=detail-head"
-        );
-        assert_eq!(
-            detail_slot.text_content().as_deref(),
-            Some("NodeSelectionLoading node detail...")
-        );
-        assert_eq!(
-            provider_context_slot.text_content().as_deref(),
-            Some("Provider ContextLoading provider context...")
-        );
-        assert_eq!(selected_node_target(&window), None);
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_server_fragment_refreshes_time_scale_without_replacing_track() {
-        let fixture = GraphFixture::new();
-        let document = fixture.graph.borrow().document.clone();
-        let original_track = fixture.graph.borrow().time_scale_track.clone();
-        let container = document
-            .create_element("div")
-            .expect_throw("fragment container should be created");
-        container.set_inner_html(
-            r#"
-            <main id="console-root" data-version="1">
-              <nav class="time-scale" aria-label="Graph time navigator" tabindex="0">
-                <div class="time-scale-track">
-                  <span class="time-scale-tick" data-position="0" data-graph-x="10" data-time-label="new-start"></span>
-                  <span class="time-scale-tick" data-position="50" data-graph-x="20" data-time-label="new-middle"></span>
-                  <span class="time-scale-tick" data-position="100" data-graph-x="30" data-time-label="new-end"></span>
-                  <div class="time-scale-cursor"><span class="time-scale-label"></span></div>
-                </div>
-                <div class="time-scale-extents">
-                  <span>new-start</span>
-                  <span>new-end</span>
-                </div>
-              </nav>
-            </main>
-            "#,
-        );
-
-        refresh_time_scale_fragment(&document, &container)
-            .expect_throw("time scale fragment should refresh");
-        fixture
-            .graph
-            .borrow_mut()
-            .refresh_time_scale_elements()
-            .expect_throw("time scale elements should refresh");
-
-        let graph = fixture.graph.borrow();
-        assert!(original_track.is_same_node(Some(&graph.time_scale_track)));
-        assert_eq!(
-            graph
-                .time_scale
-                .get_attribute("tabindex")
-                .expect_throw("time scale should remain focusable"),
-            "0",
-        );
-        assert_eq!(
-            graph
-                .time_scale_track
-                .query_selector_all(".time-scale-tick")
-                .expect_throw("time scale ticks should be queryable")
-                .length(),
-            3,
-        );
-        assert_eq!(
-            graph
-                .time_scale
-                .query_selector_all(".time-scale-extents span")
-                .expect_throw("time scale extents should be queryable")
-                .item(1)
-                .expect_throw("time scale max extent should exist")
-                .text_content()
-                .expect_throw("time scale max extent should have text"),
-            "new-end",
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_auto_follow_pins_to_top_right() {
-        let fixture = GraphFixture::new();
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = ViewportState {
-                x: 25.0,
-                y: 40.0,
-                width: 320.0,
-                height: 180.0,
-                overscan: MIN_OVERSCAN,
-            };
-            graph.canvas = Some(GraphCanvas {
-                width: 1000,
-                height: 600,
-            });
-        }
-
-        update_auto_follow(fixture.graph.clone(), true);
-
-        let graph = fixture.graph.borrow();
-        assert!(graph.auto_follow);
-        assert_eq!(rounded_i32(graph.viewport.x), 680);
-        assert_eq!(rounded_i32(graph.viewport.y), 0);
-        assert_eq!(
-            graph.follow_toggle.get_attribute("aria-pressed").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            graph.follow_toggle.text_content().as_deref(),
-            Some("Following")
-        );
-        assert_eq!(
-            session_storage(&graph.window)
-                .and_then(|storage| storage.get_item(AUTO_FOLLOW_KEY).ok().flatten())
-                .as_deref(),
-            Some("1")
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_auto_follow_loads_stored_state() {
-        let window = web_sys::window().expect_throw("window should be available");
-        session_storage(&window)
-            .expect_throw("session storage should be available")
-            .set_item(AUTO_FOLLOW_KEY, "1")
-            .expect_throw("auto follow state should be stored");
-
-        let fixture = GraphFixture::new();
-        let graph = fixture.graph.borrow();
-
-        assert!(graph.auto_follow);
-        assert_eq!(
-            graph.follow_toggle.get_attribute("aria-pressed").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            graph.follow_toggle.text_content().as_deref(),
-            Some("Following")
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_normalizes_stored_viewport_overscan() {
-        let window = web_sys::window().expect_throw("window should be available");
-        session_storage(&window)
-            .expect_throw("session storage should be available")
-            .set_item(VIEWPORT_KEY, "10,20,1000,600,200")
-            .expect_throw("stored viewport should be written");
-
-        let fixture = GraphFixture::new();
-        let graph = fixture.graph.borrow();
-
-        assert_eq!(rounded_i32(graph.viewport.x), 10);
-        assert_eq!(rounded_i32(graph.viewport.y), 20);
-        assert_eq!(rounded_i32(graph.viewport.width), 1000);
-        assert_eq!(rounded_i32(graph.viewport.height), 600);
-        assert_eq!(graph.viewport.overscan, graph.viewport.render_overscan());
-        assert_eq!(graph.viewport.overscan, 1800);
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_canvas_lane_visibility_reflows_when_branch_enters_and_exits_viewport() {
-        let fixture = GraphFixture::new();
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = viewport(1780, 0, 1000, 600).into();
-            graph
-                .apply_full(lane_visibility_response(viewport(1780, 0, 1000, 600)))
-                .expect_throw("graph payload should render");
-        }
-
-        assert_branch_hidden(&fixture.root, "B", true);
-        assert_branch_hidden(&fixture.root, "day", true);
-        assert_node_display(&fixture.root, "node:b2", 230, true);
-        assert_node_display(&fixture.root, "node:c3", 230, false);
-        assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 230, false);
-
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = viewport(1780, 300, 1000, 300).into();
-            graph.sync_branch_visibility();
-        }
-
-        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
-        assert_node_display(&fixture.root, "node:c3", 230, false);
-
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = viewport(1780, 229, 1000, 300).into();
-            graph.sync_branch_visibility();
-        }
-
-        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
-
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = viewport(1780, 231, 1000, 300).into();
-            graph.sync_branch_visibility();
-        }
-
-        assert_graph_viewbox(&fixture.root, "1780 160 1000 300");
-
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = viewport(1100, 0, 1000, 600).into();
-            graph.sync_branch_visibility();
-        }
-
-        assert_branch_hidden(&fixture.root, "B", false);
-        assert_branch_hidden(&fixture.root, "day", true);
-        assert_node_display(&fixture.root, "node:b2", 230, false);
-        assert_node_display(&fixture.root, "node:c3", 370, false);
-        assert_edge_display(&fixture.root, "edge:merge:a5:c3", 90, 370, false);
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_canvas_lane_visibility_expands_lanes_shifted_into_viewport() {
-        let fixture = GraphFixture::new();
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = viewport(1780, 0, 1000, 300).into();
-            graph
-                .apply_full(lane_shift_response(viewport(1780, 0, 1000, 300)))
-                .expect_throw("graph payload should render");
-        }
-
-        assert_branch_hidden(&fixture.root, "A", true);
-        assert_branch_hidden(&fixture.root, "B", true);
-        assert_branch_hidden(&fixture.root, "C", false);
-        assert_branch_hidden(&fixture.root, "day", true);
-        assert_node_display(&fixture.root, "node:c3", 90, false);
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_canvas_lane_visibility_keeps_shifted_lanes_in_viewbox_after_scroll() {
-        let fixture = GraphFixture::new();
-        {
-            let mut graph = fixture.graph.borrow_mut();
-            graph.viewport = viewport(1780, 300, 1000, 300).into();
-            graph
-                .apply_full(lane_shift_response(viewport(1780, 300, 1000, 300)))
-                .expect_throw("graph payload should render");
-        }
-
-        assert_graph_viewbox(&fixture.root, "1780 20 1000 300");
-        assert_branch_hidden(&fixture.root, "A", true);
-        assert_branch_hidden(&fixture.root, "B", true);
-        assert_branch_hidden(&fixture.root, "C", false);
-        assert_branch_hidden(&fixture.root, "day", true);
-        assert_node_display(&fixture.root, "node:c3", 90, false);
-    }
-
     impl GraphFixture {
         fn new() -> Self {
             let window = web_sys::window().expect_throw("window should be available");
+            if let Some(storage) = session_storage(&window) {
+                let _ = storage.remove_item(AUTO_FOLLOW_KEY);
+                let _ = storage.remove_item(VIEWPORT_KEY);
+            }
+            let _ = window.location().set_hash("");
             let document = window
                 .document()
                 .expect_throw("document should be available");
@@ -3776,36 +2693,45 @@ mod tests {
                 .expect_throw("test root should be created");
             root.set_inner_html(
                 r#"
-                <main id="console-root" data-version="0">
+                <main id="console-root" data-version="0" data-graph-mode="anchors">
                   <div class="graph-wrap" data-zoom="1">
                     <button class="follow-toggle" type="button" aria-pressed="false">Follow</button>
                     <svg class="graph">
                       <rect class="graph-bg"></rect>
-                      <g class="graph-lanes"></g>
                       <g class="graph-edges"></g>
                       <g class="graph-nodes"></g>
                     </svg>
                   </div>
-                  <nav class="time-scale">
+                  <nav class="time-scale" tabindex="0">
                     <div class="time-scale-track">
-                      <span class="time-scale-tick" data-position="0" data-graph-x="120" data-time-label="start"></span>
-                      <span class="time-scale-tick" data-position="100" data-graph-x="340" data-time-label="end"></span>
-                      <div class="time-scale-cursor"><span class="time-scale-label"></span></div>
-                    </div>
-                    <div class="time-scale-extents">
-                      <span>start</span>
-                      <span>end</span>
+                      <span class="time-scale-tick"
+                            data-position="0"
+                            data-node-target="detail-aaaaaaaa"
+                            data-node-x="120"
+                            data-node-y="90"
+                            data-time-label="start"></span>
+                      <span class="time-scale-tick"
+                            data-position="50"
+                            data-node-target="detail-bbbbbbbb"
+                            data-node-x="232"
+                            data-node-y="162"
+                            data-time-label="middle"></span>
+                      <span class="time-scale-tick"
+                            data-position="100"
+                            data-node-target="detail-cccccccc"
+                            data-node-x="344"
+                            data-node-y="90"
+                            data-time-label="end"></span>
+                      <div class="time-scale-cursor" hidden>
+                        <span class="time-scale-label"></span>
+                      </div>
                     </div>
                   </nav>
                   <div class="graph-status" hidden></div>
-                  <aside class="side">
-                    <ul class="branch-list">
-                      <li class="branch" data-lane-key="lane:A" data-lane-y="90"><strong>A</strong></li>
-                      <li class="branch" data-lane-key="lane:B" data-lane-y="230"><strong>B</strong></li>
-                      <li class="branch" data-lane-key="lane:C" data-lane-y="370"><strong>C</strong></li>
-                      <li class="branch" data-lane-key="lane:day" data-lane-y="510"><strong>day</strong></li>
-                    </ul>
-                  </aside>
+                  <ul class="branch-list">
+                    <li class="branch"><strong>main</strong></li>
+                    <li class="branch"><strong>feature</strong></li>
+                  </ul>
                 </main>
                 "#,
             );
@@ -3824,192 +2750,297 @@ mod tests {
         }
     }
 
-    fn lane_shift_response(viewport: GraphViewport) -> GraphViewportResponse {
-        GraphViewportResponse {
-            version: 1,
-            canvas: GraphCanvas {
-                width: 4200,
-                height: 720,
-            },
-            viewport,
-            lanes: vec![lane("A", 90), lane("B", 230), lane("C", 370)],
-            nodes: vec![node("node:c3", "c3", 2100, 370)],
-            edges: Vec::new(),
+    impl Drop for GraphFixture {
+        fn drop(&mut self) {
+            let window = self.graph.borrow().window.clone();
+            if let Some(storage) = session_storage(&window) {
+                let _ = storage.remove_item(AUTO_FOLLOW_KEY);
+                let _ = storage.remove_item(VIEWPORT_KEY);
+            }
+            let _ = window.location().set_hash("");
+            self.root.remove();
         }
     }
 
-    fn lane_visibility_response(viewport: GraphViewport) -> GraphViewportResponse {
-        GraphViewportResponse {
-            version: 1,
-            canvas: GraphCanvas {
-                width: 4200,
-                height: 720,
-            },
-            viewport,
-            lanes: vec![
-                lane("A", 90),
-                lane("B", 230),
-                lane("C", 370),
-                lane("day", 510),
-            ],
-            nodes: vec![
-                node("node:a5", "a5", 1000, 90),
-                node("node:a7", "a7", 1440, 90),
-                node("node:b1", "b1", 1220, 230),
-                node("node:b2", "b2", 1440, 230),
-                node("node:c2", "c2", 1440, 370),
-                node("node:c3", "c3", 2100, 370),
-                node("node:day", "day", 120, 510),
-            ],
-            edges: vec![
-                primary_edge("edge:primary:b1:b2", "b1", "b2", 1220, 230, 1440, 230),
-                primary_edge("edge:primary:c2:c3", "c2", "c3", 1440, 370, 2100, 370),
-                GraphViewportEdge {
-                    key: "edge:merge:a5:c3".to_owned(),
-                    kind: GraphViewportEdgeKind::MergeParent,
-                    source_id: "a5".to_owned(),
-                    target_id: "c3".to_owned(),
-                    source: Point { x: 1000, y: 90 },
-                    target: Point { x: 2100, y: 370 },
-                    route_slot: 0,
-                    target_port_offset: 0.0,
-                },
-            ],
+    #[wasm_bindgen_test]
+    fn graph_progress_reports_typed_states() {
+        let building = [progress_status(
+            "anchors",
+            "building",
+            9,
+            12,
+            "Building graph entries",
+        )];
+        let failed = [progress_status(
+            "anchors",
+            "failed",
+            0,
+            0,
+            "Graph build failed",
+        )];
+
+        assert_eq!(
+            graph_progress_action("anchors", &building),
+            GraphProgressAction::Active("Building graph entries (9/12)".to_owned())
+        );
+        assert_eq!(
+            graph_progress_action("anchors", &failed),
+            GraphProgressAction::Failed("Graph build failed".to_owned())
+        );
+        assert_eq!(
+            graph_progress_action("all", &building),
+            GraphProgressAction::Ignore
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn node_label_limits_heads_and_character_count() {
+        let mut node = graph_node("aaaaaaaa", 56, 56);
+        node.labels = vec![
+            "abcdefghijklmnop".to_owned(),
+            "short".to_owned(),
+            "third".to_owned(),
+        ];
+
+        assert_eq!(node_label(&node), "aaaaaaaa abcdefghijk… · short · +1");
+        assert_eq!(truncate_label("abcdefghijkl", 12), "abcdefghijkl");
+        assert_eq!(truncate_label("abcdefghijklm", 12), "abcdefghijk…");
+        assert_eq!(truncate_label("anything", 0), "");
+    }
+
+    #[wasm_bindgen_test]
+    fn viewport_updates_reuse_stable_node_and_edge_elements() {
+        let fixture = GraphFixture::new();
+        let initial_route = route((74, 56), (104, 56), (120, 128), (150, 128));
+        let updated_route = route((298, 162), (326, 162), (350, 90), (374, 90));
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .apply_full(GraphViewportResponse {
+                    version: 1,
+                    canvas: GraphCanvas {
+                        width: 640,
+                        height: 360,
+                    },
+                    viewport: viewport(),
+                    nodes: vec![
+                        graph_node("aaaaaaaa", 56, 56),
+                        graph_node("bbbbbbbb", 168, 128),
+                    ],
+                    edges: vec![graph_edge(
+                        GraphViewportEdgeKind::Primary,
+                        "aaaaaaaa",
+                        "bbbbbbbb",
+                        initial_route,
+                    )],
+                })
+                .expect_throw("full viewport should render");
+            graph
+                .window
+                .location()
+                .set_hash("detail-aaaaaaaa")
+                .expect_throw("selection hash should be set");
+            graph.sync_selected_graph_node();
+        }
+
+        let document = fixture.graph.borrow().document.clone();
+        let node_key = "node:aaaaaaaa";
+        let edge_key = "edge:primary_parent:aaaaaaaa:bbbbbbbb";
+        let node_before = document
+            .get_element_by_id(&render_element_id(node_key))
+            .expect_throw("node should be rendered");
+        let edge_before = document
+            .get_element_by_id(&render_element_id(edge_key))
+            .expect_throw("edge should be rendered");
+        assert!(node_before.class_list().contains("node-link-selected"));
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .apply_diff(GraphViewportDiffResponse {
+                    version: 2,
+                    canvas: GraphCanvas {
+                        width: 640,
+                        height: 360,
+                    },
+                    previous_viewport: viewport(),
+                    viewport: viewport(),
+                    added: GraphViewportItems::default(),
+                    updated: GraphViewportItems {
+                        nodes: vec![graph_node("aaaaaaaa", 280, 162)],
+                        edges: vec![graph_edge(
+                            GraphViewportEdgeKind::Primary,
+                            "aaaaaaaa",
+                            "bbbbbbbb",
+                            updated_route,
+                        )],
+                    },
+                    removed: Vec::new(),
+                })
+                .expect_throw("viewport diff should render");
+        }
+
+        let node_after = document
+            .get_element_by_id(&render_element_id(node_key))
+            .expect_throw("updated node should remain rendered");
+        let edge_after = document
+            .get_element_by_id(&render_element_id(edge_key))
+            .expect_throw("updated edge should remain rendered");
+        assert!(node_before.is_same_node(Some(&node_after)));
+        assert!(edge_before.is_same_node(Some(&edge_after)));
+        assert!(node_after.class_list().contains("node-link-selected"));
+        assert!(!node_after.class_list().contains("node-new"));
+        assert_eq!(
+            node_after
+                .query_selector("g")
+                .expect_throw("node group query should succeed")
+                .expect_throw("node group should exist")
+                .get_attribute("transform")
+                .as_deref(),
+            Some("translate(280 162)")
+        );
+        assert_eq!(
+            edge_after.get_attribute("d").as_deref(),
+            Some(bezier_path(updated_route).as_str())
+        );
+
+        let branches = fixture
+            .root
+            .query_selector_all(".branch")
+            .expect_throw("branches should be queryable");
+        assert_eq!(branches.length(), 2);
+        for index in 0..branches.length() {
+            let branch = branches
+                .item(index)
+                .expect_throw("branch should exist")
+                .unchecked_into::<Element>();
+            assert!(!branch.class_list().contains("branch-viewport-hidden"));
+            assert!(branch.get_attribute("aria-hidden").is_none());
         }
     }
 
-    fn lane(label: &str, y: i32) -> GraphViewportLane {
-        GraphViewportLane {
-            key: format!("lane:{label}"),
-            label: label.to_owned(),
-            y,
+    #[wasm_bindgen_test]
+    fn time_scale_targets_nodes_and_navigates_by_tick() {
+        let fixture = GraphFixture::new();
+        let ticks = {
+            let graph = fixture.graph.borrow();
+            time_scale_ticks(&graph.time_scale).expect_throw("ticks should parse")
+        };
+        assert_eq!(ticks.len(), 3);
+        assert_eq!(ticks[1].node_target, "detail-bbbbbbbb");
+        assert_eq!(ticks[1].point, Point { x: 232, y: 162 });
+        assert_eq!(
+            adjacent_time_scale_tick(&ticks, Some(50.0), -1)
+                .expect_throw("previous tick should exist")
+                .node_target,
+            "detail-aaaaaaaa"
+        );
+        assert_eq!(
+            adjacent_time_scale_tick(&ticks, Some(50.0), 1)
+                .expect_throw("next tick should exist")
+                .node_target,
+            "detail-cccccccc"
+        );
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.canvas = Some(GraphCanvas {
+                width: 640,
+                height: 360,
+            });
+            graph.viewport = ViewportState {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+                overscan: MIN_OVERSCAN,
+            };
+            graph
+                .set_auto_follow(true)
+                .expect_throw("follow should enable");
+            select_time_scale_tick(&mut graph, &ticks[1]);
+
+            assert!(!graph.auto_follow);
+            assert_eq!(
+                selected_node_target(&graph.window).as_deref(),
+                Some("detail-bbbbbbbb")
+            );
+            assert_eq!(rounded_i32(graph.viewport.x), 132);
+            assert_eq!(rounded_i32(graph.viewport.y), 112);
+            assert!(graph.time_scale_cursor.get_attribute("hidden").is_none());
+            assert_eq!(
+                graph
+                    .time_scale_cursor
+                    .get_attribute("data-time-label")
+                    .as_deref(),
+                Some("middle")
+            );
         }
     }
 
-    fn node(key: &str, id: &str, x: i32, y: i32) -> GraphViewportNode {
+    fn graph_node(id: &str, x: i32, y: i32) -> GraphViewportNode {
         GraphViewportNode {
-            key: key.to_owned(),
+            key: format!("node:{id}"),
             id: id.to_owned(),
-            node_target: id.to_owned(),
+            node_target: format!("detail-{id}"),
             short_id: id.to_owned(),
             kind: "prompt".to_owned(),
-            summary: id.to_owned(),
+            summary: format!("summary for {id}"),
             labels: Vec::new(),
             x,
             y,
         }
     }
 
-    fn primary_edge(
-        key: &str,
+    fn graph_edge(
+        kind: GraphViewportEdgeKind,
         source_id: &str,
         target_id: &str,
-        source_x: i32,
-        source_y: i32,
-        target_x: i32,
-        target_y: i32,
+        route: GraphBezierRoute,
     ) -> GraphViewportEdge {
         GraphViewportEdge {
-            key: key.to_owned(),
-            kind: GraphViewportEdgeKind::PrimaryParent,
+            key: format!("edge:{}:{source_id}:{target_id}", kind.key_part()),
+            kind,
             source_id: source_id.to_owned(),
             target_id: target_id.to_owned(),
+            route,
+        }
+    }
+
+    fn route(
+        source: (i32, i32),
+        control_1: (i32, i32),
+        control_2: (i32, i32),
+        target: (i32, i32),
+    ) -> GraphBezierRoute {
+        GraphBezierRoute {
             source: Point {
-                x: source_x,
-                y: source_y,
+                x: source.0,
+                y: source.1,
+            },
+            control_1: Point {
+                x: control_1.0,
+                y: control_1.1,
+            },
+            control_2: Point {
+                x: control_2.0,
+                y: control_2.1,
             },
             target: Point {
-                x: target_x,
-                y: target_y,
+                x: target.0,
+                y: target.1,
             },
-            route_slot: 0,
-            target_port_offset: 0.0,
         }
     }
 
-    fn viewport(x: i32, y: i32, width: i32, height: i32) -> GraphViewport {
+    fn viewport() -> GraphViewport {
         GraphViewport {
-            x,
-            y,
-            width,
-            height,
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 240,
             overscan: MIN_OVERSCAN,
         }
-    }
-
-    fn assert_branch_hidden(root: &Element, name: &str, hidden: bool) {
-        let branch = root
-            .query_selector(&format!(".branch[data-lane-key=\"lane:{name}\"]"))
-            .expect_throw("branch query should succeed")
-            .expect_throw("branch should exist");
-        assert_eq!(
-            branch.class_list().contains("branch-viewport-hidden"),
-            hidden
-        );
-    }
-
-    fn assert_node_display(root: &Element, key: &str, display_y: i32, hidden: bool) {
-        let node = root
-            .query_selector(&format!("[data-render-key=\"{key}\"]"))
-            .expect_throw("node query should succeed")
-            .expect_throw("node should exist");
-        assert_eq!(
-            node.get_attribute("data-display-y"),
-            Some(display_y.to_string())
-        );
-        assert_eq!(node.class_list().contains("node-viewport-hidden"), hidden);
-        assert!(
-            node.query_selector("g")
-                .expect_throw("node group query should succeed")
-                .expect_throw("node group should exist")
-                .get_attribute("transform")
-                .expect_throw("node group should have a transform")
-                .ends_with(&format!(" {display_y})"))
-        );
-        if hidden {
-            assert_eq!(node.get_attribute("aria-hidden").as_deref(), Some("true"));
-            assert_eq!(node.get_attribute("tabindex").as_deref(), Some("-1"));
-            assert_eq!(node.get_attribute("focusable").as_deref(), Some("false"));
-        } else {
-            assert!(node.get_attribute("aria-hidden").is_none());
-            assert!(node.get_attribute("tabindex").is_none());
-            assert!(node.get_attribute("focusable").is_none());
-        }
-    }
-
-    fn assert_edge_display(root: &Element, key: &str, source_y: i32, target_y: i32, hidden: bool) {
-        let edge = root
-            .query_selector(&format!("[data-render-key=\"{key}\"]"))
-            .expect_throw("edge query should succeed")
-            .expect_throw("edge should exist");
-        assert_eq!(
-            edge.get_attribute("data-display-source-y"),
-            Some(source_y.to_string())
-        );
-        assert_eq!(
-            edge.get_attribute("data-display-target-y"),
-            Some(target_y.to_string())
-        );
-        assert_eq!(edge.class_list().contains("edge-viewport-hidden"), hidden);
-    }
-
-    fn assert_graph_viewbox(root: &Element, viewbox: &str) {
-        let graph = root
-            .query_selector(".graph")
-            .expect_throw("graph query should succeed")
-            .expect_throw("graph should exist");
-        assert_eq!(graph.get_attribute("viewBox").as_deref(), Some(viewbox));
-    }
-
-    fn abort_error() -> JsValue {
-        let error = js_sys::Error::new("aborted");
-        js_sys::Reflect::set(
-            error.as_ref(),
-            &JsValue::from_str("name"),
-            &JsValue::from_str("AbortError"),
-        )
-        .expect_throw("abort error name should be set");
-        error.into()
     }
 
     fn progress_status(
@@ -4026,29 +3057,5 @@ mod tests {
             total,
             message: message.to_owned(),
         }
-    }
-
-    fn install_console_error_counter() -> (Rc<Cell<u32>>, ConsoleErrorGuard) {
-        let console = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("console"))
-            .expect_throw("console should be available");
-        let original = js_sys::Reflect::get(&console, &JsValue::from_str("error"))
-            .expect_throw("console.error should be available");
-        let calls = Rc::new(Cell::new(0));
-        let calls_for_closure = calls.clone();
-        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_| {
-            calls_for_closure.set(calls_for_closure.get() + 1);
-        });
-
-        js_sys::Reflect::set(&console, &JsValue::from_str("error"), closure.as_ref())
-            .expect_throw("console.error should be replaceable");
-
-        (
-            calls,
-            ConsoleErrorGuard {
-                console,
-                original,
-                _closure: closure,
-            },
-        )
     }
 }

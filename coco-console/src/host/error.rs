@@ -28,6 +28,11 @@ pub enum Error {
         message: String,
     },
 
+    #[snafu(display("Console graph layout failed: {source}"))]
+    GraphLayout {
+        source: crate::layout::GraphLayoutError,
+    },
+
     #[snafu(display("Console graph snapshot store {} query failed: {source}", path.display()))]
     QueryGraphSnapshotStore {
         path: PathBuf,
@@ -69,6 +74,15 @@ pub enum Error {
         column: &'static str,
         source: serde_json::Error,
     },
+
+    #[snafu(display("Failed to serialize console graph snapshot store value {column}: {source}"))]
+    SerializeGraphSnapshotStoreValue {
+        column: &'static str,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("Invalid console graph snapshot store value {column}: {value}"))]
+    InvalidGraphSnapshotStoreValue { column: &'static str, value: String },
 
     #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },

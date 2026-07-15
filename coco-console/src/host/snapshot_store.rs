@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
-use async_trait::async_trait;
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Double, Integer, Text};
+use diesel::sql_types::{BigInt, Integer, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_async::pooled_connection::bb8::Pool as AsyncSqlitePool;
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
@@ -14,71 +14,1624 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use snafu::prelude::*;
 
 use crate::api::{
-    GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
-    GraphViewportEdgeKind, GraphViewportLane, GraphViewportNode, GraphViewportResponse, Point,
+    GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
+    GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse, Point,
 };
 use crate::error::{
-    AcquireGraphSnapshotConnectionSnafu, ConfigureGraphSnapshotStoreSnafu,
-    CreateGraphSnapshotPoolSnafu, MigrateGraphSnapshotStoreSnafu,
-    ParseGraphSnapshotStoreValueSnafu, QueryGraphSnapshotStoreSnafu,
+    InvalidGraphSnapshotStoreValueSnafu, ParseGraphSnapshotStoreValueSnafu,
+    QueryGraphSnapshotStoreSnafu, SerializeGraphSnapshotStoreValueSnafu,
 };
-use crate::graph::{
-    GraphMode, graph_kind_name, initial_visible_graph_lane_nodes, node_target_id,
-    provider_context_ancestry_nodes, shorten_id, summarize_node,
-    visible_skill_invocation_subtree_nodes_with_lookup,
-};
+use crate::graph::{GraphEdgeKind, GraphMode, GraphSnapshot};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
-    EDGE_TARGET_PORT_STEP, GRAPH_COLUMN_WIDTH, GRAPH_LEFT_X, diff_graph_viewport_responses,
-    lane_key,
-};
-use crate::schema::{
-    console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
-};
-use coco_mem::{
-    BranchStore, Kind, MergeParent, NewNode, Node, NodeStore, PauseReason, SessionAnchorPatch,
-    SessionState, SessionStore,
+    GraphLayout, GraphLayoutEdge, GraphLayoutNode, LayoutHint, diff_graph_viewport_responses,
+    edge_bounds, edge_key, node_bounds, node_key, try_graph_ranks, try_layout_graph_with_hints,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
 const SQLITE_POOL_MAX_SIZE: u32 = 4;
-const COORDINATE_SPACE: &str = "graph_layout_v1";
-const NODE_RADIUS: i32 = 26;
-const EDGE_TARGET_APPROACH: i32 = 48;
-const GRAPH_LANE_HEIGHT: i32 = 140;
-const EDGE_ROUTE_STEP: i32 = 12;
-const MAX_EDGE_COLUMN_GAP: usize = 5;
-const DERIVED_ORPHAN_LANE_KEY_PREFIX: &str = "derived:orphan:";
-const DERIVED_SKILL_LANE_KEY_PREFIX: &str = "derived:skill:";
+const COORDINATE_SPACE: &str = "graph_layout_v2";
 const CONSOLE_GRAPH_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 type AsyncSnapshotConnection = SyncConnectionWrapper<SqliteConnection>;
 type AsyncSnapshotPool = AsyncSqlitePool<AsyncSnapshotConnection>;
 
-mod anchor;
 mod database;
-mod full;
-mod materialization;
-mod mutation;
-mod query;
-mod row;
-mod source;
-mod transaction;
-mod viewport;
 
 pub(crate) use database::SnapshotDatabase;
-#[cfg(test)]
-pub(crate) use database::database_path;
-pub use row::*;
-pub use source::MaterializationSourceSnapshot;
-pub use transaction::SnapshotTransactionError;
-pub use viewport::*;
 
 #[derive(Clone, Debug)]
 pub struct ConsoleGraphSnapshotStore {
     path: Arc<PathBuf>,
     database: SnapshotDatabase,
+    policy: GraphLayoutPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GraphLayoutPolicy {
+    pub full_layout_node_limit: usize,
+    pub full_layout_edge_limit: usize,
+    pub local_layout_node_limit: usize,
+    pub local_layout_percent: usize,
+}
+
+impl Default for GraphLayoutPolicy {
+    fn default() -> Self {
+        Self {
+            full_layout_node_limit: 10_000,
+            full_layout_edge_limit: 20_000,
+            local_layout_node_limit: 2_000,
+            local_layout_percent: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterializationStrategy {
+    Full,
+    Local,
+    PayloadOnly,
+}
+
+impl MaterializationStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Local => "local",
+            Self::PayloadOnly => "payload_only",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlannedMaterialization {
+    layout: GraphLayout,
+    strategy: MaterializationStrategy,
+    affected_nodes: usize,
+    affected_ranks: usize,
+    fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, QueryableByName)]
+pub struct MaterializationRow {
+    #[diesel(sql_type = BigInt)]
+    pub source_version: i64,
+    #[diesel(sql_type = Integer)]
+    pub world_max_x: i32,
+    #[diesel(sql_type = Integer)]
+    pub world_max_y: i32,
+}
+
+#[derive(Debug, Clone, QueryableByName, PartialEq, Eq)]
+struct StoredNodeRow {
+    #[diesel(sql_type = Text)]
+    node_id: String,
+    #[diesel(sql_type = Text)]
+    node_key: String,
+    #[diesel(sql_type = Text)]
+    node_target: String,
+    #[diesel(sql_type = Text)]
+    short_id: String,
+    #[diesel(sql_type = Text)]
+    node_kind: String,
+    #[diesel(sql_type = Text)]
+    summary: String,
+    #[diesel(sql_type = Text)]
+    labels_json: String,
+    #[diesel(sql_type = Integer)]
+    rank: i32,
+    #[diesel(sql_type = Integer)]
+    sort_order: i32,
+    #[diesel(sql_type = Integer)]
+    x: i32,
+    #[diesel(sql_type = Integer)]
+    y: i32,
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = BigInt)]
+    created_at_ns: i64,
+    #[diesel(sql_type = Integer)]
+    min_x: i32,
+    #[diesel(sql_type = Integer)]
+    min_y: i32,
+    #[diesel(sql_type = Integer)]
+    max_x: i32,
+    #[diesel(sql_type = Integer)]
+    max_y: i32,
+}
+
+#[derive(Debug, Clone, QueryableByName, PartialEq, Eq)]
+struct StoredEdgeRow {
+    #[diesel(sql_type = Text)]
+    edge_key: String,
+    #[diesel(sql_type = Text)]
+    edge_kind: String,
+    #[diesel(sql_type = Text)]
+    source_id: String,
+    #[diesel(sql_type = Text)]
+    target_id: String,
+    #[diesel(sql_type = Integer)]
+    source_x: i32,
+    #[diesel(sql_type = Integer)]
+    source_y: i32,
+    #[diesel(sql_type = Integer)]
+    control_1_x: i32,
+    #[diesel(sql_type = Integer)]
+    control_1_y: i32,
+    #[diesel(sql_type = Integer)]
+    control_2_x: i32,
+    #[diesel(sql_type = Integer)]
+    control_2_y: i32,
+    #[diesel(sql_type = Integer)]
+    target_x: i32,
+    #[diesel(sql_type = Integer)]
+    target_y: i32,
+    #[diesel(sql_type = Integer)]
+    min_x: i32,
+    #[diesel(sql_type = Integer)]
+    min_y: i32,
+    #[diesel(sql_type = Integer)]
+    max_x: i32,
+    #[diesel(sql_type = Integer)]
+    max_y: i32,
+}
+
+#[derive(Debug, QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
+#[derive(Debug)]
+struct StoredGraph {
+    materialization: Option<MaterializationRow>,
+    nodes: BTreeMap<String, StoredNodeRow>,
+    edges: BTreeMap<String, StoredEdgeRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedNode {
+    node_id: String,
+    node_key: String,
+    node_target: String,
+    short_id: String,
+    node_kind: String,
+    summary: String,
+    labels_json: String,
+    rank: i32,
+    sort_order: i32,
+    x: i32,
+    y: i32,
+    created_at: String,
+    created_at_ns: i64,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedEdge {
+    edge_key: String,
+    edge_kind: String,
+    source_id: String,
+    target_id: String,
+    source_x: i32,
+    source_y: i32,
+    control_1_x: i32,
+    control_1_y: i32,
+    control_2_x: i32,
+    control_2_y: i32,
+    target_x: i32,
+    target_y: i32,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MaterializedGraphShellFacts {
+    pub version: u64,
+    pub nodes: Vec<MaterializedGraphShellNode>,
+    pub edge_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MaterializedGraphShellNode {
+    pub node_target: String,
+    pub point: Point,
+    pub created_at: String,
+    pub created_at_ns: i128,
+}
+
+pub struct MaterializedNodeReference {
+    pub node_id: String,
+    pub labels: Vec<String>,
+}
+
+impl ConsoleGraphSnapshotStore {
+    pub async fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
+        Self::open_with_policy(dir, GraphLayoutPolicy::default()).await
+    }
+
+    async fn open_with_policy(
+        dir: impl AsRef<Path>,
+        policy: GraphLayoutPolicy,
+    ) -> crate::Result<Self> {
+        let dir = dir.as_ref();
+        let path = database_path(dir);
+        let database = SnapshotDatabase::open(&path).await?;
+        let store = Self {
+            path: Arc::new(path),
+            database,
+            policy,
+        };
+        store.ensure_schema().await?;
+        Ok(store)
+    }
+
+    pub async fn with_connection<T, F>(&self, operation: F) -> crate::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut SqliteConnection) -> crate::Result<T> + Send + 'static,
+    {
+        self.database.with_connection(operation).await
+    }
+
+    async fn ensure_schema(&self) -> crate::Result<()> {
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            connection
+                .run_pending_migrations(CONSOLE_GRAPH_MIGRATIONS)
+                .map(|_| ())
+                .context(crate::error::MigrateGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub async fn latest_materialization_version(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Option<u64>> {
+        Ok(self
+            .latest_materialization_row(mode)
+            .await?
+            .map(|row| row.source_version.max(0) as u64))
+    }
+
+    pub async fn latest_materialization_row(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Option<MaterializationRow>> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            this.latest_materialization_row_in_connection(connection, mode)
+        })
+        .await
+    }
+
+    fn latest_materialization_row_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<Option<MaterializationRow>> {
+        diesel::sql_query(
+            "SELECT source_version, world_max_x, world_max_y \
+             FROM console_graph_materializations \
+             WHERE mode = ? AND coordinate_space = ?",
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Text, _>(COORDINATE_SPACE)
+        .get_result(connection)
+        .optional()
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    pub async fn has_materialization(&self, mode: GraphMode) -> crate::Result<bool> {
+        Ok(self.latest_materialization_version(mode).await?.is_some())
+    }
+
+    pub async fn materialize_snapshot(&self, snapshot: &GraphSnapshot) -> crate::Result<()> {
+        let layout_started = Instant::now();
+        let previous = self.load_stored_graph(snapshot.mode).await?;
+        let plan = plan_materialization(snapshot, &previous, self.policy)?;
+        let layout_duration = layout_started.elapsed();
+        let node_count = plan.layout.nodes.len();
+        let edge_count = plan.layout.edges.len();
+        tracing::info!(
+            mode = ?snapshot.mode,
+            source_version = snapshot.version,
+            strategy = plan.strategy.as_str(),
+            node_count,
+            edge_count,
+            affected_nodes = plan.affected_nodes,
+            affected_ranks = plan.affected_ranks,
+            layout_duration_ms = layout_duration.as_millis(),
+            fallback_reason = plan.fallback_reason.unwrap_or("none"),
+            "console graph layout planned",
+        );
+
+        let write_started = Instant::now();
+        let strategy = plan.strategy;
+        self.write_materialization(snapshot.version, snapshot.mode, plan, previous)
+            .await?;
+        tracing::info!(
+            mode = ?snapshot.mode,
+            source_version = snapshot.version,
+            strategy = strategy.as_str(),
+            node_count,
+            edge_count,
+            write_duration_ms = write_started.elapsed().as_millis(),
+            "console graph materialization committed",
+        );
+        Ok(())
+    }
+
+    pub async fn latest_viewport(
+        &self,
+        mode: GraphMode,
+        request: GraphViewportRequest,
+    ) -> crate::Result<Option<GraphViewportResponse>> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            this.viewport_in_connection(connection, mode, request)
+        })
+        .await
+    }
+
+    pub async fn latest_viewport_diff(
+        &self,
+        mode: GraphMode,
+        request: GraphViewportDiffRequest,
+    ) -> crate::Result<Option<GraphViewportDiffResponse>> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            let Some(previous) = this.viewport_in_connection(connection, mode, request.previous)?
+            else {
+                return Ok(None);
+            };
+            let Some(current) = this.viewport_in_connection(connection, mode, request.current)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(diff_graph_viewport_responses(
+                previous,
+                current,
+                request.known.as_ref(),
+            )))
+        })
+        .await
+    }
+
+    pub(crate) async fn materialized_node_reference(
+        &self,
+        mode: GraphMode,
+        target: &str,
+    ) -> crate::Result<Option<MaterializedNodeReference>> {
+        let this = self.clone();
+        let target = target.to_owned();
+        self.with_connection(move |connection| {
+            let row = diesel::sql_query(
+                "SELECT node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
+                        rank, sort_order, x, y, created_at, created_at_ns, \
+                        min_x, min_y, max_x, max_y \
+                 FROM console_graph_node_locations \
+                 WHERE mode = ? AND (node_target = ? OR node_id = ? OR node_key = ?) \
+                 ORDER BY node_id LIMIT 1",
+            )
+            .bind::<Text, _>(mode.as_query_value())
+            .bind::<Text, _>(&target)
+            .bind::<Text, _>(&target)
+            .bind::<Text, _>(&target)
+            .get_result::<StoredNodeRow>(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: this.path.as_ref().clone(),
+            })?;
+            row.map(|row| {
+                Ok(MaterializedNodeReference {
+                    node_id: row.node_id,
+                    labels: parse_labels(&row.labels_json)?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    pub(crate) async fn materialized_node_points(
+        &self,
+        mode: GraphMode,
+        node_ids: &BTreeSet<String>,
+    ) -> crate::Result<BTreeMap<String, Point>> {
+        let this = self.clone();
+        let node_ids = node_ids.clone();
+        self.with_connection(move |connection| {
+            let rows = this.load_node_rows_in_connection(connection, mode)?;
+            Ok(rows
+                .into_iter()
+                .filter(|row| node_ids.contains(&row.node_id))
+                .map(|row| (row.node_id, Point { x: row.x, y: row.y }))
+                .collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn materialized_shell_facts(
+        &self,
+        mode: GraphMode,
+    ) -> crate::Result<Option<MaterializedGraphShellFacts>> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            let Some(materialization) =
+                this.latest_materialization_row_in_connection(connection, mode)?
+            else {
+                return Ok(None);
+            };
+            let mut rows = this.load_node_rows_in_connection(connection, mode)?;
+            rows.sort_by(|left, right| {
+                left.created_at_ns
+                    .cmp(&right.created_at_ns)
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            });
+            let count = diesel::sql_query(
+                "SELECT COUNT(*) AS count FROM console_graph_edge_routes WHERE mode = ?",
+            )
+            .bind::<Text, _>(mode.as_query_value())
+            .get_result::<CountRow>(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: this.path.as_ref().clone(),
+            })?;
+            Ok(Some(MaterializedGraphShellFacts {
+                version: materialization.source_version.max(0) as u64,
+                nodes: rows
+                    .into_iter()
+                    .map(|row| MaterializedGraphShellNode {
+                        node_target: row.node_target,
+                        point: Point { x: row.x, y: row.y },
+                        created_at: row.created_at,
+                        created_at_ns: i128::from(row.created_at_ns),
+                    })
+                    .collect(),
+                edge_count: count.count.max(0) as usize,
+            }))
+        })
+        .await
+    }
+
+    fn viewport_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+        request: GraphViewportRequest,
+    ) -> crate::Result<Option<GraphViewportResponse>> {
+        let Some(materialization) =
+            self.latest_materialization_row_in_connection(connection, mode)?
+        else {
+            return Ok(None);
+        };
+        let request = request.normalized();
+        let left = request.x.saturating_sub(request.overscan);
+        let top = request.y.saturating_sub(request.overscan);
+        let right = request
+            .x
+            .saturating_add(request.width)
+            .saturating_add(request.overscan);
+        let bottom = request
+            .y
+            .saturating_add(request.height)
+            .saturating_add(request.overscan);
+        let node_rows = diesel::sql_query(
+            "SELECT node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
+                    rank, sort_order, x, y, created_at, created_at_ns, \
+                    min_x, min_y, max_x, max_y \
+             FROM console_graph_node_locations \
+             WHERE mode = ? AND min_x <= ? AND max_x >= ? AND min_y <= ? AND max_y >= ? \
+             ORDER BY rank, sort_order, node_id",
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(right)
+        .bind::<Integer, _>(left)
+        .bind::<Integer, _>(bottom)
+        .bind::<Integer, _>(top)
+        .load::<StoredNodeRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        let edge_rows = diesel::sql_query(
+            "SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, \
+                    control_1_x, control_1_y, control_2_x, control_2_y, target_x, target_y, \
+                    min_x, min_y, max_x, max_y \
+             FROM console_graph_edge_routes \
+             WHERE mode = ? AND min_x <= ? AND max_x >= ? AND min_y <= ? AND max_y >= ? \
+             ORDER BY edge_key",
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .bind::<Integer, _>(right)
+        .bind::<Integer, _>(left)
+        .bind::<Integer, _>(bottom)
+        .bind::<Integer, _>(top)
+        .load::<StoredEdgeRow>(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })?;
+        let nodes = node_rows
+            .into_iter()
+            .map(stored_viewport_node)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let edges = edge_rows
+            .into_iter()
+            .map(stored_viewport_edge)
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(Some(GraphViewportResponse {
+            version: materialization.source_version.max(0) as u64,
+            canvas: GraphCanvas {
+                width: materialization.world_max_x,
+                height: materialization.world_max_y,
+            },
+            viewport: GraphViewport {
+                x: request.x,
+                y: request.y,
+                width: request.width,
+                height: request.height,
+                overscan: request.overscan,
+            },
+            nodes,
+            edges,
+        }))
+    }
+
+    async fn load_stored_graph(&self, mode: GraphMode) -> crate::Result<StoredGraph> {
+        let this = self.clone();
+        self.with_connection(move |connection| {
+            let materialization =
+                this.latest_materialization_row_in_connection(connection, mode)?;
+            let nodes = this
+                .load_node_rows_in_connection(connection, mode)?
+                .into_iter()
+                .map(|row| (row.node_id.clone(), row))
+                .collect();
+            let edges = this
+                .load_edge_rows_in_connection(connection, mode)?
+                .into_iter()
+                .map(|row| (row.edge_key.clone(), row))
+                .collect();
+            Ok(StoredGraph {
+                materialization,
+                nodes,
+                edges,
+            })
+        })
+        .await
+    }
+
+    fn load_node_rows_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<Vec<StoredNodeRow>> {
+        diesel::sql_query(
+            "SELECT node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
+                    rank, sort_order, x, y, created_at, created_at_ns, \
+                    min_x, min_y, max_x, max_y \
+             FROM console_graph_node_locations WHERE mode = ? ORDER BY node_id",
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .load(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    fn load_edge_rows_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mode: GraphMode,
+    ) -> crate::Result<Vec<StoredEdgeRow>> {
+        diesel::sql_query(
+            "SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, \
+                    control_1_x, control_1_y, control_2_x, control_2_y, target_x, target_y, \
+                    min_x, min_y, max_x, max_y \
+             FROM console_graph_edge_routes WHERE mode = ? ORDER BY edge_key",
+        )
+        .bind::<Text, _>(mode.as_query_value())
+        .load(connection)
+        .context(QueryGraphSnapshotStoreSnafu {
+            path: self.path.as_ref().clone(),
+        })
+    }
+
+    async fn write_materialization(
+        &self,
+        source_version: u64,
+        mode: GraphMode,
+        plan: PlannedMaterialization,
+        previous: StoredGraph,
+    ) -> crate::Result<()> {
+        let strategy = plan.strategy;
+        let width = plan.layout.width;
+        let height = plan.layout.height;
+        let nodes = plan
+            .layout
+            .nodes
+            .iter()
+            .map(PersistedNode::try_from)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let edges = plan
+            .layout
+            .edges
+            .iter()
+            .map(PersistedEdge::from)
+            .collect::<Vec<_>>();
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            connection
+                .transaction::<_, diesel::result::Error, _>(|connection| {
+                    if strategy == MaterializationStrategy::Full {
+                        delete_mode_rows(connection, mode)?;
+                        for node in &nodes {
+                            upsert_node(connection, mode, node)?;
+                        }
+                        for edge in &edges {
+                            upsert_edge(connection, mode, edge)?;
+                        }
+                    } else {
+                        write_changed_rows(connection, mode, &previous, &nodes, &edges)?;
+                    }
+                    upsert_materialization(connection, mode, source_version, width, height)
+                })
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+}
+
+fn plan_materialization(
+    snapshot: &GraphSnapshot,
+    previous: &StoredGraph,
+    policy: GraphLayoutPolicy,
+) -> crate::Result<PlannedMaterialization> {
+    let hints = previous
+        .nodes
+        .iter()
+        .map(|(node_id, row)| {
+            (
+                node_id.clone(),
+                LayoutHint {
+                    rank: row.rank.max(0) as usize,
+                    order: row.sort_order.max(0) as usize,
+                    point: Point { x: row.x, y: row.y },
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let cold_start = previous.materialization.is_none();
+    let small_graph = snapshot.nodes.len() <= policy.full_layout_node_limit
+        && snapshot.edges.len() <= policy.full_layout_edge_limit;
+    if cold_start || small_graph {
+        let layout = try_layout_graph_with_hints(snapshot, &hints, None)
+            .context(crate::error::GraphLayoutSnafu)?;
+        return Ok(PlannedMaterialization {
+            layout,
+            strategy: MaterializationStrategy::Full,
+            affected_nodes: snapshot.nodes.len(),
+            affected_ranks: 0,
+            fallback_reason: cold_start.then_some("cold_start"),
+        });
+    }
+
+    let previous_nodes = previous.nodes.keys().cloned().collect::<BTreeSet<_>>();
+    let current_nodes = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let previous_edges = previous_edge_identities(previous)?;
+    let current_edges = snapshot_edge_identities(snapshot);
+    if previous_nodes == current_nodes && previous_edges == current_edges {
+        let reflow_ranks = BTreeSet::new();
+        let layout = try_layout_graph_with_hints(snapshot, &hints, Some(&reflow_ranks))
+            .context(crate::error::GraphLayoutSnafu)?;
+        return Ok(PlannedMaterialization {
+            layout,
+            strategy: MaterializationStrategy::PayloadOnly,
+            affected_nodes: 0,
+            affected_ranks: 0,
+            fallback_reason: None,
+        });
+    }
+
+    let affected = affected_descendant_closure(
+        &previous_nodes,
+        &current_nodes,
+        &previous_edges,
+        &current_edges,
+    );
+    let fresh_rank_by_node = try_graph_ranks(snapshot).context(crate::error::GraphLayoutSnafu)?;
+    let mut affected_ranks = BTreeSet::new();
+    for node_id in &affected {
+        if let Some(rank) = fresh_rank_by_node.get(node_id) {
+            affected_ranks.insert(*rank);
+        }
+        if let Some(hint) = hints.get(node_id) {
+            affected_ranks.insert(hint.rank);
+        }
+    }
+    for (node_id, rank) in &fresh_rank_by_node {
+        if hints.get(node_id).is_some_and(|hint| hint.rank != *rank) {
+            affected_ranks.insert(*rank);
+            affected_ranks.insert(hints[node_id].rank);
+        }
+    }
+    affected_ranks = expanded_ranks(&affected_ranks);
+    let affected_current_nodes = fresh_rank_by_node
+        .values()
+        .filter(|rank| affected_ranks.contains(rank))
+        .count();
+    let removed_nodes = previous_nodes.difference(&current_nodes).count();
+    let affected_node_count = affected_current_nodes + removed_nodes;
+    let percentage_limit = snapshot
+        .nodes
+        .len()
+        .saturating_mul(policy.local_layout_percent)
+        / 100;
+    let local_limit = policy.local_layout_node_limit.min(percentage_limit.max(1));
+    if affected_node_count <= local_limit {
+        let layout = try_layout_graph_with_hints(snapshot, &hints, Some(&affected_ranks))
+            .context(crate::error::GraphLayoutSnafu)?;
+        Ok(PlannedMaterialization {
+            layout,
+            strategy: MaterializationStrategy::Local,
+            affected_nodes: affected_node_count,
+            affected_ranks: affected_ranks.len(),
+            fallback_reason: None,
+        })
+    } else {
+        let layout = try_layout_graph_with_hints(snapshot, &hints, None)
+            .context(crate::error::GraphLayoutSnafu)?;
+        Ok(PlannedMaterialization {
+            layout,
+            strategy: MaterializationStrategy::Full,
+            affected_nodes: affected_node_count,
+            affected_ranks: affected_ranks.len(),
+            fallback_reason: Some("affected_region_exceeds_limit"),
+        })
+    }
+}
+
+fn snapshot_edge_identities(snapshot: &GraphSnapshot) -> BTreeSet<(String, String, String)> {
+    snapshot
+        .edges
+        .iter()
+        .map(|edge| {
+            (
+                graph_edge_kind_value(edge.kind).to_owned(),
+                edge.source.clone(),
+                edge.target.clone(),
+            )
+        })
+        .collect()
+}
+
+fn previous_edge_identities(
+    previous: &StoredGraph,
+) -> crate::Result<BTreeSet<(String, String, String)>> {
+    previous
+        .edges
+        .values()
+        .map(|edge| {
+            let kind = parse_edge_kind(&edge.edge_kind)?;
+            Ok((
+                graph_edge_kind_value(kind).to_owned(),
+                edge.source_id.clone(),
+                edge.target_id.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn affected_descendant_closure(
+    previous_nodes: &BTreeSet<String>,
+    current_nodes: &BTreeSet<String>,
+    previous_edges: &BTreeSet<(String, String, String)>,
+    current_edges: &BTreeSet<(String, String, String)>,
+) -> BTreeSet<String> {
+    let mut affected = previous_nodes
+        .symmetric_difference(current_nodes)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for (_, source, target) in previous_edges.symmetric_difference(current_edges) {
+        affected.insert(source.clone());
+        affected.insert(target.clone());
+    }
+    let mut outgoing = BTreeMap::<String, Vec<String>>::new();
+    for (_, source, target) in previous_edges.iter().chain(current_edges) {
+        outgoing
+            .entry(source.clone())
+            .or_default()
+            .push(target.clone());
+    }
+    let mut pending = affected.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(node_id) = pending.pop_front() {
+        for target in outgoing.get(&node_id).into_iter().flatten() {
+            if affected.insert(target.clone()) {
+                pending.push_back(target.clone());
+            }
+        }
+    }
+    affected
+}
+
+fn expanded_ranks(ranks: &BTreeSet<usize>) -> BTreeSet<usize> {
+    ranks
+        .iter()
+        .flat_map(|rank| [rank.saturating_sub(1), *rank, rank.saturating_add(1)])
+        .collect()
+}
+
+impl TryFrom<&GraphLayoutNode> for PersistedNode {
+    type Error = crate::Error;
+
+    fn try_from(node: &GraphLayoutNode) -> crate::Result<Self> {
+        let labels_json =
+            serde_json::to_string(&node.labels).context(SerializeGraphSnapshotStoreValueSnafu {
+                column: "labels_json",
+            })?;
+        let (min_x, min_y, max_x, max_y) = node_bounds(node);
+        Ok(Self {
+            node_id: node.node_id.clone(),
+            node_key: node_key(&node.node_id),
+            node_target: node.node_target.clone(),
+            short_id: node.short_id.clone(),
+            node_kind: node.kind.clone(),
+            summary: node.summary.clone(),
+            labels_json,
+            rank: saturating_i32(node.rank),
+            sort_order: saturating_i32(node.order),
+            x: node.point.x,
+            y: node.point.y,
+            created_at: node.created_at.clone(),
+            created_at_ns: saturating_i64(node.created_at_ns),
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        })
+    }
+}
+
+impl From<&StoredNodeRow> for PersistedNode {
+    fn from(row: &StoredNodeRow) -> Self {
+        Self {
+            node_id: row.node_id.clone(),
+            node_key: row.node_key.clone(),
+            node_target: row.node_target.clone(),
+            short_id: row.short_id.clone(),
+            node_kind: row.node_kind.clone(),
+            summary: row.summary.clone(),
+            labels_json: row.labels_json.clone(),
+            rank: row.rank,
+            sort_order: row.sort_order,
+            x: row.x,
+            y: row.y,
+            created_at: row.created_at.clone(),
+            created_at_ns: row.created_at_ns,
+            min_x: row.min_x,
+            min_y: row.min_y,
+            max_x: row.max_x,
+            max_y: row.max_y,
+        }
+    }
+}
+
+impl From<&GraphLayoutEdge> for PersistedEdge {
+    fn from(edge: &GraphLayoutEdge) -> Self {
+        let (min_x, min_y, max_x, max_y) = edge_bounds(edge);
+        Self {
+            edge_key: edge_key(edge.kind, &edge.source_node_id, &edge.target_node_id),
+            edge_kind: edge.kind.key_part().to_owned(),
+            source_id: edge.source_node_id.clone(),
+            target_id: edge.target_node_id.clone(),
+            source_x: edge.route.source.x,
+            source_y: edge.route.source.y,
+            control_1_x: edge.route.control_1.x,
+            control_1_y: edge.route.control_1.y,
+            control_2_x: edge.route.control_2.x,
+            control_2_y: edge.route.control_2.y,
+            target_x: edge.route.target.x,
+            target_y: edge.route.target.y,
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
+    }
+}
+
+impl From<&StoredEdgeRow> for PersistedEdge {
+    fn from(row: &StoredEdgeRow) -> Self {
+        Self {
+            edge_key: row.edge_key.clone(),
+            edge_kind: row.edge_kind.clone(),
+            source_id: row.source_id.clone(),
+            target_id: row.target_id.clone(),
+            source_x: row.source_x,
+            source_y: row.source_y,
+            control_1_x: row.control_1_x,
+            control_1_y: row.control_1_y,
+            control_2_x: row.control_2_x,
+            control_2_y: row.control_2_y,
+            target_x: row.target_x,
+            target_y: row.target_y,
+            min_x: row.min_x,
+            min_y: row.min_y,
+            max_x: row.max_x,
+            max_y: row.max_y,
+        }
+    }
+}
+
+fn write_changed_rows(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+    previous: &StoredGraph,
+    nodes: &[PersistedNode],
+    edges: &[PersistedEdge],
+) -> QueryResult<()> {
+    let next_nodes = nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    for node_id in previous.nodes.keys() {
+        if !next_nodes.contains_key(node_id.as_str()) {
+            diesel::sql_query(
+                "DELETE FROM console_graph_node_locations WHERE mode = ? AND node_id = ?",
+            )
+            .bind::<Text, _>(mode.as_query_value())
+            .bind::<Text, _>(node_id)
+            .execute(connection)?;
+        }
+    }
+    for node in nodes {
+        if previous
+            .nodes
+            .get(&node.node_id)
+            .is_none_or(|stored| PersistedNode::from(stored) != *node)
+        {
+            upsert_node(connection, mode, node)?;
+        }
+    }
+
+    let next_edges = edges
+        .iter()
+        .map(|edge| (edge.edge_key.as_str(), edge))
+        .collect::<BTreeMap<_, _>>();
+    for edge_key in previous.edges.keys() {
+        if !next_edges.contains_key(edge_key.as_str()) {
+            diesel::sql_query(
+                "DELETE FROM console_graph_edge_routes WHERE mode = ? AND edge_key = ?",
+            )
+            .bind::<Text, _>(mode.as_query_value())
+            .bind::<Text, _>(edge_key)
+            .execute(connection)?;
+        }
+    }
+    for edge in edges {
+        if previous
+            .edges
+            .get(&edge.edge_key)
+            .is_none_or(|stored| PersistedEdge::from(stored) != *edge)
+        {
+            upsert_edge(connection, mode, edge)?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_mode_rows(connection: &mut SqliteConnection, mode: GraphMode) -> QueryResult<()> {
+    diesel::sql_query("DELETE FROM console_graph_edge_routes WHERE mode = ?")
+        .bind::<Text, _>(mode.as_query_value())
+        .execute(connection)?;
+    diesel::sql_query("DELETE FROM console_graph_node_locations WHERE mode = ?")
+        .bind::<Text, _>(mode.as_query_value())
+        .execute(connection)?;
+    Ok(())
+}
+
+fn upsert_node(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+    node: &PersistedNode,
+) -> QueryResult<()> {
+    diesel::sql_query(
+        "INSERT INTO console_graph_node_locations (\
+            mode, node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
+            rank, sort_order, x, y, created_at, created_at_ns, min_x, min_y, max_x, max_y\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(mode, node_id) DO UPDATE SET \
+            node_key = excluded.node_key, node_target = excluded.node_target, \
+            short_id = excluded.short_id, node_kind = excluded.node_kind, \
+            summary = excluded.summary, labels_json = excluded.labels_json, \
+            rank = excluded.rank, sort_order = excluded.sort_order, x = excluded.x, y = excluded.y, \
+            created_at = excluded.created_at, created_at_ns = excluded.created_at_ns, \
+            min_x = excluded.min_x, min_y = excluded.min_y, max_x = excluded.max_x, max_y = excluded.max_y",
+    )
+    .bind::<Text, _>(mode.as_query_value())
+    .bind::<Text, _>(&node.node_id)
+    .bind::<Text, _>(&node.node_key)
+    .bind::<Text, _>(&node.node_target)
+    .bind::<Text, _>(&node.short_id)
+    .bind::<Text, _>(&node.node_kind)
+    .bind::<Text, _>(&node.summary)
+    .bind::<Text, _>(&node.labels_json)
+    .bind::<Integer, _>(node.rank)
+    .bind::<Integer, _>(node.sort_order)
+    .bind::<Integer, _>(node.x)
+    .bind::<Integer, _>(node.y)
+    .bind::<Text, _>(&node.created_at)
+    .bind::<BigInt, _>(node.created_at_ns)
+    .bind::<Integer, _>(node.min_x)
+    .bind::<Integer, _>(node.min_y)
+    .bind::<Integer, _>(node.max_x)
+    .bind::<Integer, _>(node.max_y)
+    .execute(connection)
+    .map(|_| ())
+}
+
+fn upsert_edge(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+    edge: &PersistedEdge,
+) -> QueryResult<()> {
+    diesel::sql_query(
+        "INSERT INTO console_graph_edge_routes (\
+            mode, edge_key, edge_kind, source_id, target_id, source_x, source_y, \
+            control_1_x, control_1_y, control_2_x, control_2_y, target_x, target_y, \
+            min_x, min_y, max_x, max_y\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(mode, edge_key) DO UPDATE SET \
+            edge_kind = excluded.edge_kind, source_id = excluded.source_id, target_id = excluded.target_id, \
+            source_x = excluded.source_x, source_y = excluded.source_y, \
+            control_1_x = excluded.control_1_x, control_1_y = excluded.control_1_y, \
+            control_2_x = excluded.control_2_x, control_2_y = excluded.control_2_y, \
+            target_x = excluded.target_x, target_y = excluded.target_y, \
+            min_x = excluded.min_x, min_y = excluded.min_y, max_x = excluded.max_x, max_y = excluded.max_y",
+    )
+    .bind::<Text, _>(mode.as_query_value())
+    .bind::<Text, _>(&edge.edge_key)
+    .bind::<Text, _>(&edge.edge_kind)
+    .bind::<Text, _>(&edge.source_id)
+    .bind::<Text, _>(&edge.target_id)
+    .bind::<Integer, _>(edge.source_x)
+    .bind::<Integer, _>(edge.source_y)
+    .bind::<Integer, _>(edge.control_1_x)
+    .bind::<Integer, _>(edge.control_1_y)
+    .bind::<Integer, _>(edge.control_2_x)
+    .bind::<Integer, _>(edge.control_2_y)
+    .bind::<Integer, _>(edge.target_x)
+    .bind::<Integer, _>(edge.target_y)
+    .bind::<Integer, _>(edge.min_x)
+    .bind::<Integer, _>(edge.min_y)
+    .bind::<Integer, _>(edge.max_x)
+    .bind::<Integer, _>(edge.max_y)
+    .execute(connection)
+    .map(|_| ())
+}
+
+fn upsert_materialization(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+    source_version: u64,
+    width: i32,
+    height: i32,
+) -> QueryResult<()> {
+    diesel::sql_query(
+        "INSERT INTO console_graph_materializations (\
+            mode, source_version, coordinate_space, world_min_x, world_min_y, world_max_x, world_max_y\
+         ) VALUES (?, ?, ?, 0, 0, ?, ?) \
+         ON CONFLICT(mode) DO UPDATE SET \
+            source_version = excluded.source_version, coordinate_space = excluded.coordinate_space, \
+            world_min_x = excluded.world_min_x, world_min_y = excluded.world_min_y, \
+            world_max_x = excluded.world_max_x, world_max_y = excluded.world_max_y, \
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+    )
+    .bind::<Text, _>(mode.as_query_value())
+    .bind::<BigInt, _>(source_version.min(i64::MAX as u64) as i64)
+    .bind::<Text, _>(COORDINATE_SPACE)
+    .bind::<Integer, _>(width)
+    .bind::<Integer, _>(height)
+    .execute(connection)
+    .map(|_| ())
+}
+
+fn stored_viewport_node(row: StoredNodeRow) -> crate::Result<GraphViewportNode> {
+    Ok(GraphViewportNode {
+        key: row.node_key,
+        id: row.node_id,
+        node_target: row.node_target,
+        short_id: row.short_id,
+        kind: row.node_kind,
+        summary: row.summary,
+        labels: parse_labels(&row.labels_json)?,
+        x: row.x,
+        y: row.y,
+    })
+}
+
+fn stored_viewport_edge(row: StoredEdgeRow) -> crate::Result<GraphViewportEdge> {
+    Ok(GraphViewportEdge {
+        key: row.edge_key,
+        kind: parse_viewport_edge_kind(&row.edge_kind)?,
+        source_id: row.source_id,
+        target_id: row.target_id,
+        route: GraphBezierRoute {
+            source: Point {
+                x: row.source_x,
+                y: row.source_y,
+            },
+            control_1: Point {
+                x: row.control_1_x,
+                y: row.control_1_y,
+            },
+            control_2: Point {
+                x: row.control_2_x,
+                y: row.control_2_y,
+            },
+            target: Point {
+                x: row.target_x,
+                y: row.target_y,
+            },
+        },
+    })
+}
+
+fn parse_labels(value: &str) -> crate::Result<Vec<String>> {
+    serde_json::from_str(value).context(ParseGraphSnapshotStoreValueSnafu {
+        column: "labels_json",
+    })
+}
+
+fn parse_viewport_edge_kind(value: &str) -> crate::Result<GraphViewportEdgeKind> {
+    match value {
+        "primary_parent" => Ok(GraphViewportEdgeKind::Primary),
+        "merge_parent" => Ok(GraphViewportEdgeKind::Merge),
+        "shadow_parent" => Ok(GraphViewportEdgeKind::Shadow),
+        _ => InvalidGraphSnapshotStoreValueSnafu {
+            column: "edge_kind",
+            value: value.to_owned(),
+        }
+        .fail(),
+    }
+}
+
+fn parse_edge_kind(value: &str) -> crate::Result<GraphEdgeKind> {
+    match parse_viewport_edge_kind(value)? {
+        GraphViewportEdgeKind::Primary => Ok(GraphEdgeKind::Primary),
+        GraphViewportEdgeKind::Merge => Ok(GraphEdgeKind::Merge),
+        GraphViewportEdgeKind::Shadow => Ok(GraphEdgeKind::Shadow),
+    }
+}
+
+fn graph_edge_kind_value(kind: GraphEdgeKind) -> &'static str {
+    match kind {
+        GraphEdgeKind::Primary => "primary_parent",
+        GraphEdgeKind::Merge => "merge_parent",
+        GraphEdgeKind::Shadow => "shadow_parent",
+    }
+}
+
+fn saturating_i32(value: usize) -> i32 {
+    value.min(i32::MAX as usize) as i32
+}
+
+fn saturating_i64(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+pub fn database_path(dir: impl AsRef<Path>) -> PathBuf {
+    dir.as_ref().join(SQLITE_DATABASE_FILE_NAME)
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::graph::{GraphBranch, GraphEdge, GraphNode};
+    use crate::layout::layout_graph;
+    use coco_mem::SessionState;
+    use diesel::connection::SimpleConnection;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn node(index: usize) -> GraphNode {
+        let id = format!("node-{index:04}");
+        GraphNode {
+            short_id: id.chars().take(8).collect(),
+            id: id.clone(),
+            kind: "text".to_owned(),
+            role: "User".to_owned(),
+            created_at: format!("time-{index:04}"),
+            created_at_ns: index as i128,
+            content: id.clone(),
+            summary: id,
+            labels: Vec::new(),
+            provider_context_ids: Vec::new(),
+        }
+    }
+
+    fn linear_snapshot(version: u64, mode: GraphMode, node_count: usize) -> GraphSnapshot {
+        let nodes = (0..node_count).map(node).collect::<Vec<_>>();
+        let edges = (1..node_count)
+            .map(|index| GraphEdge {
+                source: nodes[index - 1].id.clone(),
+                target: nodes[index].id.clone(),
+                kind: GraphEdgeKind::Primary,
+            })
+            .collect();
+        GraphSnapshot {
+            version,
+            mode,
+            root_id: "root".to_owned(),
+            nodes,
+            edges,
+            branches: vec![GraphBranch {
+                name: "main".to_owned(),
+                head_id: format!("node-{:04}", node_count.saturating_sub(1)),
+                visible_head_id: node_count
+                    .checked_sub(1)
+                    .map(|index| format!("node-{index:04}")),
+                state: SessionState::Active,
+            }],
+            provider_contexts: Vec::new(),
+        }
+    }
+
+    fn stored_graph(snapshot: &GraphSnapshot) -> StoredGraph {
+        let layout = layout_graph(snapshot);
+        let nodes = layout
+            .nodes
+            .iter()
+            .map(|node| {
+                let persisted = PersistedNode::try_from(node).unwrap();
+                (
+                    persisted.node_id.clone(),
+                    StoredNodeRow {
+                        node_id: persisted.node_id,
+                        node_key: persisted.node_key,
+                        node_target: persisted.node_target,
+                        short_id: persisted.short_id,
+                        node_kind: persisted.node_kind,
+                        summary: persisted.summary,
+                        labels_json: persisted.labels_json,
+                        rank: persisted.rank,
+                        sort_order: persisted.sort_order,
+                        x: persisted.x,
+                        y: persisted.y,
+                        created_at: persisted.created_at,
+                        created_at_ns: persisted.created_at_ns,
+                        min_x: persisted.min_x,
+                        min_y: persisted.min_y,
+                        max_x: persisted.max_x,
+                        max_y: persisted.max_y,
+                    },
+                )
+            })
+            .collect();
+        let edges = layout
+            .edges
+            .iter()
+            .map(|edge| {
+                let persisted = PersistedEdge::from(edge);
+                (
+                    persisted.edge_key.clone(),
+                    StoredEdgeRow {
+                        edge_key: persisted.edge_key,
+                        edge_kind: persisted.edge_kind,
+                        source_id: persisted.source_id,
+                        target_id: persisted.target_id,
+                        source_x: persisted.source_x,
+                        source_y: persisted.source_y,
+                        control_1_x: persisted.control_1_x,
+                        control_1_y: persisted.control_1_y,
+                        control_2_x: persisted.control_2_x,
+                        control_2_y: persisted.control_2_y,
+                        target_x: persisted.target_x,
+                        target_y: persisted.target_y,
+                        min_x: persisted.min_x,
+                        min_y: persisted.min_y,
+                        max_x: persisted.max_x,
+                        max_y: persisted.max_y,
+                    },
+                )
+            })
+            .collect();
+        StoredGraph {
+            materialization: Some(MaterializationRow {
+                source_version: snapshot.version as i64,
+                world_max_x: layout.width,
+                world_max_y: layout.height,
+            }),
+            nodes,
+            edges,
+        }
+    }
+
+    fn local_policy(local_limit: usize) -> GraphLayoutPolicy {
+        GraphLayoutPolicy {
+            full_layout_node_limit: 0,
+            full_layout_edge_limit: 0,
+            local_layout_node_limit: local_limit,
+            local_layout_percent: 100,
+        }
+    }
+
+    #[test]
+    fn payload_only_updates_keep_all_coordinates() {
+        let previous_snapshot = linear_snapshot(1, GraphMode::All, 5);
+        let previous = stored_graph(&previous_snapshot);
+        let mut next = previous_snapshot.clone();
+        next.version = 2;
+        next.nodes[2].summary = "updated".to_owned();
+
+        let plan = plan_materialization(&next, &previous, local_policy(10)).unwrap();
+
+        assert_eq!(plan.strategy, MaterializationStrategy::PayloadOnly);
+        for node in &plan.layout.nodes {
+            let stored = &previous.nodes[&node.node_id];
+            assert_eq!(
+                node.point,
+                Point {
+                    x: stored.x,
+                    y: stored.y
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn local_updates_pin_ranks_outside_the_affected_region() {
+        let previous_snapshot = linear_snapshot(1, GraphMode::All, 8);
+        let mut previous = stored_graph(&previous_snapshot);
+        for index in 0..=4 {
+            let row = previous.nodes.get_mut(&format!("node-{index:04}")).unwrap();
+            row.x += index + 1;
+            row.y += (index + 1) * 7;
+        }
+        let mut next = previous_snapshot.clone();
+        next.version = 2;
+        next.nodes.push(node(8));
+        next.edges.push(GraphEdge {
+            source: "node-0006".to_owned(),
+            target: "node-0008".to_owned(),
+            kind: GraphEdgeKind::Primary,
+        });
+
+        let plan = plan_materialization(&next, &previous, local_policy(10)).unwrap();
+        let full = layout_graph(&next);
+
+        assert_eq!(plan.strategy, MaterializationStrategy::Local);
+        for index in 0..=4 {
+            let node_id = format!("node-{index:04}");
+            let node = plan
+                .layout
+                .nodes
+                .iter()
+                .find(|node| node.node_id == node_id)
+                .unwrap();
+            let stored = &previous.nodes[&node_id];
+            assert_eq!(
+                node.point,
+                Point {
+                    x: stored.x,
+                    y: stored.y
+                }
+            );
+        }
+        assert_eq!(
+            plan.layout
+                .nodes
+                .iter()
+                .map(|node| node.node_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            full.nodes
+                .iter()
+                .map(|node| node.node_id.as_str())
+                .collect()
+        );
+        assert_eq!(
+            plan.layout
+                .edges
+                .iter()
+                .map(|edge| (
+                    edge.kind,
+                    edge.source_node_id.as_str(),
+                    edge.target_node_id.as_str()
+                ))
+                .collect::<BTreeSet<_>>(),
+            full.edges
+                .iter()
+                .map(|edge| (
+                    edge.kind,
+                    edge.source_node_id.as_str(),
+                    edge.target_node_id.as_str()
+                ))
+                .collect()
+        );
+    }
+
+    #[test]
+    fn large_affected_regions_fall_back_to_full_layout() {
+        let previous_snapshot = linear_snapshot(1, GraphMode::All, 8);
+        let previous = stored_graph(&previous_snapshot);
+        let mut next = previous_snapshot.clone();
+        next.version = 2;
+        next.nodes.push(node(8));
+        next.edges.push(GraphEdge {
+            source: "node-0000".to_owned(),
+            target: "node-0008".to_owned(),
+            kind: GraphEdgeKind::Primary,
+        });
+
+        let plan = plan_materialization(&next, &previous, local_policy(1)).unwrap();
+
+        assert_eq!(plan.strategy, MaterializationStrategy::Full);
+        assert_eq!(plan.fallback_reason, Some("affected_region_exceeds_limit"));
+    }
+
+    #[tokio::test]
+    async fn graph_modes_are_materialized_independently() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(3, GraphMode::All, 3))
+            .await
+            .unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(5, GraphMode::Anchors, 2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::Anchors)
+                .await
+                .unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            store
+                .latest_viewport(GraphMode::All, GraphViewportRequest::default())
+                .await
+                .unwrap()
+                .unwrap()
+                .nodes
+                .len(),
+            3
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_rebuild_keeps_the_previous_ready_version() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        let initial = linear_snapshot(1, GraphMode::All, 2);
+        store.materialize_snapshot(&initial).await.unwrap();
+        store
+            .with_connection(|connection| {
+                connection
+                    .batch_execute(
+                        "CREATE TRIGGER reject_graph_node_insert \
+                         BEFORE INSERT ON console_graph_node_locations \
+                         BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END;",
+                    )
+                    .context(QueryGraphSnapshotStoreSnafu {
+                        path: PathBuf::from("injected"),
+                    })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut next = initial;
+        next.version = 2;
+        next.nodes[1].summary = "new payload".to_owned();
+
+        let error = store.materialize_snapshot(&next).await.unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::QueryGraphSnapshotStore { .. }
+        ));
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let viewport = store
+            .latest_viewport(GraphMode::All, GraphViewportRequest::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(viewport.nodes[1].summary, "new payload");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v2_migration_clears_v1_derived_facts() {
+        let mut connection = SqliteConnection::establish(":memory:").unwrap();
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000001_initial_console_graph_schema/up.sql"
+            ))
+            .unwrap();
+        connection
+            .batch_execute(
+                "INSERT INTO console_graph_materializations \
+                 (mode, source_version, coordinate_space, world_min_x, world_min_y, world_max_x, world_max_y) \
+                 VALUES ('all', 1, 'graph_layout_v1', 0, 0, 100, 100); \
+                 INSERT INTO console_graph_node_locations \
+                 (mode, node_key, node_id, node_target, short_id, node_kind, summary, labels_json, \
+                  lane_key, lane_label, lane_y, x, y, min_x, min_y, max_x, max_y) \
+                 VALUES ('all', 'node:a:1:1', 'a', 'detail-a', 'a', 'text', 'a', '[]', \
+                         'lane:main', 'main', 1, 1, 1, 0, 0, 2, 2);",
+            )
+            .unwrap();
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000002_unique_dag_layout/up.sql"
+            ))
+            .unwrap();
+
+        let materializations =
+            diesel::sql_query("SELECT COUNT(*) AS count FROM console_graph_materializations")
+                .get_result::<CountRow>(&mut connection)
+                .unwrap();
+        let nodes = diesel::sql_query("SELECT COUNT(*) AS count FROM console_graph_node_locations")
+            .get_result::<CountRow>(&mut connection)
+            .unwrap();
+        let legacy_node_columns = diesel::sql_query(
+            "SELECT COUNT(*) AS count \
+             FROM pragma_table_info('console_graph_node_locations') \
+             WHERE name IN ('lane_key', 'lane_label', 'lane_y')",
+        )
+        .get_result::<CountRow>(&mut connection)
+        .unwrap();
+        let bezier_columns = diesel::sql_query(
+            "SELECT COUNT(*) AS count \
+             FROM pragma_table_info('console_graph_edge_routes') \
+             WHERE name IN ('control_1_x', 'control_1_y', 'control_2_x', 'control_2_y')",
+        )
+        .get_result::<CountRow>(&mut connection)
+        .unwrap();
+
+        assert_eq!(materializations.count, 0);
+        assert_eq!(nodes.count, 0);
+        assert_eq!(legacy_node_columns.count, 0);
+        assert_eq!(bezier_columns.count, 4);
+    }
+
+    fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "coco-console-layout-v2-{}-{nonce}-{counter}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}

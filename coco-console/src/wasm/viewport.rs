@@ -1,5 +1,5 @@
 pub const MIN_OVERSCAN: i32 = 180;
-const COLLAPSED_LANE_OVERSCAN_HEIGHT_MULTIPLIER: f64 = 3.0;
+const VERTICAL_PREFETCH_MULTIPLIER: f64 = 3.0;
 const SHORT_CANVAS_VISIBLE_WIDTH_FRACTION: f64 = 0.74;
 const SHORT_CANVAS_VISIBLE_HEIGHT_FRACTION: f64 = 0.82;
 
@@ -35,7 +35,7 @@ impl ViewportState {
 
     pub fn render_overscan(self) -> i32 {
         ((self.width.max(self.height) / 2.0)
-            .max(self.height * COLLAPSED_LANE_OVERSCAN_HEIGHT_MULTIPLIER)
+            .max(self.height * VERTICAL_PREFETCH_MULTIPLIER)
             .ceil() as i32)
             .max(MIN_OVERSCAN)
     }
@@ -91,19 +91,6 @@ pub fn needs_full_viewport_fetch(rendered: ViewportState, current: ViewportState
 
 pub fn needs_full_viewport_jump_fetch(rendered: ViewportState, current: ViewportState) -> bool {
     needs_full_fetch(ViewportBounds::strict(rendered), current)
-}
-
-pub fn bounds_visible_in_viewport(
-    viewport: ViewportState,
-    left: f64,
-    top: f64,
-    right: f64,
-    bottom: f64,
-) -> bool {
-    left < viewport.x + viewport.width
-        && right > viewport.x
-        && top < viewport.y + viewport.height
-        && bottom > viewport.y
 }
 
 fn needs_full_fetch(rendered: ViewportBounds, current: ViewportState) -> bool {
@@ -164,8 +151,8 @@ fn short_axis_zoom(
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportState, bounds_visible_in_viewport, needs_full_viewport_fetch,
-        needs_full_viewport_jump_fetch, same_viewport, short_canvas_auto_zoom,
+        ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch, same_viewport,
+        short_canvas_auto_zoom,
     };
 
     fn viewport(x: f64, y: f64) -> ViewportState {
@@ -219,21 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn graph_item_bounds_visibility_uses_strict_viewport() {
-        let current = viewport(200.0, 140.0);
-
-        assert!(bounds_visible_in_viewport(
-            current, 180.0, 130.0, 230.0, 190.0
-        ));
-        assert!(!bounds_visible_in_viewport(
-            current, 10.0, 130.0, 180.0, 190.0
-        ));
-        assert!(!bounds_visible_in_viewport(
-            current, 180.0, 10.0, 230.0, 120.0
-        ));
-    }
-
-    #[test]
     fn request_query_rounds_dimensions_and_uses_render_overscan() {
         let mut viewport = ViewportState {
             x: 1.4,
@@ -251,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn render_overscan_prefetches_collapsed_lane_space() {
+    fn render_overscan_prefetches_distant_graph_items() {
         let viewport = ViewportState {
             x: 0.0,
             y: 0.0,
