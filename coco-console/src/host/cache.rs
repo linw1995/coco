@@ -116,8 +116,9 @@ macro_rules! log_rebuild_status {
 macro_rules! set_rebuild_status {
     ($cache:expr, $status:expr) => {{
         let status = $status;
-        log_rebuild_status!(status);
-        $cache.set_rebuild_status(status);
+        if $cache.set_rebuild_status(&status) {
+            log_rebuild_status!(status);
+        }
     }};
 }
 
@@ -256,18 +257,7 @@ where
         let snapshot = Arc::new(snapshot);
         self.store_cached_snapshot(mode, source_version, snapshot.clone());
         self.publish_ready_version(source_version);
-        set_rebuild_status!(
-            self,
-            rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Ready,
-                None,
-                1,
-                1,
-                "Graph snapshot ready",
-            )
-        );
+        set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
         Ok(snapshot)
     }
 
@@ -692,18 +682,7 @@ where
     fn ensure_snapshot_current(&self, mode: GraphMode) {
         let source_version = self.invalidations.current_version();
         if self.cached_snapshot(mode, source_version).is_some() {
-            set_rebuild_status!(
-                self,
-                rebuild_status(
-                    mode,
-                    source_version,
-                    ConsoleGraphRebuildState::Ready,
-                    None,
-                    1,
-                    1,
-                    "Graph snapshot ready",
-                )
-            );
+            set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
             return;
         }
         if !self.mark_rebuild_scheduled(mode, source_version) {
@@ -721,18 +700,7 @@ where
         if (self.snapshots.is_none() && self.cached_snapshot(mode, source_version).is_some())
             || self.materialization_current(mode, source_version).await
         {
-            set_rebuild_status!(
-                self,
-                rebuild_status(
-                    mode,
-                    source_version,
-                    ConsoleGraphRebuildState::Ready,
-                    None,
-                    1,
-                    1,
-                    "Graph materialization ready",
-                )
-            );
+            set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
             return;
         }
         if !self.mark_rebuild_scheduled(mode, source_version) {
@@ -793,18 +761,7 @@ where
             Ok(snapshot) => {
                 self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
                 self.publish_ready_version(source_version);
-                set_rebuild_status!(
-                    self,
-                    rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Ready,
-                        None,
-                        1,
-                        1,
-                        "Graph snapshot ready",
-                    )
-                );
+                set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
             }
             Err(error) => {
                 set_rebuild_status!(
@@ -901,15 +858,19 @@ where
         true
     }
 
-    fn set_rebuild_status(&self, status: ConsoleGraphRebuildStatus) {
+    fn set_rebuild_status(&self, status: &ConsoleGraphRebuildStatus) -> bool {
         let mode = status.mode;
         let mut state = self
             .state
             .lock()
             .expect("console graph cache lock poisoned");
-        *state.rebuild_slot_mut(mode) = Some(status);
+        if state.rebuild_slot(mode).as_ref() == Some(status) {
+            return false;
+        }
+        *state.rebuild_slot_mut(mode) = Some(status.clone());
         drop(state);
         self.progress.mark_changed();
+        true
     }
 }
 
@@ -990,6 +951,18 @@ fn rebuild_status(
         total,
         message: message.into(),
     }
+}
+
+fn ready_rebuild_status(mode: GraphMode, source_version: u64) -> ConsoleGraphRebuildStatus {
+    rebuild_status(
+        mode,
+        source_version,
+        ConsoleGraphRebuildState::Ready,
+        None,
+        1,
+        1,
+        "Graph ready",
+    )
 }
 
 async fn latest_persistent_materialization_version(
@@ -1149,4 +1122,23 @@ async fn materialized_shell_branches(
 
 fn branch_order(branch: &str) -> (u8, &str) {
     (u8::from(branch != "main"), branch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coco_mem::SqliteStore;
+
+    #[tokio::test]
+    async fn identical_rebuild_status_is_not_republished() {
+        let store = SqliteStore::open_temporary().await.unwrap();
+        let cache = ConsoleGraphCache::new(store, ConsolePublisher::new());
+        let status = ready_rebuild_status(GraphMode::All, 7);
+
+        assert!(cache.set_rebuild_status(&status));
+        assert_eq!(cache.progress.current_version(), 1);
+
+        assert!(!cache.set_rebuild_status(&status));
+        assert_eq!(cache.progress.current_version(), 1);
+    }
 }
