@@ -175,6 +175,21 @@ struct StoredGraph {
     edges: BTreeMap<String, StoredEdgeRow>,
 }
 
+#[derive(Debug)]
+struct StoredViewport {
+    materialization: MaterializationRow,
+    request: GraphViewportRequest,
+    nodes: Vec<StoredNodeRow>,
+    edges: Vec<StoredEdgeRow>,
+}
+
+#[derive(Debug)]
+struct StoredShellFacts {
+    materialization: MaterializationRow,
+    nodes: Vec<StoredNodeRow>,
+    edge_count: i64,
+}
+
 #[derive(Debug, Clone, Insertable, AsChangeset, PartialEq, Eq)]
 #[diesel(table_name = console_graph_node_locations)]
 struct PersistedNode {
@@ -305,27 +320,12 @@ impl ConsoleGraphSnapshotStore {
         &self,
         mode: GraphMode,
     ) -> crate::Result<Option<MaterializationRow>> {
-        let this = self.clone();
+        let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
-            this.latest_materialization_row_in_connection(connection, mode)
+            query_materialization_row(connection, mode)
+                .context(QueryGraphSnapshotStoreSnafu { path })
         })
         .await
-    }
-
-    fn latest_materialization_row_in_connection(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-    ) -> crate::Result<Option<MaterializationRow>> {
-        console_graph_materializations::table
-            .filter(console_graph_materializations::mode.eq(mode.as_query_value()))
-            .filter(console_graph_materializations::coordinate_space.eq(COORDINATE_SPACE))
-            .select(MaterializationRow::as_select())
-            .first(connection)
-            .optional()
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })
     }
 
     pub async fn has_materialization(&self, mode: GraphMode) -> crate::Result<bool> {
@@ -392,9 +392,13 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         request: GraphViewportRequest,
     ) -> crate::Result<Option<GraphViewportResponse>> {
-        let this = self.clone();
+        let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
-            this.viewport_in_connection(connection, mode, request)
+            let stored = read_snapshot(connection, |connection| {
+                query_viewport(connection, mode, request)
+            })
+            .context(QueryGraphSnapshotStoreSnafu { path })?;
+            stored.map(stored_viewport_response).transpose()
         })
         .await
     }
@@ -404,19 +408,24 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         request: GraphViewportDiffRequest,
     ) -> crate::Result<Option<GraphViewportDiffResponse>> {
-        let this = self.clone();
+        let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
-            let Some(previous) = this.viewport_in_connection(connection, mode, request.previous)?
-            else {
+            let (previous, current) = read_snapshot(connection, |connection| {
+                Ok((
+                    query_viewport(connection, mode, request.previous)?,
+                    query_viewport(connection, mode, request.current)?,
+                ))
+            })
+            .context(QueryGraphSnapshotStoreSnafu { path })?;
+            let Some(previous) = previous else {
                 return Ok(None);
             };
-            let Some(current) = this.viewport_in_connection(connection, mode, request.current)?
-            else {
+            let Some(current) = current else {
                 return Ok(None);
             };
             Ok(Some(diff_graph_viewport_responses(
-                previous,
-                current,
+                stored_viewport_response(previous)?,
+                stored_viewport_response(current)?,
                 request.known.as_ref(),
             )))
         })
@@ -495,29 +504,23 @@ impl ConsoleGraphSnapshotStore {
         &self,
         mode: GraphMode,
     ) -> crate::Result<Option<MaterializedGraphShellFacts>> {
-        let this = self.clone();
+        let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
-            let Some(materialization) =
-                this.latest_materialization_row_in_connection(connection, mode)?
-            else {
+            let stored =
+                read_snapshot(connection, |connection| query_shell_facts(connection, mode))
+                    .context(QueryGraphSnapshotStoreSnafu { path })?;
+            let Some(mut stored) = stored else {
                 return Ok(None);
             };
-            let mut rows = this.load_node_rows_in_connection(connection, mode)?;
-            rows.sort_by(|left, right| {
+            stored.nodes.sort_by(|left, right| {
                 left.created_at_ns
                     .cmp(&right.created_at_ns)
                     .then_with(|| left.node_id.cmp(&right.node_id))
             });
-            let edge_count = console_graph_edge_routes::table
-                .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
-                .count()
-                .get_result::<i64>(connection)
-                .context(QueryGraphSnapshotStoreSnafu {
-                    path: this.path.as_ref().clone(),
-                })?;
             Ok(Some(MaterializedGraphShellFacts {
-                version: materialization.source_version.max(0) as u64,
-                nodes: rows
+                version: stored.materialization.source_version.max(0) as u64,
+                nodes: stored
+                    .nodes
                     .into_iter()
                     .map(|row| MaterializedGraphShellNode {
                         node_target: row.node_target,
@@ -526,140 +529,34 @@ impl ConsoleGraphSnapshotStore {
                         created_at_ns: i128::from(row.created_at_ns),
                     })
                     .collect(),
-                edge_count: edge_count.max(0) as usize,
+                edge_count: stored.edge_count.max(0) as usize,
             }))
         })
         .await
     }
 
-    fn viewport_in_connection(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-        request: GraphViewportRequest,
-    ) -> crate::Result<Option<GraphViewportResponse>> {
-        let Some(materialization) =
-            self.latest_materialization_row_in_connection(connection, mode)?
-        else {
-            return Ok(None);
-        };
-        let request = request.normalized();
-        let left = request.x.saturating_sub(request.overscan);
-        let top = request.y.saturating_sub(request.overscan);
-        let right = request
-            .x
-            .saturating_add(request.width)
-            .saturating_add(request.overscan);
-        let bottom = request
-            .y
-            .saturating_add(request.height)
-            .saturating_add(request.overscan);
-        let node_rows = console_graph_node_locations::table
-            .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
-            .filter(console_graph_node_locations::min_x.le(right))
-            .filter(console_graph_node_locations::max_x.ge(left))
-            .filter(console_graph_node_locations::min_y.le(bottom))
-            .filter(console_graph_node_locations::max_y.ge(top))
-            .order((
-                console_graph_node_locations::rank,
-                console_graph_node_locations::sort_order,
-                console_graph_node_locations::node_id,
-            ))
-            .select(StoredNodeRow::as_select())
-            .load(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
-        let edge_rows = console_graph_edge_routes::table
-            .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
-            .filter(console_graph_edge_routes::min_x.le(right))
-            .filter(console_graph_edge_routes::max_x.ge(left))
-            .filter(console_graph_edge_routes::min_y.le(bottom))
-            .filter(console_graph_edge_routes::max_y.ge(top))
-            .order(console_graph_edge_routes::edge_key)
-            .select(StoredEdgeRow::as_select())
-            .load(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })?;
-        let nodes = node_rows
-            .into_iter()
-            .map(stored_viewport_node)
-            .collect::<crate::Result<Vec<_>>>()?;
-        let edges = edge_rows
-            .into_iter()
-            .map(stored_viewport_edge)
-            .collect::<crate::Result<Vec<_>>>()?;
-        Ok(Some(GraphViewportResponse {
-            version: materialization.source_version.max(0) as u64,
-            canvas: GraphCanvas {
-                width: materialization.world_max_x,
-                height: materialization.world_max_y,
-            },
-            viewport: GraphViewport {
-                x: request.x,
-                y: request.y,
-                width: request.width,
-                height: request.height,
-                overscan: request.overscan,
-            },
-            nodes,
-            edges,
-        }))
-    }
-
     async fn load_stored_graph(&self, mode: GraphMode) -> crate::Result<StoredGraph> {
-        let this = self.clone();
+        let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
-            let materialization =
-                this.latest_materialization_row_in_connection(connection, mode)?;
-            let nodes = this
-                .load_node_rows_in_connection(connection, mode)?
-                .into_iter()
-                .map(|row| (row.node_id.clone(), row))
-                .collect();
-            let edges = this
-                .load_edge_rows_in_connection(connection, mode)?
-                .into_iter()
-                .map(|row| (row.edge_key.clone(), row))
-                .collect();
-            Ok(StoredGraph {
-                materialization,
-                nodes,
-                edges,
+            read_snapshot(connection, |connection| {
+                let materialization = query_materialization_row(connection, mode)?;
+                let nodes = query_nodes(connection, mode)?
+                    .into_iter()
+                    .map(|row| (row.node_id.clone(), row))
+                    .collect();
+                let edges = query_edges(connection, mode)?
+                    .into_iter()
+                    .map(|row| (row.edge_key.clone(), row))
+                    .collect();
+                Ok(StoredGraph {
+                    materialization,
+                    nodes,
+                    edges,
+                })
             })
+            .context(QueryGraphSnapshotStoreSnafu { path })
         })
         .await
-    }
-
-    fn load_node_rows_in_connection(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-    ) -> crate::Result<Vec<StoredNodeRow>> {
-        console_graph_node_locations::table
-            .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
-            .order(console_graph_node_locations::node_id)
-            .select(StoredNodeRow::as_select())
-            .load(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })
-    }
-
-    fn load_edge_rows_in_connection(
-        &self,
-        connection: &mut SqliteConnection,
-        mode: GraphMode,
-    ) -> crate::Result<Vec<StoredEdgeRow>> {
-        console_graph_edge_routes::table
-            .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
-            .order(console_graph_edge_routes::edge_key)
-            .select(StoredEdgeRow::as_select())
-            .load(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: self.path.as_ref().clone(),
-            })
     }
 
     async fn write_materialization(
@@ -736,6 +633,144 @@ impl ConsoleGraphSnapshotStore {
         })
         .await
     }
+}
+
+fn read_snapshot<T>(
+    connection: &mut SqliteConnection,
+    operation: impl FnOnce(&mut SqliteConnection) -> QueryResult<T>,
+) -> QueryResult<T> {
+    connection.transaction(operation)
+}
+
+fn query_materialization_row(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+) -> QueryResult<Option<MaterializationRow>> {
+    console_graph_materializations::table
+        .filter(console_graph_materializations::mode.eq(mode.as_query_value()))
+        .filter(console_graph_materializations::coordinate_space.eq(COORDINATE_SPACE))
+        .select(MaterializationRow::as_select())
+        .first(connection)
+        .optional()
+}
+
+fn query_nodes(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+) -> QueryResult<Vec<StoredNodeRow>> {
+    console_graph_node_locations::table
+        .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+        .order(console_graph_node_locations::node_id)
+        .select(StoredNodeRow::as_select())
+        .load(connection)
+}
+
+fn query_edges(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+) -> QueryResult<Vec<StoredEdgeRow>> {
+    console_graph_edge_routes::table
+        .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+        .order(console_graph_edge_routes::edge_key)
+        .select(StoredEdgeRow::as_select())
+        .load(connection)
+}
+
+fn query_viewport(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+    request: GraphViewportRequest,
+) -> QueryResult<Option<StoredViewport>> {
+    let Some(materialization) = query_materialization_row(connection, mode)? else {
+        return Ok(None);
+    };
+    let request = request.normalized();
+    let left = request.x.saturating_sub(request.overscan);
+    let top = request.y.saturating_sub(request.overscan);
+    let right = request
+        .x
+        .saturating_add(request.width)
+        .saturating_add(request.overscan);
+    let bottom = request
+        .y
+        .saturating_add(request.height)
+        .saturating_add(request.overscan);
+    let nodes = console_graph_node_locations::table
+        .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+        .filter(console_graph_node_locations::min_x.le(right))
+        .filter(console_graph_node_locations::max_x.ge(left))
+        .filter(console_graph_node_locations::min_y.le(bottom))
+        .filter(console_graph_node_locations::max_y.ge(top))
+        .order((
+            console_graph_node_locations::rank,
+            console_graph_node_locations::sort_order,
+            console_graph_node_locations::node_id,
+        ))
+        .select(StoredNodeRow::as_select())
+        .load(connection)?;
+    let edges = console_graph_edge_routes::table
+        .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+        .filter(console_graph_edge_routes::min_x.le(right))
+        .filter(console_graph_edge_routes::max_x.ge(left))
+        .filter(console_graph_edge_routes::min_y.le(bottom))
+        .filter(console_graph_edge_routes::max_y.ge(top))
+        .order(console_graph_edge_routes::edge_key)
+        .select(StoredEdgeRow::as_select())
+        .load(connection)?;
+    Ok(Some(StoredViewport {
+        materialization,
+        request,
+        nodes,
+        edges,
+    }))
+}
+
+fn query_shell_facts(
+    connection: &mut SqliteConnection,
+    mode: GraphMode,
+) -> QueryResult<Option<StoredShellFacts>> {
+    let Some(materialization) = query_materialization_row(connection, mode)? else {
+        return Ok(None);
+    };
+    let nodes = query_nodes(connection, mode)?;
+    let edge_count = console_graph_edge_routes::table
+        .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+        .count()
+        .get_result(connection)?;
+    Ok(Some(StoredShellFacts {
+        materialization,
+        nodes,
+        edge_count,
+    }))
+}
+
+fn stored_viewport_response(stored: StoredViewport) -> crate::Result<GraphViewportResponse> {
+    let nodes = stored
+        .nodes
+        .into_iter()
+        .map(stored_viewport_node)
+        .collect::<crate::Result<Vec<_>>>()?;
+    let edges = stored
+        .edges
+        .into_iter()
+        .map(stored_viewport_edge)
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(GraphViewportResponse {
+        version: stored.materialization.source_version.max(0) as u64,
+        canvas: GraphCanvas {
+            width: stored.materialization.world_max_x,
+            height: stored.materialization.world_max_y,
+        },
+        viewport: GraphViewport {
+            x: stored.request.x,
+            y: stored.request.y,
+            width: stored.request.width,
+            height: stored.request.height,
+            overscan: stored.request.overscan,
+        },
+        nodes,
+        edges,
+    })
 }
 
 fn plan_materialization(
@@ -1254,9 +1289,11 @@ mod tests {
     use crate::graph::{GraphBranch, GraphEdge, GraphNode};
     use crate::layout::layout_graph;
     use coco_mem::SessionState;
-    use diesel::connection::SimpleConnection;
+    use diesel::connection::{Connection, InstrumentationEvent, SimpleConnection};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn node(index: usize) -> GraphNode {
         let id = format!("node-{index:04}");
@@ -1378,6 +1415,200 @@ mod tests {
             local_layout_node_limit: local_limit,
             local_layout_percent: 100,
         }
+    }
+
+    fn test_connection(path: &Path) -> SqliteConnection {
+        let mut connection = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        connection
+            .batch_execute("PRAGMA busy_timeout = 10000; PRAGMA foreign_keys = ON")
+            .unwrap();
+        connection
+    }
+
+    fn replace_snapshot(
+        connection: &mut SqliteConnection,
+        snapshot: &GraphSnapshot,
+    ) -> QueryResult<()> {
+        let layout = layout_graph(snapshot);
+        let nodes = layout
+            .nodes
+            .iter()
+            .map(|node| PersistedNode::try_from(node).unwrap())
+            .collect::<Vec<_>>();
+        let edges = layout
+            .edges
+            .iter()
+            .map(PersistedEdge::from)
+            .collect::<Vec<_>>();
+        connection.transaction(|connection| {
+            delete_mode_rows(connection, snapshot.mode)?;
+            for node in &nodes {
+                upsert_node(connection, snapshot.mode, node)?;
+            }
+            for edge in &edges {
+                upsert_edge(connection, snapshot.mode, edge)?;
+            }
+            upsert_materialization(
+                connection,
+                snapshot.mode,
+                snapshot.version,
+                layout.width,
+                layout.height,
+            )
+        })
+    }
+
+    fn commit_snapshot_after_materialization_read(
+        reader: &mut SqliteConnection,
+        path: PathBuf,
+        snapshot: GraphSnapshot,
+    ) -> thread::JoinHandle<()> {
+        let (materialization_read, wait_for_materialization) = mpsc::sync_channel(0);
+        let (snapshot_committed, wait_for_snapshot) = mpsc::sync_channel(0);
+        let writer = thread::spawn(move || {
+            wait_for_materialization
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            replace_snapshot(&mut test_connection(&path), &snapshot).unwrap();
+            snapshot_committed.send(()).unwrap();
+        });
+        let mut paused = false;
+        reader.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+            if paused {
+                return;
+            }
+            let InstrumentationEvent::FinishQuery { query, error, .. } = event else {
+                return;
+            };
+            if error.is_none() && query.to_string().contains("console_graph_materializations") {
+                paused = true;
+                materialization_read.send(()).unwrap();
+                wait_for_snapshot
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+        });
+        writer
+    }
+
+    #[tokio::test]
+    async fn viewport_reads_use_one_sqlite_snapshot() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::All, 2))
+            .await
+            .unwrap();
+        let path = database_path(&dir);
+        let mut reader = test_connection(&path);
+        let writer = commit_snapshot_after_materialization_read(
+            &mut reader,
+            path,
+            linear_snapshot(2, GraphMode::All, 3),
+        );
+
+        let viewport = read_snapshot(&mut reader, |connection| {
+            query_viewport(connection, GraphMode::All, GraphViewportRequest::default())
+        })
+        .unwrap()
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(viewport.materialization.source_version, 1);
+        assert_eq!(viewport.nodes.len(), 2);
+        assert_eq!(viewport.edges.len(), 1);
+        assert_eq!(
+            query_materialization_row(&mut reader, GraphMode::All)
+                .unwrap()
+                .unwrap()
+                .source_version,
+            2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn viewport_diff_reads_use_one_sqlite_snapshot() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::All, 2))
+            .await
+            .unwrap();
+        let path = database_path(&dir);
+        let mut reader = test_connection(&path);
+        let writer = commit_snapshot_after_materialization_read(
+            &mut reader,
+            path,
+            linear_snapshot(2, GraphMode::All, 3),
+        );
+
+        let (previous, current) = read_snapshot(&mut reader, |connection| {
+            Ok((
+                query_viewport(connection, GraphMode::All, GraphViewportRequest::default())?,
+                query_viewport(
+                    connection,
+                    GraphMode::All,
+                    GraphViewportRequest {
+                        x: 1,
+                        ..GraphViewportRequest::default()
+                    },
+                )?,
+            ))
+        })
+        .unwrap();
+        writer.join().unwrap();
+
+        let previous = previous.unwrap();
+        let current = current.unwrap();
+        assert_eq!(previous.materialization.source_version, 1);
+        assert_eq!(current.materialization.source_version, 1);
+        assert_eq!(previous.nodes.len(), 2);
+        assert_eq!(current.nodes.len(), 2);
+        assert_eq!(
+            query_materialization_row(&mut reader, GraphMode::All)
+                .unwrap()
+                .unwrap()
+                .source_version,
+            2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_facts_reads_use_one_sqlite_snapshot() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::All, 2))
+            .await
+            .unwrap();
+        let path = database_path(&dir);
+        let mut reader = test_connection(&path);
+        let writer = commit_snapshot_after_materialization_read(
+            &mut reader,
+            path,
+            linear_snapshot(2, GraphMode::All, 3),
+        );
+
+        let facts = read_snapshot(&mut reader, |connection| {
+            query_shell_facts(connection, GraphMode::All)
+        })
+        .unwrap()
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(facts.materialization.source_version, 1);
+        assert_eq!(facts.nodes.len(), 2);
+        assert_eq!(facts.edge_count, 1);
+        assert_eq!(
+            query_materialization_row(&mut reader, GraphMode::All)
+                .unwrap()
+                .unwrap()
+                .source_version,
+            2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
