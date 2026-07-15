@@ -1,4 +1,5 @@
 use super::*;
+use diesel::sql_types::Text;
 
 #[derive(diesel::QueryableByName)]
 struct SnapshotJournalModeRow {
@@ -32,7 +33,7 @@ impl SnapshotDatabase {
             .max_size(SQLITE_POOL_MAX_SIZE)
             .build(manager)
             .await
-            .context(CreateGraphSnapshotPoolSnafu { path: path.clone() })?;
+            .context(crate::error::CreateGraphSnapshotPoolSnafu { path: path.clone() })?;
         let database = Self {
             path: Arc::new(path.clone()),
             pool,
@@ -41,10 +42,10 @@ impl SnapshotDatabase {
             .with_connection(move |connection| {
                 let mode = diesel::sql_query("PRAGMA journal_mode = WAL")
                     .get_result::<SnapshotJournalModeRow>(connection)
-                    .context(QueryGraphSnapshotStoreSnafu { path: path.clone() })?;
+                    .context(crate::error::QueryGraphSnapshotStoreSnafu { path: path.clone() })?;
                 ensure!(
                     mode.journal_mode.eq_ignore_ascii_case("wal"),
-                    ConfigureGraphSnapshotStoreSnafu {
+                    crate::error::ConfigureGraphSnapshotStoreSnafu {
                         path: path.clone(),
                         message: format!(
                             "SQLite refused WAL journal mode and remained in {:?}",
@@ -67,7 +68,7 @@ impl SnapshotDatabase {
             self.pool
                 .get()
                 .await
-                .context(AcquireGraphSnapshotConnectionSnafu {
+                .context(crate::error::AcquireGraphSnapshotConnectionSnafu {
                     path: self.path.as_ref().clone(),
                 })?;
         match connection
@@ -97,53 +98,4 @@ fn snapshot_pool_manager_config() -> ManagerConfig<AsyncSnapshotConnection> {
         })
     });
     config
-}
-
-impl ConsoleGraphSnapshotStore {
-    pub async fn open(dir: impl AsRef<Path>) -> crate::Result<Self> {
-        let dir = dir.as_ref();
-        let path = database_path(dir);
-        let database = SnapshotDatabase::open(&path).await?;
-        let store = Self {
-            path: Arc::new(path),
-            database,
-        };
-        store.ensure_schema().await?;
-        Ok(store)
-    }
-
-    pub async fn ensure_schema(&self) -> crate::Result<()> {
-        let this = self.clone();
-        self.with_connection(move |connection| {
-            connection
-                .run_pending_migrations(CONSOLE_GRAPH_MIGRATIONS)
-                .map(|_| ())
-                .context(MigrateGraphSnapshotStoreSnafu {
-                    path: this.path.as_ref().clone(),
-                })?;
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn with_connection<T, F>(&self, operation: F) -> crate::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut SqliteConnection) -> crate::Result<T> + Send + 'static,
-    {
-        self.database.with_connection(operation).await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn with_connection_for_tests<T, F>(&self, operation: F) -> crate::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut SqliteConnection) -> crate::Result<T> + Send + 'static,
-    {
-        self.with_connection(operation).await
-    }
-}
-
-pub fn database_path(dir: impl AsRef<Path>) -> PathBuf {
-    dir.as_ref().join(SQLITE_DATABASE_FILE_NAME)
 }

@@ -48,8 +48,6 @@ pub struct GraphViewportDiffRequest {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphViewportKnownItems {
-    pub lanes: Vec<String>,
-    pub lane_fingerprints: BTreeMap<String, String>,
     pub nodes: Vec<String>,
     pub node_fingerprints: BTreeMap<String, String>,
     pub edges: Vec<String>,

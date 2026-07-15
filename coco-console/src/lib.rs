@@ -25,6 +25,7 @@ mod host {
     pub use store::ConsoleStore;
 
     #[cfg(test)]
+    #[path = "v2_tests.rs"]
     mod tests;
 }
 

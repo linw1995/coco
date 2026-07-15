@@ -447,8 +447,7 @@ fn viewport_diff_has_changes(
 }
 
 fn viewport_diff_has_key_changes(response: &crate::api::GraphViewportDiffResponse) -> bool {
-    !response.added.lanes.is_empty()
-        || !response.added.nodes.is_empty()
+    !response.added.nodes.is_empty()
         || !response.added.edges.is_empty()
         || !response.removed.is_empty()
 }
@@ -457,12 +456,7 @@ fn viewport_diff_has_fingerprint_changes(
     response: &crate::api::GraphViewportDiffResponse,
     known: &GraphViewportKnownItems,
 ) -> bool {
-    response.updated.lanes.iter().any(|lane| {
-        known
-            .lane_fingerprints
-            .get(&lane.key)
-            .is_none_or(|fingerprint| fingerprint != &lane.fingerprint())
-    }) || response.updated.nodes.iter().any(|node| {
+    response.updated.nodes.iter().any(|node| {
         known
             .node_fingerprints
             .get(&node.key)
@@ -734,7 +728,6 @@ fn empty_graph_viewport_response(
             height: request.height,
             overscan: request.overscan,
         },
-        lanes: Vec::new(),
         nodes: Vec::new(),
         edges: Vec::new(),
     }
@@ -952,18 +945,13 @@ fn known_canvas_from_query(query: &QueryParams) -> Option<GraphCanvas> {
 
 fn known_items_from_query(query: &QueryParams) -> Option<GraphViewportKnownItems> {
     let known = GraphViewportKnownItems {
-        lanes: query.get_all("known_lane"),
-        lane_fingerprints: known_fingerprints_from_query(query, "known_lane_fingerprint"),
         nodes: query.get_all("known_node"),
         node_fingerprints: known_fingerprints_from_query(query, "known_node_fingerprint"),
         edges: query.get_all("known_edge"),
         edge_fingerprints: known_fingerprints_from_query(query, "known_edge_fingerprint"),
     };
-    (query.contains_key("known")
-        || !known.lanes.is_empty()
-        || !known.nodes.is_empty()
-        || !known.edges.is_empty())
-    .then_some(known)
+    (query.contains_key("known") || !known.nodes.is_empty() || !known.edges.is_empty())
+        .then_some(known)
 }
 
 fn known_fingerprints_from_query(
@@ -1024,8 +1012,8 @@ mod tests {
         viewport_diff_request_from_query,
     };
     use crate::api::{
-        GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
-        GraphViewportItems, GraphViewportRemovedItem, Point,
+        GraphBezierRoute, GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge,
+        GraphViewportEdgeKind, GraphViewportItems, GraphViewportRemovedItem, Point,
     };
     use crate::graph::{GraphMode, build_graph_snapshot, node_target_id};
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
@@ -1076,9 +1064,6 @@ mod tests {
             rendered.canvas.width,
             rendered.canvas.height,
         );
-        for lane in &rendered.lanes {
-            append_known_item(&mut query, "lane", &lane.key, &lane.fingerprint());
-        }
         for node in &rendered.nodes {
             append_known_item(&mut query, "node", &node.key, &node.fingerprint());
         }
@@ -1445,13 +1430,15 @@ mod tests {
     fn viewport_diff_detects_updated_edge_payload_changes() {
         let edge = GraphViewportEdge {
             key: "edge:primary_parent:root:child".to_owned(),
-            kind: GraphViewportEdgeKind::PrimaryParent,
+            kind: GraphViewportEdgeKind::Primary,
             source_id: "root".to_owned(),
             target_id: "child".to_owned(),
-            source: Point { x: 0, y: 0 },
-            target: Point { x: 100, y: 100 },
-            route_slot: 0,
-            target_port_offset: 0.0,
+            route: GraphBezierRoute {
+                source: Point { x: 0, y: 0 },
+                control_1: Point { x: 30, y: 0 },
+                control_2: Point { x: 70, y: 100 },
+                target: Point { x: 100, y: 100 },
+            },
         };
         let response = GraphViewportDiffResponse {
             version: 1,
@@ -1475,7 +1462,6 @@ mod tests {
             },
             added: GraphViewportItems::default(),
             updated: GraphViewportItems {
-                lanes: Vec::new(),
                 nodes: Vec::new(),
                 edges: vec![edge.clone()],
             },
@@ -1875,13 +1861,12 @@ mod tests {
     #[test]
     fn viewport_diff_query_parses_repeated_known_keys() {
         let query = parse_query(
-            "known_node=node%3Abase&known_node=node:merged&known_lane=lane%3Amain&known_edge=edge%3Aprimary_parent%3Abase%3Amerged",
+            "known_node=node%3Abase&known_node=node:merged&known_edge=edge%3Aprimary_parent%3Abase%3Amerged",
         );
 
         let request = viewport_diff_request_from_query(&query);
         let known = request.known.expect("known keys should parse");
 
-        assert_eq!(known.lanes, vec!["lane:main"]);
         assert_eq!(known.nodes, vec!["node:base", "node:merged"]);
         assert_eq!(known.edges, vec!["edge:primary_parent:base:merged"]);
     }
@@ -1893,7 +1878,6 @@ mod tests {
         let request = viewport_diff_request_from_query(&query);
         let known = request.known.expect("empty known set should parse");
 
-        assert!(known.lanes.is_empty());
         assert!(known.nodes.is_empty());
         assert!(known.edges.is_empty());
     }
@@ -1939,7 +1923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fragment_uses_materialized_shell_without_full_snapshot() {
+    async fn fragment_rebuilds_materialized_shell_on_startup() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
@@ -2006,12 +1990,6 @@ mod tests {
         assert!(html.contains("<strong>main</strong>"), "{html}");
         assert!(html.contains("time-scale-tick"), "{html}");
         assert!(!html.contains("Loading graph / Anchors"), "{html}");
-        assert!(
-            state
-                .cache
-                .snapshot_current_ready(GraphMode::Anchors)
-                .is_none()
-        );
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
@@ -2033,7 +2011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_detail_uses_materialized_facts_without_full_snapshot() {
+    async fn node_detail_uses_rebuilt_materialized_facts() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
@@ -2066,7 +2044,18 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(html.contains("single node detail"), "{html}");
-        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
+        let materialization_version = timeout(Duration::from_secs(1), async {
+            loop {
+                let version = state.cache.current_viewport_version(GraphMode::All).await;
+                if version > 0 {
+                    break version;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("graph materialization should finish");
+        assert_eq!(materialization_version, 1);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

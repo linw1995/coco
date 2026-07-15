@@ -35,7 +35,7 @@ impl GraphMode {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct GraphSnapshot {
     pub version: u64,
     pub mode: GraphMode,
@@ -73,7 +73,7 @@ pub struct GraphBuildProgress {
     pub total: usize,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct GraphNode {
     pub id: String,
     pub short_id: String,
@@ -112,7 +112,7 @@ pub(crate) struct GraphProviderContextSelection {
     pub selected_id: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphEdge {
     pub source: String,
     pub target: String,
@@ -127,7 +127,7 @@ pub enum GraphEdgeKind {
     Shadow,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct GraphBranch {
     pub name: String,
     pub head_id: String,
@@ -969,96 +969,6 @@ fn is_visible_graph_node(node: &Node, mode: GraphMode) -> bool {
     }
 }
 
-pub(crate) fn initial_visible_graph_lane_nodes(
-    _store: &impl NodeStore,
-    mode: GraphMode,
-    ancestry: Vec<Node>,
-) -> Result<Vec<Node>> {
-    let mut nodes = Vec::new();
-    let mut seen = BTreeSet::new();
-    let ancestry = match mode {
-        GraphMode::Anchors => provider_context_ancestry_nodes(ancestry),
-        GraphMode::All => ancestry,
-    };
-    for node in ancestry.into_iter().rev() {
-        push_initial_lane_node(mode, node.clone(), &mut seen, &mut nodes);
-    }
-    Ok(nodes)
-}
-
-#[cfg(test)]
-pub(crate) async fn visible_skill_invocation_subtree_nodes(
-    store: &impl NodeStore,
-    mode: GraphMode,
-    parent_id: &str,
-) -> Result<Vec<Node>> {
-    let mut nodes = Vec::new();
-    let mut seen = BTreeSet::new();
-    push_initial_skill_invocation_subtrees(store, mode, parent_id, &mut seen, &mut nodes).await?;
-    Ok(nodes)
-}
-
-pub(crate) fn visible_skill_invocation_subtree_nodes_with_lookup(
-    mode: GraphMode,
-    parent_id: &str,
-    mut get_node: impl FnMut(&str) -> Result<Node>,
-    mut get_children: impl FnMut(&str) -> Result<Vec<Node>>,
-) -> Result<Vec<Node>> {
-    let mut nodes = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut pending = skill_invocation_children_with_lookup(parent_id, &mut get_children)?;
-    pending.reverse();
-    let mut visited = BTreeSet::new();
-
-    while let Some(node_id) = pending.pop() {
-        if node_id.is_empty() || !visited.insert(node_id.clone()) {
-            continue;
-        }
-        let node = get_node(&node_id)?;
-        let mut children = child_ids_with_lookup(&node.id, &mut get_children)?;
-        children.reverse();
-        pending.extend(children);
-        push_initial_lane_node(mode, node, &mut seen, &mut nodes);
-    }
-    Ok(nodes)
-}
-
-#[cfg(test)]
-async fn push_initial_skill_invocation_subtrees(
-    store: &impl NodeStore,
-    mode: GraphMode,
-    parent_id: &str,
-    seen: &mut BTreeSet<String>,
-    nodes: &mut Vec<Node>,
-) -> Result<()> {
-    let mut pending = skill_invocation_children(store, parent_id).await?;
-    pending.reverse();
-    let mut visited = BTreeSet::new();
-
-    while let Some(node_id) = pending.pop() {
-        if node_id.is_empty() || !visited.insert(node_id.clone()) {
-            continue;
-        }
-        let node = store.get_node(&node_id).await.context(StoreSnafu)?;
-        let mut children = child_ids(store, &node.id).await?;
-        children.reverse();
-        pending.extend(children);
-        push_initial_lane_node(mode, node, seen, nodes);
-    }
-    Ok(())
-}
-
-fn push_initial_lane_node(
-    mode: GraphMode,
-    node: Node,
-    seen: &mut BTreeSet<String>,
-    nodes: &mut Vec<Node>,
-) {
-    if !node.is_root() && is_visible_graph_node(&node, mode) && seen.insert(node.id.clone()) {
-        nodes.push(node);
-    }
-}
-
 async fn collect_visible_skill_invocation_subtrees(
     store: &impl NodeStore,
     parent_id: &str,
@@ -1081,16 +991,6 @@ async fn skill_invocation_children(store: &impl NodeStore, parent_id: &str) -> R
         .list_children(parent_id)
         .await
         .context(StoreSnafu)?
-        .into_iter()
-        .filter_map(skill_invocation_child_id)
-        .collect())
-}
-
-fn skill_invocation_children_with_lookup(
-    parent_id: &str,
-    get_children: &mut impl FnMut(&str) -> Result<Vec<Node>>,
-) -> Result<Vec<String>> {
-    Ok(get_children(parent_id)?
         .into_iter()
         .filter_map(skill_invocation_child_id)
         .collect())
@@ -1120,16 +1020,6 @@ async fn child_ids(store: &impl NodeStore, node_id: &str) -> Result<Vec<String>>
         .list_children(node_id)
         .await
         .context(StoreSnafu)?
-        .into_iter()
-        .map(|child| child.id)
-        .collect())
-}
-
-fn child_ids_with_lookup(
-    node_id: &str,
-    get_children: &mut impl FnMut(&str) -> Result<Vec<Node>>,
-) -> Result<Vec<String>> {
-    Ok(get_children(node_id)?
         .into_iter()
         .map(|child| child.id)
         .collect())

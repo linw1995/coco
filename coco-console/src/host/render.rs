@@ -7,16 +7,11 @@ use crate::graph::{
     GraphMode, GraphNode, GraphProviderContext, GraphProviderContextNode, GraphSnapshot,
     node_target_id, shorten_id,
 };
-use crate::layout::{lane_key, layout_graph};
+use crate::layout::layout_graph;
 
 #[derive(Template)]
 #[template(path = "graph_shell.html")]
 struct GraphShellTemplate;
-
-#[cfg(test)]
-pub fn render_index_page(snapshot: &GraphSnapshot) -> String {
-    render_snapshot_document(snapshot, true)
-}
 
 pub fn render_loading_index_page(mode: GraphMode, version: u64) -> String {
     render_document(render_loading_root(mode, version), true)
@@ -156,8 +151,6 @@ pub(crate) struct MaterializedGraphShell {
 #[derive(Clone)]
 pub(crate) struct MaterializedGraphShellBranch {
     pub name: String,
-    pub key: String,
-    pub lane_y: Option<i32>,
     pub head_short_id: String,
     pub state: SessionState,
 }
@@ -166,7 +159,8 @@ pub(crate) struct MaterializedGraphShellBranch {
 pub(crate) struct MaterializedGraphShellTick {
     pub time_ns: i128,
     pub label: String,
-    pub graph_x: f64,
+    pub node_target: String,
+    pub point: Point,
 }
 
 #[cfg(test)]
@@ -371,14 +365,15 @@ fn render_materialized_time_scale(shell: &MaterializedGraphShell) -> AnyView {
         .map(|tick| TimeScaleTick {
             time_ns: tick.time_ns,
             label: tick.label.clone(),
-            graph_x: tick.graph_x,
+            node_target: tick.node_target.clone(),
+            point: tick.point,
             position: 0.0,
         })
         .collect::<Vec<_>>();
     ticks.sort_by(|left, right| {
         left.time_ns
             .cmp(&right.time_ns)
-            .then_with(|| left.graph_x.total_cmp(&right.graph_x))
+            .then_with(|| left.node_target.cmp(&right.node_target))
     });
     let tick_count = ticks.len();
     for (index, tick) in ticks.iter_mut().enumerate() {
@@ -396,7 +391,6 @@ fn render_time_scale_ticks(ticks: Vec<TimeScaleTick>) -> AnyView {
         .iter()
         .map(|tick| {
             let style = format!("left: {:.4}%;", tick.position);
-            let graph_x = format!("{:.3}", tick.graph_x);
             let position = format!("{:.6}", tick.position);
             let time_ns = tick.time_ns.to_string();
             let label = tick.label.clone();
@@ -405,7 +399,9 @@ fn render_time_scale_ticks(ticks: Vec<TimeScaleTick>) -> AnyView {
                 <span
                     class="time-scale-tick"
                     style=style
-                    data-graph-x=graph_x
+                    data-node-target=tick.node_target.clone()
+                    data-node-x=tick.point.x.to_string()
+                    data-node-y=tick.point.y.to_string()
                     data-position=position
                     data-time-ns=time_ns
                     data-time-label=label
@@ -424,7 +420,7 @@ fn render_time_scale_ticks(ticks: Vec<TimeScaleTick>) -> AnyView {
         <nav class="time-scale" aria-label="Graph time navigator" tabindex="0">
             <div class="time-scale-track">
                 {tick_views}
-                <div class="time-scale-cursor" style="left: 0%;">
+                <div class="time-scale-cursor" style="left: 0%;" hidden=true>
                     <span class="time-scale-label">{cursor_label}</span>
                 </div>
             </div>
@@ -441,28 +437,29 @@ fn render_time_scale_ticks(ticks: Vec<TimeScaleTick>) -> AnyView {
 struct TimeScaleTick {
     time_ns: i128,
     label: String,
-    graph_x: f64,
+    node_target: String,
+    point: Point,
     position: f64,
 }
 
 fn time_scale_ticks(snapshot: &GraphSnapshot) -> Vec<TimeScaleTick> {
     let layout = layout_graph(snapshot);
-    let mut graph_x_by_node = std::collections::BTreeMap::<&str, i32>::new();
-    for occurrence in &layout.occurrences {
-        graph_x_by_node
-            .entry(occurrence.node_id.as_str())
-            .or_insert(occurrence.point.x);
-    }
+    let points_by_node = layout
+        .nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node.point))
+        .collect::<std::collections::BTreeMap<_, _>>();
 
     let mut ticks = snapshot
         .nodes
         .iter()
         .filter_map(|node| {
-            let graph_x = graph_x_by_node.get(node.id.as_str())?;
+            let point = points_by_node.get(node.id.as_str())?;
             Some(TimeScaleTick {
                 time_ns: node.created_at_ns,
                 label: node.created_at.clone(),
-                graph_x: f64::from(*graph_x),
+                node_target: node_target_id(&node.id),
+                point: *point,
                 position: 0.0,
             })
         })
@@ -470,7 +467,7 @@ fn time_scale_ticks(snapshot: &GraphSnapshot) -> Vec<TimeScaleTick> {
     ticks.sort_by(|left, right| {
         left.time_ns
             .cmp(&right.time_ns)
-            .then_with(|| left.graph_x.total_cmp(&right.graph_x))
+            .then_with(|| left.node_target.cmp(&right.node_target))
     });
     let tick_count = ticks.len();
     for (index, tick) in ticks.iter_mut().enumerate() {
@@ -723,9 +720,9 @@ fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
 
 fn graph_points_by_node(snapshot: &GraphSnapshot) -> std::collections::BTreeMap<String, Point> {
     layout_graph(snapshot)
-        .occurrences
+        .nodes
         .into_iter()
-        .map(|occurrence| (occurrence.node_id, occurrence.point))
+        .map(|node| (node.node_id, node.point))
         .collect()
 }
 
@@ -813,25 +810,16 @@ fn render_missing_node_details(target: &str) -> AnyView {
 }
 
 fn render_branches(snapshot: &GraphSnapshot) -> AnyView {
-    let lane_y_by_label = layout_graph(snapshot)
-        .lanes
+    let mut branches = snapshot.branches.iter().collect::<Vec<_>>();
+    branches.sort_by(|left, right| branch_order(&left.name).cmp(&branch_order(&right.name)));
+    let items = branches
         .into_iter()
-        .map(|lane| (lane.label, lane.y))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let items = snapshot
-        .branches
-        .iter()
         .map(|branch| {
             let name = branch.name.clone();
-            let key = lane_key(&name);
-            let lane_y = lane_y_by_label
-                .get(&name)
-                .map(i32::to_string)
-                .unwrap_or_default();
             let head = format!("head {}", shorten_id(&branch.head_id));
             let state = format_session_state(&branch.state);
             view! {
-                <li class="branch" data-lane-key=key data-lane-y=lane_y>
+                <li class="branch">
                     <strong>{name}</strong>
                     <span>{head}</span>
                     <span>{state}</span>
@@ -849,12 +837,10 @@ fn render_materialized_branches(shell: &MaterializedGraphShell) -> AnyView {
         .iter()
         .map(|branch| {
             let name = branch.name.clone();
-            let key = branch.key.clone();
-            let lane_y = branch.lane_y.map(|y| y.to_string()).unwrap_or_default();
             let head = format!("head {}", branch.head_short_id);
             let state = format_session_state(&branch.state);
             view! {
-                <li class="branch" data-lane-key=key data-lane-y=lane_y>
+                <li class="branch">
                     <strong>{name}</strong>
                     <span>{head}</span>
                     <span>{state}</span>
@@ -864,6 +850,10 @@ fn render_materialized_branches(shell: &MaterializedGraphShell) -> AnyView {
         .collect::<Vec<_>>();
 
     view! { <section class="branch-section"><h2>"Branches"</h2><ul class="branch-list">{items}</ul></section> }.into_any()
+}
+
+fn branch_order(branch: &str) -> (u8, &str) {
+    (u8::from(branch != "main"), branch)
 }
 
 fn format_session_state(state: &SessionState) -> String {
