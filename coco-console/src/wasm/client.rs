@@ -2809,6 +2809,72 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_fragment_helpers_refresh_attributes_and_loading_context() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        let container = document
+            .create_element("div")
+            .expect_throw("fragment container should be created");
+        container.set_inner_html(
+            r#"<nav class="time-scale refreshed" aria-label="Updated time scale"></nav>"#,
+        );
+
+        refresh_attributes(
+            &document,
+            &container,
+            ".time-scale",
+            &["class", "tabindex", "aria-label"],
+        )
+        .expect_throw("time scale attributes should refresh");
+        let time_scale = fixture
+            .root
+            .query_selector(".time-scale")
+            .expect_throw("time scale query should succeed")
+            .expect_throw("time scale should exist");
+        assert_eq!(
+            time_scale.get_attribute("class").as_deref(),
+            Some("time-scale refreshed")
+        );
+        assert_eq!(
+            time_scale.get_attribute("aria-label").as_deref(),
+            Some("Updated time scale")
+        );
+        assert!(time_scale.get_attribute("tabindex").is_none());
+
+        let empty_container = document
+            .create_element("div")
+            .expect_throw("empty fragment container should be created");
+        refresh_attributes(&document, &empty_container, ".missing", &["class"])
+            .expect_throw("missing source should be ignored");
+        empty_container.set_inner_html(r#"<div class="source-only"></div>"#);
+        refresh_attributes(&document, &empty_container, ".source-only", &["class"])
+            .expect_throw("missing target should be ignored");
+
+        let loading = loading_provider_context(&document, Some("detail-aaaaaaaa"))
+            .expect_throw("loading provider context should render");
+        assert_eq!(
+            loading
+                .query_selector(".provider-context-empty")
+                .expect_throw("loading message query should succeed")
+                .expect_throw("loading message should exist")
+                .text_content()
+                .as_deref(),
+            Some("Loading provider context...")
+        );
+        let empty = loading_provider_context(&document, None)
+            .expect_throw("empty provider context should render");
+        assert_eq!(
+            empty
+                .query_selector(".provider-context-empty")
+                .expect_throw("empty message query should succeed")
+                .expect_throw("empty message should exist")
+                .text_content()
+                .as_deref(),
+            Some("Select a node to inspect its provider context.")
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_viewport_updates_reuse_stable_node_and_edge_elements() {
         let fixture = GraphFixture::new();
         let initial_route = route((74, 56), (104, 56), (120, 128), (150, 128));
