@@ -1,4 +1,5 @@
 use super::*;
+use diesel::sql_types::Text;
 
 #[derive(diesel::QueryableByName)]
 struct SnapshotJournalModeRow {

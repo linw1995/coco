@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Integer, Text};
+#[cfg(test)]
+use diesel::sql_types::BigInt;
 use diesel::sqlite::SqliteConnection;
 use diesel_async::pooled_connection::bb8::Pool as AsyncSqlitePool;
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
@@ -26,6 +27,9 @@ use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
     GraphLayout, GraphLayoutEdge, GraphLayoutNode, LayoutHint, diff_graph_viewport_responses,
     edge_bounds, edge_key, node_bounds, node_key, try_graph_ranks, try_layout_graph_with_hints,
+};
+use crate::schema::{
+    console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
@@ -92,90 +96,61 @@ struct PlannedMaterialization {
     fallback_reason: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, QueryableByName)]
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = console_graph_materializations)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub struct MaterializationRow {
-    #[diesel(sql_type = BigInt)]
     pub source_version: i64,
-    #[diesel(sql_type = Integer)]
     pub world_max_x: i32,
-    #[diesel(sql_type = Integer)]
     pub world_max_y: i32,
 }
 
-#[derive(Debug, Clone, QueryableByName, PartialEq, Eq)]
+#[derive(Debug, Clone, Queryable, Selectable, PartialEq, Eq)]
+#[diesel(table_name = console_graph_node_locations)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct StoredNodeRow {
-    #[diesel(sql_type = Text)]
     node_id: String,
-    #[diesel(sql_type = Text)]
     node_key: String,
-    #[diesel(sql_type = Text)]
     node_target: String,
-    #[diesel(sql_type = Text)]
     short_id: String,
-    #[diesel(sql_type = Text)]
     node_kind: String,
-    #[diesel(sql_type = Text)]
     summary: String,
-    #[diesel(sql_type = Text)]
     labels_json: String,
-    #[diesel(sql_type = Integer)]
     rank: i32,
-    #[diesel(sql_type = Integer)]
     sort_order: i32,
-    #[diesel(sql_type = Integer)]
     x: i32,
-    #[diesel(sql_type = Integer)]
     y: i32,
-    #[diesel(sql_type = Text)]
     created_at: String,
-    #[diesel(sql_type = BigInt)]
     created_at_ns: i64,
-    #[diesel(sql_type = Integer)]
     min_x: i32,
-    #[diesel(sql_type = Integer)]
     min_y: i32,
-    #[diesel(sql_type = Integer)]
     max_x: i32,
-    #[diesel(sql_type = Integer)]
     max_y: i32,
 }
 
-#[derive(Debug, Clone, QueryableByName, PartialEq, Eq)]
+#[derive(Debug, Clone, Queryable, Selectable, PartialEq, Eq)]
+#[diesel(table_name = console_graph_edge_routes)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct StoredEdgeRow {
-    #[diesel(sql_type = Text)]
     edge_key: String,
-    #[diesel(sql_type = Text)]
     edge_kind: String,
-    #[diesel(sql_type = Text)]
     source_id: String,
-    #[diesel(sql_type = Text)]
     target_id: String,
-    #[diesel(sql_type = Integer)]
     source_x: i32,
-    #[diesel(sql_type = Integer)]
     source_y: i32,
-    #[diesel(sql_type = Integer)]
     control_1_x: i32,
-    #[diesel(sql_type = Integer)]
     control_1_y: i32,
-    #[diesel(sql_type = Integer)]
     control_2_x: i32,
-    #[diesel(sql_type = Integer)]
     control_2_y: i32,
-    #[diesel(sql_type = Integer)]
     target_x: i32,
-    #[diesel(sql_type = Integer)]
     target_y: i32,
-    #[diesel(sql_type = Integer)]
     min_x: i32,
-    #[diesel(sql_type = Integer)]
     min_y: i32,
-    #[diesel(sql_type = Integer)]
     max_x: i32,
-    #[diesel(sql_type = Integer)]
     max_y: i32,
 }
 
+#[cfg(test)]
 #[derive(Debug, QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = BigInt)]
@@ -189,7 +164,8 @@ struct StoredGraph {
     edges: BTreeMap<String, StoredEdgeRow>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Insertable, AsChangeset, PartialEq, Eq)]
+#[diesel(table_name = console_graph_node_locations)]
 struct PersistedNode {
     node_id: String,
     node_key: String,
@@ -210,7 +186,8 @@ struct PersistedNode {
     max_y: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Insertable, AsChangeset, PartialEq, Eq)]
+#[diesel(table_name = console_graph_edge_routes)]
 struct PersistedEdge {
     edge_key: String,
     edge_kind: String,
@@ -228,6 +205,19 @@ struct PersistedEdge {
     min_y: i32,
     max_x: i32,
     max_y: i32,
+}
+
+#[derive(Debug, Insertable, AsChangeset)]
+#[diesel(table_name = console_graph_materializations)]
+struct PersistedMaterialization<'a> {
+    mode: &'a str,
+    source_version: i64,
+    coordinate_space: &'a str,
+    world_min_x: i32,
+    world_min_y: i32,
+    world_max_x: i32,
+    world_max_y: i32,
+    updated_at: String,
 }
 
 #[derive(Clone, Debug)]
@@ -316,18 +306,15 @@ impl ConsoleGraphSnapshotStore {
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<Option<MaterializationRow>> {
-        diesel::sql_query(
-            "SELECT source_version, world_max_x, world_max_y \
-             FROM console_graph_materializations \
-             WHERE mode = ? AND coordinate_space = ?",
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Text, _>(COORDINATE_SPACE)
-        .get_result(connection)
-        .optional()
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        console_graph_materializations::table
+            .filter(console_graph_materializations::mode.eq(mode.as_query_value()))
+            .filter(console_graph_materializations::coordinate_space.eq(COORDINATE_SPACE))
+            .select(MaterializationRow::as_select())
+            .first(connection)
+            .optional()
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     pub async fn has_materialization(&self, mode: GraphMode) -> crate::Result<bool> {
@@ -414,27 +401,28 @@ impl ConsoleGraphSnapshotStore {
         let this = self.clone();
         let target = target.to_owned();
         self.with_connection(move |connection| {
-            let row = diesel::sql_query(
-                "SELECT node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
-                        rank, sort_order, x, y, created_at, created_at_ns, \
-                        min_x, min_y, max_x, max_y \
-                 FROM console_graph_node_locations \
-                 WHERE mode = ? AND (node_target = ? OR node_id = ? OR node_key = ?) \
-                 ORDER BY node_id LIMIT 1",
-            )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(&target)
-            .bind::<Text, _>(&target)
-            .bind::<Text, _>(&target)
-            .get_result::<StoredNodeRow>(connection)
-            .optional()
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
-            row.map(|row| {
+            let row = console_graph_node_locations::table
+                .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+                .filter(
+                    console_graph_node_locations::node_target
+                        .eq(&target)
+                        .or(console_graph_node_locations::node_id.eq(&target))
+                        .or(console_graph_node_locations::node_key.eq(&target)),
+                )
+                .order(console_graph_node_locations::node_id)
+                .select((
+                    console_graph_node_locations::node_id,
+                    console_graph_node_locations::labels_json,
+                ))
+                .first::<(String, String)>(connection)
+                .optional()
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: this.path.as_ref().clone(),
+                })?;
+            row.map(|(node_id, labels_json)| {
                 Ok(MaterializedNodeReference {
-                    node_id: row.node_id,
-                    labels: parse_labels(&row.labels_json)?,
+                    node_id,
+                    labels: parse_labels(&labels_json)?,
                 })
             })
             .transpose()
@@ -448,13 +436,26 @@ impl ConsoleGraphSnapshotStore {
         node_ids: &BTreeSet<String>,
     ) -> crate::Result<BTreeMap<String, Point>> {
         let this = self.clone();
-        let node_ids = node_ids.clone();
+        let node_ids = node_ids.iter().cloned().collect::<Vec<_>>();
         self.with_connection(move |connection| {
-            let rows = this.load_node_rows_in_connection(connection, mode)?;
+            if node_ids.is_empty() {
+                return Ok(BTreeMap::new());
+            }
+            let rows = console_graph_node_locations::table
+                .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+                .filter(console_graph_node_locations::node_id.eq_any(&node_ids))
+                .select((
+                    console_graph_node_locations::node_id,
+                    console_graph_node_locations::x,
+                    console_graph_node_locations::y,
+                ))
+                .load::<(String, i32, i32)>(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: this.path.as_ref().clone(),
+                })?;
             Ok(rows
                 .into_iter()
-                .filter(|row| node_ids.contains(&row.node_id))
-                .map(|row| (row.node_id, Point { x: row.x, y: row.y }))
+                .map(|(node_id, x, y)| (node_id, Point { x, y }))
                 .collect())
         })
         .await
@@ -477,14 +478,13 @@ impl ConsoleGraphSnapshotStore {
                     .cmp(&right.created_at_ns)
                     .then_with(|| left.node_id.cmp(&right.node_id))
             });
-            let count = diesel::sql_query(
-                "SELECT COUNT(*) AS count FROM console_graph_edge_routes WHERE mode = ?",
-            )
-            .bind::<Text, _>(mode.as_query_value())
-            .get_result::<CountRow>(connection)
-            .context(QueryGraphSnapshotStoreSnafu {
-                path: this.path.as_ref().clone(),
-            })?;
+            let edge_count = console_graph_edge_routes::table
+                .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+                .count()
+                .get_result::<i64>(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: this.path.as_ref().clone(),
+                })?;
             Ok(Some(MaterializedGraphShellFacts {
                 version: materialization.source_version.max(0) as u64,
                 nodes: rows
@@ -496,7 +496,7 @@ impl ConsoleGraphSnapshotStore {
                         created_at_ns: i128::from(row.created_at_ns),
                     })
                     .collect(),
-                edge_count: count.count.max(0) as usize,
+                edge_count: edge_count.max(0) as usize,
             }))
         })
         .await
@@ -524,40 +524,34 @@ impl ConsoleGraphSnapshotStore {
             .y
             .saturating_add(request.height)
             .saturating_add(request.overscan);
-        let node_rows = diesel::sql_query(
-            "SELECT node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
-                    rank, sort_order, x, y, created_at, created_at_ns, \
-                    min_x, min_y, max_x, max_y \
-             FROM console_graph_node_locations \
-             WHERE mode = ? AND min_x <= ? AND max_x >= ? AND min_y <= ? AND max_y >= ? \
-             ORDER BY rank, sort_order, node_id",
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Integer, _>(right)
-        .bind::<Integer, _>(left)
-        .bind::<Integer, _>(bottom)
-        .bind::<Integer, _>(top)
-        .load::<StoredNodeRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
-        let edge_rows = diesel::sql_query(
-            "SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, \
-                    control_1_x, control_1_y, control_2_x, control_2_y, target_x, target_y, \
-                    min_x, min_y, max_x, max_y \
-             FROM console_graph_edge_routes \
-             WHERE mode = ? AND min_x <= ? AND max_x >= ? AND min_y <= ? AND max_y >= ? \
-             ORDER BY edge_key",
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .bind::<Integer, _>(right)
-        .bind::<Integer, _>(left)
-        .bind::<Integer, _>(bottom)
-        .bind::<Integer, _>(top)
-        .load::<StoredEdgeRow>(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })?;
+        let node_rows = console_graph_node_locations::table
+            .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+            .filter(console_graph_node_locations::min_x.le(right))
+            .filter(console_graph_node_locations::max_x.ge(left))
+            .filter(console_graph_node_locations::min_y.le(bottom))
+            .filter(console_graph_node_locations::max_y.ge(top))
+            .order((
+                console_graph_node_locations::rank,
+                console_graph_node_locations::sort_order,
+                console_graph_node_locations::node_id,
+            ))
+            .select(StoredNodeRow::as_select())
+            .load(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
+        let edge_rows = console_graph_edge_routes::table
+            .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+            .filter(console_graph_edge_routes::min_x.le(right))
+            .filter(console_graph_edge_routes::max_x.ge(left))
+            .filter(console_graph_edge_routes::min_y.le(bottom))
+            .filter(console_graph_edge_routes::max_y.ge(top))
+            .order(console_graph_edge_routes::edge_key)
+            .select(StoredEdgeRow::as_select())
+            .load(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })?;
         let nodes = node_rows
             .into_iter()
             .map(stored_viewport_node)
@@ -613,17 +607,14 @@ impl ConsoleGraphSnapshotStore {
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<Vec<StoredNodeRow>> {
-        diesel::sql_query(
-            "SELECT node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
-                    rank, sort_order, x, y, created_at, created_at_ns, \
-                    min_x, min_y, max_x, max_y \
-             FROM console_graph_node_locations WHERE mode = ? ORDER BY node_id",
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .load(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        console_graph_node_locations::table
+            .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+            .order(console_graph_node_locations::node_id)
+            .select(StoredNodeRow::as_select())
+            .load(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     fn load_edge_rows_in_connection(
@@ -631,17 +622,14 @@ impl ConsoleGraphSnapshotStore {
         connection: &mut SqliteConnection,
         mode: GraphMode,
     ) -> crate::Result<Vec<StoredEdgeRow>> {
-        diesel::sql_query(
-            "SELECT edge_key, edge_kind, source_id, target_id, source_x, source_y, \
-                    control_1_x, control_1_y, control_2_x, control_2_y, target_x, target_y, \
-                    min_x, min_y, max_x, max_y \
-             FROM console_graph_edge_routes WHERE mode = ? ORDER BY edge_key",
-        )
-        .bind::<Text, _>(mode.as_query_value())
-        .load(connection)
-        .context(QueryGraphSnapshotStoreSnafu {
-            path: self.path.as_ref().clone(),
-        })
+        console_graph_edge_routes::table
+            .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+            .order(console_graph_edge_routes::edge_key)
+            .select(StoredEdgeRow::as_select())
+            .load(connection)
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: self.path.as_ref().clone(),
+            })
     }
 
     async fn write_materialization(
@@ -987,11 +975,11 @@ fn write_changed_rows(
         .collect::<BTreeMap<_, _>>();
     for node_id in previous.nodes.keys() {
         if !next_nodes.contains_key(node_id.as_str()) {
-            diesel::sql_query(
-                "DELETE FROM console_graph_node_locations WHERE mode = ? AND node_id = ?",
+            diesel::delete(
+                console_graph_node_locations::table
+                    .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+                    .filter(console_graph_node_locations::node_id.eq(node_id)),
             )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(node_id)
             .execute(connection)?;
         }
     }
@@ -1011,11 +999,11 @@ fn write_changed_rows(
         .collect::<BTreeMap<_, _>>();
     for edge_key in previous.edges.keys() {
         if !next_edges.contains_key(edge_key.as_str()) {
-            diesel::sql_query(
-                "DELETE FROM console_graph_edge_routes WHERE mode = ? AND edge_key = ?",
+            diesel::delete(
+                console_graph_edge_routes::table
+                    .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+                    .filter(console_graph_edge_routes::edge_key.eq(edge_key)),
             )
-            .bind::<Text, _>(mode.as_query_value())
-            .bind::<Text, _>(edge_key)
             .execute(connection)?;
         }
     }
@@ -1032,12 +1020,16 @@ fn write_changed_rows(
 }
 
 fn delete_mode_rows(connection: &mut SqliteConnection, mode: GraphMode) -> QueryResult<()> {
-    diesel::sql_query("DELETE FROM console_graph_edge_routes WHERE mode = ?")
-        .bind::<Text, _>(mode.as_query_value())
-        .execute(connection)?;
-    diesel::sql_query("DELETE FROM console_graph_node_locations WHERE mode = ?")
-        .bind::<Text, _>(mode.as_query_value())
-        .execute(connection)?;
+    diesel::delete(
+        console_graph_edge_routes::table
+            .filter(console_graph_edge_routes::mode.eq(mode.as_query_value())),
+    )
+    .execute(connection)?;
+    diesel::delete(
+        console_graph_node_locations::table
+            .filter(console_graph_node_locations::mode.eq(mode.as_query_value())),
+    )
+    .execute(connection)?;
     Ok(())
 }
 
@@ -1046,39 +1038,19 @@ fn upsert_node(
     mode: GraphMode,
     node: &PersistedNode,
 ) -> QueryResult<()> {
-    diesel::sql_query(
-        "INSERT INTO console_graph_node_locations (\
-            mode, node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
-            rank, sort_order, x, y, created_at, created_at_ns, min_x, min_y, max_x, max_y\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(mode, node_id) DO UPDATE SET \
-            node_key = excluded.node_key, node_target = excluded.node_target, \
-            short_id = excluded.short_id, node_kind = excluded.node_kind, \
-            summary = excluded.summary, labels_json = excluded.labels_json, \
-            rank = excluded.rank, sort_order = excluded.sort_order, x = excluded.x, y = excluded.y, \
-            created_at = excluded.created_at, created_at_ns = excluded.created_at_ns, \
-            min_x = excluded.min_x, min_y = excluded.min_y, max_x = excluded.max_x, max_y = excluded.max_y",
-    )
-    .bind::<Text, _>(mode.as_query_value())
-    .bind::<Text, _>(&node.node_id)
-    .bind::<Text, _>(&node.node_key)
-    .bind::<Text, _>(&node.node_target)
-    .bind::<Text, _>(&node.short_id)
-    .bind::<Text, _>(&node.node_kind)
-    .bind::<Text, _>(&node.summary)
-    .bind::<Text, _>(&node.labels_json)
-    .bind::<Integer, _>(node.rank)
-    .bind::<Integer, _>(node.sort_order)
-    .bind::<Integer, _>(node.x)
-    .bind::<Integer, _>(node.y)
-    .bind::<Text, _>(&node.created_at)
-    .bind::<BigInt, _>(node.created_at_ns)
-    .bind::<Integer, _>(node.min_x)
-    .bind::<Integer, _>(node.min_y)
-    .bind::<Integer, _>(node.max_x)
-    .bind::<Integer, _>(node.max_y)
-    .execute(connection)
-    .map(|_| ())
+    diesel::insert_into(console_graph_node_locations::table)
+        .values((
+            console_graph_node_locations::mode.eq(mode.as_query_value()),
+            node,
+        ))
+        .on_conflict((
+            console_graph_node_locations::mode,
+            console_graph_node_locations::node_id,
+        ))
+        .do_update()
+        .set(node)
+        .execute(connection)
+        .map(|_| ())
 }
 
 fn upsert_edge(
@@ -1086,39 +1058,19 @@ fn upsert_edge(
     mode: GraphMode,
     edge: &PersistedEdge,
 ) -> QueryResult<()> {
-    diesel::sql_query(
-        "INSERT INTO console_graph_edge_routes (\
-            mode, edge_key, edge_kind, source_id, target_id, source_x, source_y, \
-            control_1_x, control_1_y, control_2_x, control_2_y, target_x, target_y, \
-            min_x, min_y, max_x, max_y\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(mode, edge_key) DO UPDATE SET \
-            edge_kind = excluded.edge_kind, source_id = excluded.source_id, target_id = excluded.target_id, \
-            source_x = excluded.source_x, source_y = excluded.source_y, \
-            control_1_x = excluded.control_1_x, control_1_y = excluded.control_1_y, \
-            control_2_x = excluded.control_2_x, control_2_y = excluded.control_2_y, \
-            target_x = excluded.target_x, target_y = excluded.target_y, \
-            min_x = excluded.min_x, min_y = excluded.min_y, max_x = excluded.max_x, max_y = excluded.max_y",
-    )
-    .bind::<Text, _>(mode.as_query_value())
-    .bind::<Text, _>(&edge.edge_key)
-    .bind::<Text, _>(&edge.edge_kind)
-    .bind::<Text, _>(&edge.source_id)
-    .bind::<Text, _>(&edge.target_id)
-    .bind::<Integer, _>(edge.source_x)
-    .bind::<Integer, _>(edge.source_y)
-    .bind::<Integer, _>(edge.control_1_x)
-    .bind::<Integer, _>(edge.control_1_y)
-    .bind::<Integer, _>(edge.control_2_x)
-    .bind::<Integer, _>(edge.control_2_y)
-    .bind::<Integer, _>(edge.target_x)
-    .bind::<Integer, _>(edge.target_y)
-    .bind::<Integer, _>(edge.min_x)
-    .bind::<Integer, _>(edge.min_y)
-    .bind::<Integer, _>(edge.max_x)
-    .bind::<Integer, _>(edge.max_y)
-    .execute(connection)
-    .map(|_| ())
+    diesel::insert_into(console_graph_edge_routes::table)
+        .values((
+            console_graph_edge_routes::mode.eq(mode.as_query_value()),
+            edge,
+        ))
+        .on_conflict((
+            console_graph_edge_routes::mode,
+            console_graph_edge_routes::edge_key,
+        ))
+        .do_update()
+        .set(edge)
+        .execute(connection)
+        .map(|_| ())
 }
 
 fn upsert_materialization(
@@ -1128,23 +1080,23 @@ fn upsert_materialization(
     width: i32,
     height: i32,
 ) -> QueryResult<()> {
-    diesel::sql_query(
-        "INSERT INTO console_graph_materializations (\
-            mode, source_version, coordinate_space, world_min_x, world_min_y, world_max_x, world_max_y\
-         ) VALUES (?, ?, ?, 0, 0, ?, ?) \
-         ON CONFLICT(mode) DO UPDATE SET \
-            source_version = excluded.source_version, coordinate_space = excluded.coordinate_space, \
-            world_min_x = excluded.world_min_x, world_min_y = excluded.world_min_y, \
-            world_max_x = excluded.world_max_x, world_max_y = excluded.world_max_y, \
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-    )
-    .bind::<Text, _>(mode.as_query_value())
-    .bind::<BigInt, _>(source_version.min(i64::MAX as u64) as i64)
-    .bind::<Text, _>(COORDINATE_SPACE)
-    .bind::<Integer, _>(width)
-    .bind::<Integer, _>(height)
-    .execute(connection)
-    .map(|_| ())
+    let materialization = PersistedMaterialization {
+        mode: mode.as_query_value(),
+        source_version: source_version.min(i64::MAX as u64) as i64,
+        coordinate_space: COORDINATE_SPACE,
+        world_min_x: 0,
+        world_min_y: 0,
+        world_max_x: width,
+        world_max_y: height,
+        updated_at: jiff::Timestamp::now().to_string(),
+    };
+    diesel::insert_into(console_graph_materializations::table)
+        .values(&materialization)
+        .on_conflict(console_graph_materializations::mode)
+        .do_update()
+        .set(&materialization)
+        .execute(connection)
+        .map(|_| ())
 }
 
 fn stored_viewport_node(row: StoredNodeRow) -> crate::Result<GraphViewportNode> {
@@ -1592,12 +1544,13 @@ mod tests {
             ))
             .unwrap();
 
-        let materializations =
-            diesel::sql_query("SELECT COUNT(*) AS count FROM console_graph_materializations")
-                .get_result::<CountRow>(&mut connection)
-                .unwrap();
-        let nodes = diesel::sql_query("SELECT COUNT(*) AS count FROM console_graph_node_locations")
-            .get_result::<CountRow>(&mut connection)
+        let materializations = console_graph_materializations::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .unwrap();
+        let nodes = console_graph_node_locations::table
+            .count()
+            .get_result::<i64>(&mut connection)
             .unwrap();
         let legacy_node_columns = diesel::sql_query(
             "SELECT COUNT(*) AS count \
@@ -1614,8 +1567,8 @@ mod tests {
         .get_result::<CountRow>(&mut connection)
         .unwrap();
 
-        assert_eq!(materializations.count, 0);
-        assert_eq!(nodes.count, 0);
+        assert_eq!(materializations, 0);
+        assert_eq!(nodes, 0);
         assert_eq!(legacy_node_columns.count, 0);
         assert_eq!(bezier_columns.count, 4);
     }
