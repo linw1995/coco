@@ -2044,7 +2044,18 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(html.contains("single node detail"), "{html}");
-        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_some());
+        let materialization_version = timeout(Duration::from_secs(1), async {
+            loop {
+                let version = state.cache.current_viewport_version(GraphMode::All).await;
+                if version > 0 {
+                    break version;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("graph materialization should finish");
+        assert_eq!(materialization_version, 1);
 
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

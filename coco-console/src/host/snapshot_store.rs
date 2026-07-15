@@ -96,6 +96,17 @@ struct PlannedMaterialization {
     fallback_reason: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterializationWriteOutcome {
+    Committed {
+        strategy: MaterializationStrategy,
+        fallback_reason: Option<&'static str>,
+    },
+    SkippedStale {
+        current_version: u64,
+    },
+}
+
 #[derive(Debug, Clone, Queryable, Selectable)]
 #[diesel(table_name = console_graph_materializations)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -342,18 +353,37 @@ impl ConsoleGraphSnapshotStore {
         );
 
         let write_started = Instant::now();
-        let strategy = plan.strategy;
-        self.write_materialization(snapshot.version, snapshot.mode, plan, previous)
+        let outcome = self
+            .write_materialization(snapshot.version, snapshot.mode, plan, previous)
             .await?;
-        tracing::info!(
-            mode = ?snapshot.mode,
-            source_version = snapshot.version,
-            strategy = strategy.as_str(),
-            node_count,
-            edge_count,
-            write_duration_ms = write_started.elapsed().as_millis(),
-            "console graph materialization committed",
-        );
+        match outcome {
+            MaterializationWriteOutcome::Committed {
+                strategy,
+                fallback_reason,
+            } => {
+                tracing::info!(
+                    mode = ?snapshot.mode,
+                    source_version = snapshot.version,
+                    strategy = strategy.as_str(),
+                    node_count,
+                    edge_count,
+                    write_duration_ms = write_started.elapsed().as_millis(),
+                    fallback_reason = fallback_reason.unwrap_or("none"),
+                    "console graph materialization committed",
+                );
+            }
+            MaterializationWriteOutcome::SkippedStale { current_version } => {
+                tracing::info!(
+                    mode = ?snapshot.mode,
+                    source_version = snapshot.version,
+                    current_version,
+                    node_count,
+                    edge_count,
+                    write_duration_ms = write_started.elapsed().as_millis(),
+                    "console graph stale materialization skipped",
+                );
+            }
+        }
         Ok(())
     }
 
@@ -638,8 +668,12 @@ impl ConsoleGraphSnapshotStore {
         mode: GraphMode,
         plan: PlannedMaterialization,
         previous: StoredGraph,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<MaterializationWriteOutcome> {
         let strategy = plan.strategy;
+        let previous_version = previous
+            .materialization
+            .as_ref()
+            .map(|row| row.source_version.max(0) as u64);
         let width = plan.layout.width;
         let height = plan.layout.height;
         let nodes = plan
@@ -658,7 +692,29 @@ impl ConsoleGraphSnapshotStore {
         self.with_connection(move |connection| {
             connection
                 .transaction::<_, diesel::result::Error, _>(|connection| {
-                    if strategy == MaterializationStrategy::Full {
+                    let current_version = console_graph_materializations::table
+                        .filter(console_graph_materializations::mode.eq(mode.as_query_value()))
+                        .filter(
+                            console_graph_materializations::coordinate_space.eq(COORDINATE_SPACE),
+                        )
+                        .select(console_graph_materializations::source_version)
+                        .first::<i64>(connection)
+                        .optional()?
+                        .map(|version| version.max(0) as u64);
+                    if let Some(current_version) =
+                        current_version.filter(|current| *current >= source_version)
+                    {
+                        return Ok(MaterializationWriteOutcome::SkippedStale { current_version });
+                    }
+
+                    let baseline_changed = strategy != MaterializationStrategy::Full
+                        && current_version != previous_version;
+                    let effective_strategy = if baseline_changed {
+                        MaterializationStrategy::Full
+                    } else {
+                        strategy
+                    };
+                    if effective_strategy == MaterializationStrategy::Full {
                         delete_mode_rows(connection, mode)?;
                         for node in &nodes {
                             upsert_node(connection, mode, node)?;
@@ -669,7 +725,12 @@ impl ConsoleGraphSnapshotStore {
                     } else {
                         write_changed_rows(connection, mode, &previous, &nodes, &edges)?;
                     }
-                    upsert_materialization(connection, mode, source_version, width, height)
+                    upsert_materialization(connection, mode, source_version, width, height)?;
+                    Ok(MaterializationWriteOutcome::Committed {
+                        strategy: effective_strategy,
+                        fallback_reason: baseline_changed
+                            .then_some("materialization_baseline_changed"),
+                    })
                 })
                 .context(QueryGraphSnapshotStoreSnafu { path })
         })
@@ -1469,6 +1530,81 @@ mod tests {
                 .len(),
             3
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_rebuild_does_not_replace_newer_materialization() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open_with_policy(&dir, local_policy(10))
+            .await
+            .unwrap();
+        let initial = linear_snapshot(1, GraphMode::All, 2);
+        store.materialize_snapshot(&initial).await.unwrap();
+        let previous = store.load_stored_graph(GraphMode::All).await.unwrap();
+
+        let mut stale = initial.clone();
+        stale.version = 2;
+        stale.nodes[1].summary = "stale payload".to_owned();
+        let stale_plan = plan_materialization(&stale, &previous, local_policy(10)).unwrap();
+        assert_eq!(stale_plan.strategy, MaterializationStrategy::PayloadOnly);
+
+        let mut newer = initial;
+        newer.version = 3;
+        newer.nodes[1].summary = "newer payload".to_owned();
+        store.materialize_snapshot(&newer).await.unwrap();
+
+        let outcome = store
+            .write_materialization(stale.version, stale.mode, stale_plan, previous)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            MaterializationWriteOutcome::SkippedStale { current_version: 3 }
+        );
+        let stored = store.load_stored_graph(GraphMode::All).await.unwrap();
+        assert_eq!(stored.materialization.unwrap().source_version, 3);
+        assert_eq!(stored.nodes["node-0001"].summary, "newer payload");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_write_baseline_falls_back_to_full_rewrite() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open_with_policy(&dir, local_policy(10))
+            .await
+            .unwrap();
+        let initial = linear_snapshot(1, GraphMode::All, 2);
+        store.materialize_snapshot(&initial).await.unwrap();
+        let previous = store.load_stored_graph(GraphMode::All).await.unwrap();
+
+        let mut target = initial;
+        target.version = 3;
+        target.nodes[1].summary = "target payload".to_owned();
+        let target_plan = plan_materialization(&target, &previous, local_policy(10)).unwrap();
+        assert_eq!(target_plan.strategy, MaterializationStrategy::PayloadOnly);
+
+        store
+            .materialize_snapshot(&linear_snapshot(2, GraphMode::All, 3))
+            .await
+            .unwrap();
+        let outcome = store
+            .write_materialization(target.version, target.mode, target_plan, previous)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            MaterializationWriteOutcome::Committed {
+                strategy: MaterializationStrategy::Full,
+                fallback_reason: Some("materialization_baseline_changed"),
+            }
+        );
+        let stored = store.load_stored_graph(GraphMode::All).await.unwrap();
+        assert_eq!(stored.materialization.unwrap().source_version, 3);
+        assert_eq!(stored.nodes.len(), 2);
+        assert_eq!(stored.nodes["node-0001"].summary, "target payload");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
