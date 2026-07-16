@@ -82,6 +82,10 @@ impl SnapshotDatabase {
             }),
         }
     }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_ref()
+    }
 }
 
 fn snapshot_pool_manager_config() -> ManagerConfig<AsyncSnapshotConnection> {
