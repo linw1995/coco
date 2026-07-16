@@ -48,12 +48,14 @@ impl PersistentGraphIndex {
         self.branches.is_empty()
     }
 
-    pub(crate) async fn refresh_all(&mut self, store: &SqliteGraphStore) -> StoreResult<()> {
+    pub(crate) fn start_refresh(&mut self) {
         #[cfg(test)]
         {
             self.refresh_count += 1;
         }
-        let records = store.graph_branches().await?;
+    }
+
+    pub(crate) fn reconcile_full_refresh(&mut self, records: &[GraphBranchRecord]) {
         let current_names = records
             .iter()
             .map(|record| record.name.clone())
@@ -67,40 +69,33 @@ impl PersistentGraphIndex {
         for name in removed {
             self.remove_branch(&name);
         }
+    }
+
+    pub(crate) async fn refresh_records(
+        &mut self,
+        store: &SqliteGraphStore,
+        records: impl IntoIterator<Item = GraphBranchRecord>,
+    ) -> StoreResult<()> {
         for record in records {
             self.refresh_branch(store, record).await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn refresh_branches(
+    pub(crate) async fn refresh_named_batch(
         &mut self,
         store: &SqliteGraphStore,
-        names: &BTreeSet<String>,
+        names: &[String],
     ) -> StoreResult<()> {
-        #[cfg(test)]
-        {
-            self.refresh_count += 1;
-        }
-        for batch in names
+        let records = store.graph_branches_by_names(names).await?;
+        let found = records
             .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .chunks(GRAPH_READ_BATCH_SIZE)
-        {
-            let records = store.graph_branches_by_names(batch).await?;
-            let found = records
-                .iter()
-                .map(|record| record.name.clone())
-                .collect::<HashSet<_>>();
-            for name in batch.iter().filter(|name| !found.contains(*name)) {
-                self.remove_branch(name);
-            }
-            for record in records {
-                self.refresh_branch(store, record).await?;
-            }
+            .map(|record| record.name.clone())
+            .collect::<HashSet<_>>();
+        for name in names.iter().filter(|name| !found.contains(*name)) {
+            self.remove_branch(name);
         }
-        Ok(())
+        self.refresh_records(store, records).await
     }
 
     async fn refresh_branch(

@@ -79,6 +79,12 @@ struct GraphSnapshotSet {
     all: GraphSnapshot,
 }
 
+#[derive(Clone, Copy)]
+struct RefreshBatchProgress {
+    index: usize,
+    total: usize,
+}
+
 macro_rules! log_rebuild_status {
     ($status:expr) => {{
         let status = &$status;
@@ -810,37 +816,173 @@ where
             );
         }
 
-        let graph_store = if let (Some(store), Some(index)) =
-            (&self.persistent_graph_store, &self.persistent_index)
-        {
-            let mut index = index.lock().await;
-            if invalidations.full || index.is_empty() {
-                index
-                    .refresh_all(store)
-                    .await
-                    .context(crate::error::StoreSnafu)?;
-            } else {
-                index
-                    .refresh_branches(store, &invalidations.branches)
-                    .await
-                    .context(crate::error::StoreSnafu)?;
-            }
-            Some(index.snapshot_store(store.root_id()))
-        } else {
-            None
-        };
+        if let (Some(store), Some(index), Some(snapshot_store)) = (
+            &self.persistent_graph_store,
+            &self.persistent_index,
+            &self.snapshots,
+        ) {
+            return self
+                .refresh_persistent_snapshot_set(
+                    store,
+                    index,
+                    snapshot_store,
+                    source_version,
+                    invalidations,
+                )
+                .await;
+        }
 
         let anchors = self
-            .build_snapshot_for_mode(graph_store.as_ref(), GraphMode::Anchors, source_version)
+            .build_snapshot_for_mode(None, GraphMode::Anchors, source_version)
             .await?;
         let all = self
-            .build_snapshot_for_mode(graph_store.as_ref(), GraphMode::All, source_version)
+            .build_snapshot_for_mode(None, GraphMode::All, source_version)
             .await?;
-        if let Some(snapshot_store) = &self.snapshots {
-            snapshot_store.materialize_snapshot(&anchors).await?;
-            snapshot_store.materialize_snapshot(&all).await?;
-        }
         Ok(GraphSnapshotSet { anchors, all })
+    }
+
+    async fn refresh_persistent_snapshot_set(
+        &self,
+        store: &SqliteGraphStore,
+        index: &Arc<tokio::sync::Mutex<PersistentGraphIndex>>,
+        snapshot_store: &ConsoleGraphSnapshotStore,
+        source_version: u64,
+        invalidations: &ConsoleInvalidationBatch,
+    ) -> crate::Result<GraphSnapshotSet> {
+        snapshot_store.prune_inactive_generations().await?;
+        let mut baseline_generation = snapshot_store.active_generation().await?;
+        let mut index = index.lock().await;
+        index.start_refresh();
+        let mut final_snapshots = None;
+
+        if invalidations.full || index.is_empty() {
+            let records = store
+                .graph_branches()
+                .await
+                .context(crate::error::StoreSnafu)?;
+            index.reconcile_full_refresh(&records);
+            let total_batches = records.len().div_ceil(coco_mem::GRAPH_READ_BATCH_SIZE);
+            if records.is_empty() {
+                let (snapshots, generation) = self
+                    .checkpoint_index(
+                        store,
+                        &index,
+                        snapshot_store,
+                        baseline_generation,
+                        source_version,
+                        RefreshBatchProgress { index: 1, total: 1 },
+                    )
+                    .await?;
+                baseline_generation = generation;
+                final_snapshots = Some(snapshots);
+            } else {
+                for (batch_index, records) in
+                    records.chunks(coco_mem::GRAPH_READ_BATCH_SIZE).enumerate()
+                {
+                    index
+                        .refresh_records(store, records.iter().cloned())
+                        .await
+                        .context(crate::error::StoreSnafu)?;
+                    let (snapshots, generation) = self
+                        .checkpoint_index(
+                            store,
+                            &index,
+                            snapshot_store,
+                            baseline_generation,
+                            source_version,
+                            RefreshBatchProgress {
+                                index: batch_index + 1,
+                                total: total_batches,
+                            },
+                        )
+                        .await?;
+                    baseline_generation = generation;
+                    final_snapshots = Some(snapshots);
+                }
+            }
+        } else {
+            let names = invalidations.branches.iter().cloned().collect::<Vec<_>>();
+            let total_batches = names.len().div_ceil(coco_mem::GRAPH_READ_BATCH_SIZE);
+            if names.is_empty() {
+                let (snapshots, generation) = self
+                    .checkpoint_index(
+                        store,
+                        &index,
+                        snapshot_store,
+                        baseline_generation,
+                        source_version,
+                        RefreshBatchProgress { index: 1, total: 1 },
+                    )
+                    .await?;
+                baseline_generation = generation;
+                final_snapshots = Some(snapshots);
+            } else {
+                for (batch_index, names) in
+                    names.chunks(coco_mem::GRAPH_READ_BATCH_SIZE).enumerate()
+                {
+                    index
+                        .refresh_named_batch(store, names)
+                        .await
+                        .context(crate::error::StoreSnafu)?;
+                    let (snapshots, generation) = self
+                        .checkpoint_index(
+                            store,
+                            &index,
+                            snapshot_store,
+                            baseline_generation,
+                            source_version,
+                            RefreshBatchProgress {
+                                index: batch_index + 1,
+                                total: total_batches,
+                            },
+                        )
+                        .await?;
+                    baseline_generation = generation;
+                    final_snapshots = Some(snapshots);
+                }
+            }
+        }
+
+        snapshot_store
+            .activate_generation(baseline_generation, source_version)
+            .await?;
+        final_snapshots.context(crate::error::InvalidGraphSnapshotStoreValueSnafu {
+            column: "generation",
+            value: "refresh completed without a materialized checkpoint".to_owned(),
+        })
+    }
+
+    async fn checkpoint_index(
+        &self,
+        store: &SqliteGraphStore,
+        index: &PersistentGraphIndex,
+        snapshot_store: &ConsoleGraphSnapshotStore,
+        baseline_generation: i64,
+        source_version: u64,
+        batch: RefreshBatchProgress,
+    ) -> crate::Result<(GraphSnapshotSet, i64)> {
+        let graph_store = index.snapshot_store(store.root_id());
+        let anchors = self
+            .build_snapshot_for_mode(Some(&graph_store), GraphMode::Anchors, source_version)
+            .await?;
+        let all = self
+            .build_snapshot_for_mode(Some(&graph_store), GraphMode::All, source_version)
+            .await?;
+        let generation = snapshot_store.allocate_staging_generation().await?;
+        snapshot_store
+            .materialize_checkpoint(&anchors, baseline_generation, generation)
+            .await?;
+        snapshot_store
+            .materialize_checkpoint(&all, baseline_generation, generation)
+            .await?;
+        tracing::info!(
+            source_version,
+            generation,
+            batch_index = batch.index,
+            total_batches = batch.total,
+            "console graph refresh batch checkpoint committed",
+        );
+        Ok((GraphSnapshotSet { anchors, all }, generation))
     }
 
     async fn build_snapshot_for_mode(
@@ -1196,6 +1338,45 @@ mod tests {
                 .await
                 .refresh_count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn full_refresh_checkpoints_each_branch_batch_before_activation() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        let root = writer.root_id();
+        for index in 0..=coco_mem::GRAPH_READ_BATCH_SIZE {
+            writer
+                .fork(&format!("branch-{index:03}"), &root)
+                .await
+                .unwrap();
+        }
+        let publisher = ConsolePublisher::new();
+        publisher.mark_changed();
+        let cache =
+            ConsoleGraphCache::new_with_persistent_store_path(writer.clone(), publisher, path)
+                .await
+                .unwrap();
+
+        let snapshot = cache.snapshot_current(GraphMode::All).await.unwrap();
+        let snapshot_store = cache.snapshots.as_ref().unwrap();
+
+        assert_eq!(snapshot.branches.len(), coco_mem::GRAPH_READ_BATCH_SIZE + 1);
+        assert_eq!(snapshot_store.active_generation().await.unwrap(), 2);
+        assert_eq!(
+            snapshot_store
+                .latest_materialization_version(GraphMode::Anchors)
+                .await
+                .unwrap(),
+            Some(snapshot.version)
+        );
+        assert_eq!(
+            snapshot_store
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(snapshot.version)
         );
     }
 

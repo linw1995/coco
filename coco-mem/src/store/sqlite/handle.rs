@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
 
 use diesel::prelude::*;
