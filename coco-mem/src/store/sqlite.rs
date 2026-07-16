@@ -90,7 +90,6 @@ pub struct SqliteGraphStore {
     database_path: PathBuf,
     database: SqliteDatabase,
     root_id: String,
-    read_transaction: Arc<tokio::sync::Mutex<Option<AsyncSqliteConnectionGuard<'static>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

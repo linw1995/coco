@@ -14,9 +14,6 @@ use super::node::{
     load_child_ids_by_parent_ids, load_node_by_exact_id, load_node_by_prefix_or_branch,
     load_nodes_by_exact_ids, load_root_id, node_count, persist_node_without_transaction,
 };
-use super::transaction::{
-    begin_deferred_transaction, commit_deferred_transaction, rollback_deferred_transaction,
-};
 use super::{
     AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
     SqliteDatabase, SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore,
@@ -24,9 +21,8 @@ use super::{
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    AcquireSqliteConnectionSnafu, CorruptedStoreSnafu, GraphReadBatchTooLargeSnafu,
-    QuerySqliteStoreSnafu, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
-    WriteStoreDirectorySnafu,
+    CorruptedStoreSnafu, GraphReadBatchTooLargeSnafu, QuerySqliteStoreSnafu,
+    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
 use crate::schema::branches;
 use crate::store::ProcessShareableStore;
@@ -269,7 +265,6 @@ impl SqliteGraphStore {
             database_path,
             database,
             root_id: String::new(),
-            read_transaction: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -302,78 +297,8 @@ impl SqliteGraphStore {
         F: for<'a> FnOnce(&'a mut AsyncSqliteConnection) -> SqliteGraphConnectionFuture<'a, T>
             + Send,
     {
-        let mut read_transaction = self.read_transaction.lock().await;
-        if let Some(connection) = read_transaction.as_mut() {
-            return operation(&mut *connection).await;
-        }
-        drop(read_transaction);
-
         let mut connection = self.connect().await?;
         operation(&mut connection).await
-    }
-
-    pub async fn begin_read_transaction(&self) -> Result<()> {
-        let transaction_is_inactive = self.read_transaction.lock().await.is_none();
-        ensure!(
-            transaction_is_inactive,
-            CorruptedStoreSnafu {
-                path: self.database_path.clone(),
-                message: "SQLite graph read transaction already active".to_owned(),
-            }
-        );
-
-        let mut connection =
-            self.database
-                .inner
-                .pool
-                .get_owned()
-                .await
-                .context(AcquireSqliteConnectionSnafu {
-                    path: self.database_path.clone(),
-                })?;
-        begin_deferred_transaction(&mut connection, &self.database_path).await?;
-        let mut connection = Some(connection);
-        let transaction_already_active = {
-            let mut read_transaction = self.read_transaction.lock().await;
-            if read_transaction.is_some() {
-                true
-            } else {
-                *read_transaction = connection.take();
-                false
-            }
-        };
-        if transaction_already_active {
-            let mut connection = connection.expect("pending graph read connection is missing");
-            rollback_deferred_transaction(&mut connection, &self.database_path).await?;
-            return CorruptedStoreSnafu {
-                path: self.database_path.clone(),
-                message: "SQLite graph read transaction already active".to_owned(),
-            }
-            .fail();
-        }
-        Ok(())
-    }
-
-    pub async fn commit_read_transaction(&self) -> Result<()> {
-        let mut connection =
-            self.read_transaction
-                .lock()
-                .await
-                .take()
-                .context(CorruptedStoreSnafu {
-                    path: self.database_path.clone(),
-                    message: "SQLite graph read transaction is not active".to_owned(),
-                })?;
-
-        commit_deferred_transaction(&mut connection, &self.database_path).await
-    }
-
-    pub async fn rollback_read_transaction(&self) -> Result<()> {
-        let Some(mut connection) = self.read_transaction.lock().await.take() else {
-            return Ok(());
-        };
-
-        rollback_deferred_transaction(&mut connection, &self.database_path).await
     }
 
     pub(super) fn ensure_read_only<T>(&self) -> Result<T> {
