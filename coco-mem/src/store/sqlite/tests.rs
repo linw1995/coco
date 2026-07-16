@@ -12,16 +12,17 @@ use crate::schema::{
     skill_version_scripts, skill_versions,
 };
 use crate::{
-    Anchor, BackendMetadata, BranchStore, Job, JobStatus, JobStore, Kind, MergeParent,
-    MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset, PresetStore, PromptAnchor,
-    PromptAttachment, PromptImageAttachment, Role, SessionAnchor, SessionAnchorPatch, SessionRole,
-    SessionState, SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
-    SkillRuntimeContext, SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, Tool,
-    ToolResult, ToolUse,
+    Anchor, BackendMetadata, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord, Job, JobStatus,
+    JobStore, Kind, MergeParent, MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset,
+    PresetStore, PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
+    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillInvocationAnchor,
+    SkillInvocationMode, SkillResultAnchor, SkillRuntimeContext, SkillScript, SkillStore,
+    SkillUpdatePatch, SkillVersionSpec, StoreError, Tool, ToolResult, ToolUse,
 };
 use diesel::connection::InstrumentationEvent;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::sync::{Barrier, oneshot};
@@ -695,6 +696,117 @@ async fn graph_store_connection_contention_does_not_block_writer() {
     graph_lock.await.unwrap();
     write.await.unwrap();
     assert_eq!(store.get_node(&written).await.unwrap().id, written);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_read_batch_releases_its_connection_before_writer_runs() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+    assert!(std::ptr::eq(
+        store.database.shared_pool(),
+        graph.database.shared_pool()
+    ));
+
+    let mut held_connections = Vec::new();
+    for _ in 0..3 {
+        held_connections.push(graph.database.acquire().await.unwrap());
+    }
+
+    let root = store.root_id();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        graph.graph_nodes_by_ids(std::slice::from_ref(&root)),
+    )
+    .await
+    .expect("graph read should acquire the remaining pool connection")
+    .unwrap();
+
+    let written = tokio::time::timeout(
+        Duration::from_secs(1),
+        store.append(NewNode {
+            parent: root,
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("write between graph read batches".to_owned()),
+        }),
+    )
+    .await
+    .expect("writer should reuse the connection released by the graph read batch")
+    .unwrap();
+
+    drop(held_connections);
+    assert_eq!(store.get_node(&written).await.unwrap().id, written);
+}
+
+#[tokio::test]
+async fn graph_read_api_loads_branches_nodes_and_children_in_bounded_calls() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let root = store.root_id();
+    store.fork("main", &root).await.unwrap();
+    let child = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("graph read batch".to_owned()),
+        })
+        .await
+        .unwrap();
+    store.set_branch_head("main", &root, &child).await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+
+    assert_eq!(
+        graph.graph_branches().await.unwrap(),
+        vec![GraphBranchRecord {
+            name: "main".to_owned(),
+            head_id: child.clone(),
+            state: SessionState::Active,
+        }]
+    );
+    let nodes = graph
+        .graph_nodes_by_ids(&[root.clone(), child.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        nodes
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([root.clone(), child.clone()])
+    );
+    assert_eq!(
+        graph
+            .graph_child_ids(std::slice::from_ref(&root))
+            .await
+            .unwrap()
+            .get(&root),
+        Some(&vec![child])
+    );
+}
+
+#[tokio::test]
+async fn graph_read_api_rejects_oversized_batches() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let ids = (0..=GRAPH_READ_BATCH_SIZE)
+        .map(|index| format!("node-{index}"))
+        .collect::<Vec<_>>();
+
+    let error = graph.graph_nodes_by_ids(&ids).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::GraphReadBatchTooLarge {
+            actual,
+            maximum: GRAPH_READ_BATCH_SIZE,
+        } if actual == GRAPH_READ_BATCH_SIZE + 1
+    ));
 }
 
 #[tokio::test]

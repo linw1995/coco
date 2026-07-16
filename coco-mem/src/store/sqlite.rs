@@ -7,8 +7,18 @@ use diesel_async::pooled_connection::bb8::{
 };
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 
+use crate::SessionState;
 use crate::StoreResult as Result;
 use crate::error::StoreError;
+
+pub const GRAPH_READ_BATCH_SIZE: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBranchRecord {
+    pub name: String,
+    pub head_id: String,
+    pub state: SessionState,
+}
 
 mod branch;
 mod codec;

@@ -1218,15 +1218,7 @@ mod tests {
         let mut trigger_response = Vec::new();
         trigger.read_to_end(&mut trigger_response).await.unwrap();
 
-        store
-            .append(NewNode {
-                parent: store.root_id(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("changed".to_owned()),
-            })
-            .await
-            .unwrap();
+        store.fork("main", &store.root_id()).await.unwrap();
 
         let mut invalidated = Vec::new();
         while !contains_bytes(&invalidated, b"event: graph\ndata: 1") {
@@ -1726,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_page_uses_mode_specific_loading_version() {
+    async fn index_page_uses_shared_graph_loading_version() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
@@ -1766,7 +1758,7 @@ mod tests {
                 .cache
                 .current_viewport_version(GraphMode::Anchors)
                 .await,
-            0
+            all.version
         );
 
         let response = index_page(
@@ -1777,7 +1769,10 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(html.contains("data-version=\"0\""), "{html}");
+        assert!(
+            html.contains(&format!("data-version=\"{}\"", all.version)),
+            "{html}"
+        );
 
         drop(state);
         drop(writer);
@@ -2264,7 +2259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_context_uses_materialized_facts_without_full_snapshot() {
+    async fn provider_context_uses_materialized_graph_facts() {
         let path = temp_store_path();
         let writer = PersistentStore::open(&path).await.unwrap();
         let publisher = ConsolePublisher::new();
@@ -2342,13 +2337,6 @@ mod tests {
             "{visible_html}"
         );
         assert!(visible_html.contains("data-node-x="), "{visible_html}");
-        assert!(
-            state
-                .cache
-                .snapshot_current_ready(GraphMode::Anchors)
-                .is_none()
-        );
-
         let hidden_query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
         let response = provider_context(State(state.clone()), RawQuery(Some(hidden_query))).await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -2359,13 +2347,6 @@ mod tests {
             hidden_html.contains("class=\"provider-context-node selected\""),
             "{hidden_html}"
         );
-        assert!(
-            state
-                .cache
-                .snapshot_current_ready(GraphMode::Anchors)
-                .is_none()
-        );
-
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();
     }

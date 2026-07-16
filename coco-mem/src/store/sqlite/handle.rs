@@ -11,24 +11,27 @@ use snafu::prelude::*;
 use super::OwnedStoreDirectory;
 use super::database::sqlite_database_path;
 use super::node::{
-    load_node_by_exact_id, load_node_by_prefix_or_branch, load_root_id, node_count,
-    persist_node_without_transaction,
+    load_child_ids_by_parent_ids, load_node_by_exact_id, load_node_by_prefix_or_branch,
+    load_nodes_by_exact_ids, load_root_id, node_count, persist_node_without_transaction,
 };
 use super::transaction::{
     begin_deferred_transaction, commit_deferred_transaction, rollback_deferred_transaction,
 };
 use super::{
-    AsyncSqliteConnection, AsyncSqliteConnectionGuard, SqliteDatabase, SqliteGraphConnectionFuture,
-    SqliteGraphStore, SqliteStore, SqliteTransactionError, StoreAccess, migration,
+    AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
+    SqliteDatabase, SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore,
+    SqliteTransactionError, StoreAccess, migration,
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    AcquireSqliteConnectionSnafu, CorruptedStoreSnafu, QuerySqliteStoreSnafu,
-    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    AcquireSqliteConnectionSnafu, CorruptedStoreSnafu, GraphReadBatchTooLargeSnafu,
+    QuerySqliteStoreSnafu, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
+    WriteStoreDirectorySnafu,
 };
 use crate::schema::branches;
 use crate::store::ProcessShareableStore;
 use crate::{Kind, Node, Role};
+use std::collections::HashMap;
 
 impl std::fmt::Debug for SqliteGraphStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -228,6 +231,36 @@ impl SqliteGraphStore {
         &self.dir
     }
 
+    pub async fn graph_branches(&self) -> Result<Vec<GraphBranchRecord>> {
+        let mut connection = self.connect().await?;
+        super::branch::load_graph_branch_records(&mut connection, &self.database_path, None).await
+    }
+
+    pub async fn graph_branches_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<GraphBranchRecord>> {
+        ensure_graph_read_batch_size(names.len())?;
+        let mut connection = self.connect().await?;
+        super::branch::load_graph_branch_records(&mut connection, &self.database_path, Some(names))
+            .await
+    }
+
+    pub async fn graph_nodes_by_ids(&self, ids: &[String]) -> Result<Vec<Node>> {
+        ensure_graph_read_batch_size(ids.len())?;
+        let mut connection = self.connect().await?;
+        load_nodes_by_exact_ids(&mut connection, &self.database_path, ids).await
+    }
+
+    pub async fn graph_child_ids(
+        &self,
+        parent_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        ensure_graph_read_batch_size(parent_ids.len())?;
+        let mut connection = self.connect().await?;
+        load_child_ids_by_parent_ids(&mut connection, &self.database_path, parent_ids).await
+    }
+
     async fn new(path: &Path) -> Result<Self> {
         let database_path = sqlite_database_path(path);
         let database = SqliteDatabase::open(database_path.clone(), false).await?;
@@ -377,6 +410,17 @@ impl SqliteGraphStore {
         })
         .await
     }
+}
+
+fn ensure_graph_read_batch_size(actual: usize) -> Result<()> {
+    ensure!(
+        actual <= GRAPH_READ_BATCH_SIZE,
+        GraphReadBatchTooLargeSnafu {
+            actual,
+            maximum: GRAPH_READ_BATCH_SIZE,
+        }
+    );
+    Ok(())
 }
 
 fn initial_root_node() -> Node {

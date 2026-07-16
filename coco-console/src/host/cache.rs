@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::snapshot_store::ConsoleGraphSnapshotStore;
+use super::source_cache::{InMemoryGraphStore, PersistentGraphIndex};
 use crate::api::{GraphViewportDiffResponse, GraphViewportResponse};
 use crate::graph::{
     GraphMode, GraphNode, GraphSnapshot, build_graph_snapshot_with_mode_and_progress,
@@ -15,7 +15,7 @@ use crate::host::render::{
     ProviderContextItem,
 };
 use crate::layout::{layout_graph_viewport, layout_graph_viewport_diff};
-use crate::publisher::ConsolePublisher;
+use crate::publisher::{ConsoleInvalidationBatch, ConsolePublisher};
 use coco_mem::{BranchStore, NodeStore, SessionState, SessionStore, SqliteGraphStore, Store};
 use serde::Serialize;
 use snafu::prelude::*;
@@ -47,6 +47,8 @@ pub struct ConsoleGraphCache<S> {
     ready: ConsolePublisher,
     progress: ConsolePublisher,
     snapshots: Option<ConsoleGraphSnapshotStore>,
+    persistent_graph_store: Option<SqliteGraphStore>,
+    persistent_index: Option<Arc<tokio::sync::Mutex<PersistentGraphIndex>>>,
     publish_lock: Arc<Mutex<()>>,
     state: Arc<Mutex<CacheState>>,
 }
@@ -64,11 +66,17 @@ struct CacheState {
     all: Option<CachedGraphSnapshot>,
     anchors_rebuild: Option<ConsoleGraphRebuildStatus>,
     all_rebuild: Option<ConsoleGraphRebuildStatus>,
+    refresh_worker_running: bool,
 }
 
 struct CachedGraphSnapshot {
     source_version: u64,
     snapshot: Arc<GraphSnapshot>,
+}
+
+struct GraphSnapshotSet {
+    anchors: GraphSnapshot,
+    all: GraphSnapshot,
 }
 
 macro_rules! log_rebuild_status {
@@ -134,6 +142,8 @@ where
             ready: ConsolePublisher::new(),
             progress: ConsolePublisher::new(),
             snapshots: None,
+            persistent_graph_store: None,
+            persistent_index: None,
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
         }
@@ -144,7 +154,7 @@ where
         invalidations: ConsolePublisher,
         path: PathBuf,
     ) -> crate::Result<Self> {
-        SqliteGraphStore::open_read_only(&path)
+        let persistent_graph_store = SqliteGraphStore::open_read_only(&path)
             .await
             .context(crate::error::StoreSnafu)?;
         let snapshots = ConsoleGraphSnapshotStore::open(&path).await?;
@@ -164,6 +174,10 @@ where
             ready,
             progress: ConsolePublisher::new(),
             snapshots: Some(snapshots),
+            persistent_graph_store: Some(persistent_graph_store),
+            persistent_index: Some(Arc::new(tokio::sync::Mutex::new(
+                PersistentGraphIndex::default(),
+            ))),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
         })
@@ -209,9 +223,7 @@ where
     }
 
     pub async fn rebuild_requested_modes(&self) {
-        for mode in [GraphMode::Anchors, GraphMode::All] {
-            self.ensure_viewport_current(mode).await;
-        }
+        self.ensure_graph_current();
     }
 
     #[cfg(test)]
@@ -219,46 +231,20 @@ where
         &self,
         mode: GraphMode,
     ) -> crate::Result<Arc<GraphSnapshot>> {
-        let source_version = self.invalidations.current_version();
-        if let Some(snapshot) = self.cached_snapshot(mode, source_version) {
-            return Ok(snapshot);
+        self.ensure_graph_current();
+        loop {
+            let source_version = self.invalidations.current_version();
+            if let Some(snapshot) = self.cached_snapshot(mode, source_version) {
+                return Ok(snapshot);
+            }
+            self.fail_if_materialization_failed(mode, source_version)?;
+            let mut ready = self.ready.subscribe();
+            let mut progress = self.progress.subscribe();
+            tokio::select! {
+                _ = ready.changed() => {}
+                _ = progress.changed() => {}
+            }
         }
-        let graph_version = source_version;
-        let source = self.source.clone();
-        set_rebuild_status!(
-            self,
-            rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Building,
-                None,
-                0,
-                0,
-                "Building graph snapshot",
-            )
-        );
-        let progress_cache = self.clone();
-        let snapshot = source
-            .build_snapshot_with_progress(mode, graph_version, |progress| {
-                set_rebuild_status!(
-                    progress_cache,
-                    rebuild_status(
-                        mode,
-                        source_version,
-                        ConsoleGraphRebuildState::Building,
-                        Some(progress.phase),
-                        progress.processed,
-                        progress.total,
-                        progress.phase.label(),
-                    )
-                );
-            })
-            .await?;
-        let snapshot = Arc::new(snapshot);
-        self.store_cached_snapshot(mode, source_version, snapshot.clone());
-        self.publish_ready_version(source_version);
-        set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
-        Ok(snapshot)
     }
 
     pub(crate) fn snapshot_current_ready_or_schedule(
@@ -685,14 +671,7 @@ where
             set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
             return;
         }
-        if !self.mark_rebuild_scheduled(mode, source_version) {
-            return;
-        }
-
-        let cache = self.clone();
-        tokio::spawn(async move {
-            cache.rebuild_snapshot(mode, source_version).await;
-        });
+        self.ensure_graph_current();
     }
 
     async fn ensure_viewport_current(&self, mode: GraphMode) {
@@ -703,79 +682,198 @@ where
             set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
             return;
         }
-        if !self.mark_rebuild_scheduled(mode, source_version) {
+        self.ensure_graph_current();
+    }
+
+    fn ensure_graph_current(&self) {
+        let source_version = self.invalidations.current_version();
+        let should_start = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("console graph cache lock poisoned");
+            if state.refresh_worker_running {
+                false
+            } else {
+                state.refresh_worker_running = true;
+                true
+            }
+        };
+        if !should_start {
             return;
         }
-
+        for mode in [GraphMode::Anchors, GraphMode::All] {
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Scheduled,
+                    None,
+                    0,
+                    0,
+                    "Graph snapshot scheduled",
+                )
+            );
+        }
         let cache = self.clone();
         tokio::spawn(async move {
-            cache.rebuild_snapshot(mode, source_version).await;
+            cache.run_refresh_worker().await;
         });
     }
 
-    async fn rebuild_snapshot(&self, mode: GraphMode, source_version: u64) {
-        let uses_materialized_store = self.snapshots.is_some();
-        set_rebuild_status!(
-            self,
-            rebuild_status(
-                mode,
-                source_version,
-                ConsoleGraphRebuildState::Building,
-                None,
-                0,
-                0,
-                if uses_materialized_store {
-                    "Building graph materialization"
-                } else {
-                    "Building graph snapshot"
-                },
-            )
-        );
-        let source = self.source.clone();
-        let progress_cache = self.clone();
-        let snapshots = self.snapshots.clone();
-        let result = async move {
-            let snapshot = source
-                .build_snapshot_with_progress(mode, source_version, |progress| {
-                    set_rebuild_status!(
-                        progress_cache,
-                        rebuild_status(
-                            mode,
-                            source_version,
-                            ConsoleGraphRebuildState::Building,
-                            Some(progress.phase),
-                            progress.processed,
-                            progress.total,
-                            progress.phase.label(),
-                        )
-                    );
-                })
-                .await?;
-            if let Some(snapshots) = snapshots {
-                snapshots.materialize_snapshot(&snapshot).await?;
-            }
-            crate::Result::Ok(snapshot)
-        }
-        .await;
-        match result {
-            Ok(snapshot) => {
-                self.store_cached_snapshot(mode, source_version, Arc::new(snapshot));
-                self.publish_ready_version(source_version);
-                set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
-            }
-            Err(error) => {
-                set_rebuild_status!(
-                    self,
-                    rebuild_status(
-                        mode,
+    async fn run_refresh_worker(&self) {
+        loop {
+            let source_version = self.invalidations.current_version();
+            let mut invalidations = self.invalidations.take_invalidations();
+            invalidations.version = source_version;
+            let result = self
+                .refresh_snapshot_set(source_version, &invalidations)
+                .await;
+            match result {
+                Ok(snapshots) => {
+                    self.store_cached_snapshot(
+                        GraphMode::Anchors,
                         source_version,
-                        ConsoleGraphRebuildState::Failed,
-                        None,
-                        0,
-                        0,
-                        error.to_string(),
-                    )
-                );
+                        Arc::new(snapshots.anchors),
+                    );
+                    self.store_cached_snapshot(
+                        GraphMode::All,
+                        source_version,
+                        Arc::new(snapshots.all),
+                    );
+                    self.publish_ready_version(source_version);
+                    for mode in [GraphMode::Anchors, GraphMode::All] {
+                        set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
+                    }
+                }
+                Err(error) => {
+                    self.invalidations.restore_invalidations(invalidations);
+                    for mode in [GraphMode::Anchors, GraphMode::All] {
+                        set_rebuild_status!(
+                            self,
+                            rebuild_status(
+                                mode,
+                                source_version,
+                                ConsoleGraphRebuildState::Failed,
+                                None,
+                                0,
+                                0,
+                                error.to_string(),
+                            )
+                        );
+                    }
+                    self.finish_refresh_worker();
+                    return;
+                }
+            }
+
+            if self.invalidations.current_version() <= source_version {
+                self.finish_refresh_worker();
+                if self.invalidations.current_version() > source_version {
+                    self.ensure_graph_current();
+                }
+                return;
+            }
+        }
+    }
+
+    fn finish_refresh_worker(&self) {
+        self.state
+            .lock()
+            .expect("console graph cache lock poisoned")
+            .refresh_worker_running = false;
+    }
+
+    async fn refresh_snapshot_set(
+        &self,
+        source_version: u64,
+        invalidations: &ConsoleInvalidationBatch,
+    ) -> crate::Result<GraphSnapshotSet> {
+        let uses_materialized_store = self.snapshots.is_some();
+        for mode in [GraphMode::Anchors, GraphMode::All] {
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Building,
+                    None,
+                    0,
+                    0,
+                    if uses_materialized_store {
+                        "Building graph materialization"
+                    } else {
+                        "Building graph snapshot"
+                    },
+                )
+            );
+        }
+
+        let graph_store = if let (Some(store), Some(index)) =
+            (&self.persistent_graph_store, &self.persistent_index)
+        {
+            let mut index = index.lock().await;
+            if invalidations.full || index.is_empty() {
+                index
+                    .refresh_all(store)
+                    .await
+                    .context(crate::error::StoreSnafu)?;
+            } else {
+                index
+                    .refresh_branches(store, &invalidations.branches)
+                    .await
+                    .context(crate::error::StoreSnafu)?;
+            }
+            Some(index.snapshot_store(store.root_id()))
+        } else {
+            None
+        };
+
+        let anchors = self
+            .build_snapshot_for_mode(graph_store.as_ref(), GraphMode::Anchors, source_version)
+            .await?;
+        let all = self
+            .build_snapshot_for_mode(graph_store.as_ref(), GraphMode::All, source_version)
+            .await?;
+        if let Some(snapshot_store) = &self.snapshots {
+            snapshot_store.materialize_snapshot(&anchors).await?;
+            snapshot_store.materialize_snapshot(&all).await?;
+        }
+        Ok(GraphSnapshotSet { anchors, all })
+    }
+
+    async fn build_snapshot_for_mode(
+        &self,
+        graph_store: Option<&InMemoryGraphStore>,
+        mode: GraphMode,
+        source_version: u64,
+    ) -> crate::Result<GraphSnapshot> {
+        let progress_cache = self.clone();
+        let progress = move |progress: crate::graph::GraphBuildProgress| {
+            set_rebuild_status!(
+                progress_cache,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Building,
+                    Some(progress.phase),
+                    progress.processed,
+                    progress.total,
+                    progress.phase.label(),
+                )
+            );
+        };
+        match graph_store {
+            Some(store) => {
+                build_graph_snapshot_with_mode_and_progress(store, source_version, mode, progress)
+                    .await
+            }
+            None => {
+                self.source
+                    .clone()
+                    .build_snapshot_with_progress(mode, source_version, progress)
+                    .await
             }
         }
     }
@@ -818,53 +916,18 @@ where
         Ok(())
     }
 
-    fn mark_rebuild_scheduled(&self, mode: GraphMode, source_version: u64) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .expect("console graph cache lock poisoned");
-        if self.snapshots.is_none()
-            && state
-                .slot(mode)
-                .as_ref()
-                .is_some_and(|cached| cached.source_version == source_version)
-        {
-            return false;
-        }
-        if state.rebuild_slot(mode).as_ref().is_some_and(|status| {
-            status.source_version == source_version
-                && matches!(
-                    status.state,
-                    ConsoleGraphRebuildState::Scheduled
-                        | ConsoleGraphRebuildState::Building
-                        | ConsoleGraphRebuildState::Failed
-                )
-        }) {
-            return false;
-        }
-        let status = rebuild_status(
-            mode,
-            source_version,
-            ConsoleGraphRebuildState::Scheduled,
-            None,
-            0,
-            0,
-            "Graph snapshot scheduled",
-        );
-        log_rebuild_status!(status);
-        *state.rebuild_slot_mut(mode) = Some(status);
-        drop(state);
-        self.progress.mark_changed();
-        true
-    }
-
     fn set_rebuild_status(&self, status: &ConsoleGraphRebuildStatus) -> bool {
         let mode = status.mode;
         let mut state = self
             .state
             .lock()
             .expect("console graph cache lock poisoned");
-        if state.rebuild_slot(mode).as_ref() == Some(status) {
+        if state.rebuild_slot(mode).as_ref() == Some(status)
+            || state
+                .rebuild_slot(mode)
+                .as_ref()
+                .is_some_and(|current| current.source_version > status.source_version)
+        {
             return false;
         }
         *state.rebuild_slot_mut(mode) = Some(status.clone());
@@ -990,39 +1053,6 @@ async fn open_persistent_graph_store(path: &Path) -> crate::Result<SqliteGraphSt
         .context(crate::error::StoreSnafu)
 }
 
-async fn run_sqlite_graph_read_transaction<T, Fut>(
-    store: &SqliteGraphStore,
-    operation: Fut,
-) -> crate::Result<T>
-where
-    Fut: Future<Output = crate::Result<T>>,
-{
-    store
-        .begin_read_transaction()
-        .await
-        .context(crate::error::StoreSnafu)?;
-
-    let result = operation.await;
-    match result {
-        Ok(value) => {
-            store
-                .commit_read_transaction()
-                .await
-                .context(crate::error::StoreSnafu)?;
-            Ok(value)
-        }
-        Err(error) => {
-            if let Err(rollback_error) = store.rollback_read_transaction().await {
-                tracing::warn!(
-                    error = %rollback_error,
-                    "failed to roll back SQLite graph read transaction after console graph read error"
-                );
-            }
-            Err(error)
-        }
-    }
-}
-
 impl<S> ConsoleGraphSource<S>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -1042,11 +1072,7 @@ where
             }
             Self::PersistentStore(path) => {
                 let store = open_persistent_graph_store(&path).await?;
-                run_sqlite_graph_read_transaction(
-                    &store,
-                    build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress),
-                )
-                .await
+                build_graph_snapshot_with_mode_and_progress(&store, version, mode, progress).await
             }
         }
     }
@@ -1127,7 +1153,7 @@ fn branch_order(branch: &str) -> (u8, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coco_mem::SqliteStore;
+    use coco_mem::{BranchStore, Kind, NewNode, NodeStore, Role, SqliteStore};
 
     #[tokio::test]
     async fn identical_rebuild_status_is_not_republished() {
@@ -1140,5 +1166,111 @@ mod tests {
 
         assert!(!cache.set_rebuild_status(&status));
         assert_eq!(cache.progress.current_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_modes_share_one_persistent_source_refresh() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let publisher = ConsolePublisher::new();
+        publisher.mark_changed();
+        let cache =
+            ConsoleGraphCache::new_with_persistent_store_path(writer.clone(), publisher, path)
+                .await
+                .unwrap();
+
+        let (anchors, all) = tokio::join!(
+            cache.snapshot_current(GraphMode::Anchors),
+            cache.snapshot_current(GraphMode::All),
+        );
+
+        assert_eq!(anchors.unwrap().version, all.unwrap().version);
+        assert_eq!(
+            cache
+                .persistent_index
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .refresh_count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_branch_refresh_matches_full_rebuild_for_both_modes() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let publisher = ConsolePublisher::new();
+        publisher.mark_changed();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            publisher.clone(),
+            path,
+        )
+        .await
+        .unwrap();
+        cache.snapshot_current(GraphMode::All).await.unwrap();
+        let child = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("dirty branch".to_owned()),
+            })
+            .await
+            .unwrap();
+        writer.set_branch_head("main", &root, &child).await.unwrap();
+        let version = publisher.mark_branch_changed("main");
+
+        let (anchors, all) = tokio::join!(
+            cache.snapshot_current(GraphMode::Anchors),
+            cache.snapshot_current(GraphMode::All),
+        );
+        let expected_anchors =
+            crate::graph::build_graph_snapshot_with_mode(&writer, version, GraphMode::Anchors)
+                .await
+                .unwrap();
+        let expected_all =
+            crate::graph::build_graph_snapshot_with_mode(&writer, version, GraphMode::All)
+                .await
+                .unwrap();
+
+        assert_eq!(*anchors.unwrap(), expected_anchors);
+        assert_eq!(*all.unwrap(), expected_all);
+        assert_eq!(
+            cache
+                .persistent_index
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .refresh_count(),
+            2
+        );
+
+        writer.delete_branch("main").await.unwrap();
+        let version = publisher.mark_branch_changed("main");
+        let (anchors, all) = tokio::join!(
+            cache.snapshot_current(GraphMode::Anchors),
+            cache.snapshot_current(GraphMode::All),
+        );
+        let expected_anchors =
+            crate::graph::build_graph_snapshot_with_mode(&writer, version, GraphMode::Anchors)
+                .await
+                .unwrap();
+        let expected_all =
+            crate::graph::build_graph_snapshot_with_mode(&writer, version, GraphMode::All)
+                .await
+                .unwrap();
+        assert_eq!(*anchors.unwrap(), expected_anchors);
+        assert_eq!(*all.unwrap(), expected_all);
+        let index = cache.persistent_index.as_ref().unwrap().lock().await;
+        assert_eq!(index.refresh_count(), 3);
+        assert_eq!(index.node_count(), 0);
     }
 }
