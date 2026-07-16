@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 use coco_mem::{
     Anchor, AnchorPayload, BranchStore, Kind, MergeParent, Node, NodeStore, PauseReason,
@@ -165,6 +166,7 @@ struct BranchGraphScope {
 
 struct VisibleGraphCollector<'a, S: NodeStore> {
     store: &'a S,
+    branch: &'a str,
     mode: GraphMode,
     scope_node_ids: &'a mut BTreeSet<String>,
     visible_node_ids: &'a mut BTreeSet<String>,
@@ -360,7 +362,7 @@ impl GraphBuildState {
         state: SessionState,
     ) -> Result<()> {
         let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
-        let scope = self.collect_branch_scope(store, &head_id).await?;
+        let scope = self.collect_branch_scope(store, &branch, &head_id).await?;
         let visible_head_id = self
             .resolve_visible_parent(store, &scope.node_ids, &head_id)
             .await?;
@@ -377,19 +379,23 @@ impl GraphBuildState {
     async fn collect_branch_scope(
         &mut self,
         store: &impl NodeStore,
+        branch: &str,
         head_id: &str,
     ) -> Result<BranchGraphScope> {
         let mut scope_node_ids = initial_graph_scope(store, head_id, self.mode).await?;
         let mut branch_visible_node_ids = BTreeSet::new();
-        collect_visible_graph_nodes(
+        VisibleGraphCollector {
             store,
-            head_id,
-            &mut scope_node_ids,
-            self.mode,
-            &mut self.visible_node_ids,
-            &mut self.visible_nodes,
-            &mut branch_visible_node_ids,
-        )
+            branch,
+            mode: self.mode,
+            scope_node_ids: &mut scope_node_ids,
+            visible_node_ids: &mut self.visible_node_ids,
+            visible_nodes: &mut self.visible_nodes,
+            branch_visible_node_ids: &mut branch_visible_node_ids,
+            pending: vec![head_id.to_owned()],
+            visited: BTreeSet::new(),
+        }
+        .collect()
         .await?;
         self.merge_visible_node_scopes(&scope_node_ids, &branch_visible_node_ids);
         Ok(BranchGraphScope {
@@ -402,6 +408,9 @@ impl GraphBuildState {
         scope_node_ids: &BTreeSet<String>,
         visible_node_ids: &BTreeSet<String>,
     ) {
+        if self.mode == GraphMode::All {
+            return;
+        }
         for node_id in visible_node_ids {
             self.visible_node_scopes
                 .entry(node_id.clone())
@@ -463,16 +472,22 @@ impl GraphBuildState {
         node: Node,
         context_ids_by_node: &HashMap<String, Vec<String>>,
     ) -> Result<GraphNodeEntry> {
-        let scope_node_ids = self
-            .visible_node_scopes
-            .remove(&node.id)
-            .unwrap_or_default();
-        let primary_parent = self
-            .resolve_visible_parent(store, &scope_node_ids, &node.parent)
-            .await?;
-        let merge_parents = self
-            .visible_merge_parents(store, &node, &scope_node_ids, &primary_parent)
-            .await?;
+        let (primary_parent, merge_parents) = match self.mode {
+            GraphMode::All => self.all_mode_parents(&node),
+            GraphMode::Anchors => {
+                let scope_node_ids = self
+                    .visible_node_scopes
+                    .remove(&node.id)
+                    .unwrap_or_default();
+                let primary_parent = self
+                    .resolve_visible_parent(store, &scope_node_ids, &node.parent)
+                    .await?;
+                let merge_parents = self
+                    .visible_merge_parents(store, &node, &scope_node_ids, &primary_parent)
+                    .await?;
+                (primary_parent, merge_parents)
+            }
+        };
         let labels = self.labels_by_node.remove(&node.id).unwrap_or_default();
         let provider_context_ids = context_ids_by_node
             .get(&node.id)
@@ -485,6 +500,29 @@ impl GraphBuildState {
             labels,
             provider_context_ids,
         })
+    }
+
+    fn all_mode_parents(&self, node: &Node) -> (Option<String>, Vec<MergeParent>) {
+        let primary_parent = self
+            .visible_node_ids
+            .contains(&node.parent)
+            .then(|| node.parent.clone());
+        let mut merge_parents = Vec::new();
+        if let Some(anchor) = node_anchor(node) {
+            for merge_parent in anchor.merge_parents() {
+                let parent_id = merge_parent.node_id();
+                if self.visible_node_ids.contains(parent_id)
+                    && !is_duplicate_visible_merge_parent(
+                        &primary_parent,
+                        &merge_parents,
+                        parent_id,
+                    )
+                {
+                    merge_parents.push(visible_merge_parent(merge_parent, parent_id.to_owned()));
+                }
+            }
+        }
+        (primary_parent, merge_parents)
     }
 
     async fn provider_contexts<F>(
@@ -603,8 +641,23 @@ impl GraphBuildState {
 
 impl<S: NodeStore> VisibleGraphCollector<'_, S> {
     async fn collect(&mut self) -> Result<()> {
+        let started_at = Instant::now();
+        let mut last_reported_at = started_at;
         while let Some(node_id) = self.next_node_id() {
             self.visit(node_id).await?;
+            if self.visited.len().is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+                if last_reported_at.elapsed() >= Duration::from_secs(10) {
+                    tracing::info!(
+                        mode = ?self.mode,
+                        branch = self.branch,
+                        processed_nodes = self.visited.len(),
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        "console graph branch collection progress",
+                    );
+                    last_reported_at = Instant::now();
+                }
+            }
         }
         Ok(())
     }
@@ -760,29 +813,6 @@ fn is_duplicate_visible_merge_parent(
         || parents
             .iter()
             .any(|existing| existing.node_id() == parent_id)
-}
-
-async fn collect_visible_graph_nodes<S: NodeStore>(
-    store: &S,
-    head_id: &str,
-    scope_node_ids: &mut BTreeSet<String>,
-    mode: GraphMode,
-    visible_node_ids: &mut BTreeSet<String>,
-    visible_nodes: &mut HashMap<String, Node>,
-    branch_visible_node_ids: &mut BTreeSet<String>,
-) -> Result<()> {
-    VisibleGraphCollector {
-        store,
-        mode,
-        scope_node_ids,
-        visible_node_ids,
-        visible_nodes,
-        branch_visible_node_ids,
-        pending: vec![head_id.to_owned()],
-        visited: BTreeSet::new(),
-    }
-    .collect()
-    .await
 }
 
 async fn initial_graph_scope(
@@ -1178,5 +1208,36 @@ fn format_state_suffix(state: &SessionState) -> String {
             PauseReason::Merged { .. } => format!("@Paused({target_branch},merged)"),
             PauseReason::Closed => format!("@Paused({target_branch},closed)"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coco_mem::{NewNode, Role, SqliteStore};
+
+    #[tokio::test]
+    async fn all_mode_does_not_copy_branch_scope_into_each_visible_node() {
+        let store = SqliteStore::open_temporary().await.unwrap();
+        let mut parent = store.root_id();
+        for index in 0..64 {
+            parent = store
+                .append(NewNode {
+                    parent,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text(format!("node {index}")),
+                })
+                .await
+                .unwrap();
+        }
+        store.fork("main", &parent).await.unwrap();
+
+        let state = collect_graph_state(&store, GraphMode::All, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(state.visible_node_ids.len(), 64);
+        assert!(state.visible_node_scopes.is_empty());
     }
 }
