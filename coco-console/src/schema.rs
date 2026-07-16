@@ -1,5 +1,6 @@
 diesel::table! {
-    console_graph_edge_routes (mode, edge_key) {
+    console_graph_edge_routes (generation, mode, edge_key) {
+        generation -> BigInt,
         mode -> Text,
         edge_key -> Text,
         edge_kind -> Text,
@@ -21,7 +22,16 @@ diesel::table! {
 }
 
 diesel::table! {
-    console_graph_materializations (mode) {
+    console_graph_generation_state (id) {
+        id -> Integer,
+        active_generation -> BigInt,
+        next_generation -> BigInt,
+    }
+}
+
+diesel::table! {
+    console_graph_materializations (generation, mode) {
+        generation -> BigInt,
         mode -> Text,
         source_version -> BigInt,
         coordinate_space -> Text,
@@ -34,7 +44,8 @@ diesel::table! {
 }
 
 diesel::table! {
-    console_graph_node_locations (mode, node_id) {
+    console_graph_node_locations (generation, mode, node_id) {
+        generation -> BigInt,
         mode -> Text,
         node_id -> Text,
         node_key -> Text,
@@ -58,6 +69,7 @@ diesel::table! {
 
 diesel::allow_tables_to_appear_in_same_query!(
     console_graph_edge_routes,
+    console_graph_generation_state,
     console_graph_materializations,
     console_graph_node_locations,
 );

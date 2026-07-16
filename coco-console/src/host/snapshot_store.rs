@@ -29,11 +29,13 @@ use crate::layout::{
     edge_bounds, edge_key, node_bounds, node_key, try_graph_ranks, try_layout_graph_with_hints,
 };
 use crate::schema::{
-    console_graph_edge_routes, console_graph_materializations, console_graph_node_locations,
+    console_graph_edge_routes, console_graph_generation_state, console_graph_materializations,
+    console_graph_node_locations,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
 const SQLITE_POOL_MAX_SIZE: u32 = 4;
+const MATERIALIZATION_WRITE_BATCH_SIZE: usize = 128;
 const COORDINATE_SPACE: &str = "graph_layout_v2";
 const CONSOLE_GRAPH_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
@@ -96,6 +98,7 @@ struct PlannedMaterialization {
     fallback_reason: Option<&'static str>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializationWriteOutcome {
     Committed {
@@ -236,6 +239,7 @@ struct PersistedEdge {
 #[derive(Debug, Insertable, AsChangeset)]
 #[diesel(table_name = console_graph_materializations)]
 struct PersistedMaterialization<'a> {
+    generation: i64,
     mode: &'a str,
     source_version: i64,
     coordinate_space: &'a str,
@@ -306,6 +310,181 @@ impl ConsoleGraphSnapshotStore {
         .await
     }
 
+    pub(crate) async fn active_generation(&self) -> crate::Result<i64> {
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            query_active_generation(connection).context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn allocate_staging_generation(&self) -> crate::Result<i64> {
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            connection
+                .transaction::<_, diesel::result::Error, _>(|connection| {
+                    let generation = console_graph_generation_state::table
+                        .filter(console_graph_generation_state::id.eq(1))
+                        .select(console_graph_generation_state::next_generation)
+                        .first::<i64>(connection)?;
+                    diesel::update(
+                        console_graph_generation_state::table
+                            .filter(console_graph_generation_state::id.eq(1)),
+                    )
+                    .set(
+                        console_graph_generation_state::next_generation
+                            .eq(generation.saturating_add(1)),
+                    )
+                    .execute(connection)?;
+                    Ok(generation)
+                })
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn prune_inactive_generations(&self) -> crate::Result<()> {
+        let active_generation = self.active_generation().await?;
+        loop {
+            let path = self.path.as_ref().clone();
+            let deleted = self
+                .with_connection(move |connection| {
+                    connection
+                        .transaction::<_, diesel::result::Error, _>(|connection| {
+                            let keys = console_graph_node_locations::table
+                                .filter(
+                                    console_graph_node_locations::generation.ne(active_generation),
+                                )
+                                .select((
+                                    console_graph_node_locations::generation,
+                                    console_graph_node_locations::mode,
+                                    console_graph_node_locations::node_id,
+                                ))
+                                .limit(MATERIALIZATION_WRITE_BATCH_SIZE as i64)
+                                .load::<(i64, String, String)>(connection)?;
+                            for (generation, mode, node_id) in &keys {
+                                diesel::delete(
+                                    console_graph_node_locations::table
+                                        .filter(
+                                            console_graph_node_locations::generation.eq(generation),
+                                        )
+                                        .filter(console_graph_node_locations::mode.eq(mode))
+                                        .filter(console_graph_node_locations::node_id.eq(node_id)),
+                                )
+                                .execute(connection)?;
+                            }
+                            Ok(keys.len())
+                        })
+                        .context(QueryGraphSnapshotStoreSnafu { path })
+                })
+                .await?;
+            if deleted == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        loop {
+            let path = self.path.as_ref().clone();
+            let deleted = self
+                .with_connection(move |connection| {
+                    connection
+                        .transaction::<_, diesel::result::Error, _>(|connection| {
+                            let keys = console_graph_edge_routes::table
+                                .filter(console_graph_edge_routes::generation.ne(active_generation))
+                                .select((
+                                    console_graph_edge_routes::generation,
+                                    console_graph_edge_routes::mode,
+                                    console_graph_edge_routes::edge_key,
+                                ))
+                                .limit(MATERIALIZATION_WRITE_BATCH_SIZE as i64)
+                                .load::<(i64, String, String)>(connection)?;
+                            for (generation, mode, edge_key) in &keys {
+                                diesel::delete(
+                                    console_graph_edge_routes::table
+                                        .filter(
+                                            console_graph_edge_routes::generation.eq(generation),
+                                        )
+                                        .filter(console_graph_edge_routes::mode.eq(mode))
+                                        .filter(console_graph_edge_routes::edge_key.eq(edge_key)),
+                                )
+                                .execute(connection)?;
+                            }
+                            Ok(keys.len())
+                        })
+                        .context(QueryGraphSnapshotStoreSnafu { path })
+                })
+                .await?;
+            if deleted == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            diesel::delete(
+                console_graph_materializations::table
+                    .filter(console_graph_materializations::generation.ne(active_generation)),
+            )
+            .execute(connection)
+            .map(|_| ())
+            .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn activate_generation(
+        &self,
+        generation: i64,
+        source_version: u64,
+    ) -> crate::Result<()> {
+        let path = self.path.as_ref().clone();
+        let expected_version = source_version.min(i64::MAX as u64) as i64;
+        let complete = self
+            .with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        let modes = console_graph_materializations::table
+                            .filter(console_graph_materializations::generation.eq(generation))
+                            .filter(
+                                console_graph_materializations::source_version.eq(expected_version),
+                            )
+                            .filter(
+                                console_graph_materializations::coordinate_space
+                                    .eq(COORDINATE_SPACE),
+                            )
+                            .select(console_graph_materializations::mode)
+                            .load::<String>(connection)?;
+                        let complete = modes.into_iter().collect::<BTreeSet<_>>()
+                            == BTreeSet::from([
+                                GraphMode::Anchors.as_query_value().to_owned(),
+                                GraphMode::All.as_query_value().to_owned(),
+                            ]);
+                        if !complete {
+                            return Ok(false);
+                        }
+                        diesel::update(
+                            console_graph_generation_state::table
+                                .filter(console_graph_generation_state::id.eq(1)),
+                        )
+                        .set(console_graph_generation_state::active_generation.eq(generation))
+                        .execute(connection)?;
+                        Ok(true)
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await?;
+        ensure!(
+            complete,
+            InvalidGraphSnapshotStoreValueSnafu {
+                column: "generation",
+                value: format!(
+                    "{generation} does not contain both graph modes for source version {source_version}"
+                ),
+            }
+        );
+        Ok(())
+    }
+
     pub async fn latest_materialization_version(
         &self,
         mode: GraphMode,
@@ -322,8 +501,11 @@ impl ConsoleGraphSnapshotStore {
     ) -> crate::Result<Option<MaterializationRow>> {
         let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
-            query_materialization_row(connection, mode)
-                .context(QueryGraphSnapshotStoreSnafu { path })
+            read_snapshot(connection, |connection| {
+                let generation = query_active_generation(connection)?;
+                query_materialization_row_for_generation(connection, generation, mode)
+            })
+            .context(QueryGraphSnapshotStoreSnafu { path })
         })
         .await
     }
@@ -332,9 +514,38 @@ impl ConsoleGraphSnapshotStore {
         Ok(self.latest_materialization_version(mode).await?.is_some())
     }
 
+    #[cfg(test)]
     pub async fn materialize_snapshot(&self, snapshot: &GraphSnapshot) -> crate::Result<()> {
+        let generation = self.active_generation().await?;
+        self.materialize_snapshot_in_generation(snapshot, generation)
+            .await
+    }
+
+    pub(crate) async fn materialize_checkpoint(
+        &self,
+        snapshot: &GraphSnapshot,
+        baseline_generation: i64,
+        generation: i64,
+    ) -> crate::Result<()> {
         let layout_started = Instant::now();
-        let previous = self.load_stored_graph(snapshot.mode).await?;
+        let previous = self
+            .load_stored_graph_for_generation(baseline_generation, snapshot.mode)
+            .await?;
+        let plan = plan_materialization(snapshot, &previous, self.policy)?;
+        self.write_checkpoint(snapshot, generation, plan, layout_started)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn materialize_snapshot_in_generation(
+        &self,
+        snapshot: &GraphSnapshot,
+        generation: i64,
+    ) -> crate::Result<()> {
+        let layout_started = Instant::now();
+        let previous = self
+            .load_stored_graph_for_generation(generation, snapshot.mode)
+            .await?;
         let plan = plan_materialization(snapshot, &previous, self.policy)?;
         let layout_duration = layout_started.elapsed();
         let node_count = plan.layout.nodes.len();
@@ -354,7 +565,7 @@ impl ConsoleGraphSnapshotStore {
 
         let write_started = Instant::now();
         let outcome = self
-            .write_materialization(snapshot.version, snapshot.mode, plan, previous)
+            .write_materialization(generation, snapshot.version, snapshot.mode, plan, previous)
             .await?;
         match outcome {
             MaterializationWriteOutcome::Committed {
@@ -384,6 +595,96 @@ impl ConsoleGraphSnapshotStore {
                 );
             }
         }
+        Ok(())
+    }
+
+    async fn write_checkpoint(
+        &self,
+        snapshot: &GraphSnapshot,
+        generation: i64,
+        plan: PlannedMaterialization,
+        layout_started: Instant,
+    ) -> crate::Result<()> {
+        let node_count = plan.layout.nodes.len();
+        let edge_count = plan.layout.edges.len();
+        tracing::info!(
+            mode = ?snapshot.mode,
+            source_version = snapshot.version,
+            generation,
+            strategy = plan.strategy.as_str(),
+            node_count,
+            edge_count,
+            affected_nodes = plan.affected_nodes,
+            affected_ranks = plan.affected_ranks,
+            layout_duration_ms = layout_started.elapsed().as_millis(),
+            fallback_reason = plan.fallback_reason.unwrap_or("none"),
+            "console graph checkpoint layout planned",
+        );
+
+        let width = plan.layout.width;
+        let height = plan.layout.height;
+        let nodes = plan
+            .layout
+            .nodes
+            .iter()
+            .map(PersistedNode::try_from)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let edges = plan
+            .layout
+            .edges
+            .iter()
+            .map(PersistedEdge::from)
+            .collect::<Vec<_>>();
+        let write_started = Instant::now();
+        let mode = snapshot.mode;
+        for batch in nodes.chunks(MATERIALIZATION_WRITE_BATCH_SIZE) {
+            let batch = batch.to_vec();
+            let path = self.path.as_ref().clone();
+            self.with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        for node in &batch {
+                            upsert_node(connection, generation, mode, node)?;
+                        }
+                        Ok(())
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await?;
+            tokio::task::yield_now().await;
+        }
+        for batch in edges.chunks(MATERIALIZATION_WRITE_BATCH_SIZE) {
+            let batch = batch.to_vec();
+            let path = self.path.as_ref().clone();
+            self.with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        for edge in &batch {
+                            upsert_edge(connection, generation, mode, edge)?;
+                        }
+                        Ok(())
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await?;
+            tokio::task::yield_now().await;
+        }
+        let path = self.path.as_ref().clone();
+        let source_version = snapshot.version;
+        self.with_connection(move |connection| {
+            upsert_materialization(connection, generation, mode, source_version, width, height)
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await?;
+        tracing::info!(
+            mode = ?snapshot.mode,
+            source_version = snapshot.version,
+            generation,
+            node_count,
+            edge_count,
+            write_duration_ms = write_started.elapsed().as_millis(),
+            "console graph checkpoint committed",
+        );
         Ok(())
     }
 
@@ -440,24 +741,28 @@ impl ConsoleGraphSnapshotStore {
         let this = self.clone();
         let target = target.to_owned();
         self.with_connection(move |connection| {
-            let row = console_graph_node_locations::table
-                .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
-                .filter(
-                    console_graph_node_locations::node_target
-                        .eq(&target)
-                        .or(console_graph_node_locations::node_id.eq(&target))
-                        .or(console_graph_node_locations::node_key.eq(&target)),
-                )
-                .order(console_graph_node_locations::node_id)
-                .select((
-                    console_graph_node_locations::node_id,
-                    console_graph_node_locations::labels_json,
-                ))
-                .first::<(String, String)>(connection)
-                .optional()
-                .context(QueryGraphSnapshotStoreSnafu {
-                    path: this.path.as_ref().clone(),
-                })?;
+            let row = read_snapshot(connection, |connection| {
+                let generation = query_active_generation(connection)?;
+                console_graph_node_locations::table
+                    .filter(console_graph_node_locations::generation.eq(generation))
+                    .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+                    .filter(
+                        console_graph_node_locations::node_target
+                            .eq(&target)
+                            .or(console_graph_node_locations::node_id.eq(&target))
+                            .or(console_graph_node_locations::node_key.eq(&target)),
+                    )
+                    .order(console_graph_node_locations::node_id)
+                    .select((
+                        console_graph_node_locations::node_id,
+                        console_graph_node_locations::labels_json,
+                    ))
+                    .first::<(String, String)>(connection)
+                    .optional()
+            })
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: this.path.as_ref().clone(),
+            })?;
             row.map(|(node_id, labels_json)| {
                 Ok(MaterializedNodeReference {
                     node_id,
@@ -480,18 +785,22 @@ impl ConsoleGraphSnapshotStore {
             if node_ids.is_empty() {
                 return Ok(BTreeMap::new());
             }
-            let rows = console_graph_node_locations::table
-                .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
-                .filter(console_graph_node_locations::node_id.eq_any(&node_ids))
-                .select((
-                    console_graph_node_locations::node_id,
-                    console_graph_node_locations::x,
-                    console_graph_node_locations::y,
-                ))
-                .load::<(String, i32, i32)>(connection)
-                .context(QueryGraphSnapshotStoreSnafu {
-                    path: this.path.as_ref().clone(),
-                })?;
+            let rows = read_snapshot(connection, |connection| {
+                let generation = query_active_generation(connection)?;
+                console_graph_node_locations::table
+                    .filter(console_graph_node_locations::generation.eq(generation))
+                    .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+                    .filter(console_graph_node_locations::node_id.eq_any(&node_ids))
+                    .select((
+                        console_graph_node_locations::node_id,
+                        console_graph_node_locations::x,
+                        console_graph_node_locations::y,
+                    ))
+                    .load::<(String, i32, i32)>(connection)
+            })
+            .context(QueryGraphSnapshotStoreSnafu {
+                path: this.path.as_ref().clone(),
+            })?;
             Ok(rows
                 .into_iter()
                 .map(|(node_id, x, y)| (node_id, Point { x, y }))
@@ -535,16 +844,28 @@ impl ConsoleGraphSnapshotStore {
         .await
     }
 
+    #[cfg(test)]
     async fn load_stored_graph(&self, mode: GraphMode) -> crate::Result<StoredGraph> {
+        let generation = self.active_generation().await?;
+        self.load_stored_graph_for_generation(generation, mode)
+            .await
+    }
+
+    async fn load_stored_graph_for_generation(
+        &self,
+        generation: i64,
+        mode: GraphMode,
+    ) -> crate::Result<StoredGraph> {
         let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
             read_snapshot(connection, |connection| {
-                let materialization = query_materialization_row(connection, mode)?;
-                let nodes = query_nodes(connection, mode)?
+                let materialization =
+                    query_materialization_row_for_generation(connection, generation, mode)?;
+                let nodes = query_nodes_for_generation(connection, generation, mode)?
                     .into_iter()
                     .map(|row| (row.node_id.clone(), row))
                     .collect();
-                let edges = query_edges(connection, mode)?
+                let edges = query_edges_for_generation(connection, generation, mode)?
                     .into_iter()
                     .map(|row| (row.edge_key.clone(), row))
                     .collect();
@@ -559,8 +880,10 @@ impl ConsoleGraphSnapshotStore {
         .await
     }
 
+    #[cfg(test)]
     async fn write_materialization(
         &self,
+        generation: i64,
         source_version: u64,
         mode: GraphMode,
         plan: PlannedMaterialization,
@@ -590,6 +913,7 @@ impl ConsoleGraphSnapshotStore {
             connection
                 .transaction::<_, diesel::result::Error, _>(|connection| {
                     let current_version = console_graph_materializations::table
+                        .filter(console_graph_materializations::generation.eq(generation))
                         .filter(console_graph_materializations::mode.eq(mode.as_query_value()))
                         .filter(
                             console_graph_materializations::coordinate_space.eq(COORDINATE_SPACE),
@@ -612,17 +936,26 @@ impl ConsoleGraphSnapshotStore {
                         strategy
                     };
                     if effective_strategy == MaterializationStrategy::Full {
-                        delete_mode_rows(connection, mode)?;
+                        delete_mode_rows(connection, generation, mode)?;
                         for node in &nodes {
-                            upsert_node(connection, mode, node)?;
+                            upsert_node(connection, generation, mode, node)?;
                         }
                         for edge in &edges {
-                            upsert_edge(connection, mode, edge)?;
+                            upsert_edge(connection, generation, mode, edge)?;
                         }
                     } else {
-                        write_changed_rows(connection, mode, &previous, &nodes, &edges)?;
+                        write_changed_rows(
+                            connection, generation, mode, &previous, &nodes, &edges,
+                        )?;
                     }
-                    upsert_materialization(connection, mode, source_version, width, height)?;
+                    upsert_materialization(
+                        connection,
+                        generation,
+                        mode,
+                        source_version,
+                        width,
+                        height,
+                    )?;
                     Ok(MaterializationWriteOutcome::Committed {
                         strategy: effective_strategy,
                         fallback_reason: baseline_changed
@@ -642,11 +975,29 @@ fn read_snapshot<T>(
     connection.transaction(operation)
 }
 
+fn query_active_generation(connection: &mut SqliteConnection) -> QueryResult<i64> {
+    console_graph_generation_state::table
+        .filter(console_graph_generation_state::id.eq(1))
+        .select(console_graph_generation_state::active_generation)
+        .first(connection)
+}
+
+#[cfg(test)]
 fn query_materialization_row(
     connection: &mut SqliteConnection,
     mode: GraphMode,
 ) -> QueryResult<Option<MaterializationRow>> {
+    let generation = query_active_generation(connection)?;
+    query_materialization_row_for_generation(connection, generation, mode)
+}
+
+fn query_materialization_row_for_generation(
+    connection: &mut SqliteConnection,
+    generation: i64,
+    mode: GraphMode,
+) -> QueryResult<Option<MaterializationRow>> {
     console_graph_materializations::table
+        .filter(console_graph_materializations::generation.eq(generation))
         .filter(console_graph_materializations::mode.eq(mode.as_query_value()))
         .filter(console_graph_materializations::coordinate_space.eq(COORDINATE_SPACE))
         .select(MaterializationRow::as_select())
@@ -654,22 +1005,26 @@ fn query_materialization_row(
         .optional()
 }
 
-fn query_nodes(
+fn query_nodes_for_generation(
     connection: &mut SqliteConnection,
+    generation: i64,
     mode: GraphMode,
 ) -> QueryResult<Vec<StoredNodeRow>> {
     console_graph_node_locations::table
+        .filter(console_graph_node_locations::generation.eq(generation))
         .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
         .order(console_graph_node_locations::node_id)
         .select(StoredNodeRow::as_select())
         .load(connection)
 }
 
-fn query_edges(
+fn query_edges_for_generation(
     connection: &mut SqliteConnection,
+    generation: i64,
     mode: GraphMode,
 ) -> QueryResult<Vec<StoredEdgeRow>> {
     console_graph_edge_routes::table
+        .filter(console_graph_edge_routes::generation.eq(generation))
         .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
         .order(console_graph_edge_routes::edge_key)
         .select(StoredEdgeRow::as_select())
@@ -681,7 +1036,10 @@ fn query_viewport(
     mode: GraphMode,
     request: GraphViewportRequest,
 ) -> QueryResult<Option<StoredViewport>> {
-    let Some(materialization) = query_materialization_row(connection, mode)? else {
+    let generation = query_active_generation(connection)?;
+    let Some(materialization) =
+        query_materialization_row_for_generation(connection, generation, mode)?
+    else {
         return Ok(None);
     };
     let request = request.normalized();
@@ -696,6 +1054,7 @@ fn query_viewport(
         .saturating_add(request.height)
         .saturating_add(request.overscan);
     let nodes = console_graph_node_locations::table
+        .filter(console_graph_node_locations::generation.eq(generation))
         .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
         .filter(console_graph_node_locations::min_x.le(right))
         .filter(console_graph_node_locations::max_x.ge(left))
@@ -709,6 +1068,7 @@ fn query_viewport(
         .select(StoredNodeRow::as_select())
         .load(connection)?;
     let edges = console_graph_edge_routes::table
+        .filter(console_graph_edge_routes::generation.eq(generation))
         .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
         .filter(console_graph_edge_routes::min_x.le(right))
         .filter(console_graph_edge_routes::max_x.ge(left))
@@ -729,11 +1089,15 @@ fn query_shell_facts(
     connection: &mut SqliteConnection,
     mode: GraphMode,
 ) -> QueryResult<Option<StoredShellFacts>> {
-    let Some(materialization) = query_materialization_row(connection, mode)? else {
+    let generation = query_active_generation(connection)?;
+    let Some(materialization) =
+        query_materialization_row_for_generation(connection, generation, mode)?
+    else {
         return Ok(None);
     };
-    let nodes = query_nodes(connection, mode)?;
+    let nodes = query_nodes_for_generation(connection, generation, mode)?;
     let edge_count = console_graph_edge_routes::table
+        .filter(console_graph_edge_routes::generation.eq(generation))
         .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
         .count()
         .get_result(connection)?;
@@ -1058,8 +1422,10 @@ impl From<&StoredEdgeRow> for PersistedEdge {
     }
 }
 
+#[cfg(test)]
 fn write_changed_rows(
     connection: &mut SqliteConnection,
+    generation: i64,
     mode: GraphMode,
     previous: &StoredGraph,
     nodes: &[PersistedNode],
@@ -1073,6 +1439,7 @@ fn write_changed_rows(
         if !next_nodes.contains_key(node_id.as_str()) {
             diesel::delete(
                 console_graph_node_locations::table
+                    .filter(console_graph_node_locations::generation.eq(generation))
                     .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
                     .filter(console_graph_node_locations::node_id.eq(node_id)),
             )
@@ -1085,7 +1452,7 @@ fn write_changed_rows(
             .get(&node.node_id)
             .is_none_or(|stored| PersistedNode::from(stored) != *node)
         {
-            upsert_node(connection, mode, node)?;
+            upsert_node(connection, generation, mode, node)?;
         }
     }
 
@@ -1097,6 +1464,7 @@ fn write_changed_rows(
         if !next_edges.contains_key(edge_key.as_str()) {
             diesel::delete(
                 console_graph_edge_routes::table
+                    .filter(console_graph_edge_routes::generation.eq(generation))
                     .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
                     .filter(console_graph_edge_routes::edge_key.eq(edge_key)),
             )
@@ -1109,20 +1477,27 @@ fn write_changed_rows(
             .get(&edge.edge_key)
             .is_none_or(|stored| PersistedEdge::from(stored) != *edge)
         {
-            upsert_edge(connection, mode, edge)?;
+            upsert_edge(connection, generation, mode, edge)?;
         }
     }
     Ok(())
 }
 
-fn delete_mode_rows(connection: &mut SqliteConnection, mode: GraphMode) -> QueryResult<()> {
+#[cfg(test)]
+fn delete_mode_rows(
+    connection: &mut SqliteConnection,
+    generation: i64,
+    mode: GraphMode,
+) -> QueryResult<()> {
     diesel::delete(
         console_graph_edge_routes::table
+            .filter(console_graph_edge_routes::generation.eq(generation))
             .filter(console_graph_edge_routes::mode.eq(mode.as_query_value())),
     )
     .execute(connection)?;
     diesel::delete(
         console_graph_node_locations::table
+            .filter(console_graph_node_locations::generation.eq(generation))
             .filter(console_graph_node_locations::mode.eq(mode.as_query_value())),
     )
     .execute(connection)?;
@@ -1131,15 +1506,18 @@ fn delete_mode_rows(connection: &mut SqliteConnection, mode: GraphMode) -> Query
 
 fn upsert_node(
     connection: &mut SqliteConnection,
+    generation: i64,
     mode: GraphMode,
     node: &PersistedNode,
 ) -> QueryResult<()> {
     diesel::insert_into(console_graph_node_locations::table)
         .values((
+            console_graph_node_locations::generation.eq(generation),
             console_graph_node_locations::mode.eq(mode.as_query_value()),
             node,
         ))
         .on_conflict((
+            console_graph_node_locations::generation,
             console_graph_node_locations::mode,
             console_graph_node_locations::node_id,
         ))
@@ -1151,15 +1529,18 @@ fn upsert_node(
 
 fn upsert_edge(
     connection: &mut SqliteConnection,
+    generation: i64,
     mode: GraphMode,
     edge: &PersistedEdge,
 ) -> QueryResult<()> {
     diesel::insert_into(console_graph_edge_routes::table)
         .values((
+            console_graph_edge_routes::generation.eq(generation),
             console_graph_edge_routes::mode.eq(mode.as_query_value()),
             edge,
         ))
         .on_conflict((
+            console_graph_edge_routes::generation,
             console_graph_edge_routes::mode,
             console_graph_edge_routes::edge_key,
         ))
@@ -1171,12 +1552,14 @@ fn upsert_edge(
 
 fn upsert_materialization(
     connection: &mut SqliteConnection,
+    generation: i64,
     mode: GraphMode,
     source_version: u64,
     width: i32,
     height: i32,
 ) -> QueryResult<()> {
     let materialization = PersistedMaterialization {
+        generation,
         mode: mode.as_query_value(),
         source_version: source_version.min(i64::MAX as u64) as i64,
         coordinate_space: COORDINATE_SPACE,
@@ -1188,7 +1571,10 @@ fn upsert_materialization(
     };
     diesel::insert_into(console_graph_materializations::table)
         .values(&materialization)
-        .on_conflict(console_graph_materializations::mode)
+        .on_conflict((
+            console_graph_materializations::generation,
+            console_graph_materializations::mode,
+        ))
         .do_update()
         .set(&materialization)
         .execute(connection)
@@ -1441,15 +1827,17 @@ mod tests {
             .map(PersistedEdge::from)
             .collect::<Vec<_>>();
         connection.transaction(|connection| {
-            delete_mode_rows(connection, snapshot.mode)?;
+            let generation = query_active_generation(connection)?;
+            delete_mode_rows(connection, generation, snapshot.mode)?;
             for node in &nodes {
-                upsert_node(connection, snapshot.mode, node)?;
+                upsert_node(connection, generation, snapshot.mode, node)?;
             }
             for edge in &edges {
-                upsert_edge(connection, snapshot.mode, edge)?;
+                upsert_edge(connection, generation, snapshot.mode, edge)?;
             }
             upsert_materialization(
                 connection,
+                generation,
                 snapshot.mode,
                 snapshot.version,
                 layout.width,
@@ -1765,6 +2153,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_generation_is_invisible_until_both_modes_are_activated() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::Anchors, 2))
+            .await
+            .unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::All, 2))
+            .await
+            .unwrap();
+
+        let baseline_generation = store.active_generation().await.unwrap();
+        let generation = store.allocate_staging_generation().await.unwrap();
+        store
+            .materialize_checkpoint(
+                &linear_snapshot(2, GraphMode::Anchors, 3),
+                baseline_generation,
+                generation,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_checkpoint(
+                &linear_snapshot(2, GraphMode::All, 3),
+                baseline_generation,
+                generation,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.active_generation().await.unwrap(),
+            baseline_generation
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::Anchors)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        store.activate_generation(generation, 2).await.unwrap();
+
+        assert_eq!(store.active_generation().await.unwrap(), generation);
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::Anchors)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_checkpoint_generation_cannot_be_activated() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::Anchors, 2))
+            .await
+            .unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::All, 2))
+            .await
+            .unwrap();
+
+        let baseline_generation = store.active_generation().await.unwrap();
+        let generation = store.allocate_staging_generation().await.unwrap();
+        store
+            .materialize_checkpoint(
+                &linear_snapshot(2, GraphMode::All, 3),
+                baseline_generation,
+                generation,
+            )
+            .await
+            .unwrap();
+
+        let error = store.activate_generation(generation, 2).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::InvalidGraphSnapshotStoreValue { .. }
+        ));
+        assert_eq!(
+            store.active_generation().await.unwrap(),
+            baseline_generation
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::Anchors)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_rebuild_does_not_replace_newer_materialization() {
         let dir = temp_dir();
         let store = ConsoleGraphSnapshotStore::open_with_policy(&dir, local_policy(10))
@@ -1786,7 +2296,13 @@ mod tests {
         store.materialize_snapshot(&newer).await.unwrap();
 
         let outcome = store
-            .write_materialization(stale.version, stale.mode, stale_plan, previous)
+            .write_materialization(
+                store.active_generation().await.unwrap(),
+                stale.version,
+                stale.mode,
+                stale_plan,
+                previous,
+            )
             .await
             .unwrap();
 
@@ -1821,7 +2337,13 @@ mod tests {
             .await
             .unwrap();
         let outcome = store
-            .write_materialization(target.version, target.mode, target_plan, previous)
+            .write_materialization(
+                store.active_generation().await.unwrap(),
+                target.version,
+                target.mode,
+                target_plan,
+                previous,
+            )
             .await
             .unwrap();
 
@@ -1938,6 +2460,63 @@ mod tests {
         assert_eq!(nodes, 0);
         assert_eq!(legacy_node_columns.count, 0);
         assert_eq!(bezier_columns.count, 4);
+    }
+
+    #[test]
+    fn v3_migration_preserves_v2_materializations_in_generation_zero() {
+        let mut connection = SqliteConnection::establish(":memory:").unwrap();
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000001_initial_console_graph_schema/up.sql"
+            ))
+            .unwrap();
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000002_unique_dag_layout/up.sql"
+            ))
+            .unwrap();
+        connection
+            .batch_execute(
+                "INSERT INTO console_graph_materializations \
+                 (mode, source_version, coordinate_space, world_min_x, world_min_y, world_max_x, world_max_y) \
+                 VALUES ('all', 7, 'graph_layout_v2', 0, 0, 100, 100); \
+                 INSERT INTO console_graph_node_locations \
+                 (mode, node_id, node_key, node_target, short_id, node_kind, summary, labels_json, \
+                  rank, sort_order, x, y, created_at, created_at_ns, min_x, min_y, max_x, max_y) \
+                 VALUES ('all', 'node-1', 'node:node-1', 'detail-node-1', 'node-1', 'text', \
+                         'node-1', '[]', 0, 0, 1, 2, 'time-1', 1, 0, 1, 2, 3);",
+            )
+            .unwrap();
+
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000003_materialization_generations/up.sql"
+            ))
+            .unwrap();
+
+        assert_eq!(query_active_generation(&mut connection).unwrap(), 0);
+        assert_eq!(
+            console_graph_generation_state::table
+                .select(console_graph_generation_state::next_generation)
+                .first::<i64>(&mut connection)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            query_materialization_row_for_generation(&mut connection, 0, GraphMode::All)
+                .unwrap()
+                .unwrap()
+                .source_version,
+            7
+        );
+        assert_eq!(
+            console_graph_node_locations::table
+                .filter(console_graph_node_locations::generation.eq(0))
+                .count()
+                .get_result::<i64>(&mut connection)
+                .unwrap(),
+            1
+        );
     }
 
     fn temp_dir() -> PathBuf {

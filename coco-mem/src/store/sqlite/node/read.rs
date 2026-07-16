@@ -550,7 +550,7 @@ fn node_tool_result_slice<'a>(
     rows.get(node_id).map(Vec::as_slice).unwrap_or_default()
 }
 
-async fn node_rows_into_nodes(
+pub(super) async fn node_rows_into_nodes(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     rows: Vec<NodeRow>,
@@ -631,6 +631,66 @@ async fn node_rows_into_nodes(
             )
         })
         .collect()
+}
+
+pub async fn load_nodes_by_exact_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    ids: &[String],
+) -> Result<Vec<Node>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = nodes::table
+        .filter(nodes::id.eq_any(ids))
+        .select(node_row_columns!())
+        .load::<NodeRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    ensure!(
+        rows.len() == ids.len(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "SQLite graph batch requested {} nodes but returned {}",
+                ids.len(),
+                rows.len()
+            ),
+        }
+    );
+    node_rows_into_nodes(connection, path, rows).await
+}
+
+pub async fn load_child_ids_by_parent_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent_ids: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    if parent_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = node_relations::table
+        .filter(node_relations::parent_node_id.eq_any(parent_ids))
+        .select((
+            node_relations::parent_node_id,
+            node_relations::child_node_id,
+        ))
+        .order((
+            node_relations::parent_node_id,
+            node_relations::child_node_id,
+        ))
+        .load::<(String, String)>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    let mut children = HashMap::<String, Vec<String>>::new();
+    for (parent_id, child_id) in rows {
+        children.entry(parent_id).or_default().push(child_id);
+    }
+    Ok(children)
 }
 
 pub async fn load_node_by_exact_id(

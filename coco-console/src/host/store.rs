@@ -30,9 +30,24 @@ impl<S> ConsoleStore<S> {
         &self.publisher
     }
 
-    fn notify_if_ok<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
+    fn notify_branch_if_ok<T>(
+        &self,
+        branch: impl Into<String>,
+        result: StoreResult<T>,
+    ) -> StoreResult<T> {
         if result.is_ok() {
-            self.publisher.mark_changed();
+            self.publisher.mark_branch_changed(branch);
+        }
+        result
+    }
+
+    fn notify_branches_if_ok<T>(
+        &self,
+        branches: impl IntoIterator<Item = String>,
+        result: StoreResult<T>,
+    ) -> StoreResult<T> {
+        if result.is_ok() {
+            self.publisher.mark_branches_changed(branches);
         }
         result
     }
@@ -48,8 +63,7 @@ where
     }
 
     async fn append(&self, node: NewNode) -> StoreResult<String> {
-        let result = self.inner.append(node).await;
-        self.notify_if_ok(result)
+        self.inner.append(node).await
     }
 
     async fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
@@ -75,7 +89,7 @@ where
     S: BranchStore + Sync,
 {
     async fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.fork(name, from_ref).await)
+        self.notify_branch_if_ok(name, self.inner.fork(name, from_ref).await)
     }
 
     async fn get_branch_head(&self, name: &str) -> StoreResult<String> {
@@ -83,7 +97,7 @@ where
     }
 
     async fn delete_branch(&self, name: &str) -> StoreResult<()> {
-        self.notify_if_ok(self.inner.delete_branch(name).await)
+        self.notify_branch_if_ok(name, self.inner.delete_branch(name).await)
     }
 
     async fn set_branch_head(
@@ -92,7 +106,8 @@ where
         expected_old_head: &str,
         new_head: &str,
     ) -> StoreResult<()> {
-        self.notify_if_ok(
+        self.notify_branch_if_ok(
+            name,
             self.inner
                 .set_branch_head(name, expected_old_head, new_head)
                 .await,
@@ -106,7 +121,8 @@ where
         parent: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_if_ok(
+        self.notify_branch_if_ok(
+            name,
             self.inner
                 .append_nodes_and_set_branch_head(name, expected_old_head, parent, nodes)
                 .await,
@@ -121,7 +137,8 @@ where
         new_head: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_if_ok(
+        self.notify_branch_if_ok(
+            name,
             self.inner
                 .append_nodes_and_set_branch_head_to(
                     name,
@@ -138,7 +155,9 @@ where
         &self,
         update: BranchAppendSessionState,
     ) -> StoreResult<String> {
-        self.notify_if_ok(
+        let branches = [update.branch.clone(), update.session_branch.clone()];
+        self.notify_branches_if_ok(
+            branches,
             self.inner
                 .append_nodes_and_set_branch_head_with_session_state(update)
                 .await,
@@ -165,11 +184,14 @@ where
         expected: Option<&SessionState>,
         next: SessionState,
     ) -> StoreResult<SessionState> {
-        self.notify_if_ok(self.inner.set_session_state(name, expected, next).await)
+        self.notify_branch_if_ok(
+            name,
+            self.inner.set_session_state(name, expected, next).await,
+        )
     }
 
     async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.rebase_session(name, patch).await)
+        self.notify_branch_if_ok(name, self.inner.rebase_session(name, patch).await)
     }
 
     async fn handoff_session(
@@ -178,7 +200,7 @@ where
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> StoreResult<String> {
-        self.notify_if_ok(self.inner.handoff_session(name, patch, prompt).await)
+        self.notify_branch_if_ok(name, self.inner.handoff_session(name, patch, prompt).await)
     }
 }
 
@@ -196,15 +218,15 @@ where
     }
 
     async fn set_preset(&self, name: &str, config: Preset) -> StoreResult<PresetRecord> {
-        self.notify_if_ok(self.inner.set_preset(name, config).await)
+        self.inner.set_preset(name, config).await
     }
 
     async fn rollback_preset(&self, name: &str, target_version: u64) -> StoreResult<PresetRecord> {
-        self.notify_if_ok(self.inner.rollback_preset(name, target_version).await)
+        self.inner.rollback_preset(name, target_version).await
     }
 
     async fn delete_preset(&self, name: &str) -> StoreResult<()> {
-        self.notify_if_ok(self.inner.delete_preset(name).await)
+        self.inner.delete_preset(name).await
     }
 }
 
@@ -227,7 +249,7 @@ where
         name: &str,
         spec: SkillVersionSpec,
     ) -> StoreResult<SkillRecord> {
-        self.notify_if_ok(self.inner.add_skill(role, name, spec).await)
+        self.inner.add_skill(role, name, spec).await
     }
 
     async fn update_skill(
@@ -236,7 +258,7 @@ where
         name: &str,
         patch: &SkillUpdatePatch,
     ) -> StoreResult<SkillRecord> {
-        self.notify_if_ok(self.inner.update_skill(role, name, patch).await)
+        self.inner.update_skill(role, name, patch).await
     }
 
     async fn rollback_skill(
@@ -245,7 +267,7 @@ where
         name: &str,
         target_version: u64,
     ) -> StoreResult<SkillRecord> {
-        self.notify_if_ok(self.inner.rollback_skill(role, name, target_version).await)
+        self.inner.rollback_skill(role, name, target_version).await
     }
 }
 
@@ -255,7 +277,7 @@ where
     S: JobStore + Sync,
 {
     async fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job> {
-        self.notify_if_ok(self.inner.submit_job(branch, base).await)
+        self.inner.submit_job(branch, base).await
     }
 
     async fn submit_job_with_prompt_base(
@@ -265,15 +287,13 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job> {
-        self.notify_if_ok(
-            self.inner
-                .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
-                .await,
-        )
+        self.inner
+            .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
+            .await
     }
 
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
-        self.notify_if_ok(self.inner.submit_job_with_id(job_id, branch, base).await)
+        self.inner.submit_job_with_id(job_id, branch, base).await
     }
 
     async fn submit_job_with_id_and_prompt_base(
@@ -284,17 +304,15 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job> {
-        self.notify_if_ok(
-            self.inner
-                .submit_job_with_id_and_prompt_base(
-                    job_id,
-                    branch,
-                    prompt,
-                    merge_parents,
-                    session_patch,
-                )
-                .await,
-        )
+        self.inner
+            .submit_job_with_id_and_prompt_base(
+                job_id,
+                branch,
+                prompt,
+                merge_parents,
+                session_patch,
+            )
+            .await
     }
 
     async fn get_job(&self, job_id: &str) -> StoreResult<Job> {
@@ -311,7 +329,7 @@ where
         expected: JobStatus,
         next: JobStatus,
     ) -> StoreResult<Job> {
-        self.notify_if_ok(self.inner.set_job_status(job_id, expected, next).await)
+        self.inner.set_job_status(job_id, expected, next).await
     }
 
     async fn set_job_work_branch(
@@ -320,11 +338,9 @@ where
         expected_work_branch: &str,
         next_work_branch: &str,
     ) -> StoreResult<Job> {
-        self.notify_if_ok(
-            self.inner
-                .set_job_work_branch(job_id, expected_work_branch, next_work_branch)
-                .await,
-        )
+        self.inner
+            .set_job_work_branch(job_id, expected_work_branch, next_work_branch)
+            .await
     }
 }
 
@@ -338,17 +354,11 @@ where
         queue: &str,
         payload: serde_json::Value,
     ) -> StoreResult<MessageQueueItem> {
-        let item = self.inner.enqueue_message(queue, payload).await?;
-        self.publisher.mark_changed();
-        Ok(item)
+        self.inner.enqueue_message(queue, payload).await
     }
 
     async fn dequeue_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
-        let item = self.inner.dequeue_message(queue).await?;
-        if item.is_some() {
-            self.publisher.mark_changed();
-        }
-        Ok(item)
+        self.inner.dequeue_message(queue).await
     }
 
     async fn peek_message(&self, queue: &str) -> StoreResult<Option<MessageQueueItem>> {
@@ -370,5 +380,43 @@ where
 {
     fn store_path(&self) -> &Path {
         self.inner.store_path()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coco_mem::{Kind, Role, SqliteStore};
+
+    #[tokio::test]
+    async fn only_visible_graph_mutations_publish_branch_invalidations() {
+        let inner = SqliteStore::open_temporary().await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(inner, publisher.clone());
+        let root = store.root_id();
+        let child = store
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("not visible yet".to_owned()),
+            })
+            .await
+            .unwrap();
+        store
+            .enqueue_message("test", serde_json::json!({"value": 1}))
+            .await
+            .unwrap();
+
+        assert_eq!(publisher.current_version(), 0);
+
+        store.fork("main", &root).await.unwrap();
+        store.submit_job("main", &root).await.unwrap();
+        store.set_branch_head("main", &root, &child).await.unwrap();
+
+        assert_eq!(publisher.current_version(), 2);
+        let invalidations = publisher.take_invalidations();
+        assert_eq!(invalidations.branches, ["main".to_owned()].into());
+        assert!(!invalidations.full);
     }
 }

@@ -115,6 +115,9 @@ pub enum StoreError {
     #[snafu(display("Store at {path:?} was opened read-only"))]
     StoreReadOnly { path: PathBuf },
 
+    #[snafu(display("SQLite graph read batch contains {actual} items; maximum is {maximum}"))]
+    GraphReadBatchTooLarge { actual: usize, maximum: usize },
+
     #[snafu(display(
         "Store at {path:?} uses the removed JSON/JSONL format; run a version that still supports migration first or choose a different COCO_STORE_PATH"
     ))]

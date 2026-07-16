@@ -15,6 +15,7 @@ mod host {
     pub mod render;
     pub mod server;
     pub mod snapshot_store;
+    pub mod source_cache;
     pub mod store;
 
     pub use config::ConsoleConfig;

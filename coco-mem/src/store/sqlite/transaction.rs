@@ -1,10 +1,8 @@
 use std::path::Path;
 
-use diesel_async::{AsyncConnection, TransactionManager};
-use snafu::{IntoError, ResultExt};
+use snafu::IntoError;
 
-use super::{AsyncSqliteConnection, SqliteTransactionError};
-use crate::StoreResult as Result;
+use super::SqliteTransactionError;
 use crate::error::{QuerySqliteStoreSnafu, StoreError};
 
 impl From<diesel::result::Error> for SqliteTransactionError {
@@ -23,37 +21,4 @@ impl SqliteTransactionError {
             Self::Operation(error) => error,
         }
     }
-}
-
-pub async fn begin_deferred_transaction(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-) -> Result<()> {
-    <AsyncSqliteConnection as AsyncConnection>::TransactionManager::begin_transaction(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
-}
-
-pub async fn commit_deferred_transaction(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-) -> Result<()> {
-    <AsyncSqliteConnection as AsyncConnection>::TransactionManager::commit_transaction(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
-}
-
-pub async fn rollback_deferred_transaction(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-) -> Result<()> {
-    <AsyncSqliteConnection as AsyncConnection>::TransactionManager::rollback_transaction(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })
 }

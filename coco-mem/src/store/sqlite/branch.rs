@@ -12,7 +12,9 @@ use super::node::{
     load_ancestry_nodes, load_node_by_exact_id, persist_node_without_transaction, resolve_ref_id,
     upsert_node_without_transaction, validate_new_node,
 };
-use super::{AsyncSqliteConnection, SqliteGraphStore, SqliteStore, SqliteTransactionError};
+use super::{
+    AsyncSqliteConnection, GraphBranchRecord, SqliteGraphStore, SqliteStore, SqliteTransactionError,
+};
 use crate::error::{
     BranchExistsSnafu, BranchHeadMovedSnafu, BranchNotFoundSnafu, CorruptedStoreSnafu,
     InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu, MissingSessionAnchorSnafu,
@@ -39,6 +41,69 @@ pub struct SessionRow {
     pub pause_reason: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub merged_anchor_id: Option<String>,
+}
+
+#[derive(Queryable)]
+struct GraphBranchRow {
+    name: String,
+    head_id: String,
+    state: String,
+    target_branch: Option<String>,
+    base_head_id: Option<String>,
+    pause_reason: Option<String>,
+    merged_anchor_id: Option<String>,
+}
+
+pub async fn load_graph_branch_records(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    names: Option<&[String]>,
+) -> Result<Vec<GraphBranchRecord>> {
+    let mut query = branches::table
+        .inner_join(sessions::table.on(sessions::branch_name.eq(branches::name)))
+        .select((
+            branches::name,
+            branches::head_id,
+            sessions::state,
+            sessions::target_branch,
+            sessions::base_head_id,
+            sessions::pause_reason,
+            sessions::merged_anchor_id,
+        ))
+        .into_boxed();
+    if let Some(names) = names {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        query = query.filter(branches::name.eq_any(names));
+    }
+    query
+        .order(branches::name)
+        .load::<GraphBranchRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .into_iter()
+        .map(|row| {
+            let (name, state) = session_row_into_state(
+                path,
+                SessionRow {
+                    branch_name: row.name,
+                    state: row.state,
+                    target_branch: row.target_branch,
+                    base_head_id: row.base_head_id,
+                    pause_reason: row.pause_reason,
+                    merged_anchor_id: row.merged_anchor_id,
+                },
+            )?;
+            Ok(GraphBranchRecord {
+                name,
+                head_id: row.head_id,
+                state,
+            })
+        })
+        .collect()
 }
 
 async fn load_session_states(
