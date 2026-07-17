@@ -578,7 +578,24 @@ impl IncrementalWorkStore {
                         .bind::<BigInt, _>(baseline_generation)
                         .get_result::<CountRow>(connection)?
                         .count;
-                        let kind = if complete_modes == 2 && removed_nodes == 0 {
+                        let missing_ports = diesel::sql_query(
+                            "SELECT COUNT(*) AS count \
+                             FROM console_graph_edge_routes AS routes \
+                             WHERE routes.generation = ? \
+                               AND NOT EXISTS ( \
+                                   SELECT 1 FROM console_graph_edge_ports AS ports \
+                                   WHERE ports.generation = routes.generation \
+                                     AND ports.mode = routes.mode \
+                                     AND ports.edge_key = routes.edge_key \
+                               )",
+                        )
+                        .bind::<BigInt, _>(baseline_generation)
+                        .get_result::<CountRow>(connection)?
+                        .count;
+                        let kind = if complete_modes == 2
+                            && removed_nodes == 0
+                            && missing_ports == 0
+                        {
                             IncrementalBuildKind::Append
                         } else {
                             IncrementalBuildKind::Full
@@ -2118,10 +2135,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_forward_reuses_published_geometry_and_rewind_rebuilds() {
+    async fn missing_ports_rebuild_before_fast_forward_reuses_geometry() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
-        let published_head = append_text(&writer, &root, "published").await;
+        let baseline_parent = append_text(&writer, &root, "baseline").await;
+        let published_head = append_text(&writer, &baseline_parent, "published").await;
         writer.fork("main", &published_head).await.unwrap();
 
         let source = SqliteGraphStore::open_read_only(writer.store_path())
@@ -2174,6 +2192,46 @@ mod tests {
             .unwrap();
         let published_point = (published_node.x, published_node.y);
 
+        let upgraded_generation = snapshots.active_generation().await.unwrap();
+        snapshots
+            .with_connection(move |connection| {
+                diesel::sql_query("DELETE FROM console_graph_edge_ports WHERE generation = ?")
+                    .bind::<BigInt, _>(upgraded_generation)
+                    .execute(connection)
+                    .map(|_| ())
+                    .context(crate::error::QueryGraphSnapshotStoreSnafu {
+                        path: PathBuf::from("missing-baseline-ports"),
+                    })
+            })
+            .await
+            .unwrap();
+        let recovery_lease = snapshots
+            .acquire_incremental_build_lease(2)
+            .await
+            .unwrap()
+            .unwrap();
+        let recovery = build_incremental_generation_with_config(
+            &snapshots,
+            &root,
+            upgraded_generation,
+            &recovery_lease,
+            2,
+            IncrementalBuildConfig {
+                frontier_low_watermark: 1,
+                frontier_high_watermark: 4,
+                graph_buffer_limit: 2,
+                child_page_size: 2,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!recovery.reused_baseline);
+        assert_eq!(recovery.processed_nodes, 3);
+        snapshots
+            .publish_incremental_generation(&recovery_lease, 2)
+            .await
+            .unwrap();
+
         let suffix_one = append_text(&writer, &published_head, "suffix one").await;
         let suffix_two = append_text(&writer, &suffix_one, "suffix two").await;
         writer
@@ -2186,7 +2244,7 @@ mod tests {
             .unwrap();
 
         let second_lease = snapshots
-            .acquire_incremental_build_lease(2)
+            .acquire_incremental_build_lease(3)
             .await
             .unwrap()
             .unwrap();
@@ -2195,7 +2253,7 @@ mod tests {
             &root,
             snapshots.active_generation().await.unwrap(),
             &second_lease,
-            2,
+            3,
             IncrementalBuildConfig {
                 frontier_low_watermark: 1,
                 frontier_high_watermark: 4,
@@ -2208,7 +2266,7 @@ mod tests {
         assert!(second.reused_baseline);
         assert_eq!(second.processed_nodes, 2);
         snapshots
-            .publish_incremental_generation(&second_lease, 2)
+            .publish_incremental_generation(&second_lease, 3)
             .await
             .unwrap();
         let second_view = snapshots
@@ -2216,7 +2274,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second_view.nodes.len(), 3);
+        assert_eq!(second_view.nodes.len(), 4);
         assert_eq!(
             {
                 let node = second_view
@@ -2238,7 +2296,7 @@ mod tests {
             .await
             .unwrap();
         let rewind_lease = snapshots
-            .acquire_incremental_build_lease(3)
+            .acquire_incremental_build_lease(4)
             .await
             .unwrap()
             .unwrap();
@@ -2247,7 +2305,7 @@ mod tests {
             &root,
             snapshots.active_generation().await.unwrap(),
             &rewind_lease,
-            3,
+            4,
             IncrementalBuildConfig {
                 frontier_low_watermark: 1,
                 frontier_high_watermark: 4,
@@ -2258,7 +2316,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!rewind.reused_baseline);
-        assert_eq!(rewind.processed_nodes, 2);
+        assert_eq!(rewind.processed_nodes, 3);
     }
 
     async fn append_text(store: &SqliteStore, parent: &str, content: &str) -> String {
