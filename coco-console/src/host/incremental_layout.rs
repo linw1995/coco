@@ -672,6 +672,71 @@ mod tests {
     }
 
     #[test]
+    fn stable_layout_errors_have_actionable_messages() {
+        let cases = [
+            (
+                StableLayoutError::DuplicateNode {
+                    node_id: "duplicate".to_owned(),
+                },
+                "duplicate node duplicate",
+            ),
+            (
+                StableLayoutError::MissingNode {
+                    node_id: "missing".to_owned(),
+                },
+                "missing node missing",
+            ),
+            (
+                StableLayoutError::MissingParent {
+                    node_id: "child".to_owned(),
+                    parent_id: "parent".to_owned(),
+                },
+                "node child references missing parent parent",
+            ),
+            (
+                StableLayoutError::SlotOccupied {
+                    rank: 2,
+                    row: 3,
+                    owner: "owner".to_owned(),
+                },
+                "rank 2 row 3 is occupied by owner",
+            ),
+            (
+                StableLayoutError::ExistingRankTooLow {
+                    node_id: "child".to_owned(),
+                    current_rank: 1,
+                    required_rank: 4,
+                },
+                "node child has rank 1, but its parents require rank 4",
+            ),
+            (
+                StableLayoutError::DuplicateEdge {
+                    edge_key: "edge".to_owned(),
+                },
+                "duplicate edge edge",
+            ),
+            (
+                StableLayoutError::PortSlotOccupied {
+                    node_id: "endpoint".to_owned(),
+                    slot: 5,
+                    owner: "edge".to_owned(),
+                },
+                "endpoint endpoint port slot 5 is occupied by edge",
+            ),
+            (
+                StableLayoutError::Cycle {
+                    node_ids: vec!["a".to_owned(), "b".to_owned()],
+                },
+                "rank propagation found a cycle involving [\"a\", \"b\"]",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn ready_nodes_use_longest_parent_rank_and_nearest_free_median_row() {
         let mut layout = StableDagLayout::default();
         let left = layout.place_ready(ready("left", &[])).unwrap();

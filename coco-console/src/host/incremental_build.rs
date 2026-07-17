@@ -201,6 +201,23 @@ struct ReadyChildPage {
     next_cursor: Option<String>,
 }
 
+type IncrementalFrontier = AdaptiveFrontier<FrontierNode, SqliteFrontierStore>;
+
+#[derive(Debug)]
+struct TraversalCounters {
+    processed_nodes: usize,
+    all_nodes: usize,
+    anchors_nodes: usize,
+}
+
+#[derive(Debug)]
+struct IncrementalBuildCompletion {
+    active_nodes: usize,
+    target_nodes: usize,
+    counters: TraversalCounters,
+    frontier: FrontierMetrics,
+}
+
 pub(crate) async fn build_incremental_generation(
     snapshots: &ConsoleGraphSnapshotStore,
     root_id: &str,
@@ -228,6 +245,57 @@ async fn build_incremental_generation_with_config(
     config: IncrementalBuildConfig,
 ) -> crate::Result<IncrementalBuildStats> {
     let generation = lease.generation();
+    validate_incremental_build_config(config)?;
+    require_build_lease(snapshots, lease).await?;
+    let (store, mut frontier) = initialize_incremental_build(
+        snapshots,
+        root_id,
+        baseline_generation,
+        lease,
+        source_version,
+        config,
+    )
+    .await?;
+
+    let active_nodes = store.active_node_count().await?;
+    if active_nodes == 0 {
+        return finish_empty_incremental_build(
+            snapshots,
+            generation,
+            source_version,
+            store.kind,
+            frontier.metrics(),
+        )
+        .await;
+    }
+
+    let target_nodes = store.target_node_count().await?;
+    seed_incremental_frontier(snapshots, lease, &store, &mut frontier).await?;
+    let counters = traverse_incremental_frontier(
+        snapshots,
+        lease,
+        &store,
+        &mut frontier,
+        generation,
+        config.graph_buffer_limit,
+    )
+    .await?;
+    finalize_incremental_build(
+        snapshots,
+        &store,
+        generation,
+        source_version,
+        IncrementalBuildCompletion {
+            active_nodes,
+            target_nodes,
+            counters,
+            frontier: frontier.metrics(),
+        },
+    )
+    .await
+}
+
+fn validate_incremental_build_config(config: IncrementalBuildConfig) -> crate::Result<()> {
     ensure!(
         config.graph_buffer_limit > 0
             && config.child_page_size > 0
@@ -240,7 +308,18 @@ async fn build_incremental_generation_with_config(
             ),
         }
     );
-    require_build_lease(snapshots, lease).await?;
+    Ok(())
+}
+
+async fn initialize_incremental_build(
+    snapshots: &ConsoleGraphSnapshotStore,
+    root_id: &str,
+    baseline_generation: i64,
+    lease: &IncrementalBuildLease,
+    source_version: u64,
+    config: IncrementalBuildConfig,
+) -> crate::Result<(IncrementalWorkStore, IncrementalFrontier)> {
+    let generation = lease.generation();
     let mut store = IncrementalWorkStore::new(
         snapshots.database(),
         root_id.to_owned(),
@@ -251,9 +330,8 @@ async fn build_incremental_generation_with_config(
         config.child_page_size,
     );
     store.begin().await?;
-
     let frontier_store = SqliteFrontierStore::new(store.database.clone(), generation);
-    let mut frontier = AdaptiveFrontier::open(
+    let frontier = AdaptiveFrontier::open(
         frontier_store,
         FrontierConfig::new(
             config.frontier_low_watermark,
@@ -262,135 +340,241 @@ async fn build_incremental_generation_with_config(
     )
     .await
     .map_err(frontier_error)?;
+    Ok((store, frontier))
+}
 
-    let active_nodes = store.active_node_count().await?;
-    if active_nodes == 0 {
-        snapshots
-            .finish_incremental_mode(generation, source_version, GraphMode::Anchors)
-            .await?;
-        snapshots
-            .finish_incremental_mode(generation, source_version, GraphMode::All)
-            .await?;
-        snapshots
-            .publish_incremental_ports(generation, generation)
-            .await?;
-        return Ok(IncrementalBuildStats {
-            processed_nodes: 0,
-            all_nodes: 0,
-            anchors_nodes: 0,
-            reused_baseline: store.kind == IncrementalBuildKind::Append,
-            frontier: frontier.metrics(),
-        });
-    }
+async fn finish_empty_incremental_build(
+    snapshots: &ConsoleGraphSnapshotStore,
+    generation: i64,
+    source_version: u64,
+    kind: IncrementalBuildKind,
+    frontier: FrontierMetrics,
+) -> crate::Result<IncrementalBuildStats> {
+    snapshots
+        .finish_incremental_mode(generation, source_version, GraphMode::Anchors)
+        .await?;
+    snapshots
+        .finish_incremental_mode(generation, source_version, GraphMode::All)
+        .await?;
+    snapshots
+        .publish_incremental_ports(generation, generation)
+        .await?;
+    Ok(IncrementalBuildStats {
+        processed_nodes: 0,
+        all_nodes: 0,
+        anchors_nodes: 0,
+        reused_baseline: kind == IncrementalBuildKind::Append,
+        frontier,
+    })
+}
 
-    let target_nodes = store.target_node_count().await?;
+async fn seed_incremental_frontier(
+    snapshots: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+    store: &IncrementalWorkStore,
+    frontier: &mut IncrementalFrontier,
+) -> crate::Result<()> {
     match store.kind {
-        IncrementalBuildKind::Full => {
-            let root = store.load_source_node(&store.root_id).await?;
-            let root_item = FrontierNode {
-                created_at_ns: saturating_i64(root.created_at.as_nanosecond()),
-                node_id: root.id.clone(),
-            };
-            store.insert_root(&root_item).await?;
-            frontier
-                .push_batch([root_item])
-                .await
-                .map_err(frontier_error)?;
-        }
+        IncrementalBuildKind::Full => seed_full_frontier(store, frontier).await,
         IncrementalBuildKind::Append => {
-            let mut seed_cursor = String::new();
-            loop {
-                let page = store.append_seed_page(&seed_cursor).await?;
-                if page.is_empty() {
-                    break;
-                }
-                seed_cursor.clone_from(
-                    &page
-                        .last()
-                        .expect("non-empty seed page must have a last node")
-                        .node_id,
-                );
-                store.insert_append_seeds(&page).await?;
-                frontier.push_batch(page).await.map_err(frontier_error)?;
-                require_build_lease(snapshots, lease).await?;
-                tokio::task::yield_now().await;
-            }
+            seed_append_frontier(snapshots, lease, store, frontier).await
         }
     }
+}
 
-    let mut buffer = GraphBuffer::new(config.graph_buffer_limit);
-    let mut processed_nodes = 0usize;
-    let mut all_nodes = store.mode_node_count(GraphMode::All).await?;
-    let mut anchors_nodes = store.mode_node_count(GraphMode::Anchors).await?;
+async fn seed_full_frontier(
+    store: &IncrementalWorkStore,
+    frontier: &mut IncrementalFrontier,
+) -> crate::Result<()> {
+    let root = store.load_source_node(&store.root_id).await?;
+    let root_item = FrontierNode {
+        created_at_ns: saturating_i64(root.created_at.as_nanosecond()),
+        node_id: root.id.clone(),
+    };
+    store.insert_root(&root_item).await?;
+    frontier
+        .push_batch([root_item])
+        .await
+        .map_err(frontier_error)?;
+    Ok(())
+}
+
+async fn seed_append_frontier(
+    snapshots: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+    store: &IncrementalWorkStore,
+    frontier: &mut IncrementalFrontier,
+) -> crate::Result<()> {
+    let mut seed_cursor = String::new();
+    loop {
+        let page = store.append_seed_page(&seed_cursor).await?;
+        if page.is_empty() {
+            return Ok(());
+        }
+        seed_cursor.clone_from(
+            &page
+                .last()
+                .expect("non-empty seed page must have a last node")
+                .node_id,
+        );
+        store.insert_append_seeds(&page).await?;
+        frontier.push_batch(page).await.map_err(frontier_error)?;
+        require_build_lease(snapshots, lease).await?;
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn traverse_incremental_frontier(
+    snapshots: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+    store: &IncrementalWorkStore,
+    frontier: &mut IncrementalFrontier,
+    generation: i64,
+    graph_buffer_limit: usize,
+) -> crate::Result<TraversalCounters> {
+    let mut buffer = GraphBuffer::new(graph_buffer_limit);
+    let mut counters = TraversalCounters {
+        processed_nodes: 0,
+        all_nodes: store.mode_node_count(GraphMode::All).await?,
+        anchors_nodes: store.mode_node_count(GraphMode::Anchors).await?,
+    };
     while let Some(cursor) = frontier.peek_min().await.map_err(frontier_error)? {
-        let node = store.load_source_node(&cursor.node_id).await?;
-        let (all_added, anchors_added) = store.process_node(&node, snapshots, &mut buffer).await?;
-        all_nodes = all_nodes.saturating_add(usize::from(all_added));
-        anchors_nodes = anchors_nodes.saturating_add(usize::from(anchors_added));
-        let first_child_page = store.discover_ready_child_page(&node.id, "").await?;
-        store.mark_processed(&node.id).await?;
-        processed_nodes = processed_nodes.saturating_add(1);
-
-        match frontier
-            .replace_min(&cursor, first_child_page.ready)
-            .await
-            .map_err(frontier_error)?
-        {
-            ReplaceMinOutcome::Applied { .. } => {}
-            ReplaceMinOutcome::StaleMinimum { current } => {
-                return crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                    column: "frontier_minimum",
-                    value: format!(
-                        "expected {:?}, current {:?}",
-                        cursor.node_id,
-                        current.map(|item| item.node_id)
-                    ),
-                }
-                .fail();
-            }
-        }
-        let mut child_cursor = first_child_page.next_cursor;
-        let mut child_pages = 0usize;
-        let mut child_lease_renewed_at = tokio::time::Instant::now();
-        while let Some(cursor) = child_cursor {
-            let page = store.discover_ready_child_page(&node.id, &cursor).await?;
-            frontier
-                .push_batch(page.ready)
-                .await
-                .map_err(frontier_error)?;
-            child_cursor = page.next_cursor;
-            child_pages = child_pages.saturating_add(1);
-            if child_pages.is_multiple_of(128)
-                || child_lease_renewed_at.elapsed() >= INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL
-            {
-                require_build_lease(snapshots, lease).await?;
-                child_lease_renewed_at = tokio::time::Instant::now();
-            }
-            tokio::task::yield_now().await;
-        }
-
-        if buffer.should_flush() {
-            flush_graph_buffer(snapshots, generation, &mut buffer).await?;
-        }
-        if processed_nodes.is_multiple_of(1_024) {
-            require_build_lease(snapshots, lease).await?;
-            tokio::task::yield_now().await;
-        }
+        let (all_added, anchors_added) =
+            process_frontier_cursor(snapshots, lease, store, frontier, &mut buffer, &cursor)
+                .await?;
+        counters.processed_nodes = counters.processed_nodes.saturating_add(1);
+        counters.all_nodes = counters.all_nodes.saturating_add(usize::from(all_added));
+        counters.anchors_nodes = counters
+            .anchors_nodes
+            .saturating_add(usize::from(anchors_added));
+        maintain_incremental_traversal(
+            snapshots,
+            lease,
+            generation,
+            &mut buffer,
+            counters.processed_nodes,
+        )
+        .await?;
     }
     flush_graph_buffer(snapshots, generation, &mut buffer).await?;
     require_build_lease(snapshots, lease).await?;
+    Ok(counters)
+}
 
-    let remaining = store.unprocessed_node_count().await?;
-    ensure!(
-        remaining == 0 && processed_nodes == target_nodes,
-        crate::error::InvalidGraphSnapshotStoreValueSnafu {
-            column: "incremental_graph",
-            value: format!(
-                "processed={processed_nodes} target={target_nodes} active={active_nodes} \
-                 remaining={remaining}"
-            ),
+async fn process_frontier_cursor(
+    snapshots: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+    store: &IncrementalWorkStore,
+    frontier: &mut IncrementalFrontier,
+    buffer: &mut GraphBuffer,
+    cursor: &FrontierNode,
+) -> crate::Result<(bool, bool)> {
+    let node = store.load_source_node(&cursor.node_id).await?;
+    let added = store.process_node(&node, snapshots, buffer).await?;
+    let first_child_page = store.discover_ready_child_page(&node.id, "").await?;
+    store.mark_processed(&node.id).await?;
+    replace_frontier_minimum(frontier, cursor, first_child_page.ready).await?;
+    push_remaining_child_pages(
+        snapshots,
+        lease,
+        store,
+        frontier,
+        &node.id,
+        first_child_page.next_cursor,
+    )
+    .await?;
+    Ok(added)
+}
+
+async fn replace_frontier_minimum(
+    frontier: &mut IncrementalFrontier,
+    cursor: &FrontierNode,
+    ready: Vec<FrontierNode>,
+) -> crate::Result<()> {
+    match frontier
+        .replace_min(cursor, ready)
+        .await
+        .map_err(frontier_error)?
+    {
+        ReplaceMinOutcome::Applied { .. } => Ok(()),
+        ReplaceMinOutcome::StaleMinimum { current } => {
+            crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                column: "frontier_minimum",
+                value: format!(
+                    "expected {:?}, current {:?}",
+                    cursor.node_id,
+                    current.map(|item| item.node_id)
+                ),
+            }
+            .fail()
         }
-    );
+    }
+}
+
+async fn push_remaining_child_pages(
+    snapshots: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+    store: &IncrementalWorkStore,
+    frontier: &mut IncrementalFrontier,
+    node_id: &str,
+    mut child_cursor: Option<String>,
+) -> crate::Result<()> {
+    let mut child_pages = 0usize;
+    let mut lease_renewed_at = tokio::time::Instant::now();
+    while let Some(cursor) = child_cursor {
+        let page = store.discover_ready_child_page(node_id, &cursor).await?;
+        frontier
+            .push_batch(page.ready)
+            .await
+            .map_err(frontier_error)?;
+        child_cursor = page.next_cursor;
+        child_pages = child_pages.saturating_add(1);
+        if should_renew_child_page_lease(child_pages, lease_renewed_at) {
+            require_build_lease(snapshots, lease).await?;
+            lease_renewed_at = tokio::time::Instant::now();
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+fn should_renew_child_page_lease(child_pages: usize, renewed_at: tokio::time::Instant) -> bool {
+    child_pages.is_multiple_of(128)
+        || renewed_at.elapsed() >= INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL
+}
+
+async fn maintain_incremental_traversal(
+    snapshots: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+    generation: i64,
+    buffer: &mut GraphBuffer,
+    processed_nodes: usize,
+) -> crate::Result<()> {
+    if buffer.should_flush() {
+        flush_graph_buffer(snapshots, generation, buffer).await?;
+    }
+    if processed_nodes.is_multiple_of(1_024) {
+        require_build_lease(snapshots, lease).await?;
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+async fn finalize_incremental_build(
+    snapshots: &ConsoleGraphSnapshotStore,
+    store: &IncrementalWorkStore,
+    generation: i64,
+    source_version: u64,
+    completion: IncrementalBuildCompletion,
+) -> crate::Result<IncrementalBuildStats> {
+    let IncrementalBuildCompletion {
+        active_nodes,
+        target_nodes,
+        counters,
+        frontier,
+    } = completion;
+    let remaining = store.unprocessed_node_count().await?;
+    validate_incremental_completion(&counters, target_nodes, active_nodes, remaining)?;
     store.apply_branch_labels(generation).await?;
     snapshots
         .publish_incremental_ports(generation, generation)
@@ -401,26 +585,52 @@ async fn build_incremental_generation_with_config(
     snapshots
         .finish_incremental_mode(generation, source_version, GraphMode::All)
         .await?;
+    log_incremental_build(source_version, generation, &counters, frontier);
+    Ok(IncrementalBuildStats {
+        processed_nodes: counters.processed_nodes,
+        all_nodes: counters.all_nodes,
+        anchors_nodes: counters.anchors_nodes,
+        reused_baseline: store.kind == IncrementalBuildKind::Append,
+        frontier,
+    })
+}
 
-    let metrics = frontier.metrics();
+fn validate_incremental_completion(
+    counters: &TraversalCounters,
+    target_nodes: usize,
+    active_nodes: usize,
+    remaining: usize,
+) -> crate::Result<()> {
+    ensure!(
+        remaining == 0 && counters.processed_nodes == target_nodes,
+        crate::error::InvalidGraphSnapshotStoreValueSnafu {
+            column: "incremental_graph",
+            value: format!(
+                "processed={} target={target_nodes} active={active_nodes} remaining={remaining}",
+                counters.processed_nodes
+            ),
+        }
+    );
+    Ok(())
+}
+
+fn log_incremental_build(
+    source_version: u64,
+    generation: i64,
+    counters: &TraversalCounters,
+    frontier: FrontierMetrics,
+) {
     tracing::info!(
         source_version,
         generation,
-        processed_nodes,
-        all_nodes,
-        anchors_nodes,
-        frontier_hot_to_spilled = metrics.hot_to_spilled,
-        frontier_spilled_to_hot = metrics.spilled_to_hot,
-        frontier_max_hot_len = metrics.max_hot_len,
+        processed_nodes = counters.processed_nodes,
+        all_nodes = counters.all_nodes,
+        anchors_nodes = counters.anchors_nodes,
+        frontier_hot_to_spilled = frontier.hot_to_spilled,
+        frontier_spilled_to_hot = frontier.spilled_to_hot,
+        frontier_max_hot_len = frontier.max_hot_len,
         "console graph incremental generation built",
     );
-    Ok(IncrementalBuildStats {
-        processed_nodes,
-        all_nodes,
-        anchors_nodes,
-        reused_baseline: store.kind == IncrementalBuildKind::Append,
-        frontier: metrics,
-    })
 }
 
 async fn flush_graph_buffer(

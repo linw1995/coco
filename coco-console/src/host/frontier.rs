@@ -649,6 +649,54 @@ mod tests {
         FrontierConfig::new(2, 4)
     }
 
+    #[test]
+    fn frontier_store_invariant_messages_are_stable() {
+        let cases = [
+            (
+                FrontierStoreInvariant::InvalidWatermarks { low: 4, high: 4 },
+                "frontier watermarks must satisfy 0 < low < high, got low=4, high=4",
+            ),
+            (
+                FrontierStoreInvariant::SnapshotNotStrictlyOrdered,
+                "frontier store snapshot is not strictly ordered",
+            ),
+            (
+                FrontierStoreInvariant::UnexpectedSnapshotLength {
+                    expected: 3,
+                    actual: 2,
+                },
+                "frontier store snapshot contained 2 items, expected 3",
+            ),
+            (
+                FrontierStoreInvariant::UnexpectedMutationLength {
+                    expected: 5,
+                    actual: 7,
+                },
+                "frontier store mutation reported 7 pending items, expected 5",
+            ),
+            (
+                FrontierStoreInvariant::MutationReturnedUnknownItem,
+                "frontier store reported an insertion that was not requested",
+            ),
+            (
+                FrontierStoreInvariant::MutationReturnedDuplicateItem,
+                "frontier store reported the same inserted item more than once",
+            ),
+            (
+                FrontierStoreInvariant::UnexpectedStaleMinimum,
+                "frontier store rejected an insertion-only mutation as stale",
+            ),
+            (
+                FrontierStoreInvariant::ConcurrentMutation,
+                "frontier store minimum changed repeatedly while applying an atomic replacement",
+            ),
+        ];
+
+        for (invariant, expected) in cases {
+            assert_eq!(invariant.to_string(), expected);
+        }
+    }
+
     #[tokio::test]
     async fn rejects_invalid_watermarks() {
         let error = AdaptiveFrontier::open(
