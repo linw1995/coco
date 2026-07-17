@@ -94,6 +94,7 @@ struct SqliteDatabase {
 struct SqliteDatabaseInner {
     database_path: PathBuf,
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
+    wal_journal_mode_enabled: tokio::sync::OnceCell<()>,
     initialized_root_id: tokio::sync::OnceCell<String>,
 }
 

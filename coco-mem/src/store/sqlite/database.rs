@@ -62,6 +62,7 @@ impl SqliteDatabase {
         let inner = Arc::new(SqliteDatabaseInner {
             database_path: database_path.clone(),
             pool,
+            wal_journal_mode_enabled: tokio::sync::OnceCell::new(),
             initialized_root_id: tokio::sync::OnceCell::new(),
         });
         let database = {
@@ -100,8 +101,14 @@ impl SqliteDatabase {
     }
 
     async fn enable_wal_journal_mode(&self) -> Result<()> {
-        let mut connection = self.acquire().await?;
-        configure_writable_connection(&mut connection, &self.inner.database_path).await
+        self.inner
+            .wal_journal_mode_enabled
+            .get_or_try_init(|| async {
+                let mut connection = self.acquire().await?;
+                configure_writable_connection(&mut connection, &self.inner.database_path).await
+            })
+            .await
+            .copied()
     }
 
     pub(super) async fn initialized_root_id<F, Fut>(&self, operation: F) -> Result<String>
