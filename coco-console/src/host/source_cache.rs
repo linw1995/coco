@@ -235,63 +235,11 @@ impl PersistentGraphIndex {
                 .map(|item| item.node_id.clone())
                 .collect::<Vec<_>>();
             let nodes = self.load_nodes(store, &ids).await?;
-            let child_parents = batch
-                .iter()
-                .filter_map(|item| {
-                    let node = nodes.get(&item.node_id)?;
-                    ((item.traversal == TraversalKind::SkillSubtree)
-                        || node.kind.as_tool_uses().is_some())
-                    .then_some(item.node_id.clone())
-                })
-                .collect::<Vec<_>>();
+            let child_parents = child_parent_ids(&batch, &nodes);
             let children = self.load_children(store, &child_parents).await?;
             let child_ids = children.values().flatten().cloned().collect::<Vec<_>>();
             let child_nodes = self.load_nodes(store, &child_ids).await?;
-            let mut pending = Vec::new();
-            for item in &batch {
-                let node = nodes.get(&item.node_id).with_context(|| {
-                    crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                        column: "node_id",
-                        value: item.node_id.clone(),
-                    }
-                })?;
-                if !node.parent.is_empty() {
-                    pending.push((node.parent.clone(), TraversalKind::Graph));
-                }
-                if let Kind::Anchor(anchor) = &node.kind {
-                    pending.extend(
-                        anchor
-                            .merge_parents()
-                            .iter()
-                            .map(|parent| (parent.node_id().to_owned(), TraversalKind::Graph)),
-                    );
-                }
-                let direct_children = children.get(&item.node_id).into_iter().flatten();
-                match item.traversal {
-                    TraversalKind::SkillSubtree => pending.extend(
-                        direct_children
-                            .cloned()
-                            .map(|child_id| (child_id, TraversalKind::SkillSubtree)),
-                    ),
-                    TraversalKind::Graph if node.kind.as_tool_uses().is_some() => {
-                        for child_id in direct_children {
-                            let child = child_nodes.get(child_id).with_context(|| {
-                                crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                                    column: "child_id",
-                                    value: child_id.clone(),
-                                }
-                            })?;
-                            if matches!(
-                                &child.kind,
-                                Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some()
-                            ) {
-                                pending.push((child_id.clone(), TraversalKind::SkillSubtree));
-                            }
-                        }
-                    }
-                    TraversalKind::Graph => {}
-                }
-            }
+            let pending = pending_traversals(&batch, &nodes, &children, &child_nodes)?;
             self.commit_refresh_batch(generation, &record.name, &batch, &pending)
                 .await?;
             processed_nodes += batch.len();
@@ -776,6 +724,106 @@ impl PersistentGraphIndex {
             })
             .await
     }
+}
+
+fn child_parent_ids(batch: &[QueueItem], nodes: &HashMap<String, Node>) -> Vec<String> {
+    batch
+        .iter()
+        .filter(|item| {
+            nodes
+                .get(&item.node_id)
+                .is_some_and(|node| needs_children(item.traversal, node))
+        })
+        .map(|item| item.node_id.clone())
+        .collect()
+}
+
+fn needs_children(traversal: TraversalKind, node: &Node) -> bool {
+    traversal == TraversalKind::SkillSubtree || node.kind.as_tool_uses().is_some()
+}
+
+fn pending_traversals(
+    batch: &[QueueItem],
+    nodes: &HashMap<String, Node>,
+    children: &HashMap<String, Vec<String>>,
+    child_nodes: &HashMap<String, Node>,
+) -> crate::Result<Vec<(String, TraversalKind)>> {
+    let mut pending = Vec::new();
+    for item in batch {
+        let node = required_node(nodes, "node_id", &item.node_id)?;
+        pending.extend(graph_parent_traversals(node));
+        pending.extend(child_traversals(item, node, children, child_nodes)?);
+    }
+    Ok(pending)
+}
+
+fn required_node<'a>(
+    nodes: &'a HashMap<String, Node>,
+    column: &'static str,
+    node_id: &str,
+) -> crate::Result<&'a Node> {
+    nodes
+        .get(node_id)
+        .with_context(|| crate::error::InvalidGraphSnapshotStoreValueSnafu {
+            column,
+            value: node_id.to_owned(),
+        })
+}
+
+fn graph_parent_traversals(node: &Node) -> Vec<(String, TraversalKind)> {
+    let mut parents = Vec::new();
+    if !node.parent.is_empty() {
+        parents.push((node.parent.clone(), TraversalKind::Graph));
+    }
+    if let Kind::Anchor(anchor) = &node.kind {
+        parents.extend(
+            anchor
+                .merge_parents()
+                .iter()
+                .map(|parent| (parent.node_id().to_owned(), TraversalKind::Graph)),
+        );
+    }
+    parents
+}
+
+fn child_traversals(
+    item: &QueueItem,
+    node: &Node,
+    children: &HashMap<String, Vec<String>>,
+    child_nodes: &HashMap<String, Node>,
+) -> crate::Result<Vec<(String, TraversalKind)>> {
+    let direct_children = children
+        .get(&item.node_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    match item.traversal {
+        TraversalKind::SkillSubtree => Ok(direct_children
+            .iter()
+            .cloned()
+            .map(|child_id| (child_id, TraversalKind::SkillSubtree))
+            .collect()),
+        TraversalKind::Graph if node.kind.as_tool_uses().is_some() => {
+            skill_invocation_traversals(direct_children, child_nodes)
+        }
+        TraversalKind::Graph => Ok(Vec::new()),
+    }
+}
+
+fn skill_invocation_traversals(
+    child_ids: &[String],
+    child_nodes: &HashMap<String, Node>,
+) -> crate::Result<Vec<(String, TraversalKind)>> {
+    let mut traversals = Vec::new();
+    for child_id in child_ids {
+        let child = required_node(child_nodes, "child_id", child_id)?;
+        if matches!(
+            &child.kind,
+            Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some()
+        ) {
+            traversals.push((child_id.clone(), TraversalKind::SkillSubtree));
+        }
+    }
+    Ok(traversals)
 }
 
 impl TryFrom<&Node> for PersistedSourceNode {
