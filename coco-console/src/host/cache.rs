@@ -175,7 +175,7 @@ where
         if let Some(version) = persisted_version {
             ready.advance_to(version);
         }
-        invalidations.advance_to(
+        invalidations.mark_full_at_least(
             persisted_version
                 .map(|version| version.saturating_add(1))
                 .unwrap_or(1),
@@ -1297,6 +1297,7 @@ fn branch_order(branch: &str) -> (u8, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::build_graph_snapshot_with_mode;
     use coco_mem::{BranchStore, Kind, NewNode, NodeStore, Role, SqliteStore};
 
     #[tokio::test]
@@ -1383,11 +1384,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_reuses_persisted_source_contributions() {
+    async fn restart_reconciles_offline_branch_changes() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let path = writer.store_path().to_owned();
         let root = writer.root_id();
         writer.fork("main", &root).await.unwrap();
+        writer.fork("stale", &root).await.unwrap();
         let publisher = ConsolePublisher::new();
         publisher.mark_changed();
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
@@ -1400,6 +1402,18 @@ mod tests {
         cache.snapshot_current(GraphMode::All).await.unwrap();
         drop(cache);
 
+        let child = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("offline branch update".to_owned()),
+            })
+            .await
+            .unwrap();
+        writer.set_branch_head("main", &root, &child).await.unwrap();
+        writer.delete_branch("stale").await.unwrap();
+
         let cache = ConsoleGraphCache::new_with_persistent_store_path(
             writer.clone(),
             ConsolePublisher::new(),
@@ -1407,11 +1421,25 @@ mod tests {
         )
         .await
         .unwrap();
-        cache.snapshot_current(GraphMode::All).await.unwrap();
+        let (anchors, all) = tokio::join!(
+            cache.snapshot_current(GraphMode::Anchors),
+            cache.snapshot_current(GraphMode::All),
+        );
+        let anchors = anchors.unwrap();
+        let all = all.unwrap();
+        let expected_anchors =
+            build_graph_snapshot_with_mode(&writer, anchors.version, GraphMode::Anchors)
+                .await
+                .unwrap();
+        let expected_all = build_graph_snapshot_with_mode(&writer, all.version, GraphMode::All)
+            .await
+            .unwrap();
         let index = cache.persistent_index.as_ref().unwrap().lock().await;
 
+        assert_eq!(*anchors, expected_anchors);
+        assert_eq!(*all, expected_all);
         assert_eq!(index.refresh_count(), 1);
-        assert_eq!(index.branch_refresh_count(), 0);
+        assert_eq!(index.branch_refresh_count(), 1);
     }
 
     #[tokio::test]
