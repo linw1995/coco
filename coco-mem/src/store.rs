@@ -8,7 +8,10 @@ mod sqlite;
 #[cfg(test)]
 mod tests;
 
-pub use sqlite::{GRAPH_READ_BATCH_SIZE, GraphBranchRecord, SqliteGraphStore, SqliteStore};
+pub use sqlite::{
+    GRAPH_READ_BATCH_SIZE, GraphBranchRecord, GraphChildPage, GraphChildPageCursor,
+    SqliteGraphStore, SqliteStore,
+};
 
 use crate::{
     Job, JobStatus, MergeParent, MessageQueueItem, NewNode, NewNodeContent, Node, Preset,

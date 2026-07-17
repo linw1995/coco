@@ -1,14 +1,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use coco_mem::{
-    BranchAppendSessionState, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord, Kind, NewNode,
-    NewNodeContent, Node, NodeStore, SessionAnchorPatch, SessionState, SessionStore,
-    SqliteGraphStore, StoreError, StoreResult,
+    BranchAppendSessionState, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
+    GraphChildPageCursor, Kind, NewNode, NewNodeContent, Node, NodeStore, SessionAnchorPatch,
+    SessionState, SessionStore, SqliteGraphStore, StoreError, StoreResult,
 };
 use diesel::prelude::*;
-use diesel::sql_types::Text;
+use diesel::sql_types::{BigInt, Text};
 use snafu::prelude::*;
 
 use super::snapshot_store::{ConsoleGraphSnapshotStore, SnapshotDatabase};
@@ -35,6 +36,8 @@ pub(crate) struct PersistentGraphIndex {
     refresh_count: usize,
     #[cfg(test)]
     branch_refresh_count: usize,
+    #[cfg(test)]
+    traversed_node_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -71,10 +74,16 @@ impl TraversalKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct QueueItem {
     node_id: String,
     traversal: TraversalKind,
+}
+
+#[derive(Debug)]
+struct PublishedBranch {
+    head_id: String,
+    contribution_generation: i64,
 }
 
 #[derive(Debug)]
@@ -95,6 +104,14 @@ struct NodeIdRow {
 struct NodeJsonRow {
     #[diesel(sql_type = Text)]
     node_json: String,
+}
+
+#[derive(Debug, QueryableByName)]
+struct ChildRecheckRow {
+    #[diesel(sql_type = Text)]
+    node_id: String,
+    #[diesel(sql_type = Text)]
+    traversal_kind: String,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -120,6 +137,8 @@ impl PersistentGraphIndex {
             refresh_count: 0,
             #[cfg(test)]
             branch_refresh_count: 0,
+            #[cfg(test)]
+            traversed_node_count: 0,
         };
         index.discard_incomplete_refreshes().await?;
         Ok(index)
@@ -211,6 +230,52 @@ impl PersistentGraphIndex {
         }
     }
 
+    async fn published_branch(&self, name: &str) -> crate::Result<Option<PublishedBranch>> {
+        let name = name.to_owned();
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                console_graph_source_branches::table
+                    .filter(console_graph_source_branches::name.eq(name))
+                    .select((
+                        console_graph_source_branches::head_id,
+                        console_graph_source_branches::contribution_generation,
+                    ))
+                    .first::<(String, i64)>(connection)
+                    .optional()
+                    .map(|published| {
+                        published.map(|(head_id, contribution_generation)| PublishedBranch {
+                            head_id,
+                            contribution_generation,
+                        })
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+
+    async fn update_published_branch_state(&self, record: &GraphBranchRecord) -> crate::Result<()> {
+        let state_json = serde_json::to_string(&record.state).context(
+            SerializeGraphSnapshotStoreValueSnafu {
+                column: "state_json",
+            },
+        )?;
+        let name = record.name.clone();
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                diesel::update(
+                    console_graph_source_branches::table
+                        .filter(console_graph_source_branches::name.eq(name)),
+                )
+                .set(console_graph_source_branches::state_json.eq(state_json))
+                .execute(connection)
+                .map(|_| ())
+                .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+
     async fn refresh_branch(
         &mut self,
         store: &SqliteGraphStore,
@@ -220,42 +285,220 @@ impl PersistentGraphIndex {
         {
             self.branch_refresh_count += 1;
         }
+        let previous = self.published_branch(&record.name).await?;
+        let same_head = previous
+            .as_ref()
+            .is_some_and(|previous| previous.head_id == record.head_id);
+        if same_head {
+            let previous = previous
+                .as_ref()
+                .expect("same-head refresh should have a previous branch");
+            if !self
+                .dynamic_children_changed(store, &record.name, previous.contribution_generation)
+                .await?
+            {
+                return self.update_published_branch_state(&record).await;
+            }
+        }
+
         let generation = self.allocate_generation().await?;
-        self.seed_refresh_queue(generation, &record.name, &record.head_id)
+        if same_head {
+            let previous = previous
+                .as_ref()
+                .expect("same-head refresh should have a previous branch");
+            self.copy_previous_contribution(
+                &record.name,
+                previous.contribution_generation,
+                generation,
+            )
             .await?;
+            self.enqueue_dynamic_child_changes(
+                store,
+                &record.name,
+                previous.contribution_generation,
+                generation,
+            )
+            .await?;
+        } else {
+            self.seed_refresh_queue(generation, &record.name, &record.head_id)
+                .await?;
+        }
         let mut processed_nodes = 0usize;
+        let mut reused_previous = same_head;
 
         loop {
             let batch = self.claim_refresh_batch(generation).await?;
             if batch.is_empty() {
                 break;
             }
-            let ids = batch
+            if !reused_previous
+                && previous.as_ref().is_some_and(|previous| {
+                    batch.iter().any(|item| {
+                        item.traversal == TraversalKind::Graph && item.node_id == previous.head_id
+                    })
+                })
+            {
+                let previous = previous
+                    .as_ref()
+                    .expect("previous branch should exist when its head is reached");
+                self.copy_previous_contribution(
+                    &record.name,
+                    previous.contribution_generation,
+                    generation,
+                )
+                .await?;
+                self.enqueue_dynamic_child_changes(
+                    store,
+                    &record.name,
+                    previous.contribution_generation,
+                    generation,
+                )
+                .await?;
+                reused_previous = true;
+            }
+            let reused_node_ids = if reused_previous {
+                let previous = previous
+                    .as_ref()
+                    .expect("reused contribution should have a previous branch");
+                self.previous_contribution_node_ids(
+                    &record.name,
+                    previous.contribution_generation,
+                    &batch,
+                )
+                .await?
+            } else {
+                HashSet::new()
+            };
+            let traversal_batch = batch
+                .iter()
+                .filter(|item| !reused_node_ids.contains(&item.node_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let ids = traversal_batch
                 .iter()
                 .map(|item| item.node_id.clone())
                 .collect::<Vec<_>>();
             let nodes = self.load_nodes(store, &ids).await?;
-            let child_parents = child_parent_ids(&batch, &nodes);
-            let children = self.load_children(store, &child_parents).await?;
-            let child_ids = children.values().flatten().cloned().collect::<Vec<_>>();
-            let child_nodes = self.load_nodes(store, &child_ids).await?;
-            let pending = pending_traversals(&batch, &nodes, &children, &child_nodes)?;
-            self.commit_refresh_batch(generation, &record.name, &batch, &pending)
+            let mut pending = Vec::new();
+            let mut child_rechecks = Vec::new();
+            let mut queued_children = 0usize;
+            for item in &traversal_batch {
+                let node = required_node(&nodes, "node_id", &item.node_id)?;
+                pending.extend(graph_parent_traversals(node));
+                if needs_children(item.traversal, node) {
+                    child_rechecks.push(item.clone());
+                    queued_children += self
+                        .enqueue_child_traversals(store, generation, &record.name, item, None)
+                        .await?;
+                }
+            }
+            self.commit_refresh_batch(generation, &record.name, &batch, &pending, &child_rechecks)
                 .await?;
-            processed_nodes += batch.len();
+            processed_nodes += traversal_batch.len();
+            #[cfg(test)]
+            {
+                self.traversed_node_count += traversal_batch.len();
+            }
             tracing::info!(
                 branch = %record.name,
                 contribution_generation = generation,
-                batch_nodes = batch.len(),
+                claimed_nodes = batch.len(),
+                reused_nodes = reused_node_ids.len(),
                 processed_nodes,
-                queued_nodes = pending.len(),
+                queued_nodes = pending.len() + queued_children,
                 "console graph source batch committed",
             );
             tokio::task::yield_now().await;
         }
 
-        self.commit_branch(generation, record).await?;
-        self.prune_orphan_nodes().await
+        self.commit_branch(generation, record).await
+    }
+
+    async fn copy_previous_contribution(
+        &self,
+        branch: &str,
+        previous_generation: i64,
+        generation: i64,
+    ) -> crate::Result<()> {
+        let branch = branch.to_owned();
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        diesel::sql_query(
+                            "INSERT OR IGNORE INTO console_graph_source_branch_nodes ( \
+                                 branch_name, contribution_generation, node_id \
+                             ) \
+                             SELECT branch_name, ?, node_id \
+                             FROM console_graph_source_branch_nodes \
+                             WHERE branch_name = ? AND contribution_generation = ?",
+                        )
+                        .bind::<BigInt, _>(generation)
+                        .bind::<Text, _>(&branch)
+                        .bind::<BigInt, _>(previous_generation)
+                        .execute(connection)?;
+                        diesel::sql_query(
+                            "INSERT OR IGNORE INTO console_graph_source_child_rechecks ( \
+                                 branch_name, contribution_generation, node_id, traversal_kind \
+                             ) \
+                             SELECT branch_name, ?, node_id, traversal_kind \
+                             FROM console_graph_source_child_rechecks \
+                             WHERE branch_name = ? AND contribution_generation = ?",
+                        )
+                        .bind::<BigInt, _>(generation)
+                        .bind::<Text, _>(&branch)
+                        .bind::<BigInt, _>(previous_generation)
+                        .execute(connection)?;
+                        Ok(())
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+
+    async fn previous_contribution_node_ids(
+        &self,
+        branch: &str,
+        previous_generation: i64,
+        batch: &[QueueItem],
+    ) -> crate::Result<HashSet<String>> {
+        let node_ids = batch
+            .iter()
+            .map(|item| item.node_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.contribution_node_ids(branch, previous_generation, &node_ids)
+            .await
+    }
+
+    async fn contribution_node_ids(
+        &self,
+        branch: &str,
+        generation: i64,
+        node_ids: &[String],
+    ) -> crate::Result<HashSet<String>> {
+        if node_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let node_ids = node_ids.to_vec();
+        let branch = branch.to_owned();
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                console_graph_source_branch_nodes::table
+                    .filter(console_graph_source_branch_nodes::branch_name.eq(branch))
+                    .filter(
+                        console_graph_source_branch_nodes::contribution_generation.eq(generation),
+                    )
+                    .filter(console_graph_source_branch_nodes::node_id.eq_any(node_ids))
+                    .select(console_graph_source_branch_nodes::node_id)
+                    .load::<String>(connection)
+                    .map(|node_ids| node_ids.into_iter().collect())
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
     }
 
     async fn load_nodes(
@@ -307,21 +550,258 @@ impl PersistentGraphIndex {
         Ok(nodes)
     }
 
-    async fn load_children(
+    async fn dynamic_children_changed(
         &self,
         store: &SqliteGraphStore,
-        parent_ids: &[String],
-    ) -> crate::Result<HashMap<String, Vec<String>>> {
-        let mut children = HashMap::new();
-        for batch in parent_ids.chunks(SOURCE_CACHE_BATCH_SIZE) {
-            let batch_children = store
-                .graph_child_ids(batch)
-                .await
-                .context(crate::error::StoreSnafu)?;
-            children.extend(batch_children);
+        branch: &str,
+        generation: i64,
+    ) -> crate::Result<bool> {
+        let mut after = None;
+        loop {
+            let page = self
+                .load_child_recheck_page(branch, generation, after.as_ref())
+                .await?;
+            if page.is_empty() {
+                return Ok(false);
+            }
+            for item in &page {
+                if self
+                    .child_recheck_has_changes(store, branch, generation, item)
+                    .await?
+                {
+                    return Ok(true);
+                }
+            }
+            let complete = page.len() < SOURCE_CACHE_BATCH_SIZE;
+            after = page.last().cloned();
+            if complete {
+                return Ok(false);
+            }
             tokio::task::yield_now().await;
         }
-        Ok(children)
+    }
+
+    async fn enqueue_dynamic_child_changes(
+        &self,
+        store: &SqliteGraphStore,
+        branch: &str,
+        previous_generation: i64,
+        generation: i64,
+    ) -> crate::Result<()> {
+        let mut after = None;
+        loop {
+            let page = self
+                .load_child_recheck_page(branch, previous_generation, after.as_ref())
+                .await?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            for item in &page {
+                self.enqueue_child_traversals(
+                    store,
+                    generation,
+                    branch,
+                    item,
+                    Some(previous_generation),
+                )
+                .await?;
+            }
+            let complete = page.len() < SOURCE_CACHE_BATCH_SIZE;
+            after = page.last().cloned();
+            if complete {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn load_child_recheck_page(
+        &self,
+        branch: &str,
+        generation: i64,
+        after: Option<&QueueItem>,
+    ) -> crate::Result<Vec<QueueItem>> {
+        let branch = branch.to_owned();
+        let after = after.map(|item| (item.node_id.clone(), item.traversal.as_str().to_owned()));
+        let path = self.path.clone();
+        let rows = self
+            .database
+            .with_connection(move |connection| {
+                let rows = if let Some((node_id, traversal_kind)) = after {
+                    diesel::sql_query(
+                        "SELECT node_id, traversal_kind \
+                         FROM console_graph_source_child_rechecks \
+                         WHERE branch_name = ? AND contribution_generation = ? \
+                           AND (node_id > ? OR (node_id = ? AND traversal_kind > ?)) \
+                         ORDER BY node_id, traversal_kind \
+                         LIMIT ?",
+                    )
+                    .bind::<Text, _>(&branch)
+                    .bind::<BigInt, _>(generation)
+                    .bind::<Text, _>(&node_id)
+                    .bind::<Text, _>(&node_id)
+                    .bind::<Text, _>(&traversal_kind)
+                    .bind::<BigInt, _>(SOURCE_CACHE_BATCH_SIZE as i64)
+                    .load::<ChildRecheckRow>(connection)
+                } else {
+                    diesel::sql_query(
+                        "SELECT node_id, traversal_kind \
+                         FROM console_graph_source_child_rechecks \
+                         WHERE branch_name = ? AND contribution_generation = ? \
+                         ORDER BY node_id, traversal_kind \
+                         LIMIT ?",
+                    )
+                    .bind::<Text, _>(&branch)
+                    .bind::<BigInt, _>(generation)
+                    .bind::<BigInt, _>(SOURCE_CACHE_BATCH_SIZE as i64)
+                    .load::<ChildRecheckRow>(connection)
+                };
+                rows.context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(QueueItem {
+                    node_id: row.node_id,
+                    traversal: TraversalKind::parse(&row.traversal_kind)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn child_recheck_has_changes(
+        &self,
+        store: &SqliteGraphStore,
+        branch: &str,
+        generation: i64,
+        item: &QueueItem,
+    ) -> crate::Result<bool> {
+        let mut cursor = None;
+        loop {
+            let (pending, next_cursor, complete) = self
+                .load_child_traversal_page(store, item, cursor.as_ref())
+                .await?;
+            let node_ids = pending
+                .iter()
+                .map(|(node_id, _)| node_id.clone())
+                .collect::<Vec<_>>();
+            let existing = self
+                .contribution_node_ids(branch, generation, &node_ids)
+                .await?;
+            if pending
+                .iter()
+                .any(|(node_id, _)| !existing.contains(node_id))
+            {
+                return Ok(true);
+            }
+            if complete {
+                return Ok(false);
+            }
+            cursor = Some(next_cursor.expect("incomplete child page should provide a cursor"));
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn enqueue_child_traversals(
+        &self,
+        store: &SqliteGraphStore,
+        generation: i64,
+        branch: &str,
+        item: &QueueItem,
+        previous_generation: Option<i64>,
+    ) -> crate::Result<usize> {
+        let mut cursor = None;
+        let mut queued = 0usize;
+        loop {
+            let (mut pending, next_cursor, complete) = self
+                .load_child_traversal_page(store, item, cursor.as_ref())
+                .await?;
+            if let Some(previous_generation) = previous_generation {
+                let node_ids = pending
+                    .iter()
+                    .map(|(node_id, _)| node_id.clone())
+                    .collect::<Vec<_>>();
+                let existing = self
+                    .contribution_node_ids(branch, previous_generation, &node_ids)
+                    .await?;
+                pending.retain(|(node_id, _)| !existing.contains(node_id));
+            }
+            queued += pending.len();
+            self.enqueue_refresh_items(generation, branch, &pending)
+                .await?;
+            if complete {
+                return Ok(queued);
+            }
+            cursor = Some(next_cursor.expect("incomplete child page should provide a cursor"));
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn load_child_traversal_page(
+        &self,
+        store: &SqliteGraphStore,
+        item: &QueueItem,
+        cursor: Option<&GraphChildPageCursor>,
+    ) -> crate::Result<(
+        Vec<(String, TraversalKind)>,
+        Option<GraphChildPageCursor>,
+        bool,
+    )> {
+        let page_size = NonZeroUsize::new(SOURCE_CACHE_BATCH_SIZE)
+            .expect("source cache batch size should be non-zero");
+        let page = store
+            .graph_child_ids_page(&item.node_id, cursor, page_size)
+            .await
+            .context(crate::error::StoreSnafu)?;
+        let child_nodes = self.load_nodes(store, &page.child_ids).await?;
+        let traversals = child_traversals_for_page(item, &page.child_ids, &child_nodes)?;
+        Ok((traversals, page.next_cursor, page.complete))
+    }
+
+    async fn enqueue_refresh_items(
+        &self,
+        generation: i64,
+        branch: &str,
+        pending: &[(String, TraversalKind)],
+    ) -> crate::Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let branch = branch.to_owned();
+        let pending = pending
+            .iter()
+            .filter(|(node_id, _)| !node_id.is_empty())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        for (node_id, traversal) in &pending {
+                            diesel::insert_into(console_graph_source_refresh_queue::table)
+                                .values((
+                                    console_graph_source_refresh_queue::contribution_generation
+                                        .eq(generation),
+                                    console_graph_source_refresh_queue::branch_name.eq(&branch),
+                                    console_graph_source_refresh_queue::node_id.eq(node_id),
+                                    console_graph_source_refresh_queue::traversal_kind
+                                        .eq(traversal.as_str()),
+                                    console_graph_source_refresh_queue::processed.eq(0),
+                                ))
+                                .on_conflict((
+                                    console_graph_source_refresh_queue::contribution_generation,
+                                    console_graph_source_refresh_queue::node_id,
+                                    console_graph_source_refresh_queue::traversal_kind,
+                                ))
+                                .do_nothing()
+                                .execute(connection)?;
+                        }
+                        Ok(())
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
     }
 
     async fn persist_nodes(&self, nodes: &[Node]) -> crate::Result<()> {
@@ -485,6 +965,7 @@ impl PersistentGraphIndex {
         branch: &str,
         processed: &[QueueItem],
         pending: &[(String, TraversalKind)],
+        child_rechecks: &[QueueItem],
     ) -> crate::Result<()> {
         let branch = branch.to_owned();
         let processed = processed
@@ -495,6 +976,11 @@ impl PersistentGraphIndex {
             .iter()
             .filter(|(node_id, _)| !node_id.is_empty())
             .cloned()
+            .collect::<BTreeSet<_>>();
+        let child_rechecks = child_rechecks
+            .iter()
+            .filter(|item| !item.node_id.is_empty())
+            .map(|item| (item.node_id.clone(), item.traversal))
             .collect::<BTreeSet<_>>();
         let path = self.path.clone();
         self.database
@@ -516,6 +1002,18 @@ impl PersistentGraphIndex {
                                 ))
                                 .do_nothing()
                                 .execute(connection)?;
+                        }
+                        for (node_id, traversal) in &child_rechecks {
+                            diesel::sql_query(
+                                "INSERT OR IGNORE INTO console_graph_source_child_rechecks ( \
+                                     branch_name, contribution_generation, node_id, traversal_kind \
+                                 ) VALUES (?, ?, ?, ?)",
+                            )
+                            .bind::<Text, _>(&branch)
+                            .bind::<BigInt, _>(generation)
+                            .bind::<Text, _>(node_id)
+                            .bind::<Text, _>(traversal.as_str())
+                            .execute(connection)?;
                         }
                         for (node_id, traversal) in &pending {
                             diesel::insert_into(console_graph_source_refresh_queue::table)
@@ -582,6 +1080,13 @@ impl PersistentGraphIndex {
                                 ),
                         )
                         .execute(connection)?;
+                        diesel::sql_query(
+                            "DELETE FROM console_graph_source_child_rechecks \
+                             WHERE branch_name = ? AND contribution_generation <> ?",
+                        )
+                        .bind::<Text, _>(&record.name)
+                        .bind::<BigInt, _>(generation)
+                        .execute(connection)?;
                         diesel::delete(
                             console_graph_source_refresh_queue::table.filter(
                                 console_graph_source_refresh_queue::contribution_generation
@@ -613,12 +1118,17 @@ impl PersistentGraphIndex {
                                 .filter(console_graph_source_branch_nodes::branch_name.eq(&name)),
                         )
                         .execute(connection)?;
+                        diesel::sql_query(
+                            "DELETE FROM console_graph_source_child_rechecks \
+                             WHERE branch_name = ?",
+                        )
+                        .bind::<Text, _>(&name)
+                        .execute(connection)?;
                         Ok(())
                     })
                     .context(QueryGraphSnapshotStoreSnafu { path })
             })
-            .await?;
-        self.prune_orphan_nodes().await
+            .await
     }
 
     async fn discard_incomplete_refreshes(&mut self) -> crate::Result<()> {
@@ -641,15 +1151,26 @@ impl PersistentGraphIndex {
                              )",
                         )
                         .execute(connection)?;
+                        diesel::sql_query(
+                            "DELETE FROM console_graph_source_child_rechecks \
+                             WHERE NOT EXISTS ( \
+                                 SELECT 1 \
+                                 FROM console_graph_source_branches \
+                                 WHERE console_graph_source_branches.name = \
+                                     console_graph_source_child_rechecks.branch_name \
+                                   AND console_graph_source_branches.contribution_generation = \
+                                     console_graph_source_child_rechecks.contribution_generation \
+                             )",
+                        )
+                        .execute(connection)?;
                         Ok(())
                     })
                     .context(QueryGraphSnapshotStoreSnafu { path })
             })
-            .await?;
-        self.prune_orphan_nodes().await
+            .await
     }
 
-    async fn prune_orphan_nodes(&self) -> crate::Result<()> {
+    pub(crate) async fn prune_published_orphans(&self) -> crate::Result<()> {
         loop {
             let path = self.path.clone();
             let ids = self
@@ -712,6 +1233,37 @@ impl PersistentGraphIndex {
     }
 
     #[cfg(test)]
+    pub(crate) fn traversed_node_count(&self) -> usize {
+        self.traversed_node_count
+    }
+
+    #[cfg(test)]
+    async fn published_branch_node_ids(&self, name: &str) -> crate::Result<BTreeSet<String>> {
+        let published = self.published_branch(name).await?.with_context(|| {
+            crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                column: "branch_name",
+                value: name.to_owned(),
+            }
+        })?;
+        let name = name.to_owned();
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                console_graph_source_branch_nodes::table
+                    .filter(console_graph_source_branch_nodes::branch_name.eq(name))
+                    .filter(
+                        console_graph_source_branch_nodes::contribution_generation
+                            .eq(published.contribution_generation),
+                    )
+                    .select(console_graph_source_branch_nodes::node_id)
+                    .load::<String>(connection)
+                    .map(|node_ids| node_ids.into_iter().collect())
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn node_count(&self) -> crate::Result<usize> {
         let path = self.path.clone();
         self.database
@@ -726,35 +1278,8 @@ impl PersistentGraphIndex {
     }
 }
 
-fn child_parent_ids(batch: &[QueueItem], nodes: &HashMap<String, Node>) -> Vec<String> {
-    batch
-        .iter()
-        .filter(|item| {
-            nodes
-                .get(&item.node_id)
-                .is_some_and(|node| needs_children(item.traversal, node))
-        })
-        .map(|item| item.node_id.clone())
-        .collect()
-}
-
 fn needs_children(traversal: TraversalKind, node: &Node) -> bool {
     traversal == TraversalKind::SkillSubtree || node.kind.as_tool_uses().is_some()
-}
-
-fn pending_traversals(
-    batch: &[QueueItem],
-    nodes: &HashMap<String, Node>,
-    children: &HashMap<String, Vec<String>>,
-    child_nodes: &HashMap<String, Node>,
-) -> crate::Result<Vec<(String, TraversalKind)>> {
-    let mut pending = Vec::new();
-    for item in batch {
-        let node = required_node(nodes, "node_id", &item.node_id)?;
-        pending.extend(graph_parent_traversals(node));
-        pending.extend(child_traversals(item, node, children, child_nodes)?);
-    }
-    Ok(pending)
 }
 
 fn required_node<'a>(
@@ -786,26 +1311,18 @@ fn graph_parent_traversals(node: &Node) -> Vec<(String, TraversalKind)> {
     parents
 }
 
-fn child_traversals(
+fn child_traversals_for_page(
     item: &QueueItem,
-    node: &Node,
-    children: &HashMap<String, Vec<String>>,
+    child_ids: &[String],
     child_nodes: &HashMap<String, Node>,
 ) -> crate::Result<Vec<(String, TraversalKind)>> {
-    let direct_children = children
-        .get(&item.node_id)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
     match item.traversal {
-        TraversalKind::SkillSubtree => Ok(direct_children
+        TraversalKind::SkillSubtree => Ok(child_ids
             .iter()
             .cloned()
             .map(|child_id| (child_id, TraversalKind::SkillSubtree))
             .collect()),
-        TraversalKind::Graph if node.kind.as_tool_uses().is_some() => {
-            skill_invocation_traversals(direct_children, child_nodes)
-        }
-        TraversalKind::Graph => Ok(Vec::new()),
+        TraversalKind::Graph => skill_invocation_traversals(child_ids, child_nodes),
     }
 }
 
@@ -1165,7 +1682,60 @@ impl SessionStore for PersistentGraphStore {
 mod tests {
     use super::*;
     use crate::graph::{GraphMode, build_graph_snapshot_with_mode};
-    use coco_mem::{Kind, Role, SqliteStore};
+    use coco_mem::{
+        Anchor, Kind, MergeParent, Role, SkillInvocationAnchor, SkillInvocationMode,
+        SkillResultAnchor, SqliteStore, ToolUse,
+    };
+
+    async fn append_text_chain(store: &SqliteStore, parent: &str, count: usize) -> Vec<String> {
+        let mut parent = parent.to_owned();
+        let mut node_ids = Vec::with_capacity(count);
+        for index in 0..count {
+            parent = store
+                .append(NewNode {
+                    parent,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text(format!("chain node {index}")),
+                })
+                .await
+                .unwrap();
+            node_ids.push(parent.clone());
+        }
+        node_ids
+    }
+
+    async fn append_skill_subtree(
+        store: &SqliteStore,
+        tool_use: &str,
+        skill_name: &str,
+    ) -> (String, String) {
+        let invocation = store
+            .append(NewNode {
+                parent: tool_use.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    Vec::new(),
+                    SkillInvocationAnchor {
+                        skill_name: skill_name.to_owned(),
+                        mode: SkillInvocationMode::InheritContext,
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let child = store
+            .append(NewNode {
+                parent: invocation.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Text(format!("{skill_name} child")),
+            })
+            .await
+            .unwrap();
+        (invocation, child)
+    }
 
     #[tokio::test]
     async fn source_cache_survives_index_reopen() {
@@ -1214,7 +1784,507 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_branch_prunes_persisted_source_nodes() {
+    async fn source_cache_refreshes_every_high_fan_out_skill_invocation() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "high-fan-out".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &root, &tool_use)
+            .await
+            .unwrap();
+        let mut invocation_ids = BTreeSet::new();
+        for index in 0..GRAPH_READ_BATCH_SIZE + 17 {
+            invocation_ids.insert(
+                writer
+                    .append(NewNode {
+                        parent: tool_use.clone(),
+                        role: Role::System,
+                        metadata: None,
+                        kind: Kind::Anchor(Anchor::skill_invocation(
+                            Vec::new(),
+                            SkillInvocationAnchor {
+                                skill_name: format!("fan-out-skill-{index}"),
+                                mode: SkillInvocationMode::InheritContext,
+                            },
+                        )),
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, writer.root_id())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+        let actual = build_graph_snapshot_with_mode(&index.graph_store(), 11, GraphMode::All)
+            .await
+            .unwrap();
+        let expected = build_graph_snapshot_with_mode(&writer, 11, GraphMode::All)
+            .await
+            .unwrap();
+        let actual_ids = actual
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert!(invocation_ids.is_subset(&actual_ids));
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn source_cache_fast_forward_refresh_traverses_only_the_new_suffix() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let initial = append_text_chain(&writer, &root, SOURCE_CACHE_BATCH_SIZE + 17).await;
+        let previous_head = initial.last().unwrap().clone();
+        writer.fork("main", &previous_head).await.unwrap();
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+        let previous = index.published_branch("main").await.unwrap().unwrap();
+        let traversed_before = index.traversed_node_count();
+
+        let suffix = append_text_chain(&writer, &previous_head, 7).await;
+        let next_head = suffix.last().unwrap().clone();
+        writer
+            .set_branch_head("main", &previous_head, &next_head)
+            .await
+            .unwrap();
+        index
+            .refresh_named_batch(&source, &["main".to_owned()])
+            .await
+            .unwrap();
+
+        let current = index.published_branch("main").await.unwrap().unwrap();
+        let mut expected_ids = BTreeSet::from([root]);
+        expected_ids.extend(initial);
+        expected_ids.extend(suffix.clone());
+        assert_ne!(
+            current.contribution_generation,
+            previous.contribution_generation
+        );
+        assert_eq!(
+            index.traversed_node_count() - traversed_before,
+            suffix.len()
+        );
+        assert_eq!(
+            index.published_branch_node_ids("main").await.unwrap(),
+            expected_ids
+        );
+        let actual = build_graph_snapshot_with_mode(&index.graph_store(), 13, GraphMode::All)
+            .await
+            .unwrap();
+        let expected = build_graph_snapshot_with_mode(&writer, 13, GraphMode::All)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn source_cache_merge_extension_reuses_the_previous_contribution() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let initial = append_text_chain(&writer, &root, 3).await;
+        let previous_head = initial.last().unwrap().clone();
+        writer.fork("main", &previous_head).await.unwrap();
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+        let traversed_before = index.traversed_node_count();
+        let other_parent = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("merge primary side".to_owned()),
+            })
+            .await
+            .unwrap();
+        let merge_head = writer
+            .append(NewNode {
+                parent: other_parent,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_result(
+                    vec![MergeParent::merge(previous_head.clone())],
+                    SkillResultAnchor {
+                        skill_name: "merge-extension".to_owned(),
+                        output: "complete".to_owned(),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &previous_head, &merge_head)
+            .await
+            .unwrap();
+
+        index
+            .refresh_named_batch(&source, &["main".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(index.traversed_node_count() - traversed_before, 2);
+        let actual = build_graph_snapshot_with_mode(&index.graph_store(), 17, GraphMode::All)
+            .await
+            .unwrap();
+        let expected = build_graph_snapshot_with_mode(&writer, 17, GraphMode::All)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn source_cache_same_head_refresh_updates_only_branch_state() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("base", &root).await.unwrap();
+        writer.fork("main", &root).await.unwrap();
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+        let previous = index.published_branch("main").await.unwrap().unwrap();
+        let traversed_before = index.traversed_node_count();
+        let next_state = SessionState::Attached {
+            target_branch: "base".to_owned(),
+            base_head_id: root,
+        };
+        writer
+            .set_session_state("main", Some(&SessionState::Active), next_state.clone())
+            .await
+            .unwrap();
+
+        index
+            .refresh_named_batch(&source, &["main".to_owned()])
+            .await
+            .unwrap();
+
+        let current = index.published_branch("main").await.unwrap().unwrap();
+        assert_eq!(current.head_id, previous.head_id);
+        assert_eq!(
+            current.contribution_generation,
+            previous.contribution_generation
+        );
+        assert_eq!(index.traversed_node_count(), traversed_before);
+        assert_eq!(
+            index.graph_store().get_session_state("main").await.unwrap(),
+            next_state
+        );
+    }
+
+    #[tokio::test]
+    async fn source_cache_same_head_refresh_discovers_new_skill_subtree() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "same-head-tool-use".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &root, &tool_use)
+            .await
+            .unwrap();
+        for index in 0..SOURCE_CACHE_BATCH_SIZE + 1 {
+            writer
+                .append(NewNode {
+                    parent: tool_use.clone(),
+                    role: Role::System,
+                    metadata: None,
+                    kind: Kind::Text(format!("irrelevant tool child {index}")),
+                })
+                .await
+                .unwrap();
+        }
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+        let previous = index.published_branch("main").await.unwrap().unwrap();
+
+        let (invocation, child) =
+            append_skill_subtree(&writer, &tool_use, "same-head-dynamic").await;
+        index
+            .refresh_named_batch(&source, &["main".to_owned()])
+            .await
+            .unwrap();
+
+        let current = index.published_branch("main").await.unwrap().unwrap();
+        assert_ne!(
+            current.contribution_generation,
+            previous.contribution_generation
+        );
+        assert_eq!(
+            index.published_branch_node_ids("main").await.unwrap(),
+            BTreeSet::from([root, tool_use, invocation, child])
+        );
+        let actual = build_graph_snapshot_with_mode(&index.graph_store(), 19, GraphMode::All)
+            .await
+            .unwrap();
+        let expected = build_graph_snapshot_with_mode(&writer, 19, GraphMode::All)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn source_cache_fast_forward_refresh_discovers_new_skill_subtree() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "fast-forward-tool-use".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &root, &tool_use)
+            .await
+            .unwrap();
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+
+        let suffix = writer
+            .append(NewNode {
+                parent: tool_use.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("fast-forward suffix".to_owned()),
+            })
+            .await
+            .unwrap();
+        let (invocation, child) =
+            append_skill_subtree(&writer, &tool_use, "fast-forward-dynamic").await;
+        writer
+            .set_branch_head("main", &tool_use, &suffix)
+            .await
+            .unwrap();
+        index
+            .refresh_named_batch(&source, &["main".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index.published_branch_node_ids("main").await.unwrap(),
+            BTreeSet::from([root, tool_use, suffix, invocation, child])
+        );
+        let actual = build_graph_snapshot_with_mode(&index.graph_store(), 23, GraphMode::All)
+            .await
+            .unwrap();
+        let expected = build_graph_snapshot_with_mode(&writer, 23, GraphMode::All)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn source_cache_rewind_and_diverge_drop_the_previous_suffix() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let initial = append_text_chain(&writer, &root, 3).await;
+        let base = initial[0].clone();
+        let old_suffix = BTreeSet::from([initial[1].clone(), initial[2].clone()]);
+        let previous_head = initial[2].clone();
+        writer.fork("diverge", &previous_head).await.unwrap();
+        writer.fork("rewind", &previous_head).await.unwrap();
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+        let traversed_before = index.traversed_node_count();
+        let diverged = writer
+            .append(NewNode {
+                parent: base.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("diverged".to_owned()),
+            })
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("diverge", &previous_head, &diverged)
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("rewind", &previous_head, &base)
+            .await
+            .unwrap();
+
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(index.traversed_node_count() - traversed_before, 5);
+        assert_eq!(
+            index.published_branch_node_ids("rewind").await.unwrap(),
+            BTreeSet::from([root.clone(), base.clone()])
+        );
+        assert_eq!(
+            index.published_branch_node_ids("diverge").await.unwrap(),
+            BTreeSet::from([root, base, diverged])
+        );
+        let retained = index
+            .graph_store()
+            .list_children(&writer.root_id())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        assert!(old_suffix.is_disjoint(&retained));
+    }
+
+    #[tokio::test]
+    async fn source_cache_retains_superseded_facts_until_explicit_prune() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let superseded = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("superseded".to_owned()),
+            })
+            .await
+            .unwrap();
+        writer.fork("main", &superseded).await.unwrap();
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &superseded, &root)
+            .await
+            .unwrap();
+
+        index
+            .refresh_named_batch(&source, &["main".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(index.node_count().await.unwrap(), 2);
+        assert_eq!(
+            index.graph_store().get_node(&superseded).await.unwrap().id,
+            superseded
+        );
+        index.prune_published_orphans().await.unwrap();
+        assert_eq!(index.node_count().await.unwrap(), 1);
+        assert!(index.graph_store().get_node(&superseded).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deleting_branch_waits_for_explicit_source_prune() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         writer.fork("main", &root).await.unwrap();
@@ -1240,6 +2310,8 @@ mod tests {
             .unwrap();
 
         assert!(index.is_empty().await.unwrap());
+        assert_eq!(index.node_count().await.unwrap(), 1);
+        index.prune_published_orphans().await.unwrap();
         assert_eq!(index.node_count().await.unwrap(), 0);
     }
 
@@ -1261,14 +2333,19 @@ mod tests {
             .refresh_records(&source, source.graph_branches().await.unwrap())
             .await
             .unwrap();
+        let published = index.published_branch("main").await.unwrap().unwrap();
         let stale_generation = index.allocate_generation().await.unwrap();
         index
             .seed_refresh_queue(stale_generation, "main", &root)
             .await
             .unwrap();
+        index
+            .copy_previous_contribution("main", published.contribution_generation, stale_generation)
+            .await
+            .unwrap();
         let batch = index.claim_refresh_batch(stale_generation).await.unwrap();
         index
-            .commit_refresh_batch(stale_generation, "main", &batch, &[])
+            .commit_refresh_batch(stale_generation, "main", &batch, &[], &[])
             .await
             .unwrap();
         drop(index);

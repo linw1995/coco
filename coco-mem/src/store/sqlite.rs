@@ -20,6 +20,19 @@ pub struct GraphBranchRecord {
     pub state: SessionState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphChildPageCursor {
+    pub created_at: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphChildPage {
+    pub child_ids: Vec<String>,
+    pub next_cursor: Option<GraphChildPageCursor>,
+    pub complete: bool,
+}
+
 mod branch;
 mod codec;
 mod database;

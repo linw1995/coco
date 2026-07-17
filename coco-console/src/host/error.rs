@@ -33,6 +33,11 @@ pub enum Error {
         source: crate::layout::GraphLayoutError,
     },
 
+    #[snafu(display("Console graph frontier failed: {source}"))]
+    IncrementalFrontier {
+        source: Box<crate::host::frontier::AdaptiveFrontierError<Error>>,
+    },
+
     #[snafu(display("Console graph snapshot store {} query failed: {source}", path.display()))]
     QueryGraphSnapshotStore {
         path: PathBuf,

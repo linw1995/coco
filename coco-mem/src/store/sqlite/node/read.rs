@@ -693,6 +693,36 @@ pub async fn load_child_ids_by_parent_ids(
     Ok(children)
 }
 
+pub async fn load_child_ids_page(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent_id: &str,
+    cursor: Option<(&str, &str)>,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut query = node_relations::table
+        .inner_join(nodes::table.on(nodes::id.eq(node_relations::child_node_id)))
+        .filter(node_relations::parent_node_id.eq(parent_id))
+        .select((nodes::created_at, nodes::id))
+        .distinct()
+        .into_boxed();
+    if let Some((created_at, node_id)) = cursor {
+        query = query.filter(
+            nodes::created_at
+                .gt(created_at)
+                .or(nodes::created_at.eq(created_at).and(nodes::id.gt(node_id))),
+        );
+    }
+    query
+        .order((nodes::created_at, nodes::id))
+        .limit(i64::try_from(limit).expect("graph child page limit should fit in i64"))
+        .load::<(String, String)>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
 pub async fn load_node_by_exact_id(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
