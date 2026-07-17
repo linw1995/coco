@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use coco_mem::{Kind, Node, SessionState};
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
+use serde::Deserialize;
 use snafu::prelude::*;
 
 use super::frontier::{
@@ -22,6 +23,131 @@ const DEFAULT_FRONTIER_LOW_WATERMARK: usize = 4_096;
 const DEFAULT_FRONTIER_HIGH_WATERMARK: usize = 8_192;
 const DEFAULT_GRAPH_BUFFER_LIMIT: usize = 256;
 const DEFAULT_CHILD_PAGE_SIZE: usize = 128;
+
+// This mirrors VisibleGraphCollector while retaining the branch provenance needed to resolve
+// each visible anchor's parents against the union of only the scopes that contain that anchor.
+const ANCHOR_SCOPE_CTE: &str = "WITH RECURSIVE provider_scope( \
+    branch_name, node_id, traversal_kind \
+) AS (\
+    SELECT name, head_id, 'graph' FROM console_graph_source_branches \
+    UNION \
+    SELECT scope.branch_name, nodes.parent_id, 'graph' \
+    FROM provider_scope AS scope \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = scope.node_id \
+    WHERE nodes.parent_id <> '' \
+      AND NOT ( \
+          COALESCE( \
+              json_type(nodes.node_json, '$.kind.Anchor.payload.Session'), \
+              '' \
+          ) = 'object' \
+          AND ( \
+              COALESCE(json_type( \
+                  nodes.node_json, \
+                  '$.kind.Anchor.payload.Session.active_skill' \
+              ), 'null') = 'null' \
+              OR COALESCE(json_type( \
+                  nodes.node_json, \
+                  '$.kind.Anchor.payload.Session.active_skill.handoff' \
+              ), 'null') <> 'null' \
+          ) \
+      ) \
+    UNION \
+    SELECT scope.branch_name, relations.parent_id, 'graph' \
+    FROM provider_scope AS scope \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = scope.node_id \
+    INNER JOIN console_graph_source_node_relations AS relations \
+        ON relations.child_id = scope.node_id \
+       AND relations.parent_id <> nodes.parent_id \
+    UNION \
+    SELECT scope.branch_name, relations.child_id, 'skill_subtree' \
+    FROM provider_scope AS scope \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = scope.node_id \
+    INNER JOIN console_graph_source_node_relations AS relations \
+        ON relations.parent_id = scope.node_id \
+    INNER JOIN console_graph_source_nodes AS children \
+        ON children.node_id = relations.child_id \
+    WHERE scope.traversal_kind = 'skill_subtree' \
+       OR ( \
+           json_type(nodes.node_json, '$.kind.ToolUse') = 'array' \
+           AND json_type( \
+               children.node_json, \
+               '$.kind.Anchor.payload.SkillInvocation' \
+           ) = 'object' \
+       ) \
+)";
+
+const ANCHOR_EDGE_CTE: &str = "WITH RECURSIVE \
+params(generation) AS (SELECT ?), \
+visible_anchors(target_id) AS ( \
+    SELECT DISTINCT scopes.node_id \
+    FROM console_graph_anchor_scopes AS scopes \
+    INNER JOIN params ON params.generation = scopes.generation \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = scopes.node_id \
+    WHERE json_type(nodes.node_json, '$.kind.Anchor') = 'object' \
+), \
+raw_edges(target_id, raw_parent_id, edge_kind, edge_order) AS ( \
+    SELECT anchors.target_id, nodes.parent_id, 'primary', 0 \
+    FROM visible_anchors AS anchors \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = anchors.target_id \
+    WHERE nodes.parent_id <> '' \
+    UNION ALL \
+    SELECT anchors.target_id, \
+           json_extract(parents.value, '$.node_id'), \
+           CASE json_extract(parents.value, '$.kind') \
+               WHEN 'shadow' THEN 'shadow' \
+               ELSE 'merge' \
+           END, \
+           CAST(parents.key AS INTEGER) + 1 \
+    FROM visible_anchors AS anchors \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = anchors.target_id \
+    INNER JOIN json_each(nodes.node_json, '$.kind.Anchor.merge_parents') AS parents \
+), \
+resolved(target_id, current_id, edge_kind, edge_order, depth) AS ( \
+    SELECT raw.target_id, raw.raw_parent_id, raw.edge_kind, raw.edge_order, 0 \
+    FROM raw_edges AS raw \
+    INNER JOIN params \
+    WHERE raw.raw_parent_id <> '' \
+      AND EXISTS ( \
+          SELECT 1 \
+          FROM console_graph_anchor_scopes AS target_scope \
+          INNER JOIN console_graph_anchor_scopes AS parent_scope \
+              ON parent_scope.generation = target_scope.generation \
+             AND parent_scope.branch_name = target_scope.branch_name \
+          WHERE target_scope.generation = params.generation \
+            AND target_scope.node_id = raw.target_id \
+            AND parent_scope.node_id = raw.raw_parent_id \
+      ) \
+    UNION ALL \
+    SELECT resolved.target_id, nodes.parent_id, resolved.edge_kind, \
+           resolved.edge_order, resolved.depth + 1 \
+    FROM resolved \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = resolved.current_id \
+    INNER JOIN params \
+    WHERE json_type(nodes.node_json, '$.kind.Anchor') IS NULL \
+      AND nodes.parent_id <> '' \
+      AND EXISTS ( \
+          SELECT 1 \
+          FROM console_graph_anchor_scopes AS target_scope \
+          INNER JOIN console_graph_anchor_scopes AS parent_scope \
+              ON parent_scope.generation = target_scope.generation \
+             AND parent_scope.branch_name = target_scope.branch_name \
+          WHERE target_scope.generation = params.generation \
+            AND target_scope.node_id = resolved.target_id \
+            AND parent_scope.node_id = nodes.parent_id \
+      ) \
+), \
+candidates(target_id, source_id, edge_kind, edge_order, precedence) AS ( \
+    SELECT resolved.target_id, resolved.current_id, resolved.edge_kind, \
+           resolved.edge_order, \
+           ROW_NUMBER() OVER ( \
+               PARTITION BY resolved.target_id, resolved.current_id \
+               ORDER BY resolved.edge_order, resolved.depth \
+           ) \
+    FROM resolved \
+    INNER JOIN console_graph_source_nodes AS nodes ON nodes.node_id = resolved.current_id \
+    WHERE json_type(nodes.node_json, '$.kind.Anchor') = 'object' \
+      AND resolved.current_id <> resolved.target_id \
+)";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IncrementalBuildConfig {
@@ -136,12 +262,6 @@ struct SourceNodeRow {
 }
 
 #[derive(Debug, QueryableByName)]
-struct NodeIdRow {
-    #[diesel(sql_type = Text)]
-    node_id: String,
-}
-
-#[derive(Debug, QueryableByName)]
 struct WorkNodeRow {
     #[diesel(sql_type = BigInt)]
     created_at_ns: i64,
@@ -149,8 +269,16 @@ struct WorkNodeRow {
     remaining_parents: i32,
     #[diesel(sql_type = Integer)]
     processed: i32,
+}
+
+#[derive(Debug, QueryableByName)]
+struct ProjectionWorkNodeRow {
+    #[diesel(sql_type = Integer)]
+    remaining_parents: i32,
+    #[diesel(sql_type = Integer)]
+    processed: i32,
     #[diesel(sql_type = Nullable<Text>)]
-    anchor_ancestor_id: Option<String>,
+    anchor_edges_json: Option<String>,
 }
 
 #[derive(Debug, Clone, QueryableByName)]
@@ -182,6 +310,18 @@ struct BranchRow {
 }
 
 #[derive(Debug, QueryableByName)]
+struct ProjectedBranchRow {
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    head_id: String,
+    #[diesel(sql_type = Text)]
+    state_json: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    anchor_id: Option<String>,
+}
+
+#[derive(Debug, QueryableByName)]
 struct PortRow {
     #[diesel(sql_type = Integer)]
     source_slot: i32,
@@ -193,6 +333,12 @@ struct PortRow {
 struct ProjectionEdge {
     source_id: String,
     kind: StableEdgeKind,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredProjectionEdge {
+    source_id: String,
+    edge_kind: String,
 }
 
 #[derive(Debug)]
@@ -763,6 +909,59 @@ impl IncrementalWorkStore {
                         if !owned {
                             return Err(diesel::result::Error::NotFound);
                         }
+                        for table in [
+                            "console_graph_build_nodes",
+                            "console_graph_build_anchor_edges",
+                            "console_graph_build_frontier",
+                            "console_graph_build_rank_slots",
+                            "console_graph_build_edge_ports",
+                        ] {
+                            diesel::sql_query(format!("DELETE FROM {table} WHERE run_id = ?"))
+                                .bind::<BigInt, _>(run_id)
+                                .execute(connection)?;
+                        }
+                        diesel::sql_query(
+                            "DELETE FROM console_graph_anchor_scopes WHERE generation = ?",
+                        )
+                        .bind::<BigInt, _>(run_id)
+                        .execute(connection)?;
+                        diesel::sql_query(format!(
+                            "{ANCHOR_SCOPE_CTE} \
+                             INSERT OR IGNORE INTO console_graph_anchor_scopes \
+                                 (generation, branch_name, node_id) \
+                             SELECT ?, scope.branch_name, scope.node_id \
+                             FROM provider_scope AS scope \
+                             INNER JOIN console_graph_source_nodes AS nodes \
+                                 ON nodes.node_id = scope.node_id \
+                             WHERE nodes.parent_id <> ''"
+                        ))
+                        .bind::<BigInt, _>(run_id)
+                        .execute(connection)?;
+                        diesel::sql_query(
+                            "INSERT INTO console_graph_anchor_scope_manifests \
+                                 (generation, scope_count) \
+                             SELECT ?, COUNT(*) \
+                             FROM console_graph_anchor_scopes \
+                             WHERE generation = ? \
+                             ON CONFLICT(generation) DO UPDATE SET \
+                                 scope_count = excluded.scope_count",
+                        )
+                        .bind::<BigInt, _>(run_id)
+                        .bind::<BigInt, _>(run_id)
+                        .execute(connection)?;
+                        diesel::sql_query(format!(
+                            "{ANCHOR_EDGE_CTE} \
+                             INSERT INTO console_graph_build_anchor_edges \
+                                 (run_id, target_id, source_id, edge_kind, edge_order) \
+                             SELECT params.generation, candidates.target_id, \
+                                    candidates.source_id, candidates.edge_kind, \
+                                    candidates.edge_order \
+                             FROM candidates \
+                             INNER JOIN params \
+                             WHERE candidates.precedence = 1"
+                        ))
+                        .bind::<BigInt, _>(run_id)
+                        .execute(connection)?;
                         let complete_modes = diesel::sql_query(
                             "SELECT COUNT(DISTINCT mode) AS count \
                              FROM console_graph_materializations \
@@ -771,6 +970,31 @@ impl IncrementalWorkStore {
                         .bind::<BigInt, _>(baseline_generation)
                         .get_result::<CountRow>(connection)?
                         .count;
+                        let baseline_scope_complete = diesel::sql_query(
+                            "SELECT CASE \
+                                 WHEN EXISTS ( \
+                                     SELECT 1 \
+                                     FROM console_graph_anchor_scope_manifests AS manifest \
+                                     WHERE manifest.generation = ? \
+                                       AND manifest.scope_count = ( \
+                                           SELECT COUNT(*) \
+                                           FROM console_graph_anchor_scopes AS scopes \
+                                           WHERE scopes.generation = manifest.generation \
+                                       ) \
+                                 ) THEN 1 \
+                                 WHEN NOT EXISTS ( \
+                                     SELECT 1 \
+                                     FROM console_graph_node_locations \
+                                     WHERE generation = ? AND mode IN ('anchors', 'all') \
+                                 ) THEN 1 \
+                                 ELSE 0 \
+                             END AS count",
+                        )
+                        .bind::<BigInt, _>(baseline_generation)
+                        .bind::<BigInt, _>(baseline_generation)
+                        .get_result::<CountRow>(connection)?
+                        .count
+                            == 1;
                         let removed_nodes = diesel::sql_query(
                             "SELECT COUNT(*) AS count \
                              FROM console_graph_node_locations AS baseline \
@@ -785,6 +1009,45 @@ impl IncrementalWorkStore {
                                    WHERE branch_nodes.node_id = baseline.node_id \
                                )",
                         )
+                        .bind::<BigInt, _>(baseline_generation)
+                        .get_result::<CountRow>(connection)?
+                        .count;
+                        let anchor_scope_changes = diesel::sql_query(
+                            "SELECT ( \
+                                 SELECT COUNT(*) \
+                                 FROM console_graph_anchor_scopes AS baseline \
+                                 WHERE baseline.generation = ? \
+                                   AND NOT EXISTS ( \
+                                       SELECT 1 \
+                                       FROM console_graph_anchor_scopes AS current \
+                                       WHERE current.generation = ? \
+                                         AND current.branch_name = baseline.branch_name \
+                                         AND current.node_id = baseline.node_id \
+                                   ) \
+                             ) + ( \
+                                 SELECT COUNT(*) \
+                                 FROM console_graph_anchor_scopes AS current \
+                                 WHERE current.generation = ? \
+                                   AND EXISTS ( \
+                                       SELECT 1 \
+                                       FROM console_graph_node_locations AS baseline_all \
+                                       WHERE baseline_all.generation = ? \
+                                         AND baseline_all.mode = 'all' \
+                                         AND baseline_all.node_id = current.node_id \
+                                   ) \
+                                   AND NOT EXISTS ( \
+                                       SELECT 1 \
+                                       FROM console_graph_anchor_scopes AS baseline \
+                                       WHERE baseline.generation = ? \
+                                         AND baseline.branch_name = current.branch_name \
+                                         AND baseline.node_id = current.node_id \
+                                   ) \
+                             ) AS count",
+                        )
+                        .bind::<BigInt, _>(baseline_generation)
+                        .bind::<BigInt, _>(run_id)
+                        .bind::<BigInt, _>(run_id)
+                        .bind::<BigInt, _>(baseline_generation)
                         .bind::<BigInt, _>(baseline_generation)
                         .get_result::<CountRow>(connection)?
                         .count;
@@ -803,23 +1066,15 @@ impl IncrementalWorkStore {
                         .get_result::<CountRow>(connection)?
                         .count;
                         let kind = if complete_modes == 2
+                            && baseline_scope_complete
                             && removed_nodes == 0
+                            && anchor_scope_changes == 0
                             && missing_ports == 0
                         {
                             IncrementalBuildKind::Append
                         } else {
                             IncrementalBuildKind::Full
                         };
-                        for table in [
-                            "console_graph_build_nodes",
-                            "console_graph_build_frontier",
-                            "console_graph_build_rank_slots",
-                            "console_graph_build_edge_ports",
-                        ] {
-                            diesel::sql_query(format!("DELETE FROM {table} WHERE run_id = ?"))
-                                .bind::<BigInt, _>(run_id)
-                                .execute(connection)?;
-                        }
                         diesel::sql_query(
                             "UPDATE console_graph_branch_build_state \
                              SET inflight_head_id = NULL, build_generation = NULL \
@@ -1227,12 +1482,56 @@ impl IncrementalWorkStore {
         self.database
             .with_connection(move |connection| {
                 diesel::sql_query(
-                    "SELECT created_at_ns, remaining_parents, processed, anchor_ancestor_id \
+                    "SELECT created_at_ns, remaining_parents, processed \
                      FROM console_graph_build_nodes WHERE run_id = ? AND node_id = ?",
                 )
                 .bind::<BigInt, _>(run_id)
                 .bind::<Text, _>(node_id)
                 .get_result::<WorkNodeRow>(connection)
+                .optional()
+                .context(crate::error::QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+
+    async fn projection_work_node(
+        &self,
+        node_id: &str,
+    ) -> crate::Result<Option<ProjectionWorkNodeRow>> {
+        let path = self.path.clone();
+        let run_id = self.run_id;
+        let node_id = node_id.to_owned();
+        self.database
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "SELECT build.remaining_parents, build.processed, \
+                            CASE WHEN EXISTS ( \
+                                SELECT 1 FROM console_graph_anchor_scopes AS scopes \
+                                WHERE scopes.generation = ? \
+                                  AND scopes.node_id = build.node_id \
+                            ) THEN ( \
+                                SELECT COALESCE( \
+                                    json_group_array(json_object( \
+                                        'source_id', desired.source_id, \
+                                        'edge_kind', desired.edge_kind \
+                                    )), \
+                                    '[]' \
+                                ) \
+                                FROM ( \
+                                    SELECT source_id, edge_kind \
+                                    FROM console_graph_build_anchor_edges \
+                                    WHERE run_id = ? AND target_id = build.node_id \
+                                    ORDER BY edge_order, source_id \
+                                ) AS desired \
+                            ) END AS anchor_edges_json \
+                     FROM console_graph_build_nodes AS build \
+                     WHERE build.run_id = ? AND build.node_id = ?",
+                )
+                .bind::<BigInt, _>(run_id)
+                .bind::<BigInt, _>(run_id)
+                .bind::<BigInt, _>(run_id)
+                .bind::<Text, _>(node_id)
+                .get_result::<ProjectionWorkNodeRow>(connection)
                 .optional()
                 .context(crate::error::QueryGraphSnapshotStoreSnafu { path })
             })
@@ -1406,8 +1705,7 @@ impl IncrementalWorkStore {
                                 continue;
                             }
                             let state = diesel::sql_query(
-                                "SELECT created_at_ns, remaining_parents, processed, \
-                                        anchor_ancestor_id \
+                                "SELECT created_at_ns, remaining_parents, processed \
                                  FROM console_graph_build_nodes \
                                  WHERE run_id = ? AND node_id = ?",
                             )
@@ -1442,12 +1740,13 @@ impl IncrementalWorkStore {
         snapshots: &ConsoleGraphSnapshotStore,
         buffer: &mut GraphBuffer,
     ) -> crate::Result<(bool, bool)> {
-        let state = self.work_node(&node.id).await?.with_context(|| {
-            crate::error::InvalidGraphSnapshotStoreValueSnafu {
+        let state = self
+            .projection_work_node(&node.id)
+            .await?
+            .with_context(|| crate::error::InvalidGraphSnapshotStoreValueSnafu {
                 column: "work_node",
                 value: node.id.clone(),
-            }
-        })?;
+            })?;
         ensure!(
             state.remaining_parents == 0 && state.processed == 0,
             crate::error::InvalidGraphSnapshotStoreValueSnafu {
@@ -1459,24 +1758,17 @@ impl IncrementalWorkStore {
             }
         );
         if node.is_root() {
-            self.set_anchor_ancestor(&node.id, None).await?;
             return Ok((false, false));
         }
 
-        let primary_anchor = self.anchor_ancestor(&node.parent).await?;
-        let current_anchor = matches!(node.kind, Kind::Anchor(_)).then(|| node.id.clone());
-        self.set_anchor_ancestor(
-            &node.id,
-            current_anchor.as_deref().or(primary_anchor.as_deref()),
-        )
-        .await?;
-
-        let all_edges = self.projected_edges(node, GraphMode::All).await?;
+        let all_edges = self.all_edges(node).await?;
         self.buffer_mode_node(node, GraphMode::All, all_edges, snapshots, buffer)
             .await?;
 
-        let anchors_added = if current_anchor.is_some() {
-            let anchor_edges = self.projected_edges(node, GraphMode::Anchors).await?;
+        let anchors_added = if matches!(node.kind, Kind::Anchor(_))
+            && let Some(edges_json) = state.anchor_edges_json
+        {
+            let anchor_edges = stored_projection_edges(&edges_json)?;
             self.buffer_mode_node(node, GraphMode::Anchors, anchor_edges, snapshots, buffer)
                 .await?;
             true
@@ -1486,89 +1778,9 @@ impl IncrementalWorkStore {
         Ok((true, anchors_added))
     }
 
-    async fn set_anchor_ancestor(
-        &self,
-        node_id: &str,
-        anchor_ancestor_id: Option<&str>,
-    ) -> crate::Result<()> {
-        let path = self.path.clone();
-        let run_id = self.run_id;
-        let node_id = node_id.to_owned();
-        let anchor_ancestor_id = anchor_ancestor_id.map(str::to_owned);
-        self.database
-            .with_connection(move |connection| {
-                diesel::sql_query(
-                    "UPDATE console_graph_build_nodes SET anchor_ancestor_id = ? \
-                     WHERE run_id = ? AND node_id = ?",
-                )
-                .bind::<Nullable<Text>, _>(anchor_ancestor_id)
-                .bind::<BigInt, _>(run_id)
-                .bind::<Text, _>(node_id)
-                .execute(connection)
-                .map(|_| ())
-                .context(crate::error::QueryGraphSnapshotStoreSnafu { path })
-            })
-            .await
-    }
-
-    async fn anchor_ancestor(&self, node_id: &str) -> crate::Result<Option<String>> {
-        if node_id.is_empty() || node_id == self.root_id {
-            return Ok(None);
-        }
-        if let Some(row) = self
-            .work_node(node_id)
-            .await?
-            .filter(|row| row.processed == 1)
-        {
-            return Ok(row.anchor_ancestor_id);
-        }
-        if self.kind != IncrementalBuildKind::Append {
-            return Ok(None);
-        }
-
-        let mut current = node_id.to_owned();
-        let mut seen = BTreeSet::new();
-        while current != self.root_id && !current.is_empty() {
-            ensure!(
-                seen.insert(current.clone()),
-                crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                    column: "anchor_ancestor",
-                    value: format!("cyclic primary parent chain at {current}"),
-                }
-            );
-            if self.slot(GraphMode::Anchors, &current).await?.is_some() {
-                return Ok(Some(current));
-            }
-            current = self.source_parent(&current).await?.unwrap_or_default();
-        }
-        Ok(None)
-    }
-
-    async fn source_parent(&self, node_id: &str) -> crate::Result<Option<String>> {
-        let path = self.path.clone();
-        let node_id = node_id.to_owned();
-        self.database
-            .with_connection(move |connection| {
-                diesel::sql_query(
-                    "SELECT parent_id AS node_id FROM console_graph_source_nodes \
-                     WHERE node_id = ?",
-                )
-                .bind::<Text, _>(node_id)
-                .get_result::<NodeIdRow>(connection)
-                .optional()
-                .map(|row| row.map(|row| row.node_id))
-                .context(crate::error::QueryGraphSnapshotStoreSnafu { path })
-            })
-            .await
-    }
-
-    async fn projected_edges(
-        &self,
-        node: &Node,
-        mode: GraphMode,
-    ) -> crate::Result<Vec<ProjectionEdge>> {
+    async fn all_edges(&self, node: &Node) -> crate::Result<Vec<ProjectionEdge>> {
         let mut edges = Vec::new();
-        self.push_projection_edge(&mut edges, mode, &node.parent, StableEdgeKind::Primary)
+        self.push_all_edge(&mut edges, &node.parent, StableEdgeKind::Primary)
             .await?;
         if let Kind::Anchor(anchor) = &node.kind {
             for merge_parent in anchor.merge_parents() {
@@ -1577,7 +1789,7 @@ impl IncrementalWorkStore {
                 } else {
                     StableEdgeKind::Merge
                 };
-                self.push_projection_edge(&mut edges, mode, merge_parent.node_id(), kind)
+                self.push_all_edge(&mut edges, merge_parent.node_id(), kind)
                     .await?;
             }
         }
@@ -1585,28 +1797,22 @@ impl IncrementalWorkStore {
         Ok(edges)
     }
 
-    async fn push_projection_edge(
+    async fn push_all_edge(
         &self,
         edges: &mut Vec<ProjectionEdge>,
-        mode: GraphMode,
         raw_parent_id: &str,
         kind: StableEdgeKind,
     ) -> crate::Result<()> {
         if raw_parent_id.is_empty() || raw_parent_id == self.root_id {
             return Ok(());
         }
-        let source_id = match mode {
-            GraphMode::All => {
-                let processed = self
-                    .work_node(raw_parent_id)
-                    .await?
-                    .is_some_and(|row| row.processed == 1);
-                let reused = self.kind == IncrementalBuildKind::Append
-                    && self.slot(GraphMode::All, raw_parent_id).await?.is_some();
-                (processed || reused).then(|| raw_parent_id.to_owned())
-            }
-            GraphMode::Anchors => self.anchor_ancestor(raw_parent_id).await?,
-        };
+        let processed = self
+            .work_node(raw_parent_id)
+            .await?
+            .is_some_and(|row| row.processed == 1);
+        let reused = self.kind == IncrementalBuildKind::Append
+            && self.slot(GraphMode::All, raw_parent_id).await?.is_some();
+        let source_id = (processed || reused).then(|| raw_parent_id.to_owned());
         let Some(source_id) = source_id else {
             return Ok(());
         };
@@ -2034,7 +2240,7 @@ impl IncrementalWorkStore {
     }
 
     async fn apply_branch_labels(&self, generation: i64) -> crate::Result<()> {
-        let branches = self.branches().await?;
+        let branches = self.projected_branches().await?;
         let mut labels = BTreeMap::<(GraphMode, String), Vec<String>>::new();
         for branch in branches {
             let state = serde_json::from_str::<SessionState>(&branch.state_json).context(
@@ -2055,7 +2261,7 @@ impl IncrementalWorkStore {
                     .or_default()
                     .push(label.clone());
             }
-            if let Some(anchor_id) = self.anchor_ancestor(&branch.head_id).await? {
+            if let Some(anchor_id) = branch.anchor_id {
                 labels
                     .entry((GraphMode::Anchors, anchor_id))
                     .or_default()
@@ -2076,15 +2282,53 @@ impl IncrementalWorkStore {
         Ok(())
     }
 
-    async fn branches(&self) -> crate::Result<Vec<BranchRow>> {
+    async fn projected_branches(&self) -> crate::Result<Vec<ProjectedBranchRow>> {
         let path = self.path.clone();
+        let generation = self.run_id;
         self.database
             .with_connection(move |connection| {
                 diesel::sql_query(
-                    "SELECT name, head_id, state_json \
-                     FROM console_graph_source_branches ORDER BY name",
+                    "WITH RECURSIVE branch_ancestry( \
+                         branch_name, node_id, depth \
+                     ) AS ( \
+                         SELECT branches.name, branches.head_id, 0 \
+                         FROM console_graph_source_branches AS branches \
+                         WHERE EXISTS ( \
+                             SELECT 1 FROM console_graph_anchor_scopes AS scopes \
+                             WHERE scopes.generation = ? \
+                               AND scopes.branch_name = branches.name \
+                               AND scopes.node_id = branches.head_id \
+                         ) \
+                         UNION ALL \
+                         SELECT ancestry.branch_name, nodes.parent_id, ancestry.depth + 1 \
+                         FROM branch_ancestry AS ancestry \
+                         INNER JOIN console_graph_source_nodes AS nodes \
+                             ON nodes.node_id = ancestry.node_id \
+                         WHERE json_type(nodes.node_json, '$.kind.Anchor') IS NULL \
+                           AND nodes.parent_id <> '' \
+                           AND EXISTS ( \
+                               SELECT 1 FROM console_graph_anchor_scopes AS scopes \
+                               WHERE scopes.generation = ? \
+                                 AND scopes.branch_name = ancestry.branch_name \
+                                 AND scopes.node_id = nodes.parent_id \
+                           ) \
+                     ) \
+                     SELECT branches.name, branches.head_id, branches.state_json, ( \
+                         SELECT ancestry.node_id \
+                         FROM branch_ancestry AS ancestry \
+                         INNER JOIN console_graph_source_nodes AS nodes \
+                             ON nodes.node_id = ancestry.node_id \
+                         WHERE ancestry.branch_name = branches.name \
+                           AND json_type(nodes.node_json, '$.kind.Anchor') = 'object' \
+                         ORDER BY ancestry.depth \
+                         LIMIT 1 \
+                     ) AS anchor_id \
+                     FROM console_graph_source_branches AS branches \
+                     ORDER BY branches.name",
                 )
-                .load::<BranchRow>(connection)
+                .bind::<BigInt, _>(generation)
+                .bind::<BigInt, _>(generation)
+                .load::<ProjectedBranchRow>(connection)
                 .context(crate::error::QueryGraphSnapshotStoreSnafu { path })
             })
             .await
@@ -2140,16 +2384,62 @@ fn graph_layout_edge_kind(kind: StableEdgeKind) -> GraphLayoutEdgeKind {
     }
 }
 
+fn stored_projection_edges(value: &str) -> crate::Result<Vec<ProjectionEdge>> {
+    serde_json::from_str::<Vec<StoredProjectionEdge>>(value)
+        .context(crate::error::ParseGraphSnapshotStoreValueSnafu {
+            column: "anchor_edges_json",
+        })?
+        .into_iter()
+        .map(|edge| {
+            Ok(ProjectionEdge {
+                source_id: edge.source_id,
+                kind: stored_edge_kind(&edge.edge_kind)?,
+            })
+        })
+        .collect()
+}
+
+fn stored_edge_kind(value: &str) -> crate::Result<StableEdgeKind> {
+    match value {
+        "primary" => Ok(StableEdgeKind::Primary),
+        "merge" => Ok(StableEdgeKind::Merge),
+        "shadow" => Ok(StableEdgeKind::Shadow),
+        _ => crate::error::InvalidGraphSnapshotStoreValueSnafu {
+            column: "edge_kind",
+            value: value.to_owned(),
+        }
+        .fail(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use coco_mem::{
         Anchor, BranchStore, Kind, MergeParent, NewNode, NodeStore, PromptAnchor, Role,
-        SqliteGraphStore, SqliteStore,
+        SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode,
+        SkillRuntimeContext, SqliteGraphStore, SqliteStore, ToolUse,
     };
+    use serde_json::json;
 
     use super::*;
+    use crate::api::{GraphViewportEdgeKind, GraphViewportResponse};
+    use crate::graph::{GraphEdgeKind, GraphSnapshot, build_graph_snapshot_with_mode};
     use crate::host::api::GraphViewportRequest;
     use crate::host::source_cache::PersistentGraphIndex;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AnchorGraphShape {
+        nodes: BTreeMap<String, Vec<String>>,
+        edges: BTreeSet<(String, String, String)>,
+    }
+
+    #[derive(Debug)]
+    struct HandoffSkillFixture {
+        invocation: String,
+        handoff_session: String,
+        external_prompt: String,
+        merge_child: String,
+    }
 
     #[tokio::test]
     async fn sqlite_frontier_spills_and_returns_to_memory_during_streaming_build() {
@@ -2341,6 +2631,307 @@ mod tests {
             all.nodes
                 .iter()
                 .all(|node| node.key == format!("node:{}", node.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn full_build_matches_handoff_skill_subtree_with_merge_child() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session(&writer, &root, "main session").await;
+        let tool_use = append_tool_use(&writer, &session).await;
+        writer.fork("main", &tool_use).await.unwrap();
+        let fixture = append_handoff_skill_fixture(&writer, &root, &tool_use).await;
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+
+        let stats = build_and_publish(&snapshots, &root, 1).await;
+        assert!(!stats.reused_baseline);
+
+        assert_handoff_skill_projection(&writer, &snapshots, 1, &fixture).await;
+    }
+
+    #[tokio::test]
+    async fn append_matches_handoff_skill_subtree_with_merge_child() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session(&writer, &root, "main session").await;
+        let tool_use = append_tool_use(&writer, &session).await;
+        writer.fork("main", &tool_use).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+        build_and_publish(&snapshots, &root, 1).await;
+
+        let fixture = append_handoff_skill_fixture(&writer, &root, &tool_use).await;
+        refresh_source_index(&source, &mut index).await;
+
+        let stats = build_and_publish(&snapshots, &root, 2).await;
+        assert!(stats.reused_baseline);
+
+        assert_handoff_skill_projection(&writer, &snapshots, 2, &fixture).await;
+    }
+
+    #[tokio::test]
+    async fn context_rollover_rebuild_matches_full_anchor_scope() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let old_session = append_session(&writer, &root, "old session").await;
+        let old_anchor = append_prompt(&writer, &old_session, Vec::new(), "old prompt").await;
+        let old_head = append_text(&writer, &old_anchor, "old response").await;
+        writer.fork("main", &old_head).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+
+        let baseline = build_and_publish(&snapshots, &root, 1).await;
+        assert!(!baseline.reused_baseline);
+
+        let new_session = append_session(&writer, &old_head, "new session").await;
+        let new_anchor = append_prompt(&writer, &new_session, Vec::new(), "new prompt").await;
+        let new_head = append_text(&writer, &new_anchor, "new response").await;
+        writer
+            .set_branch_head("main", &old_head, &new_head)
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+
+        let rollover = build_and_publish(&snapshots, &root, 2).await;
+        assert!(!rollover.reused_baseline);
+
+        let full = build_graph_snapshot_with_mode(&writer, 2, GraphMode::Anchors)
+            .await
+            .unwrap();
+        let persisted = persisted_anchors(&snapshots).await;
+        assert_eq!(snapshot_shape(&full), viewport_shape(&persisted));
+        assert_eq!(
+            persisted
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([new_session.as_str(), new_anchor.as_str()])
+        );
+        assert!(persisted.nodes.iter().all(|node| node.id != old_session));
+        assert!(persisted.nodes.iter().all(|node| node.id != old_anchor));
+    }
+
+    #[tokio::test]
+    async fn missing_active_scope_provenance_rebuilds_new_context() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let old_session = append_session(&writer, &root, "old session").await;
+        let old_anchor = append_prompt(&writer, &old_session, Vec::new(), "old prompt").await;
+        let old_head = append_text(&writer, &old_anchor, "old response").await;
+        writer.fork("main", &old_head).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+        build_and_publish(&snapshots, &root, 1).await;
+
+        let active_generation = snapshots.active_generation().await.unwrap();
+        let deleted_scopes = snapshots
+            .with_connection(move |connection| {
+                connection
+                    .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                        let deleted = diesel::sql_query(
+                            "DELETE FROM console_graph_anchor_scopes WHERE generation = ?",
+                        )
+                        .bind::<BigInt, _>(active_generation)
+                        .execute(connection)?;
+                        diesel::sql_query(
+                            "DELETE FROM console_graph_anchor_scope_manifests \
+                             WHERE generation = ?",
+                        )
+                        .bind::<BigInt, _>(active_generation)
+                        .execute(connection)?;
+                        Ok(deleted)
+                    })
+                    .context(crate::error::QueryGraphSnapshotStoreSnafu {
+                        path: PathBuf::from("missing-anchor-scope-provenance"),
+                    })
+            })
+            .await
+            .unwrap();
+        assert!(deleted_scopes > 0);
+
+        let new_session = append_session(&writer, &old_head, "new session").await;
+        let new_anchor = append_prompt(&writer, &new_session, Vec::new(), "new prompt").await;
+        let new_head = append_text(&writer, &new_anchor, "new response").await;
+        writer
+            .set_branch_head("main", &old_head, &new_head)
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+
+        let rollover = build_and_publish(&snapshots, &root, 2).await;
+        assert!(!rollover.reused_baseline);
+
+        let full = build_graph_snapshot_with_mode(&writer, 2, GraphMode::Anchors)
+            .await
+            .unwrap();
+        let persisted = persisted_anchors(&snapshots).await;
+        assert_eq!(snapshot_shape(&full), viewport_shape(&persisted));
+        assert_eq!(
+            persisted
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([new_session.as_str(), new_anchor.as_str()])
+        );
+        assert!(persisted.nodes.iter().all(|node| node.id != old_session));
+        assert!(persisted.nodes.iter().all(|node| node.id != old_anchor));
+    }
+
+    #[tokio::test]
+    async fn empty_baseline_without_scope_manifest_can_append() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+        let baseline = build_and_publish(&snapshots, &root, 1).await;
+        assert!(!baseline.reused_baseline);
+        assert!(persisted_anchors(&snapshots).await.nodes.is_empty());
+
+        let active_generation = snapshots.active_generation().await.unwrap();
+        snapshots
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "DELETE FROM console_graph_anchor_scope_manifests WHERE generation = ?",
+                )
+                .bind::<BigInt, _>(active_generation)
+                .execute(connection)
+                .map(|_| ())
+                .context(crate::error::QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("missing-empty-anchor-scope-manifest"),
+                })
+            })
+            .await
+            .unwrap();
+
+        let next = build_and_publish(&snapshots, &root, 2).await;
+        assert!(next.reused_baseline);
+        assert!(persisted_anchors(&snapshots).await.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provenance_change_rebuilds_union_without_cross_context_edge() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let old_session = append_session(&writer, &root, "old session").await;
+        let old_anchor = append_prompt(&writer, &old_session, Vec::new(), "old prompt").await;
+        let old_head = append_text(&writer, &old_anchor, "old response").await;
+        writer.fork("legacy", &old_head).await.unwrap();
+        writer.fork("main", &old_head).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+        build_and_publish(&snapshots, &root, 1).await;
+
+        let new_session = append_session(&writer, &old_head, "new session").await;
+        let new_anchor = append_prompt(&writer, &new_session, Vec::new(), "new prompt").await;
+        let new_head = append_text(&writer, &new_anchor, "new response").await;
+        writer
+            .set_branch_head("main", &old_head, &new_head)
+            .await
+            .unwrap();
+        refresh_source_index(&source, &mut index).await;
+
+        let rebuilt = build_and_publish(&snapshots, &root, 2).await;
+        assert!(!rebuilt.reused_baseline);
+
+        let full = build_graph_snapshot_with_mode(&writer, 2, GraphMode::Anchors)
+            .await
+            .unwrap();
+        let persisted = persisted_anchors(&snapshots).await;
+        assert_eq!(snapshot_shape(&full), viewport_shape(&persisted));
+        assert_eq!(
+            persisted
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                old_session.as_str(),
+                old_anchor.as_str(),
+                new_session.as_str(),
+                new_anchor.as_str(),
+            ])
+        );
+        assert!(!persisted.edges.iter().any(|edge| {
+            edge.source_id == old_anchor
+                && edge.target_id == new_session
+                && edge.kind == GraphViewportEdgeKind::Primary
+        }));
+        assert_eq!(
+            persisted
+                .nodes
+                .iter()
+                .find(|node| node.id == old_anchor)
+                .unwrap()
+                .labels,
+            vec!["legacy".to_owned()]
+        );
+        assert_eq!(
+            persisted
+                .nodes
+                .iter()
+                .find(|node| node.id == new_anchor)
+                .unwrap()
+                .labels,
+            vec!["main".to_owned()]
         );
     }
 
@@ -2541,6 +3132,122 @@ mod tests {
             .unwrap()
     }
 
+    async fn append_tool_use(store: &SqliteStore, parent: &str) -> String {
+        store
+            .append(NewNode {
+                parent: parent.to_owned(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "tool-call".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input: json!({"cmd": "coco skill run test-skill"}),
+                }),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn append_session(store: &SqliteStore, parent: &str, prompt: &str) -> String {
+        store
+            .append(NewNode {
+                parent: parent.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    Vec::new(),
+                    SessionAnchor {
+                        role: SessionRole::Orchestrator,
+                        provider_profile: None,
+                        provider: Some("test".to_owned()),
+                        model: "test-model".to_owned(),
+                        tools: Vec::new(),
+                        system_prompt: "system".to_owned(),
+                        prompt: prompt.to_owned(),
+                        temperature: None,
+                        max_tokens: None,
+                        additional_params: None,
+                        enable_coco_shim: false,
+                        active_skill: None,
+                    },
+                )),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn append_handoff_session(store: &SqliteStore, parent: &str) -> String {
+        store
+            .append(NewNode {
+                parent: parent.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    Vec::new(),
+                    SessionAnchor {
+                        role: SessionRole::Runner,
+                        provider_profile: None,
+                        provider: Some("test".to_owned()),
+                        model: "test-model".to_owned(),
+                        tools: Vec::new(),
+                        system_prompt: "skill system".to_owned(),
+                        prompt: "handoff prompt".to_owned(),
+                        temperature: None,
+                        max_tokens: None,
+                        additional_params: None,
+                        enable_coco_shim: false,
+                        active_skill: Some(SkillRuntimeContext {
+                            name: "test-skill".to_owned(),
+                            handoff: Some("handoff prompt".to_owned()),
+                        }),
+                    },
+                )),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn append_handoff_skill_fixture(
+        store: &SqliteStore,
+        root: &str,
+        tool_use: &str,
+    ) -> HandoffSkillFixture {
+        let invocation = store
+            .append(NewNode {
+                parent: tool_use.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    Vec::new(),
+                    SkillInvocationAnchor {
+                        skill_name: "test-skill".to_owned(),
+                        mode: SkillInvocationMode::Handoff {
+                            prompt: "handoff prompt".to_owned(),
+                        },
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let handoff_session = append_handoff_session(store, &invocation).await;
+        let external_session = append_session(store, root, "external session").await;
+        let external_prompt =
+            append_prompt(store, &external_session, Vec::new(), "external prompt").await;
+        let merge_child = append_prompt(
+            store,
+            &external_prompt,
+            vec![MergeParent::merge(handoff_session.clone())],
+            "merge child",
+        )
+        .await;
+        HandoffSkillFixture {
+            invocation,
+            handoff_session,
+            external_prompt,
+            merge_child,
+        }
+    }
+
     async fn append_prompt(
         store: &SqliteStore,
         parent: &str,
@@ -2562,5 +3269,125 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    async fn refresh_source_index(source: &SqliteGraphStore, index: &mut PersistentGraphIndex) {
+        let records = source.graph_branches().await.unwrap();
+        index.reconcile_full_refresh(&records).await.unwrap();
+        index.refresh_records(source, records).await.unwrap();
+    }
+
+    async fn build_and_publish(
+        snapshots: &ConsoleGraphSnapshotStore,
+        root_id: &str,
+        source_version: u64,
+    ) -> IncrementalBuildStats {
+        let lease = snapshots
+            .acquire_incremental_build_lease(source_version)
+            .await
+            .unwrap()
+            .unwrap();
+        let stats = build_incremental_generation(
+            snapshots,
+            root_id,
+            snapshots.active_generation().await.unwrap(),
+            &lease,
+            source_version,
+        )
+        .await
+        .unwrap();
+        snapshots
+            .publish_incremental_generation(&lease, source_version)
+            .await
+            .unwrap();
+        stats
+    }
+
+    async fn persisted_anchors(snapshots: &ConsoleGraphSnapshotStore) -> GraphViewportResponse {
+        snapshots
+            .latest_viewport(GraphMode::Anchors, GraphViewportRequest::default())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn assert_handoff_skill_projection(
+        writer: &SqliteStore,
+        snapshots: &ConsoleGraphSnapshotStore,
+        version: u64,
+        fixture: &HandoffSkillFixture,
+    ) {
+        let full = build_graph_snapshot_with_mode(writer, version, GraphMode::Anchors)
+            .await
+            .unwrap();
+        let persisted = persisted_anchors(snapshots).await;
+        let full_shape = snapshot_shape(&full);
+        let persisted_shape = viewport_shape(&persisted);
+        assert_eq!(full_shape, persisted_shape);
+        assert!(persisted_shape.edges.contains(&(
+            fixture.invocation.clone(),
+            fixture.handoff_session.clone(),
+            "primary_parent".to_owned(),
+        )));
+        assert!(persisted_shape.edges.contains(&(
+            fixture.external_prompt.clone(),
+            fixture.merge_child.clone(),
+            "primary_parent".to_owned(),
+        )));
+        assert!(persisted_shape.edges.contains(&(
+            fixture.handoff_session.clone(),
+            fixture.merge_child.clone(),
+            "merge_parent".to_owned(),
+        )));
+    }
+
+    fn snapshot_shape(snapshot: &GraphSnapshot) -> AnchorGraphShape {
+        AnchorGraphShape {
+            nodes: snapshot
+                .nodes
+                .iter()
+                .map(|node| (node.id.clone(), node.labels.clone()))
+                .collect(),
+            edges: snapshot
+                .edges
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.source.clone(),
+                        edge.target.clone(),
+                        snapshot_edge_kind(edge.kind).to_owned(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn viewport_shape(viewport: &GraphViewportResponse) -> AnchorGraphShape {
+        AnchorGraphShape {
+            nodes: viewport
+                .nodes
+                .iter()
+                .map(|node| (node.id.clone(), node.labels.clone()))
+                .collect(),
+            edges: viewport
+                .edges
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.source_id.clone(),
+                        edge.target_id.clone(),
+                        edge.kind.key_part().to_owned(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn snapshot_edge_kind(kind: GraphEdgeKind) -> &'static str {
+        match kind {
+            GraphEdgeKind::Primary => "primary_parent",
+            GraphEdgeKind::Merge => "merge_parent",
+            GraphEdgeKind::Shadow => "shadow_parent",
+        }
     }
 }

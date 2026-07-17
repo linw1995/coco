@@ -549,6 +549,8 @@ impl ConsoleGraphSnapshotStore {
             "console_graph_node_locations",
             "console_graph_edge_routes",
             "console_graph_edge_ports",
+            "console_graph_anchor_scopes",
+            "console_graph_anchor_scope_manifests",
             "console_graph_materializations",
             "console_graph_materialization_branches",
         ] {
@@ -599,6 +601,7 @@ impl ConsoleGraphSnapshotStore {
     pub(crate) async fn cleanup_completed_build_work(&self) -> crate::Result<()> {
         for table in [
             "console_graph_build_nodes",
+            "console_graph_build_anchor_edges",
             "console_graph_build_frontier",
             "console_graph_build_rank_slots",
             "console_graph_build_edge_ports",
@@ -638,6 +641,10 @@ impl ConsoleGraphSnapshotStore {
                        WHERE run_id = console_graph_build_runs.run_id \
                    ) \
                    AND NOT EXISTS ( \
+                       SELECT 1 FROM console_graph_build_anchor_edges \
+                       WHERE run_id = console_graph_build_runs.run_id \
+                   ) \
+                   AND NOT EXISTS ( \
                        SELECT 1 FROM console_graph_build_frontier \
                        WHERE run_id = console_graph_build_runs.run_id \
                    ) \
@@ -662,6 +669,8 @@ impl ConsoleGraphSnapshotStore {
             "console_graph_node_locations",
             "console_graph_edge_routes",
             "console_graph_edge_ports",
+            "console_graph_anchor_scopes",
+            "console_graph_anchor_scope_manifests",
             "console_graph_materializations",
             "console_graph_materialization_branches",
         ] {
