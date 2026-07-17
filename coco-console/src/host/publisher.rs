@@ -53,6 +53,14 @@ impl ConsolePublisher {
         self.publish_change()
     }
 
+    pub(crate) fn mark_full_at_least(&self, target: u64) -> u64 {
+        self.pending
+            .lock()
+            .expect("console invalidation lock poisoned")
+            .full = true;
+        self.advance_to(target)
+    }
+
     pub(crate) fn mark_branch_changed(&self, branch: impl Into<String>) -> u64 {
         self.pending
             .lock()
@@ -146,5 +154,20 @@ mod tests {
         assert_eq!(batch.version, 2);
         assert!(batch.full);
         assert_eq!(batch.branches, BTreeSet::from(["main".to_owned()]));
+    }
+
+    #[test]
+    fn full_invalidation_can_advance_without_incrementing_an_existing_version() {
+        let publisher = ConsolePublisher::new();
+        publisher.mark_branch_changed("main");
+
+        assert_eq!(publisher.mark_full_at_least(1), 1);
+        let batch = publisher.take_invalidations();
+        assert!(batch.full);
+        assert_eq!(batch.branches, BTreeSet::from(["main".to_owned()]));
+
+        assert_eq!(publisher.mark_full_at_least(4), 4);
+        assert_eq!(publisher.current_version(), 4);
+        assert!(publisher.take_invalidations().full);
     }
 }

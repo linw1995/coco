@@ -310,6 +310,10 @@ impl ConsoleGraphSnapshotStore {
         .await
     }
 
+    pub(crate) fn database(&self) -> SnapshotDatabase {
+        self.database.clone()
+    }
+
     pub(crate) async fn active_generation(&self) -> crate::Result<i64> {
         let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
