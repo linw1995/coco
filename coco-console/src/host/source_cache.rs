@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ use crate::schema::{
 };
 
 const SOURCE_CACHE_BATCH_SIZE: usize = GRAPH_READ_BATCH_SIZE;
+const TARGETED_DYNAMIC_BRANCH_LIMIT: usize = GRAPH_READ_BATCH_SIZE;
 const TRAVERSAL_GRAPH: &str = "graph";
 const TRAVERSAL_SKILL_SUBTREE: &str = "skill_subtree";
 
@@ -38,6 +40,16 @@ pub(crate) struct PersistentGraphIndex {
     branch_refresh_count: usize,
     #[cfg(test)]
     traversed_node_count: usize,
+    #[cfg(test)]
+    branch_refresh_history: Vec<String>,
+    #[cfg(test)]
+    fail_next_branch_refresh: Option<String>,
+    #[cfg(test)]
+    targeted_dynamic_branch_limit: usize,
+    #[cfg(test)]
+    full_refresh_branch_page_size: NonZeroUsize,
+    #[cfg(test)]
+    full_refresh_source_page_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +63,12 @@ pub(crate) struct PersistentGraphStore {
 enum TraversalKind {
     Graph,
     SkillSubtree,
+}
+
+#[derive(Debug)]
+enum DynamicBranchScope {
+    Targeted(BTreeSet<String>),
+    FullRefresh,
 }
 
 impl TraversalKind {
@@ -122,6 +140,12 @@ struct BranchRow {
     state_json: String,
 }
 
+#[derive(Debug, QueryableByName)]
+struct BranchNameRow {
+    #[diesel(sql_type = Text)]
+    name: String,
+}
+
 impl PersistentGraphIndex {
     pub(crate) async fn open(
         snapshots: &ConsoleGraphSnapshotStore,
@@ -139,6 +163,17 @@ impl PersistentGraphIndex {
             branch_refresh_count: 0,
             #[cfg(test)]
             traversed_node_count: 0,
+            #[cfg(test)]
+            branch_refresh_history: Vec::new(),
+            #[cfg(test)]
+            fail_next_branch_refresh: None,
+            #[cfg(test)]
+            targeted_dynamic_branch_limit: TARGETED_DYNAMIC_BRANCH_LIMIT,
+            #[cfg(test)]
+            full_refresh_branch_page_size: NonZeroUsize::new(GRAPH_READ_BATCH_SIZE)
+                .expect("graph read batch size should be non-zero"),
+            #[cfg(test)]
+            full_refresh_source_page_count: 0,
         };
         index.discard_incomplete_refreshes().await?;
         Ok(index)
@@ -208,6 +243,72 @@ impl PersistentGraphIndex {
         store: &SqliteGraphStore,
         names: &[String],
     ) -> crate::Result<()> {
+        let requested = names.iter().cloned().collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Ok(());
+        }
+        if self
+            .requires_full_refresh_for_unknown_missing_branch(store, &requested)
+            .await?
+        {
+            return self
+                .refresh_all_branches_peer_first(store, &requested)
+                .await;
+        }
+
+        let pre_dependents = match self.branches_sharing_dynamic_parents(&requested).await? {
+            DynamicBranchScope::Targeted(branches) => branches,
+            DynamicBranchScope::FullRefresh => {
+                return self
+                    .refresh_all_branches_peer_first(store, &requested)
+                    .await;
+            }
+        };
+        let pre_peers = pre_dependents
+            .difference(&requested)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.refresh_exact_branch_names(store, &pre_peers).await?;
+        self.refresh_exact_branch_names(store, &requested).await?;
+
+        let post_dependents = match self.branches_sharing_dynamic_parents(&requested).await? {
+            DynamicBranchScope::Targeted(branches) => branches,
+            DynamicBranchScope::FullRefresh => {
+                return self
+                    .refresh_all_branches_peer_first(store, &requested)
+                    .await;
+            }
+        };
+        let post_peers = post_dependents
+            .difference(&requested)
+            .filter(|name| !pre_peers.contains(*name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.refresh_exact_branch_names(store, &post_peers).await
+    }
+
+    async fn refresh_exact_branch_names(
+        &mut self,
+        store: &SqliteGraphStore,
+        names: &BTreeSet<String>,
+    ) -> crate::Result<()> {
+        let mut after = None;
+        loop {
+            let names = branch_name_batch_after(names, after.as_deref());
+            if names.is_empty() {
+                return Ok(());
+            }
+            after = names.last().cloned();
+            self.refresh_exact_branch_batch(store, &names).await?;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn refresh_exact_branch_batch(
+        &mut self,
+        store: &SqliteGraphStore,
+        names: &[String],
+    ) -> crate::Result<()> {
         let records = store
             .graph_branches_by_names(names)
             .await
@@ -220,6 +321,269 @@ impl PersistentGraphIndex {
             self.remove_branch(name).await?;
         }
         self.refresh_records(store, records).await
+    }
+
+    async fn refresh_all_branches_peer_first(
+        &mut self,
+        store: &SqliteGraphStore,
+        requested: &BTreeSet<String>,
+    ) -> crate::Result<()> {
+        let page_size = self.full_refresh_branch_page_size();
+        let high_watermark = store
+            .graph_branch_name_high_watermark()
+            .await
+            .context(crate::error::StoreSnafu)?;
+        if let Some(high_watermark) = high_watermark {
+            let mut cursor = None;
+            loop {
+                let page = store
+                    .graph_branches_page(cursor.as_ref(), &high_watermark, page_size)
+                    .await
+                    .context(crate::error::StoreSnafu)?;
+                let mut records = page.branches;
+                if records.is_empty() {
+                    break;
+                }
+                #[cfg(test)]
+                {
+                    self.full_refresh_source_page_count += 1;
+                }
+                records.retain(|record| !requested.contains(&record.name));
+                self.refresh_records(store, records).await?;
+                if page.complete {
+                    break;
+                }
+                cursor = page.next_cursor;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        self.refresh_exact_branch_names(store, requested).await?;
+        self.reconcile_full_refresh_bounded(store).await
+    }
+
+    pub(crate) async fn refresh_all_branches_bounded(
+        &mut self,
+        store: &SqliteGraphStore,
+    ) -> crate::Result<()> {
+        self.refresh_all_branches_peer_first(store, &BTreeSet::new())
+            .await
+    }
+
+    async fn reconcile_full_refresh_bounded(
+        &mut self,
+        store: &SqliteGraphStore,
+    ) -> crate::Result<()> {
+        let page_size = self.full_refresh_branch_page_size();
+        let mut after = None;
+        loop {
+            let names = self
+                .published_branch_name_page(after.as_deref(), page_size)
+                .await?;
+            if names.is_empty() {
+                return Ok(());
+            }
+            let complete = names.len() < page_size.get();
+            after = names.last().cloned();
+            let current = store
+                .graph_branches_by_names(&names)
+                .await
+                .context(crate::error::StoreSnafu)?
+                .into_iter()
+                .map(|record| record.name)
+                .collect::<HashSet<_>>();
+            for name in names.iter().filter(|name| !current.contains(*name)) {
+                self.remove_branch(name).await?;
+            }
+            if complete {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn published_branch_name_page(
+        &self,
+        after: Option<&str>,
+        page_size: NonZeroUsize,
+    ) -> crate::Result<Vec<String>> {
+        let after = after.map(str::to_owned);
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                let mut query = console_graph_source_branches::table
+                    .select(console_graph_source_branches::name)
+                    .order(console_graph_source_branches::name)
+                    .limit(page_size.get() as i64)
+                    .into_boxed();
+                if let Some(after) = after {
+                    query = query.filter(console_graph_source_branches::name.gt(after));
+                }
+                query
+                    .load::<String>(connection)
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+
+    async fn requires_full_refresh_for_unknown_missing_branch(
+        &self,
+        store: &SqliteGraphStore,
+        requested: &BTreeSet<String>,
+    ) -> crate::Result<bool> {
+        let mut after = None;
+        loop {
+            let names = branch_name_batch_after(requested, after.as_deref());
+            if names.is_empty() {
+                return Ok(false);
+            }
+            after = names.last().cloned();
+            let path = self.path.clone();
+            let query_names = names.clone();
+            let published = self
+                .database
+                .with_connection(move |connection| {
+                    console_graph_source_branches::table
+                        .filter(console_graph_source_branches::name.eq_any(query_names))
+                        .select(console_graph_source_branches::name)
+                        .load::<String>(connection)
+                        .map(|names| names.into_iter().collect::<HashSet<_>>())
+                        .context(QueryGraphSnapshotStoreSnafu { path })
+                })
+                .await?;
+            let current = store
+                .graph_branches_by_names(&names)
+                .await
+                .context(crate::error::StoreSnafu)?
+                .into_iter()
+                .map(|record| record.name)
+                .collect::<HashSet<_>>();
+            if names
+                .iter()
+                .any(|name| !published.contains(name) && !current.contains(name))
+            {
+                return Ok(true);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn branches_sharing_dynamic_parents(
+        &self,
+        origin_branches: &BTreeSet<String>,
+    ) -> crate::Result<DynamicBranchScope> {
+        let targeted_limit = self.targeted_dynamic_branch_limit();
+        if origin_branches.len() > targeted_limit {
+            return Ok(DynamicBranchScope::FullRefresh);
+        }
+
+        let mut affected = BTreeSet::new();
+        for origin_branch in origin_branches {
+            let mut after = None;
+            loop {
+                let rows = self
+                    .load_affected_branch_page(origin_branch, after.as_deref())
+                    .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                let complete = rows.len() < SOURCE_CACHE_BATCH_SIZE;
+                after = rows.last().map(|row| row.name.clone());
+                for row in rows {
+                    affected.insert(row.name);
+                    if affected.len() > targeted_limit {
+                        return Ok(DynamicBranchScope::FullRefresh);
+                    }
+                }
+                if complete {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(DynamicBranchScope::Targeted(affected))
+    }
+
+    async fn load_affected_branch_page(
+        &self,
+        origin_branch: &str,
+        after: Option<&str>,
+    ) -> crate::Result<Vec<BranchNameRow>> {
+        let origin_branch = origin_branch.to_owned();
+        let after = after.map(str::to_owned);
+        let path = self.path.clone();
+        self.database
+            .with_connection(move |connection| {
+                let rows = if let Some(after) = after {
+                    diesel::sql_query(
+                        "SELECT DISTINCT affected.branch_name AS name \
+                         FROM console_graph_source_child_rechecks AS origin \
+                         INNER JOIN console_graph_source_branches AS origin_branch \
+                             ON origin_branch.name = origin.branch_name \
+                            AND origin_branch.contribution_generation = \
+                                origin.contribution_generation \
+                         INNER JOIN console_graph_source_child_rechecks AS affected \
+                             ON affected.node_id = origin.node_id \
+                         INNER JOIN console_graph_source_branches AS affected_branch \
+                             ON affected_branch.name = affected.branch_name \
+                            AND affected_branch.contribution_generation = \
+                                affected.contribution_generation \
+                         WHERE origin.branch_name = ? AND affected.branch_name > ? \
+                         ORDER BY affected.branch_name \
+                         LIMIT ?",
+                    )
+                    .bind::<Text, _>(&origin_branch)
+                    .bind::<Text, _>(after)
+                    .bind::<BigInt, _>(SOURCE_CACHE_BATCH_SIZE as i64)
+                    .load::<BranchNameRow>(connection)
+                } else {
+                    diesel::sql_query(
+                        "SELECT DISTINCT affected.branch_name AS name \
+                         FROM console_graph_source_child_rechecks AS origin \
+                         INNER JOIN console_graph_source_branches AS origin_branch \
+                             ON origin_branch.name = origin.branch_name \
+                            AND origin_branch.contribution_generation = \
+                                origin.contribution_generation \
+                         INNER JOIN console_graph_source_child_rechecks AS affected \
+                             ON affected.node_id = origin.node_id \
+                         INNER JOIN console_graph_source_branches AS affected_branch \
+                             ON affected_branch.name = affected.branch_name \
+                            AND affected_branch.contribution_generation = \
+                                affected.contribution_generation \
+                         WHERE origin.branch_name = ? \
+                         ORDER BY affected.branch_name \
+                         LIMIT ?",
+                    )
+                    .bind::<Text, _>(&origin_branch)
+                    .bind::<BigInt, _>(SOURCE_CACHE_BATCH_SIZE as i64)
+                    .load::<BranchNameRow>(connection)
+                };
+                rows.context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+
+    fn targeted_dynamic_branch_limit(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.targeted_dynamic_branch_limit
+        }
+        #[cfg(not(test))]
+        {
+            TARGETED_DYNAMIC_BRANCH_LIMIT
+        }
+    }
+
+    fn full_refresh_branch_page_size(&self) -> NonZeroUsize {
+        #[cfg(test)]
+        {
+            self.full_refresh_branch_page_size
+        }
+        #[cfg(not(test))]
+        {
+            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE)
+                .expect("graph read batch size should be non-zero")
+        }
     }
 
     pub(crate) fn graph_store(&self) -> PersistentGraphStore {
@@ -284,6 +648,15 @@ impl PersistentGraphIndex {
         #[cfg(test)]
         {
             self.branch_refresh_count += 1;
+            self.branch_refresh_history.push(record.name.clone());
+            if self.fail_next_branch_refresh.as_deref() == Some(record.name.as_str()) {
+                self.fail_next_branch_refresh = None;
+                return crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                    column: "branch_name",
+                    value: record.name,
+                }
+                .fail();
+            }
         }
         let previous = self.published_branch(&record.name).await?;
         let same_head = previous
@@ -1233,6 +1606,31 @@ impl PersistentGraphIndex {
     }
 
     #[cfg(test)]
+    pub(crate) fn branch_refresh_history(&self) -> &[String] {
+        &self.branch_refresh_history
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_branch_refresh(&mut self, name: impl Into<String>) {
+        self.fail_next_branch_refresh = Some(name.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_targeted_dynamic_branch_limit(&mut self, limit: usize) {
+        self.targeted_dynamic_branch_limit = limit;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_full_refresh_branch_page_size(&mut self, page_size: NonZeroUsize) {
+        self.full_refresh_branch_page_size = page_size;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_refresh_source_page_count(&self) -> usize {
+        self.full_refresh_source_page_count
+    }
+
+    #[cfg(test)]
     pub(crate) fn traversed_node_count(&self) -> usize {
         self.traversed_node_count
     }
@@ -1280,6 +1678,18 @@ impl PersistentGraphIndex {
 
 fn needs_children(traversal: TraversalKind, node: &Node) -> bool {
     traversal == TraversalKind::SkillSubtree || node.kind.as_tool_uses().is_some()
+}
+
+fn branch_name_batch_after(names: &BTreeSet<String>, after: Option<&str>) -> Vec<String> {
+    if let Some(after) = after {
+        names
+            .range((Excluded(after.to_owned()), Unbounded))
+            .take(GRAPH_READ_BATCH_SIZE)
+            .cloned()
+            .collect()
+    } else {
+        names.iter().take(GRAPH_READ_BATCH_SIZE).cloned().collect()
+    }
 }
 
 fn required_node<'a>(
@@ -2098,6 +2508,376 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn source_cache_refreshes_branches_sharing_a_dynamic_skill_parent() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "shared-dynamic-parent".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        writer.fork("branch-a", &tool_use).await.unwrap();
+        writer.fork("branch-b", &tool_use).await.unwrap();
+        writer.fork("unrelated", &root).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+
+        let refreshes_before = index.branch_refresh_count();
+        let (invocation, child) =
+            append_skill_subtree(&writer, &tool_use, "shared-dynamic-child").await;
+        index
+            .refresh_named_batch(&source, &["branch-a".to_owned()])
+            .await
+            .unwrap();
+
+        let shared_nodes = BTreeSet::from([
+            root.clone(),
+            tool_use.clone(),
+            invocation.clone(),
+            child.clone(),
+        ]);
+        assert_eq!(index.branch_refresh_count() - refreshes_before, 2);
+        assert_eq!(
+            index.published_branch_node_ids("branch-a").await.unwrap(),
+            shared_nodes
+        );
+        assert_eq!(
+            index.published_branch_node_ids("branch-b").await.unwrap(),
+            shared_nodes
+        );
+        assert_eq!(
+            index.published_branch_node_ids("unrelated").await.unwrap(),
+            BTreeSet::from([root.clone()])
+        );
+
+        writer
+            .set_branch_head("branch-a", &tool_use, &root)
+            .await
+            .unwrap();
+        let refresh_history_start = index.branch_refresh_history().len();
+        index.fail_next_branch_refresh("branch-b");
+        assert!(
+            index
+                .refresh_named_batch(&source, &["branch-a".to_owned()])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            &index.branch_refresh_history()[refresh_history_start..],
+            &["branch-b".to_owned()]
+        );
+        assert_eq!(
+            index
+                .published_branch("branch-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .head_id,
+            tool_use
+        );
+        index
+            .refresh_named_batch(&source, &["branch-a".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            &index.branch_refresh_history()[refresh_history_start..],
+            &[
+                "branch-b".to_owned(),
+                "branch-b".to_owned(),
+                "branch-a".to_owned()
+            ]
+        );
+        index.prune_published_orphans().await.unwrap();
+        assert_eq!(
+            index.published_branch_node_ids("branch-a").await.unwrap(),
+            BTreeSet::from([root.clone()])
+        );
+        assert_eq!(
+            index.published_branch_node_ids("branch-b").await.unwrap(),
+            shared_nodes
+        );
+
+        writer.delete_branch("branch-a").await.unwrap();
+        index
+            .refresh_named_batch(&source, &["branch-a".to_owned()])
+            .await
+            .unwrap();
+        index.prune_published_orphans().await.unwrap();
+        assert!(index.published_branch("branch-a").await.unwrap().is_none());
+        assert_eq!(
+            index.published_branch_node_ids("branch-b").await.unwrap(),
+            shared_nodes
+        );
+        assert_eq!(
+            index.graph_store().get_node(&child).await.unwrap().id,
+            child
+        );
+    }
+
+    #[tokio::test]
+    async fn source_cache_refreshes_post_peers_for_a_new_branch() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "new-branch-dynamic-parent".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        writer.fork("branch-b", &tool_use).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+
+        let (invocation, child) =
+            append_skill_subtree(&writer, &tool_use, "new-branch-dynamic-child").await;
+        writer.fork("branch-new", &tool_use).await.unwrap();
+        let refresh_history_start = index.branch_refresh_history().len();
+        index
+            .refresh_named_batch(&source, &["branch-new".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &index.branch_refresh_history()[refresh_history_start..],
+            &["branch-new".to_owned(), "branch-b".to_owned()]
+        );
+        let expected = BTreeSet::from([root, tool_use, invocation, child]);
+        assert_eq!(
+            index.published_branch_node_ids("branch-new").await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            index.published_branch_node_ids("branch-b").await.unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn source_cache_refreshes_peers_before_a_direct_branch_delete() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "direct-delete-dynamic-parent".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        writer.fork("branch-a", &tool_use).await.unwrap();
+        writer.fork("branch-b", &tool_use).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+
+        let (invocation, child) =
+            append_skill_subtree(&writer, &tool_use, "direct-delete-dynamic-child").await;
+        index
+            .refresh_named_batch(&source, &["branch-a".to_owned()])
+            .await
+            .unwrap();
+        writer.delete_branch("branch-a").await.unwrap();
+
+        let refresh_history_start = index.branch_refresh_history().len();
+        index
+            .refresh_named_batch(&source, &["branch-a".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            &index.branch_refresh_history()[refresh_history_start..],
+            &["branch-b".to_owned()]
+        );
+
+        index.prune_published_orphans().await.unwrap();
+        assert!(index.published_branch("branch-a").await.unwrap().is_none());
+        assert_eq!(
+            index.published_branch_node_ids("branch-b").await.unwrap(),
+            BTreeSet::from([root, tool_use, invocation, child.clone()])
+        );
+        assert_eq!(
+            index.graph_store().get_node(&child).await.unwrap().id,
+            child
+        );
+    }
+
+    #[tokio::test]
+    async fn full_fallback_pages_branches_above_the_targeted_limit() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "paged-fallback-dynamic-parent".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        for index in 0..5 {
+            let name = format!("branch-{index:02}");
+            writer.fork(&name, &tool_use).await.unwrap();
+        }
+        writer.fork("stale", &root).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+
+        let (invocation, child) =
+            append_skill_subtree(&writer, &tool_use, "paged-fallback-dynamic-child").await;
+        writer.delete_branch("stale").await.unwrap();
+        index.set_targeted_dynamic_branch_limit(4);
+        index.set_full_refresh_branch_page_size(NonZeroUsize::new(2).unwrap());
+        let page_count_before = index.full_refresh_source_page_count();
+        let refresh_history_start = index.branch_refresh_history().len();
+
+        index
+            .refresh_named_batch(&source, &["branch-00".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index.full_refresh_source_page_count() - page_count_before,
+            3
+        );
+        assert_eq!(
+            &index.branch_refresh_history()[refresh_history_start..],
+            &[
+                "branch-01".to_owned(),
+                "branch-02".to_owned(),
+                "branch-03".to_owned(),
+                "branch-04".to_owned(),
+                "branch-00".to_owned(),
+            ]
+        );
+        assert!(index.published_branch("stale").await.unwrap().is_none());
+        let expected = BTreeSet::from([root, tool_use, invocation, child]);
+        assert_eq!(
+            index.published_branch_node_ids("branch-00").await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            index.published_branch_node_ids("branch-04").await.unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_deleted_branch_invalidation_falls_back_to_full_source_refresh() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let tool_use = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "fallback-dynamic-parent".to_owned(),
+                    name: "skill".to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap();
+        writer.fork("survivor", &tool_use).await.unwrap();
+
+        let source = SqliteGraphStore::open_read_only(writer.store_path())
+            .await
+            .unwrap();
+        let snapshots = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let mut index = PersistentGraphIndex::open(&snapshots, root.clone())
+            .await
+            .unwrap();
+        index
+            .refresh_records(&source, source.graph_branches().await.unwrap())
+            .await
+            .unwrap();
+
+        let (invocation, child) =
+            append_skill_subtree(&writer, &tool_use, "fallback-dynamic-child").await;
+        index
+            .refresh_named_batch(&source, &["never-observed-deleted-branch".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index.published_branch_node_ids("survivor").await.unwrap(),
+            BTreeSet::from([root, tool_use, invocation, child])
+        );
     }
 
     #[tokio::test]

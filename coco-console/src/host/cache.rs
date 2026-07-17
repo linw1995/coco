@@ -955,21 +955,10 @@ where
         index.start_refresh().await?;
 
         if invalidations.full || index.is_empty().await? {
-            let records = store
-                .graph_branches()
-                .await
-                .context(crate::error::StoreSnafu)?;
-            index.reconcile_full_refresh(&records).await?;
-            for records in records.chunks(coco_mem::GRAPH_READ_BATCH_SIZE) {
-                index
-                    .refresh_records(store, records.iter().cloned())
-                    .await?;
-            }
+            index.refresh_all_branches_bounded(store).await?;
         } else {
             let names = invalidations.branches.iter().cloned().collect::<Vec<_>>();
-            for names in names.chunks(coco_mem::GRAPH_READ_BATCH_SIZE) {
-                index.refresh_named_batch(store, names).await?;
-            }
+            index.refresh_named_batch(store, &names).await?;
         }
 
         ensure!(

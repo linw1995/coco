@@ -9,8 +9,8 @@ mod sqlite;
 mod tests;
 
 pub use sqlite::{
-    GRAPH_READ_BATCH_SIZE, GraphBranchRecord, GraphChildPage, GraphChildPageCursor,
-    SqliteGraphStore, SqliteStore,
+    GRAPH_READ_BATCH_SIZE, GraphBranchPage, GraphBranchPageCursor, GraphBranchRecord,
+    GraphChildPage, GraphChildPageCursor, SqliteGraphStore, SqliteStore,
 };
 
 use crate::{

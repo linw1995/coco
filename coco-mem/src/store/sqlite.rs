@@ -21,6 +21,18 @@ pub struct GraphBranchRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBranchPageCursor {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBranchPage {
+    pub branches: Vec<GraphBranchRecord>,
+    pub next_cursor: Option<GraphBranchPageCursor>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphChildPageCursor {
     pub created_at: String,
     pub node_id: String,

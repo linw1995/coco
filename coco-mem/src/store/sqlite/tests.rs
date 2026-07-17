@@ -790,6 +790,70 @@ async fn graph_read_api_loads_branches_nodes_and_children_in_bounded_calls() {
 }
 
 #[tokio::test]
+async fn graph_branch_pages_are_ordered_and_mark_an_exact_final_page_complete() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    for index in 0..4 {
+        let name = format!("branch-{index:02}");
+        store.fork(&name, &root).await.unwrap();
+    }
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let high_watermark = graph
+        .graph_branch_name_high_watermark()
+        .await
+        .unwrap()
+        .unwrap();
+    let page_size = NonZeroUsize::new(2).unwrap();
+
+    let first = graph
+        .graph_branches_page(None, &high_watermark, page_size)
+        .await
+        .unwrap();
+    assert!(!first.complete);
+    assert_eq!(
+        first
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["branch-00", "branch-01"]
+    );
+    assert_eq!(
+        first
+            .next_cursor
+            .as_ref()
+            .map(|cursor| cursor.name.as_str()),
+        Some("branch-01")
+    );
+
+    let second = graph
+        .graph_branches_page(first.next_cursor.as_ref(), &high_watermark, page_size)
+        .await
+        .unwrap();
+    assert!(second.complete);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        second
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["branch-02", "branch-03"]
+    );
+
+    let names = first
+        .branches
+        .into_iter()
+        .chain(second.branches)
+        .map(|branch| branch.name)
+        .collect::<Vec<_>>();
+    assert!(names.is_sorted());
+    assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
+}
+
+#[tokio::test]
 async fn graph_child_ids_page_is_stable_across_high_fan_out_and_relation_kinds() {
     let store = SqliteStore::open_temporary().await.unwrap();
     let root = store.root_id();
@@ -942,6 +1006,23 @@ async fn graph_read_api_rejects_oversized_batches() {
         .graph_child_ids_page(
             &store.root_id(),
             None,
+            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE + 1).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::GraphReadBatchTooLarge {
+            actual,
+            maximum: GRAPH_READ_BATCH_SIZE,
+        } if actual == GRAPH_READ_BATCH_SIZE + 1
+    ));
+
+    let error = graph
+        .graph_branches_page(
+            None,
+            "",
             NonZeroUsize::new(GRAPH_READ_BATCH_SIZE + 1).unwrap(),
         )
         .await

@@ -19,9 +19,10 @@ use super::node::{
     persist_node_without_transaction,
 };
 use super::{
-    AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
-    GraphChildPage, GraphChildPageCursor, SqliteDatabase, SqliteGraphConnectionFuture,
-    SqliteGraphStore, SqliteStore, SqliteTransactionError, StoreAccess, migration,
+    AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchPage,
+    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor, SqliteDatabase,
+    SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore, SqliteTransactionError,
+    StoreAccess, migration,
 };
 use crate::StoreResult as Result;
 use crate::error::{
@@ -232,7 +233,15 @@ impl SqliteGraphStore {
 
     pub async fn graph_branches(&self) -> Result<Vec<GraphBranchRecord>> {
         let mut connection = self.connect().await?;
-        super::branch::load_graph_branch_records(&mut connection, &self.database_path, None).await
+        super::branch::load_graph_branch_records(
+            &mut connection,
+            &self.database_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn graph_branches_by_names(
@@ -241,8 +250,56 @@ impl SqliteGraphStore {
     ) -> Result<Vec<GraphBranchRecord>> {
         ensure_graph_read_batch_size(names.len())?;
         let mut connection = self.connect().await?;
-        super::branch::load_graph_branch_records(&mut connection, &self.database_path, Some(names))
+        super::branch::load_graph_branch_records(
+            &mut connection,
+            &self.database_path,
+            Some(names),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn graph_branch_name_high_watermark(&self) -> Result<Option<String>> {
+        let mut connection = self.connect().await?;
+        super::branch::load_graph_branch_name_high_watermark(&mut connection, &self.database_path)
             .await
+    }
+
+    pub async fn graph_branches_page(
+        &self,
+        cursor: Option<&GraphBranchPageCursor>,
+        through: &str,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphBranchPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        let mut branches = super::branch::load_graph_branch_records(
+            &mut connection,
+            &self.database_path,
+            None,
+            cursor.map(|cursor| cursor.name.as_str()),
+            Some(through),
+            Some(page_size.get() + 1),
+        )
+        .await?;
+        let complete = branches.len() <= page_size.get();
+        if !complete {
+            branches.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| GraphBranchPageCursor {
+            name: branches
+                .last()
+                .expect("non-empty graph branch page should have a cursor")
+                .name
+                .clone(),
+        });
+        Ok(GraphBranchPage {
+            branches,
+            next_cursor,
+            complete,
+        })
     }
 
     pub async fn graph_nodes_by_ids(&self, ids: &[String]) -> Result<Vec<Node>> {
