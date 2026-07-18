@@ -8,7 +8,7 @@ async fn open_migrates_v6_data_to_current_schema() {
 
     let store = SqliteStore::open(&path).await.unwrap();
 
-    assert_eq!(store.schema_version().await.unwrap(), 23);
+    assert_eq!(store.schema_version().await.unwrap(), 25);
     assert!(!nodes_have_anchor_columns(&store).await);
     assert!(!table_exists(&store, "store_meta").await);
     assert_eq!(

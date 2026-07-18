@@ -12,17 +12,19 @@ use crate::schema::{
     skill_version_scripts, skill_versions,
 };
 use crate::{
-    Anchor, BackendMetadata, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord, Job, JobStatus,
-    JobStore, Kind, MergeParent, MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset,
-    PresetStore, PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
-    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillInvocationAnchor,
-    SkillInvocationMode, SkillResultAnchor, SkillRuntimeContext, SkillScript, SkillStore,
-    SkillUpdatePatch, SkillVersionSpec, StoreError, Tool, ToolResult, ToolUse,
+    Anchor, BackendMetadata, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
+    GraphChildPageCursor, GraphMutationBranchChangeKind, GraphMutationRevisionBounds, Job,
+    JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode, NewNodeContent, Node,
+    NodeStore, PauseReason, Preset, PresetStore, PromptAnchor, PromptAttachment,
+    PromptImageAttachment, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+    SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
+    SkillRuntimeContext, SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError,
+    Tool, ToolResult, ToolUse,
 };
 use diesel::connection::InstrumentationEvent;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -918,36 +920,27 @@ async fn graph_child_ids_page_is_stable_across_high_fan_out_and_relation_kinds()
         .execute(&mut connection)
         .await
         .unwrap();
+    let duplicate_created_revision = node_relations::table
+        .filter(node_relations::child_node_id.eq(&duplicate_id))
+        .filter(node_relations::parent_node_id.eq(&root))
+        .select(node_relations::created_revision)
+        .first::<i64>(&mut connection)
+        .await
+        .unwrap();
     diesel::insert_into(node_relations::table)
         .values((
             node_relations::child_node_id.eq(&duplicate_id),
             node_relations::parent_node_id.eq(&root),
             node_relations::kind.eq("merge"),
             node_relations::ordinal.eq(0),
+            node_relations::created_revision.eq(duplicate_created_revision),
         ))
         .execute(&mut connection)
         .await
         .unwrap();
     drop(connection);
 
-    let mut expected = expected_ids
-        .into_iter()
-        .map(|node_id| {
-            let created_at = if node_id == early_id {
-                early_created_at
-            } else if node_id == late_id {
-                late_created_at
-            } else {
-                shared_created_at
-            };
-            (created_at, node_id)
-        })
-        .collect::<Vec<_>>();
-    expected.sort();
-    let expected = expected
-        .into_iter()
-        .map(|(_, node_id)| node_id)
-        .collect::<Vec<_>>();
+    let expected = expected_ids;
     let graph = SqliteGraphStore::open_read_only(store.store_path())
         .await
         .unwrap();
@@ -980,6 +973,723 @@ async fn graph_child_ids_page_is_stable_across_high_fan_out_and_relation_kinds()
     assert!(actual.contains(&shadow_child));
     assert_eq!(actual.iter().collect::<HashSet<_>>().len(), actual.len());
     assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn graph_relation_revision_excludes_backdated_children_inserted_after_cutoff() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root_id = store.root_id();
+    let initial_revision = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap()
+        .graph_relation_revision()
+        .await
+        .unwrap();
+    assert_eq!(initial_revision, 1);
+    let first_id = store
+        .append(NewNode {
+            parent: root_id.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("first child".to_owned()),
+        })
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&first_id)))
+        .set(nodes::created_at.eq("2026-01-01T00:00:02Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let frozen_revision = graph.graph_relation_revision().await.unwrap();
+    assert_eq!(frozen_revision, initial_revision + 1);
+    let frozen_high_watermark = graph
+        .graph_child_high_watermark_at_revision(&root_id, frozen_revision)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let backdated_id = store
+        .append(NewNode {
+            parent: root_id.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("backdated child".to_owned()),
+        })
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&backdated_id)))
+        .set(nodes::created_at.eq("2026-01-01T00:00:01Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    let page_size = NonZeroUsize::new(2).unwrap();
+    let frozen_page = graph
+        .graph_child_ids_page_through_at_revision(
+            &root_id,
+            None,
+            &frozen_high_watermark,
+            frozen_revision,
+            page_size,
+        )
+        .await
+        .unwrap();
+    assert_eq!(frozen_page.child_ids, vec![first_id.clone()]);
+
+    let later_revision = graph.graph_relation_revision().await.unwrap();
+    assert_eq!(later_revision, frozen_revision + 1);
+    let later_page = graph
+        .graph_child_ids_page_through_at_revision(
+            &root_id,
+            None,
+            &frozen_high_watermark,
+            later_revision,
+            page_size,
+        )
+        .await
+        .unwrap();
+    assert_eq!(later_page.child_ids, vec![first_id]);
+}
+
+#[tokio::test]
+async fn graph_revision_apis_reject_revisions_outside_the_serviceable_range() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).await.unwrap();
+    let bounds = graph.graph_mutation_revision_bounds().await.unwrap();
+    assert_eq!(bounds.baseline_revision, 0);
+    let future_revision = bounds.current_revision + 1;
+    let page_size = NonZeroUsize::new(1).unwrap();
+    let through = GraphChildPageCursor {
+        relation_revision: i64::MAX,
+        node_id: "f".repeat(64),
+    };
+
+    let errors = vec![
+        graph
+            .graph_mutation_events_page(future_revision, page_size)
+            .await
+            .unwrap_err(),
+        graph
+            .graph_mutation_branch_changes_page(future_revision, None, page_size)
+            .await
+            .unwrap_err(),
+        graph
+            .graph_mutation_dirty_parents_page(future_revision, None, page_size)
+            .await
+            .unwrap_err(),
+        graph
+            .graph_branches_at_revision_by_names(future_revision, &["main".to_owned()])
+            .await
+            .unwrap_err(),
+        graph
+            .graph_branch_name_high_watermark_at_revision(future_revision)
+            .await
+            .unwrap_err(),
+        graph
+            .graph_branches_at_revision_page(future_revision, None, None, page_size)
+            .await
+            .unwrap_err(),
+        graph
+            .graph_child_ids_page_at_revision(&root_id, None, future_revision, page_size)
+            .await
+            .unwrap_err(),
+        graph
+            .graph_child_high_watermark_at_revision(&root_id, future_revision)
+            .await
+            .unwrap_err(),
+        graph
+            .graph_child_ids_page_through_at_revision(
+                &root_id,
+                None,
+                &through,
+                future_revision,
+                page_size,
+            )
+            .await
+            .unwrap_err(),
+    ];
+    for error in errors {
+        assert_graph_revision_error(error, future_revision, bounds);
+    }
+
+    let before_baseline = bounds.baseline_revision - 1;
+    let branch_error = graph
+        .graph_branches_at_revision_by_names(before_baseline, &["main".to_owned()])
+        .await
+        .unwrap_err();
+    assert_graph_revision_error(branch_error, before_baseline, bounds);
+    let child_error = graph
+        .graph_child_ids_page_at_revision(&root_id, None, before_baseline, page_size)
+        .await
+        .unwrap_err();
+    assert_graph_revision_error(child_error, before_baseline, bounds);
+    let event_cursor_error = graph
+        .graph_mutation_events_page(-1, page_size)
+        .await
+        .unwrap_err();
+    assert_graph_revision_error(event_cursor_error, -1, bounds);
+}
+
+#[tokio::test]
+async fn concurrent_commit_does_not_make_a_later_future_revision_serviceable() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let root_id = store.root_id();
+    let bounds = graph.graph_mutation_revision_bounds().await.unwrap();
+    let requested_revision = bounds.current_revision + 2;
+
+    let (append_result, read_result) = tokio::join!(
+        store.append(NewNode {
+            parent: root_id.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("concurrent child".to_owned()),
+        }),
+        graph.graph_child_high_watermark_at_revision(&root_id, requested_revision),
+    );
+    append_result.unwrap();
+    let error = read_result.unwrap_err();
+    let current_bounds = graph.graph_mutation_revision_bounds().await.unwrap();
+    assert_eq!(current_bounds.current_revision, bounds.current_revision + 1);
+    assert!(matches!(
+        error,
+        StoreError::GraphRevisionOutOfRange {
+            requested,
+            minimum,
+            maximum,
+        } if requested == requested_revision
+            && minimum == bounds.baseline_revision
+            && maximum <= current_bounds.current_revision
+    ));
+}
+
+fn assert_graph_revision_error(
+    error: StoreError,
+    requested: i64,
+    bounds: GraphMutationRevisionBounds,
+) {
+    assert!(matches!(
+        error,
+        StoreError::GraphRevisionOutOfRange {
+            requested: actual_requested,
+            minimum,
+            maximum,
+        } if actual_requested == requested
+            && minimum == bounds.baseline_revision
+            && maximum == bounds.current_revision
+    ));
+}
+
+#[tokio::test]
+async fn raw_node_append_commits_one_exact_graph_mutation_event() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let root_id = store.root_id();
+    let before = graph.graph_mutation_revision().await.unwrap();
+
+    let child_id = store
+        .append(NewNode {
+            parent: root_id.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("journaled child".to_owned()),
+        })
+        .await
+        .unwrap();
+
+    let revision = graph.graph_mutation_revision().await.unwrap();
+    assert_eq!(revision, before + 1);
+    let events = graph
+        .graph_mutation_events_page(before, NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(events.events, vec![super::GraphMutationEvent { revision }]);
+    assert!(events.complete);
+    assert_eq!(events.next_cursor, None);
+    let dirty = graph
+        .graph_mutation_dirty_parents_page(revision, None, NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(dirty.parent_ids, vec![root_id]);
+    assert!(dirty.complete);
+    let changes = graph
+        .graph_mutation_branch_changes_page(revision, None, NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+    assert!(changes.changes.is_empty());
+    assert!(changes.complete);
+
+    let mut connection = store.connect().await.unwrap();
+    assert_eq!(
+        node_relations::table
+            .filter(node_relations::child_node_id.eq(child_id))
+            .select(node_relations::created_revision)
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        revision
+    );
+}
+
+#[tokio::test]
+async fn multi_node_branch_append_uses_one_revision_and_bounded_snapshot_pages() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root_id = store.root_id();
+    store.fork("main", &root_id).await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let before = graph.graph_mutation_revision().await.unwrap();
+
+    let head_id = store
+        .append_nodes_and_set_branch_head(
+            "main",
+            &root_id,
+            &root_id,
+            (0..3)
+                .map(|index| NewNodeContent {
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text(format!("batch node {index}")),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let revision = graph.graph_mutation_revision().await.unwrap();
+    assert_eq!(revision, before + 1);
+
+    let ancestry = store.ancestry(&head_id).await.unwrap();
+    let appended_nodes = ancestry
+        .iter()
+        .filter(|node| node.id != root_id)
+        .collect::<Vec<_>>();
+    assert_eq!(appended_nodes.len(), 3);
+    let appended_ids = appended_nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_dirty = appended_nodes
+        .iter()
+        .map(|node| node.parent.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut connection = store.connect().await.unwrap();
+    let relation_rows = node_relations::table
+        .filter(node_relations::created_revision.eq(revision))
+        .select((
+            node_relations::child_node_id,
+            node_relations::created_revision,
+        ))
+        .load::<(String, i64)>(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(relation_rows.len(), 3);
+    assert_eq!(
+        relation_rows
+            .iter()
+            .map(|(child_id, _)| child_id.clone())
+            .collect::<BTreeSet<_>>(),
+        appended_ids
+    );
+    assert!(
+        relation_rows
+            .iter()
+            .all(|(_, created_revision)| *created_revision == revision)
+    );
+    drop(connection);
+
+    let event_page = graph
+        .graph_mutation_events_page(before, NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(event_page.events.len(), 1);
+    assert_eq!(event_page.events[0].revision, revision);
+    assert!(event_page.complete);
+
+    let branch_changes = graph
+        .graph_mutation_branch_changes_page(revision, None, NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(branch_changes.changes.len(), 1);
+    assert_eq!(branch_changes.changes[0].name, "main");
+    assert_eq!(
+        branch_changes.changes[0].kind,
+        GraphMutationBranchChangeKind::Upserted
+    );
+    assert_eq!(
+        branch_changes.changes[0].head_id.as_deref(),
+        Some(head_id.as_str())
+    );
+    assert_eq!(branch_changes.changes[0].state, Some(SessionState::Active));
+
+    let mut dirty_cursor = None;
+    let mut actual_dirty = BTreeSet::new();
+    loop {
+        let page = graph
+            .graph_mutation_dirty_parents_page(
+                revision,
+                dirty_cursor.as_ref(),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        actual_dirty.extend(page.parent_ids);
+        if page.complete {
+            break;
+        }
+        dirty_cursor = page.next_cursor;
+    }
+    assert_eq!(actual_dirty, expected_dirty);
+
+    let before_snapshot = graph
+        .graph_branches_at_revision_by_names(before, &["main".to_owned(), "main".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(before_snapshot.len(), 1);
+    assert_eq!(before_snapshot[0].head_id, root_id);
+    let high_watermark = graph
+        .graph_branch_name_high_watermark_at_revision(revision)
+        .await
+        .unwrap();
+    assert_eq!(high_watermark.as_deref(), Some("main"));
+    let after_snapshot = graph
+        .graph_branches_at_revision_page(
+            revision,
+            None,
+            high_watermark.as_deref(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_snapshot.branches.len(), 1);
+    assert_eq!(after_snapshot.branches[0].head_id, head_id);
+    assert!(after_snapshot.complete);
+}
+
+#[tokio::test]
+async fn branch_only_mutations_are_historical_and_failed_transactions_leave_no_event() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root_id = store.root_id();
+    store.fork("reused", &root_id).await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let active_revision = graph.graph_mutation_revision().await.unwrap();
+    let paused_state = SessionState::Paused {
+        target_branch: String::new(),
+        reason: PauseReason::Closed,
+    };
+    store
+        .set_session_state("reused", Some(&SessionState::Active), paused_state.clone())
+        .await
+        .unwrap();
+    let paused_revision = graph.graph_mutation_revision().await.unwrap();
+    assert_eq!(paused_revision, active_revision + 1);
+    let state_change = graph
+        .graph_mutation_branch_changes_page(paused_revision, None, NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(state_change.changes[0].state, Some(paused_state.clone()));
+    assert_eq!(
+        graph
+            .graph_branches_at_revision_by_names(active_revision, &["reused".to_owned()])
+            .await
+            .unwrap()[0]
+            .state,
+        SessionState::Active
+    );
+    assert_eq!(
+        graph
+            .graph_branches_at_revision_by_names(paused_revision, &["reused".to_owned()])
+            .await
+            .unwrap()[0]
+            .state,
+        paused_state
+    );
+    let before_failure = paused_revision;
+
+    store
+        .set_branch_head("reused", "stale-head", &root_id)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        graph.graph_mutation_revision().await.unwrap(),
+        before_failure
+    );
+    assert!(
+        graph
+            .graph_mutation_events_page(before_failure, NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap()
+            .events
+            .is_empty()
+    );
+
+    store.delete_branch("reused").await.unwrap();
+    let removed_revision = graph.graph_mutation_revision().await.unwrap();
+    assert_eq!(removed_revision, before_failure + 1);
+    let removed = graph
+        .graph_mutation_branch_changes_page(removed_revision, None, NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(removed.changes.len(), 1);
+    assert_eq!(
+        removed.changes[0].kind,
+        GraphMutationBranchChangeKind::Removed
+    );
+    assert_eq!(removed.changes[0].head_id, None);
+    assert_eq!(removed.changes[0].state, None);
+    assert!(
+        graph
+            .graph_branches_at_revision_by_names(removed_revision, &["reused".to_owned()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    store.fork("reused", &root_id).await.unwrap();
+    let recreated_revision = graph.graph_mutation_revision().await.unwrap();
+    assert_eq!(recreated_revision, removed_revision + 1);
+    assert!(
+        graph
+            .graph_branches_at_revision_by_names(removed_revision, &["reused".to_owned()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let recreated = graph
+        .graph_branches_at_revision_by_names(recreated_revision, &["reused".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(recreated.len(), 1);
+    assert_eq!(recreated[0].head_id, root_id);
+    assert_eq!(recreated[0].state, SessionState::Active);
+}
+
+#[tokio::test]
+async fn historical_branch_pages_advance_across_removed_names() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root_id = store.root_id();
+    store.fork("removed-first", &root_id).await.unwrap();
+    store.delete_branch("removed-first").await.unwrap();
+    store.fork("active", &root_id).await.unwrap();
+    store.fork("removed-last", &root_id).await.unwrap();
+    store.delete_branch("removed-last").await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let revision = graph.graph_mutation_revision().await.unwrap();
+
+    let mut cursor = None;
+    let mut active_names = Vec::new();
+    let mut empty_pages = 0;
+    loop {
+        let page = graph
+            .graph_branches_at_revision_page(
+                revision,
+                cursor.as_ref(),
+                None,
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        if page.branches.is_empty() {
+            empty_pages += 1;
+        }
+        active_names.extend(page.branches.into_iter().map(|branch| branch.name));
+        if page.complete {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+
+    assert_eq!(active_names, vec!["active"]);
+    assert_eq!(empty_pages, 2);
+}
+
+#[tokio::test]
+async fn historical_branch_pages_preserve_revision_keyset_order() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root_id = store.root_id();
+    store.fork("z-first", &root_id).await.unwrap();
+    store.fork("a-second", &root_id).await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let revision = graph.graph_mutation_revision().await.unwrap();
+
+    let page = graph
+        .graph_branches_at_revision_page(revision, None, None, NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page.branches
+            .into_iter()
+            .map(|branch| branch.name)
+            .collect::<Vec<_>>(),
+        vec!["z-first", "a-second"]
+    );
+    assert!(page.complete);
+}
+
+#[tokio::test]
+async fn prompt_job_nodes_share_one_event_and_failed_prompt_job_rolls_back_it() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root_id = store.root_id();
+    let session_id = store.append(session_anchor_node(&root_id)).await.unwrap();
+    store.fork("main", &session_id).await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let before = graph.graph_mutation_revision().await.unwrap();
+
+    let job = store
+        .submit_job_with_prompt_base(
+            "main",
+            PromptAnchor {
+                prompt: "journaled prompt".to_owned(),
+                attachments: vec![],
+            },
+            vec![],
+            Some(SessionAnchorPatch::default()),
+        )
+        .await
+        .unwrap();
+    let revision = graph.graph_mutation_revision().await.unwrap();
+    assert_eq!(revision, before + 1);
+    let prompt_node = store.get_node(&job.base).await.unwrap();
+    let patch_node = store.get_node(&prompt_node.parent).await.unwrap();
+    let mut connection = store.connect().await.unwrap();
+    let relation_revisions = node_relations::table
+        .filter(node_relations::child_node_id.eq_any([&prompt_node.id, &patch_node.id]))
+        .select(node_relations::created_revision)
+        .load::<i64>(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(relation_revisions, vec![revision, revision]);
+    drop(connection);
+    let event = graph
+        .graph_mutation_events_page(before, NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(event.events, vec![super::GraphMutationEvent { revision }]);
+    let dirty = graph
+        .graph_mutation_dirty_parents_page(revision, None, NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        dirty.parent_ids.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([session_id.clone(), patch_node.id])
+    );
+
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .await
+        .unwrap();
+    store
+        .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .await
+        .unwrap();
+    let before_failure = graph.graph_mutation_revision().await.unwrap();
+    store
+        .submit_job_with_prompt_base(
+            "main",
+            PromptAnchor {
+                prompt: "invalid prompt".to_owned(),
+                attachments: vec![],
+            },
+            vec![MergeParent::merge("missing-parent")],
+            Some(SessionAnchorPatch::default()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        graph.graph_mutation_revision().await.unwrap(),
+        before_failure
+    );
+    assert!(
+        graph
+            .graph_mutation_events_page(before_failure, NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap()
+            .events
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn upsert_existing_node_preserves_immutable_relation_revision() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let child_id = store
+        .append(NewNode {
+            parent: store.root_id(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("immutable child".to_owned()),
+        })
+        .await
+        .unwrap();
+    let node = store.get_node(&child_id).await.unwrap();
+    let mut connection = store.connect().await.unwrap();
+    let created_revision = node_relations::table
+        .filter(node_relations::child_node_id.eq(&child_id))
+        .select(node_relations::created_revision)
+        .get_result::<i64>(&mut connection)
+        .await
+        .unwrap();
+
+    super::node::upsert_node_without_transaction(
+        &mut connection,
+        &store.database_path,
+        &node,
+        created_revision,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        node_relations::table
+            .filter(node_relations::child_node_id.eq(&child_id))
+            .select(node_relations::created_revision)
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        created_revision
+    );
+    let mut conflicting = node.clone();
+    conflicting.kind = Kind::Text("conflicting content".to_owned());
+    let error = super::node::upsert_node_without_transaction(
+        &mut connection,
+        &store.database_path,
+        &conflicting,
+        created_revision,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with immutable stored data")
+    );
+    assert_eq!(store.get_node(&child_id).await.unwrap(), node);
 }
 
 #[tokio::test]

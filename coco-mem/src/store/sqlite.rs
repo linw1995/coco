@@ -34,7 +34,7 @@ pub struct GraphBranchPage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphChildPageCursor {
-    pub created_at: String,
+    pub relation_revision: i64,
     pub node_id: String,
 }
 
@@ -45,9 +45,66 @@ pub struct GraphChildPage {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphMutationEvent {
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMutationEventPage {
+    pub events: Vec<GraphMutationEvent>,
+    pub next_cursor: Option<i64>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphMutationRevisionBounds {
+    pub baseline_revision: i64,
+    pub current_revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphMutationBranchChangeKind {
+    Upserted,
+    Removed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMutationBranchChangeRecord {
+    pub name: String,
+    pub kind: GraphMutationBranchChangeKind,
+    pub head_id: Option<String>,
+    pub state: Option<SessionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMutationBranchChangePageCursor {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMutationBranchChangePage {
+    pub changes: Vec<GraphMutationBranchChangeRecord>,
+    pub next_cursor: Option<GraphMutationBranchChangePageCursor>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMutationDirtyParentPageCursor {
+    pub parent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMutationDirtyParentPage {
+    pub parent_ids: Vec<String>,
+    pub next_cursor: Option<GraphMutationDirtyParentPageCursor>,
+    pub complete: bool,
+}
+
 mod branch;
 mod codec;
 mod database;
+mod graph_mutation;
 mod handle;
 mod job;
 mod message_queue;

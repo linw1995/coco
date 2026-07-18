@@ -8,6 +8,7 @@ use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
 use super::branch::{load_branch_head, load_session_chain};
+use super::graph_mutation::{begin_graph_mutation, dirty_parent_ids, finish_graph_mutation};
 use super::node::{load_node_by_exact_id, persist_node_without_transaction, validate_new_node};
 use super::{AsyncSqliteConnection, SqliteStore, SqliteTransactionError};
 use crate::error::{
@@ -16,7 +17,7 @@ use crate::error::{
     QuerySqliteStoreSnafu,
 };
 use crate::schema::jobs;
-use crate::store::JobStore;
+use crate::store::{GraphMutationReceipt, JobStore, inserted_parent_ids};
 use crate::{
     Anchor, Job, JobStatus, Kind, MergeParent, Node, PromptAnchor, Role, SessionAnchorPatch,
     StoreResult as Result,
@@ -232,10 +233,12 @@ async fn append_prompt_job_base_in_transaction(
     prompt: PromptAnchor,
     merge_parents: Vec<MergeParent>,
     session_patch: Option<SessionAnchorPatch>,
-) -> std::result::Result<String, SqliteTransactionError> {
+    graph_mutation_revision: i64,
+) -> std::result::Result<(String, Vec<Node>), SqliteTransactionError> {
     let parent_id = load_branch_head(connection, path, branch)
         .await
         .map_err(SqliteTransactionError::Operation)?;
+    let mut nodes = Vec::with_capacity(2);
     let prompt_parent_id = if let Some(patch) = session_patch {
         load_session_chain(connection, path, &parent_id)
             .await
@@ -250,10 +253,12 @@ async fn append_prompt_job_base_in_transaction(
         validate_new_node(connection, path, &node)
             .await
             .map_err(SqliteTransactionError::Operation)?;
-        persist_node_without_transaction(connection, path, &node)
+        persist_node_without_transaction(connection, path, &node, graph_mutation_revision)
             .await
             .map_err(SqliteTransactionError::Operation)?;
-        node.id
+        let node_id = node.id.clone();
+        nodes.push(node);
+        node_id
     } else {
         parent_id
     };
@@ -268,10 +273,12 @@ async fn append_prompt_job_base_in_transaction(
     validate_new_node(connection, path, &node)
         .await
         .map_err(SqliteTransactionError::Operation)?;
-    persist_node_without_transaction(connection, path, &node)
+    persist_node_without_transaction(connection, path, &node, graph_mutation_revision)
         .await
         .map_err(SqliteTransactionError::Operation)?;
-    Ok(node.id)
+    let node_id = node.id.clone();
+    nodes.push(node);
+    Ok((node_id, nodes))
 }
 
 fn normalize_prompt_merge_parents(
@@ -346,46 +353,89 @@ impl JobStore for SqliteStore {
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> Result<Job> {
+        self.submit_job_with_prompt_base_and_graph_mutation(
+            branch,
+            prompt,
+            merge_parents,
+            session_patch,
+        )
+        .await
+        .map(|receipt| receipt.value)
+    }
+
+    async fn submit_job_with_prompt_base_and_graph_mutation(
+        &self,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> Result<GraphMutationReceipt<Job>> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
-        connection
-            .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-                let job_id = loop {
-                    let job_id = format!("job-{}", nanoid::nanoid!());
-                    if jobs::table
-                        .filter(jobs::job_id.eq(&job_id))
-                        .count()
-                        .get_result::<i64>(connection)
+        let (job, nodes) = connection
+            .immediate_transaction::<(Job, Vec<Node>), SqliteTransactionError, _>(
+                async |connection| {
+                    let job_id = loop {
+                        let job_id = format!("job-{}", nanoid::nanoid!());
+                        if jobs::table
+                            .filter(jobs::job_id.eq(&job_id))
+                            .count()
+                            .get_result::<i64>(connection)
+                            .await
+                            .context(QuerySqliteStoreSnafu {
+                                path: self.database_path.clone(),
+                            })
+                            .map_err(SqliteTransactionError::Operation)?
+                            == 0
+                        {
+                            break job_id;
+                        }
+                    };
+                    let revision = begin_graph_mutation(connection, &self.database_path)
                         .await
-                        .context(QuerySqliteStoreSnafu {
-                            path: self.database_path.clone(),
-                        })
-                        .map_err(SqliteTransactionError::Operation)?
-                        == 0
-                    {
-                        break job_id;
-                    }
-                };
-                let base = append_prompt_job_base_in_transaction(
-                    connection,
-                    &self.database_path,
-                    branch,
-                    prompt,
-                    merge_parents,
-                    session_patch,
-                )
-                .await?;
-                submit_job_with_id_in_transaction(
-                    connection,
-                    &self.database_path,
-                    &job_id,
-                    branch,
-                    &base,
-                )
-                .await
-            })
+                        .map_err(SqliteTransactionError::Operation)?;
+                    let (base, nodes) = append_prompt_job_base_in_transaction(
+                        connection,
+                        &self.database_path,
+                        branch,
+                        prompt,
+                        merge_parents,
+                        session_patch,
+                        revision,
+                    )
+                    .await?;
+                    let job = submit_job_with_id_in_transaction(
+                        connection,
+                        &self.database_path,
+                        &job_id,
+                        branch,
+                        &base,
+                    )
+                    .await?;
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(&nodes),
+                        &[],
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                    Ok((job, nodes))
+                },
+            )
             .await
-            .map_err(|error| error.into_store_error(&self.database_path))
+            .map_err(|error| error.into_store_error(&self.database_path))?;
+        let inserted_parent_ids = inserted_parent_ids(
+            nodes.iter().map(|node| node.parent.as_str()),
+            nodes.iter().map(|node| &node.kind),
+        );
+        Ok(GraphMutationReceipt {
+            value: job,
+            branch_changes: Vec::new(),
+            inserted_parent_ids,
+            exact: true,
+        })
     }
 
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> Result<Job> {
@@ -414,30 +464,75 @@ impl JobStore for SqliteStore {
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> Result<Job> {
+        self.submit_job_with_id_and_prompt_base_and_graph_mutation(
+            job_id,
+            branch,
+            prompt,
+            merge_parents,
+            session_patch,
+        )
+        .await
+        .map(|receipt| receipt.value)
+    }
+
+    async fn submit_job_with_id_and_prompt_base_and_graph_mutation(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> Result<GraphMutationReceipt<Job>> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
-        connection
-            .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-                let base = append_prompt_job_base_in_transaction(
-                    connection,
-                    &self.database_path,
-                    branch,
-                    prompt,
-                    merge_parents,
-                    session_patch,
-                )
-                .await?;
-                submit_job_with_id_in_transaction(
-                    connection,
-                    &self.database_path,
-                    job_id,
-                    branch,
-                    &base,
-                )
-                .await
-            })
+        let (job, nodes) = connection
+            .immediate_transaction::<(Job, Vec<Node>), SqliteTransactionError, _>(
+                async |connection| {
+                    let revision = begin_graph_mutation(connection, &self.database_path)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                    let (base, nodes) = append_prompt_job_base_in_transaction(
+                        connection,
+                        &self.database_path,
+                        branch,
+                        prompt,
+                        merge_parents,
+                        session_patch,
+                        revision,
+                    )
+                    .await?;
+                    let job = submit_job_with_id_in_transaction(
+                        connection,
+                        &self.database_path,
+                        job_id,
+                        branch,
+                        &base,
+                    )
+                    .await?;
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(&nodes),
+                        &[],
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                    Ok((job, nodes))
+                },
+            )
             .await
-            .map_err(|error| error.into_store_error(&self.database_path))
+            .map_err(|error| error.into_store_error(&self.database_path))?;
+        let inserted_parent_ids = inserted_parent_ids(
+            nodes.iter().map(|node| node.parent.as_str()),
+            nodes.iter().map(|node| &node.kind),
+        );
+        Ok(GraphMutationReceipt {
+            value: job,
+            branch_changes: Vec::new(),
+            inserted_parent_ids,
+            exact: true,
+        })
     }
 
     async fn get_job(&self, job_id: &str) -> Result<Job> {

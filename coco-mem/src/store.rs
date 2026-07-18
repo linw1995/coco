@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -10,14 +10,73 @@ mod tests;
 
 pub use sqlite::{
     GRAPH_READ_BATCH_SIZE, GraphBranchPage, GraphBranchPageCursor, GraphBranchRecord,
-    GraphChildPage, GraphChildPageCursor, SqliteGraphStore, SqliteStore,
+    GraphChildPage, GraphChildPageCursor, GraphMutationBranchChangeKind,
+    GraphMutationBranchChangePage, GraphMutationBranchChangePageCursor,
+    GraphMutationBranchChangeRecord, GraphMutationDirtyParentPage,
+    GraphMutationDirtyParentPageCursor, GraphMutationEvent, GraphMutationEventPage,
+    GraphMutationRevisionBounds, SqliteGraphStore, SqliteStore,
 };
 
 use crate::{
-    Job, JobStatus, MergeParent, MessageQueueItem, NewNode, NewNodeContent, Node, Preset,
+    Job, JobStatus, Kind, MergeParent, MessageQueueItem, NewNode, NewNodeContent, Node, Preset,
     PresetRecord, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
     SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMutationReceipt<T> {
+    pub value: T,
+    pub branch_changes: Vec<GraphBranchChange>,
+    pub inserted_parent_ids: BTreeSet<String>,
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphBranchChange {
+    Updated { name: String, head_id: String },
+    MetadataUpdated { name: String },
+    Removed { name: String },
+}
+
+impl<T> GraphMutationReceipt<T> {
+    fn exact(value: T) -> Self {
+        Self {
+            value,
+            branch_changes: Vec::new(),
+            inserted_parent_ids: BTreeSet::new(),
+            exact: true,
+        }
+    }
+
+    fn inexact(value: T) -> Self {
+        Self {
+            exact: false,
+            ..Self::exact(value)
+        }
+    }
+}
+
+fn inserted_parent_ids<'a>(
+    primary_parent: impl IntoIterator<Item = &'a str>,
+    kinds: impl IntoIterator<Item = &'a Kind>,
+) -> BTreeSet<String> {
+    let mut parents = primary_parent
+        .into_iter()
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    for kind in kinds {
+        if let Kind::Anchor(anchor) = kind {
+            parents.extend(
+                anchor
+                    .merge_parents()
+                    .iter()
+                    .map(|parent| parent.node_id().to_owned()),
+            );
+        }
+    }
+    parents
+}
 
 #[derive(Debug, Clone)]
 pub struct BranchAppendSessionState {
@@ -60,6 +119,17 @@ pub trait NodeStore {
     /// Appends a new node and returns the persisted node identifier.
     async fn append(&self, node: NewNode) -> StoreResult<String>;
 
+    async fn append_with_graph_mutation(
+        &self,
+        node: NewNode,
+    ) -> StoreResult<GraphMutationReceipt<String>> {
+        let parents = inserted_parent_ids([node.parent.as_str()], [&node.kind]);
+        let value = self.append(node).await?;
+        let mut receipt = GraphMutationReceipt::exact(value);
+        receipt.inserted_parent_ids = parents;
+        Ok(receipt)
+    }
+
     /// Returns the chain from a node id or branch reference back to the root.
     async fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>>;
 
@@ -79,11 +149,37 @@ pub trait BranchStore {
     /// Creates a branch from a node id or branch reference and returns its head id.
     async fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String>;
 
+    async fn fork_with_graph_mutation(
+        &self,
+        name: &str,
+        from_ref: &str,
+    ) -> StoreResult<GraphMutationReceipt<String>> {
+        let value = self.fork(name, from_ref).await?;
+        let mut receipt = GraphMutationReceipt::exact(value.clone());
+        receipt.branch_changes.push(GraphBranchChange::Updated {
+            name: name.to_owned(),
+            head_id: value,
+        });
+        Ok(receipt)
+    }
+
     /// Returns the current head node identifier for a branch.
     async fn get_branch_head(&self, name: &str) -> StoreResult<String>;
 
     /// Deletes a branch head and its session state.
     async fn delete_branch(&self, name: &str) -> StoreResult<()>;
+
+    async fn delete_branch_with_graph_mutation(
+        &self,
+        name: &str,
+    ) -> StoreResult<GraphMutationReceipt<()>> {
+        self.delete_branch(name).await?;
+        let mut receipt = GraphMutationReceipt::exact(());
+        receipt.branch_changes.push(GraphBranchChange::Removed {
+            name: name.to_owned(),
+        });
+        Ok(receipt)
+    }
 
     /// Moves a branch head when the expected current head matches.
     async fn set_branch_head(
@@ -93,6 +189,22 @@ pub trait BranchStore {
         new_head: &str,
     ) -> StoreResult<()>;
 
+    async fn set_branch_head_with_graph_mutation(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        new_head: &str,
+    ) -> StoreResult<GraphMutationReceipt<()>> {
+        self.set_branch_head(name, expected_old_head, new_head)
+            .await?;
+        let mut receipt = GraphMutationReceipt::exact(());
+        receipt.branch_changes.push(GraphBranchChange::Updated {
+            name: name.to_owned(),
+            head_id: new_head.to_owned(),
+        });
+        Ok(receipt)
+    }
+
     /// Appends nodes after `parent` and moves a branch head in the same operation.
     async fn append_nodes_and_set_branch_head(
         &self,
@@ -101,6 +213,28 @@ pub trait BranchStore {
         parent: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String>;
+
+    async fn append_nodes_and_set_branch_head_with_graph_mutation(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<GraphMutationReceipt<String>> {
+        let exact = nodes.len() <= 1;
+        let parents = inserted_parent_ids([parent], nodes.iter().map(|node| &node.kind));
+        let value = self
+            .append_nodes_and_set_branch_head(name, expected_old_head, parent, nodes)
+            .await?;
+        let mut receipt = GraphMutationReceipt::exact(value.clone());
+        receipt.branch_changes.push(GraphBranchChange::Updated {
+            name: name.to_owned(),
+            head_id: value,
+        });
+        receipt.inserted_parent_ids = parents;
+        receipt.exact = exact;
+        Ok(receipt)
+    }
 
     /// Appends nodes after `parent` and moves a branch head to `new_head` in the same operation.
     async fn append_nodes_and_set_branch_head_to(
@@ -112,11 +246,66 @@ pub trait BranchStore {
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String>;
 
+    async fn append_nodes_and_set_branch_head_to_with_graph_mutation(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        new_head: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<GraphMutationReceipt<String>> {
+        let exact = nodes.len() <= 1;
+        let parents = inserted_parent_ids([parent], nodes.iter().map(|node| &node.kind));
+        let value = self
+            .append_nodes_and_set_branch_head_to(name, expected_old_head, parent, new_head, nodes)
+            .await?;
+        let mut receipt = GraphMutationReceipt::exact(value);
+        receipt.branch_changes.push(GraphBranchChange::Updated {
+            name: name.to_owned(),
+            head_id: new_head.to_owned(),
+        });
+        receipt.inserted_parent_ids = parents;
+        receipt.exact = exact;
+        Ok(receipt)
+    }
+
     /// Appends nodes, moves a branch head, and updates session state in the same operation.
     async fn append_nodes_and_set_branch_head_with_session_state(
         &self,
         update: BranchAppendSessionState,
     ) -> StoreResult<String>;
+
+    async fn append_nodes_and_set_branch_head_with_session_state_and_graph_mutation(
+        &self,
+        update: BranchAppendSessionState,
+    ) -> StoreResult<GraphMutationReceipt<String>> {
+        let branch = update.branch.clone();
+        let session_branch = update.session_branch.clone();
+        let requested_head = update.new_head.clone();
+        let exact = update.nodes.len() <= 1;
+        let parents = inserted_parent_ids(
+            [update.parent.as_str()],
+            update.nodes.iter().map(|node| &node.kind),
+        );
+        let value = self
+            .append_nodes_and_set_branch_head_with_session_state(update)
+            .await?;
+        let mut receipt = GraphMutationReceipt::exact(value.clone());
+        receipt.branch_changes.push(GraphBranchChange::Updated {
+            name: branch.clone(),
+            head_id: requested_head.unwrap_or(value),
+        });
+        if session_branch != branch {
+            receipt
+                .branch_changes
+                .push(GraphBranchChange::MetadataUpdated {
+                    name: session_branch,
+                });
+        }
+        receipt.inserted_parent_ids = parents;
+        receipt.exact = exact;
+        Ok(receipt)
+    }
 }
 
 /// Branch workflow session state storage API.
@@ -136,8 +325,38 @@ pub trait SessionStore {
         next: SessionState,
     ) -> StoreResult<SessionState>;
 
+    async fn set_session_state_with_graph_mutation(
+        &self,
+        name: &str,
+        expected: Option<&SessionState>,
+        next: SessionState,
+    ) -> StoreResult<GraphMutationReceipt<SessionState>> {
+        let value = self.set_session_state(name, expected, next).await?;
+        let mut receipt = GraphMutationReceipt::exact(value);
+        receipt
+            .branch_changes
+            .push(GraphBranchChange::MetadataUpdated {
+                name: name.to_owned(),
+            });
+        Ok(receipt)
+    }
+
     /// Rewrites the visible session chain for a branch and returns the new head id.
     async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String>;
+
+    async fn rebase_session_with_graph_mutation(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+    ) -> StoreResult<GraphMutationReceipt<String>> {
+        let value = self.rebase_session(name, patch).await?;
+        let mut receipt = GraphMutationReceipt::inexact(value.clone());
+        receipt.branch_changes.push(GraphBranchChange::Updated {
+            name: name.to_owned(),
+            head_id: value,
+        });
+        Ok(receipt)
+    }
 
     /// Appends a new full session anchor to reset provider context for a branch.
     async fn handoff_session(
@@ -146,6 +365,21 @@ pub trait SessionStore {
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> StoreResult<String>;
+
+    async fn handoff_session_with_graph_mutation(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
+    ) -> StoreResult<GraphMutationReceipt<String>> {
+        let value = self.handoff_session(name, patch, prompt).await?;
+        let mut receipt = GraphMutationReceipt::inexact(value.clone());
+        receipt.branch_changes.push(GraphBranchChange::Updated {
+            name: name.to_owned(),
+            head_id: value,
+        });
+        Ok(receipt)
+    }
 }
 
 /// Preset storage API.
@@ -220,6 +454,19 @@ pub trait JobStore {
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job>;
 
+    async fn submit_job_with_prompt_base_and_graph_mutation(
+        &self,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<GraphMutationReceipt<Job>> {
+        let value = self
+            .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
+            .await?;
+        Ok(GraphMutationReceipt::inexact(value))
+    }
+
     /// Creates a new single-task prompt job record with a caller-provided id.
     ///
     /// Rejects the request when the branch already has an unfinished prompt job.
@@ -236,6 +483,26 @@ pub trait JobStore {
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job>;
+
+    async fn submit_job_with_id_and_prompt_base_and_graph_mutation(
+        &self,
+        job_id: &str,
+        branch: &str,
+        prompt: PromptAnchor,
+        merge_parents: Vec<MergeParent>,
+        session_patch: Option<SessionAnchorPatch>,
+    ) -> StoreResult<GraphMutationReceipt<Job>> {
+        let value = self
+            .submit_job_with_id_and_prompt_base(
+                job_id,
+                branch,
+                prompt,
+                merge_parents,
+                session_patch,
+            )
+            .await?;
+        Ok(GraphMutationReceipt::inexact(value))
+    }
 
     /// Returns a persisted prompt job.
     async fn get_job(&self, job_id: &str) -> StoreResult<Job>;

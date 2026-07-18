@@ -697,30 +697,155 @@ pub async fn load_child_ids_page(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     parent_id: &str,
-    cursor: Option<(&str, &str)>,
+    cursor: Option<(i64, &str)>,
     limit: usize,
-) -> Result<Vec<(String, String)>> {
-    let mut query = node_relations::table
-        .inner_join(nodes::table.on(nodes::id.eq(node_relations::child_node_id)))
-        .filter(node_relations::parent_node_id.eq(parent_id))
-        .select((nodes::created_at, nodes::id))
-        .distinct()
+) -> Result<Vec<(i64, String)>> {
+    load_child_ids_page_through_at_revision(
+        connection,
+        path,
+        parent_id,
+        cursor,
+        None,
+        i64::MAX,
+        limit,
+    )
+    .await
+}
+
+pub async fn load_child_ids_page_through(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent_id: &str,
+    cursor: Option<(i64, &str)>,
+    through: Option<(i64, &str)>,
+    limit: usize,
+) -> Result<Vec<(i64, String)>> {
+    load_child_ids_page_through_at_revision(
+        connection,
+        path,
+        parent_id,
+        cursor,
+        through,
+        i64::MAX,
+        limit,
+    )
+    .await
+}
+
+pub async fn load_child_ids_page_at_revision(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent_id: &str,
+    cursor: Option<(i64, &str)>,
+    revision: i64,
+    limit: usize,
+) -> Result<Vec<(i64, String)>> {
+    load_child_ids_page_through_at_revision(
+        connection, path, parent_id, cursor, None, revision, limit,
+    )
+    .await
+}
+
+pub async fn load_child_ids_page_through_at_revision(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent_id: &str,
+    cursor: Option<(i64, &str)>,
+    through: Option<(i64, &str)>,
+    revision: i64,
+    limit: usize,
+) -> Result<Vec<(i64, String)>> {
+    let mut query = graph_child_adjacency::table
+        .filter(graph_child_adjacency::parent_node_id.eq(parent_id))
+        .filter(graph_child_adjacency::first_created_revision.le(revision))
+        .select((
+            graph_child_adjacency::first_created_revision,
+            graph_child_adjacency::child_node_id,
+        ))
         .into_boxed();
-    if let Some((created_at, node_id)) = cursor {
+    if let Some((relation_revision, node_id)) = cursor {
         query = query.filter(
-            nodes::created_at
-                .gt(created_at)
-                .or(nodes::created_at.eq(created_at).and(nodes::id.gt(node_id))),
+            graph_child_adjacency::first_created_revision
+                .gt(relation_revision)
+                .or(graph_child_adjacency::first_created_revision
+                    .eq(relation_revision)
+                    .and(graph_child_adjacency::child_node_id.gt(node_id))),
+        );
+    }
+    if let Some((relation_revision, node_id)) = through {
+        query = query.filter(
+            graph_child_adjacency::first_created_revision
+                .lt(relation_revision)
+                .or(graph_child_adjacency::first_created_revision
+                    .eq(relation_revision)
+                    .and(graph_child_adjacency::child_node_id.le(node_id))),
         );
     }
     query
-        .order((nodes::created_at, nodes::id))
+        .order((
+            graph_child_adjacency::first_created_revision,
+            graph_child_adjacency::child_node_id,
+        ))
         .limit(i64::try_from(limit).expect("graph child page limit should fit in i64"))
-        .load::<(String, String)>(connection)
+        .load::<(i64, String)>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })
+}
+
+pub async fn load_child_high_watermark(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent_id: &str,
+) -> Result<Option<(i64, String)>> {
+    load_child_high_watermark_at_revision(connection, path, parent_id, i64::MAX).await
+}
+
+pub async fn load_child_high_watermark_at_revision(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    parent_id: &str,
+    revision: i64,
+) -> Result<Option<(i64, String)>> {
+    graph_child_adjacency::table
+        .filter(graph_child_adjacency::parent_node_id.eq(parent_id))
+        .filter(graph_child_adjacency::first_created_revision.le(revision))
+        .select((
+            graph_child_adjacency::first_created_revision,
+            graph_child_adjacency::child_node_id,
+        ))
+        .order((
+            graph_child_adjacency::first_created_revision.desc(),
+            graph_child_adjacency::child_node_id.desc(),
+        ))
+        .first::<(i64, String)>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+pub async fn load_graph_mutation_revision_bounds(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<GraphMutationRevisionBounds> {
+    let (baseline_revision, current_revision) = graph_relation_state::table
+        .filter(graph_relation_state::singleton.eq(1))
+        .select((
+            graph_relation_state::baseline_revision,
+            graph_relation_state::current_revision,
+        ))
+        .get_result::<(i64, i64)>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(GraphMutationRevisionBounds {
+        baseline_revision,
+        current_revision,
+    })
 }
 
 pub async fn load_node_by_exact_id(

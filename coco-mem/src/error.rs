@@ -119,6 +119,15 @@ pub enum StoreError {
     GraphReadBatchTooLarge { actual: usize, maximum: usize },
 
     #[snafu(display(
+        "SQLite graph revision {requested} is outside the serviceable range {minimum}..={maximum}"
+    ))]
+    GraphRevisionOutOfRange {
+        requested: i64,
+        minimum: i64,
+        maximum: i64,
+    },
+
+    #[snafu(display(
         "Store at {path:?} uses the removed JSON/JSONL format; run a version that still supports migration first or choose a different COCO_STORE_PATH"
     ))]
     LegacyJsonStore { path: PathBuf },

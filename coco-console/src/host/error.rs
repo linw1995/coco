@@ -44,6 +44,9 @@ pub enum Error {
         source: diesel::result::Error,
     },
 
+    #[snafu(display("Console graph source work is owned by another live worker: {resource}"))]
+    SourceRefreshBusy { resource: String },
+
     #[snafu(display("Console graph snapshot store {} migration failed: {source}", path.display()))]
     MigrateGraphSnapshotStore {
         path: PathBuf,

@@ -132,6 +132,80 @@ diesel::table! {
         parent_node_id -> Text,
         kind -> Text,
         ordinal -> Integer,
+        created_revision -> BigInt,
+    }
+}
+
+diesel::table! {
+    graph_relation_state (singleton) {
+        singleton -> Integer,
+        current_revision -> BigInt,
+        baseline_revision -> BigInt,
+    }
+}
+
+diesel::table! {
+    graph_child_adjacency (parent_node_id, child_node_id) {
+        parent_node_id -> Text,
+        child_node_id -> Text,
+        first_created_revision -> BigInt,
+    }
+}
+
+diesel::table! {
+    graph_mutation_events (revision) {
+        revision -> BigInt,
+    }
+}
+
+diesel::table! {
+    graph_mutation_event_branch_changes (revision, name) {
+        revision -> BigInt,
+        name -> Text,
+        kind -> Text,
+        head_id -> Nullable<Text>,
+        state_json -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    graph_mutation_event_dirty_parents (revision, parent_id) {
+        revision -> BigInt,
+        parent_id -> Text,
+    }
+}
+
+diesel::table! {
+    graph_mutation_event_branch_change_prune_staging (revision, name) {
+        revision -> BigInt,
+        name -> Text,
+        kind -> Text,
+        head_id -> Nullable<Text>,
+        state_json -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    graph_mutation_event_dirty_parent_prune_staging (revision, parent_id) {
+        revision -> BigInt,
+        parent_id -> Text,
+    }
+}
+
+diesel::table! {
+    graph_branch_history (name, revision) {
+        name -> Text,
+        revision -> BigInt,
+        head_id -> Nullable<Text>,
+        state_json -> Nullable<Text>,
+        removed -> Bool,
+    }
+}
+
+diesel::table! {
+    graph_branch_names (name) {
+        name -> Text,
+        first_revision -> BigInt,
     }
 }
 
@@ -270,6 +344,15 @@ diesel::allow_tables_to_appear_in_same_query!(
     node_anchor_skill_results,
     node_metadata,
     node_relations,
+    graph_child_adjacency,
+    graph_relation_state,
+    graph_mutation_events,
+    graph_mutation_event_branch_changes,
+    graph_mutation_event_dirty_parents,
+    graph_mutation_event_branch_change_prune_staging,
+    graph_mutation_event_dirty_parent_prune_staging,
+    graph_branch_history,
+    graph_branch_names,
     node_tool_results,
     node_tool_uses,
     nodes,

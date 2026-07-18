@@ -3,10 +3,11 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use coco_mem::{
-    BranchAppendSessionState, BranchStore, Job, JobStatus, JobStore, MergeParent, MessageQueueItem,
-    MessageQueueStore, NewNode, NewNodeContent, Node, NodeStore, Preset, PresetRecord, PresetStore,
-    ProcessShareableStore, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState,
-    SessionStore, SkillRecord, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    BranchAppendSessionState, BranchStore, GraphMutationReceipt, Job, JobStatus, JobStore,
+    MergeParent, MessageQueueItem, MessageQueueStore, NewNode, NewNodeContent, Node, NodeStore,
+    Preset, PresetRecord, PresetStore, ProcessShareableStore, PromptAnchor, SessionAnchorPatch,
+    SessionRole, SessionState, SessionStore, SkillRecord, SkillStore, SkillUpdatePatch,
+    SkillVersionSpec, StoreResult,
 };
 
 use crate::ConsolePublisher;
@@ -30,26 +31,14 @@ impl<S> ConsoleStore<S> {
         &self.publisher
     }
 
-    fn notify_branch_if_ok<T>(
+    fn publish_graph_mutation<T>(
         &self,
-        branch: impl Into<String>,
-        result: StoreResult<T>,
+        result: StoreResult<GraphMutationReceipt<T>>,
     ) -> StoreResult<T> {
-        if result.is_ok() {
-            self.publisher.mark_branch_changed(branch);
-        }
-        result
-    }
-
-    fn notify_branches_if_ok<T>(
-        &self,
-        branches: impl IntoIterator<Item = String>,
-        result: StoreResult<T>,
-    ) -> StoreResult<T> {
-        if result.is_ok() {
-            self.publisher.mark_branches_changed(branches);
-        }
-        result
+        result.map(|receipt| {
+            self.publisher.publish_graph_mutation(&receipt);
+            receipt.value
+        })
     }
 }
 
@@ -63,7 +52,7 @@ where
     }
 
     async fn append(&self, node: NewNode) -> StoreResult<String> {
-        self.inner.append(node).await
+        self.publish_graph_mutation(self.inner.append_with_graph_mutation(node).await)
     }
 
     async fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
@@ -89,7 +78,7 @@ where
     S: BranchStore + Sync,
 {
     async fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
-        self.notify_branch_if_ok(name, self.inner.fork(name, from_ref).await)
+        self.publish_graph_mutation(self.inner.fork_with_graph_mutation(name, from_ref).await)
     }
 
     async fn get_branch_head(&self, name: &str) -> StoreResult<String> {
@@ -97,7 +86,7 @@ where
     }
 
     async fn delete_branch(&self, name: &str) -> StoreResult<()> {
-        self.notify_branch_if_ok(name, self.inner.delete_branch(name).await)
+        self.publish_graph_mutation(self.inner.delete_branch_with_graph_mutation(name).await)
     }
 
     async fn set_branch_head(
@@ -106,10 +95,9 @@ where
         expected_old_head: &str,
         new_head: &str,
     ) -> StoreResult<()> {
-        self.notify_branch_if_ok(
-            name,
+        self.publish_graph_mutation(
             self.inner
-                .set_branch_head(name, expected_old_head, new_head)
+                .set_branch_head_with_graph_mutation(name, expected_old_head, new_head)
                 .await,
         )
     }
@@ -121,10 +109,14 @@ where
         parent: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_branch_if_ok(
-            name,
+        self.publish_graph_mutation(
             self.inner
-                .append_nodes_and_set_branch_head(name, expected_old_head, parent, nodes)
+                .append_nodes_and_set_branch_head_with_graph_mutation(
+                    name,
+                    expected_old_head,
+                    parent,
+                    nodes,
+                )
                 .await,
         )
     }
@@ -137,10 +129,9 @@ where
         new_head: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_branch_if_ok(
-            name,
+        self.publish_graph_mutation(
             self.inner
-                .append_nodes_and_set_branch_head_to(
+                .append_nodes_and_set_branch_head_to_with_graph_mutation(
                     name,
                     expected_old_head,
                     parent,
@@ -155,11 +146,9 @@ where
         &self,
         update: BranchAppendSessionState,
     ) -> StoreResult<String> {
-        let branches = [update.branch.clone(), update.session_branch.clone()];
-        self.notify_branches_if_ok(
-            branches,
+        self.publish_graph_mutation(
             self.inner
-                .append_nodes_and_set_branch_head_with_session_state(update)
+                .append_nodes_and_set_branch_head_with_session_state_and_graph_mutation(update)
                 .await,
         )
     }
@@ -184,14 +173,19 @@ where
         expected: Option<&SessionState>,
         next: SessionState,
     ) -> StoreResult<SessionState> {
-        self.notify_branch_if_ok(
-            name,
-            self.inner.set_session_state(name, expected, next).await,
+        self.publish_graph_mutation(
+            self.inner
+                .set_session_state_with_graph_mutation(name, expected, next)
+                .await,
         )
     }
 
     async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        self.notify_branch_if_ok(name, self.inner.rebase_session(name, patch).await)
+        self.publish_graph_mutation(
+            self.inner
+                .rebase_session_with_graph_mutation(name, patch)
+                .await,
+        )
     }
 
     async fn handoff_session(
@@ -200,7 +194,11 @@ where
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> StoreResult<String> {
-        self.notify_branch_if_ok(name, self.inner.handoff_session(name, patch, prompt).await)
+        self.publish_graph_mutation(
+            self.inner
+                .handoff_session_with_graph_mutation(name, patch, prompt)
+                .await,
+        )
     }
 }
 
@@ -287,9 +285,16 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job> {
-        self.inner
-            .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
-            .await
+        self.publish_graph_mutation(
+            self.inner
+                .submit_job_with_prompt_base_and_graph_mutation(
+                    branch,
+                    prompt,
+                    merge_parents,
+                    session_patch,
+                )
+                .await,
+        )
     }
 
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
@@ -304,15 +309,17 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job> {
-        self.inner
-            .submit_job_with_id_and_prompt_base(
-                job_id,
-                branch,
-                prompt,
-                merge_parents,
-                session_patch,
-            )
-            .await
+        self.publish_graph_mutation(
+            self.inner
+                .submit_job_with_id_and_prompt_base_and_graph_mutation(
+                    job_id,
+                    branch,
+                    prompt,
+                    merge_parents,
+                    session_patch,
+                )
+                .await,
+        )
     }
 
     async fn get_job(&self, job_id: &str) -> StoreResult<Job> {
@@ -389,7 +396,7 @@ mod tests {
     use coco_mem::{Kind, Role, SqliteStore};
 
     #[tokio::test]
-    async fn only_visible_graph_mutations_publish_branch_invalidations() {
+    async fn graph_mutations_publish_branch_and_relation_invalidations() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(inner, publisher.clone());
@@ -408,15 +415,51 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(publisher.current_version(), 0);
+        assert_eq!(publisher.current_version(), 1);
 
         store.fork("main", &root).await.unwrap();
         store.submit_job("main", &root).await.unwrap();
         store.set_branch_head("main", &root, &child).await.unwrap();
 
-        assert_eq!(publisher.current_version(), 2);
+        assert_eq!(publisher.current_version(), 3);
         let invalidations = publisher.take_invalidations();
-        assert_eq!(invalidations.branches, ["main".to_owned()].into());
+        assert!(!invalidations.full);
+    }
+
+    #[tokio::test]
+    async fn prompt_job_base_publishes_every_inserted_parent_relation() {
+        let inner = SqliteStore::open_temporary().await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(inner, publisher.clone());
+        let root = store.root_id();
+        store.fork("main", &root).await.unwrap();
+        let merge_parent = store
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("prompt merge parent".to_owned()),
+            })
+            .await
+            .unwrap();
+        publisher.take_invalidations();
+        let version = publisher.current_version();
+
+        store
+            .submit_job_with_prompt_base(
+                "main",
+                PromptAnchor {
+                    prompt: "test prompt".to_owned(),
+                    attachments: Vec::new(),
+                },
+                vec![MergeParent::merge(merge_parent.clone())],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(publisher.current_version(), version + 1);
+        let invalidations = publisher.take_invalidations();
         assert!(!invalidations.full);
     }
 }

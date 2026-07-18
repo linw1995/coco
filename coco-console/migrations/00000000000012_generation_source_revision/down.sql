@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS console_graph_generation_source_revisions;

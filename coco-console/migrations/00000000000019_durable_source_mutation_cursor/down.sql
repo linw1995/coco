@@ -1,0 +1,2 @@
+DROP TABLE console_graph_source_mutation_event_runs;
+DROP TABLE console_graph_source_mutation_journal_state;

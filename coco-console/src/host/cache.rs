@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::incremental_build::build_incremental_generation;
+use super::incremental_build::{IncrementalBuildStats, build_incremental_generation};
 use super::snapshot_store::{
     ConsoleGraphSnapshotStore, INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL, IncrementalBuildLease,
+    IncrementalBuildLeasePhase, IncrementalBuildProgress,
 };
 use super::source_cache::{PersistentGraphIndex, PersistentGraphStore};
 use crate::api::{GraphViewportDiffResponse, GraphViewportResponse};
@@ -53,6 +55,7 @@ pub struct ConsoleGraphCache<S> {
     snapshots: Option<ConsoleGraphSnapshotStore>,
     persistent_graph_store: Option<SqliteGraphStore>,
     persistent_index: Option<Arc<tokio::sync::Mutex<PersistentGraphIndex>>>,
+    last_notified_mutation_revision: Arc<AtomicI64>,
     rebuild_lock: Arc<tokio::sync::Mutex<()>>,
     publish_lock: Arc<Mutex<()>>,
     state: Arc<Mutex<CacheState>>,
@@ -87,12 +90,18 @@ struct GraphRefreshResult {
     snapshots: Option<GraphSnapshotSet>,
 }
 
+struct PreparedPersistentRefresh {
+    snapshots: Option<GraphSnapshotSet>,
+    stats: IncrementalBuildStats,
+}
+
 struct TakenInvalidations {
     publisher: ConsolePublisher,
     batch: Option<ConsoleInvalidationBatch>,
 }
 
-const BUILD_LEASE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const BUILD_LEASE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+const BUILD_PROGRESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 struct ActiveBuildLease {
     store: ConsoleGraphSnapshotStore,
@@ -117,11 +126,11 @@ impl ActiveBuildLease {
         self.lease = None;
     }
 
-    async fn abandon(&mut self) {
+    async fn pause(&mut self) {
         let Some(lease) = self.lease.as_ref().cloned() else {
             return;
         };
-        if abandon_build_lease(&self.store, &lease).await {
+        if pause_build_lease(&self.store, &lease).await {
             self.lease = None;
         }
     }
@@ -135,58 +144,157 @@ impl Drop for ActiveBuildLease {
         let store = self.store.clone();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(
-                generation = lease.generation(),
-                "could not schedule console graph build lease cleanup outside a Tokio runtime",
+                rebuild_output_scope = "anchors_and_all",
+                build_run_id = lease.generation(),
+                build_lease_epoch = lease.lease_epoch(),
+                build_frozen_source_revision = lease.frozen_source_revision(),
+                "could not schedule console graph build lease pause outside a Tokio runtime",
             );
             return;
         };
         runtime.spawn(async move {
-            let cleanup = async {
+            let release = async {
                 let mut retry_delay = Duration::from_millis(25);
                 loop {
-                    if abandon_build_lease(&store, &lease).await {
+                    if pause_build_lease(&store, &lease).await {
                         return;
                     }
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = (retry_delay * 2).min(Duration::from_millis(500));
                 }
             };
-            if tokio::time::timeout(BUILD_LEASE_CLEANUP_TIMEOUT, cleanup)
+            if tokio::time::timeout(BUILD_LEASE_RELEASE_TIMEOUT, release)
                 .await
                 .is_err()
             {
                 tracing::warn!(
-                    generation = lease.generation(),
-                    "timed out cleaning cancelled console graph build lease",
+                    rebuild_output_scope = "anchors_and_all",
+                    build_run_id = lease.generation(),
+                    build_lease_epoch = lease.lease_epoch(),
+                    build_frozen_source_revision = lease.frozen_source_revision(),
+                    "timed out pausing cancelled console graph build lease",
                 );
             }
         });
     }
 }
 
-async fn abandon_build_lease(
+async fn pause_build_lease(
     store: &ConsoleGraphSnapshotStore,
     lease: &IncrementalBuildLease,
 ) -> bool {
-    match store.abandon_incremental_build(lease).await {
+    match store.pause_incremental_build(lease).await {
         Ok(_) => {}
         Err(error) => {
             tracing::warn!(
-                generation = lease.generation(),
-                %error,
-                "failed to abandon console graph build lease",
+                rebuild_output_scope = "anchors_and_all",
+                build_run_id = lease.generation(),
+                build_lease_epoch = lease.lease_epoch(),
+                build_frozen_source_revision = lease.frozen_source_revision(),
+                error = %error,
+                "failed to pause console graph build lease",
             );
             return false;
         }
     }
-    if let Err(error) = store.cleanup_abandoned_generations().await {
-        tracing::warn!(
-            generation = lease.generation(),
-            %error,
-            "failed to clean abandoned console graph generation",
-        );
-    }
     true
+}
+
+async fn maintain_build_lease(
+    store: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+    process_local_invalidation_version: u64,
+    mut report_progress: impl FnMut(IncrementalBuildProgress),
+) -> crate::Result<()> {
+    let mut heartbeat = tokio::time::interval(INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    let mut progress_poll = tokio::time::interval(BUILD_PROGRESS_POLL_INTERVAL);
+    progress_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_stage = None;
+    let mut last_progress = None;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                match store.renew_incremental_build_lease(lease).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                            column: "incremental_build_lease",
+                            value: format!(
+                                "build run {} lease epoch {} is no longer owned",
+                                lease.generation(),
+                                lease.lease_epoch(),
+                            ),
+                        }
+                        .fail();
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            rebuild_output_scope = "anchors_and_all",
+                            build_run_id = lease.generation(),
+                            build_lease_epoch = lease.lease_epoch(),
+                            build_frozen_source_revision = lease.frozen_source_revision(),
+                            process_local_invalidation_version,
+                            error = %error,
+                            "failed to renew console graph build lease",
+                        );
+                    }
+                }
+            }
+            _ = progress_poll.tick() => {
+                match store.incremental_build_progress(lease).await {
+                    Ok(progress) => {
+                        if last_stage != Some(progress.stage) {
+                            tracing::info!(
+                                rebuild_output_scope = "anchors_and_all",
+                                process_local_invalidation_version,
+                                build_run_id = lease.generation(),
+                                build_lease_epoch = lease.lease_epoch(),
+                                build_frozen_source_revision = lease.frozen_source_revision(),
+                                build_stage = progress.stage,
+                                build_stage_progress_unit = progress.unit,
+                                build_stage_completed_unit_count = progress.completed_units,
+                                build_stage_total_unit_count = progress.total_units,
+                                build_stage_total_unit_count_available = progress.total_units > 0,
+                                build_stage_detail = progress.message,
+                                "console graph build stage changed",
+                            );
+                            last_stage = Some(progress.stage);
+                        } else if last_progress != Some(progress) {
+                            tracing::debug!(
+                                rebuild_output_scope = "anchors_and_all",
+                                process_local_invalidation_version,
+                                build_run_id = lease.generation(),
+                                build_lease_epoch = lease.lease_epoch(),
+                                build_frozen_source_revision = lease.frozen_source_revision(),
+                                build_stage = progress.stage,
+                                build_stage_progress_unit = progress.unit,
+                                build_stage_completed_unit_count = progress.completed_units,
+                                build_stage_total_unit_count = progress.total_units,
+                                build_stage_total_unit_count_available = progress.total_units > 0,
+                                build_stage_detail = progress.message,
+                                "console graph build stage progress",
+                            );
+                        }
+                        last_progress = Some(progress);
+                        report_progress(progress);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            rebuild_output_scope = "anchors_and_all",
+                            process_local_invalidation_version,
+                            build_run_id = lease.generation(),
+                            build_lease_epoch = lease.lease_epoch(),
+                            build_frozen_source_revision = lease.frozen_source_revision(),
+                            error = %error,
+                            "failed to read console graph build progress",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl TakenInvalidations {
@@ -219,41 +327,61 @@ impl Drop for TakenInvalidations {
 macro_rules! log_rebuild_status {
     ($status:expr) => {{
         let status = &$status;
-        if status.state == ConsoleGraphRebuildState::Failed {
-            tracing::warn!(
-                mode = ?status.mode,
-                source_version = status.source_version,
-                phase = ?status.phase,
-                processed = status.processed,
-                total = status.total,
-                progress_percent = rebuild_progress_percent(status),
-                message = %status.message,
-                "console graph rebuild failed",
-            );
-        } else if should_log_rebuild_status_at_info(status) {
-            tracing::info!(
-                mode = ?status.mode,
-                source_version = status.source_version,
-                state = ?status.state,
-                phase = ?status.phase,
-                processed = status.processed,
-                total = status.total,
-                progress_percent = rebuild_progress_percent(status),
-                message = %status.message,
-                "console graph rebuild status",
-            );
-        } else {
-            tracing::debug!(
-                mode = ?status.mode,
-                source_version = status.source_version,
-                state = ?status.state,
-                phase = ?status.phase,
-                processed = status.processed,
-                total = status.total,
-                progress_percent = rebuild_progress_percent(status),
-                message = %status.message,
-                "console graph rebuild progress",
-            );
+        debug_assert_ne!(
+            status.state,
+            ConsoleGraphRebuildState::Failed,
+            "shared rebuild failures must be logged once by the refresh worker",
+        );
+        if status.state != ConsoleGraphRebuildState::Failed
+            && should_log_rebuild_status_at_info(status)
+        {
+            if status.total > 0 {
+                tracing::info!(
+                    graph_mode = status.mode.as_query_value(),
+                    process_local_invalidation_version = status.source_version,
+                    build_state = rebuild_state_name(status.state),
+                    build_phase = rebuild_phase_name(status.phase),
+                    build_phase_progress_unit = rebuild_phase_progress_unit(status.phase),
+                    build_phase_completed_unit_count = status.processed,
+                    build_phase_total_unit_count = status.total,
+                    build_phase_progress_percent = rebuild_progress_percent(status),
+                    status_detail = %status.message,
+                    "console graph rebuild status",
+                );
+            } else {
+                tracing::info!(
+                    graph_mode = status.mode.as_query_value(),
+                    process_local_invalidation_version = status.source_version,
+                    build_state = rebuild_state_name(status.state),
+                    build_phase = rebuild_phase_name(status.phase),
+                    status_detail = %status.message,
+                    "console graph rebuild status",
+                );
+            }
+        } else if status.state != ConsoleGraphRebuildState::Failed {
+            if status.total > 0 {
+                tracing::debug!(
+                    graph_mode = status.mode.as_query_value(),
+                    process_local_invalidation_version = status.source_version,
+                    build_state = rebuild_state_name(status.state),
+                    build_phase = rebuild_phase_name(status.phase),
+                    build_phase_progress_unit = rebuild_phase_progress_unit(status.phase),
+                    build_phase_completed_unit_count = status.processed,
+                    build_phase_total_unit_count = status.total,
+                    build_phase_progress_percent = rebuild_progress_percent(status),
+                    status_detail = %status.message,
+                    "console graph rebuild progress",
+                );
+            } else {
+                tracing::debug!(
+                    graph_mode = status.mode.as_query_value(),
+                    process_local_invalidation_version = status.source_version,
+                    build_state = rebuild_state_name(status.state),
+                    build_phase = rebuild_phase_name(status.phase),
+                    status_detail = %status.message,
+                    "console graph rebuild progress",
+                );
+            }
         }
     }};
 }
@@ -281,6 +409,7 @@ where
             snapshots: None,
             persistent_graph_store: None,
             persistent_index: None,
+            last_notified_mutation_revision: Arc::new(AtomicI64::new(0)),
             rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
@@ -299,15 +428,16 @@ where
         let persistent_index =
             PersistentGraphIndex::open(&snapshots, persistent_graph_store.root_id()).await?;
         let persisted_version = latest_persistent_materialization_version(&snapshots).await?;
+        let resumable_version = snapshots.latest_resumable_build_version().await?;
         let ready = ConsolePublisher::new();
         if let Some(version) = persisted_version {
             ready.advance_to(version);
         }
-        invalidations.mark_full_at_least(
-            persisted_version
-                .map(|version| version.saturating_add(1))
-                .unwrap_or(1),
-        );
+        let startup_version = persisted_version
+            .map(|version| version.saturating_add(1))
+            .unwrap_or(1)
+            .max(resumable_version.unwrap_or(0));
+        invalidations.notify_durable_change_at_least(startup_version);
         Ok(Self {
             source: ConsoleGraphSource::PersistentStore(path),
             invalidations,
@@ -316,6 +446,7 @@ where
             snapshots: Some(snapshots),
             persistent_graph_store: Some(persistent_graph_store),
             persistent_index: Some(Arc::new(tokio::sync::Mutex::new(persistent_index))),
+            last_notified_mutation_revision: Arc::new(AtomicI64::new(0)),
             rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
@@ -359,6 +490,39 @@ where
 
     pub fn subscribe_invalidations(&self) -> tokio::sync::watch::Receiver<u64> {
         self.invalidations.subscribe()
+    }
+
+    pub(crate) async fn poll_durable_graph_mutations(&self) -> crate::Result<bool> {
+        let (Some(store), Some(index)) = (&self.persistent_graph_store, &self.persistent_index)
+        else {
+            return Ok(false);
+        };
+        let current_revision = store
+            .graph_mutation_revision()
+            .await
+            .context(crate::error::StoreSnafu)?;
+        let consumed_revision = index
+            .lock()
+            .await
+            .consumed_graph_mutation_revision()
+            .await?;
+        if current_revision <= consumed_revision {
+            return Ok(false);
+        }
+        let previously_notified = self
+            .last_notified_mutation_revision
+            .fetch_max(current_revision, Ordering::SeqCst);
+        if current_revision <= previously_notified {
+            return Ok(false);
+        }
+        let process_local_invalidation_version = self.invalidations.notify_durable_change();
+        tracing::info!(
+            source_mutation_revision = current_revision,
+            consumed_source_mutation_revision = consumed_revision,
+            process_local_invalidation_version,
+            "durable console graph mutation detected",
+        );
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -825,7 +989,7 @@ where
 
     async fn run_refresh_worker(&self) -> crate::Result<()> {
         loop {
-            let source_version = self.invalidations.current_version();
+            let (source_version, batch) = take_refresh_worker_batch(&self.invalidations, || {});
             for mode in [GraphMode::Anchors, GraphMode::All] {
                 set_rebuild_status!(
                     self,
@@ -840,8 +1004,6 @@ where
                     )
                 );
             }
-            let mut batch = self.invalidations.take_invalidations();
-            batch.version = source_version;
             let invalidations = TakenInvalidations::new(self.invalidations.clone(), batch);
             let result = self
                 .refresh_snapshot_set(source_version, invalidations.batch())
@@ -864,26 +1026,87 @@ where
                     self.publish_graph_ready(source_version);
                 }
                 Err(error) => {
-                    for mode in [GraphMode::Anchors, GraphMode::All] {
-                        set_rebuild_status!(
-                            self,
-                            rebuild_status(
-                                mode,
-                                source_version,
-                                ConsoleGraphRebuildState::Failed,
-                                None,
-                                0,
-                                0,
-                                error.to_string(),
-                            )
-                        );
-                    }
+                    self.record_refresh_worker_failure(source_version, &error)
+                        .await;
                     return Err(error);
                 }
             }
 
             if self.invalidations.current_version() <= source_version {
                 return Ok(());
+            }
+        }
+    }
+
+    async fn record_refresh_worker_failure(&self, source_version: u64, error: &crate::Error) {
+        let status_detail = error.to_string();
+        for mode in [GraphMode::Anchors, GraphMode::All] {
+            self.set_rebuild_status(&rebuild_status(
+                mode,
+                source_version,
+                ConsoleGraphRebuildState::Failed,
+                None,
+                0,
+                0,
+                &status_detail,
+            ));
+        }
+        self.log_refresh_worker_failure(source_version, error).await;
+    }
+
+    async fn log_refresh_worker_failure(&self, source_version: u64, error: &crate::Error) {
+        let Some(snapshot_store) = self.snapshots.as_ref() else {
+            tracing::warn!(
+                rebuild_output_scope = "anchors_and_all",
+                rebuild_execution_scope = "in_memory_shared",
+                process_local_invalidation_version = source_version,
+                build_context_available = false,
+                error = %error,
+                "console graph rebuild failed",
+            );
+            return;
+        };
+        match snapshot_store
+            .latest_incremental_build_diagnostic_context()
+            .await
+        {
+            Ok(Some(context)) => {
+                tracing::warn!(
+                    rebuild_output_scope = "anchors_and_all",
+                    rebuild_execution_scope = "persistent_shared",
+                    process_local_invalidation_version = source_version,
+                    build_context_available = true,
+                    build_run_id = context.build_run_id,
+                    build_lease_epoch = context.build_lease_epoch,
+                    build_target_process_local_invalidation_version =
+                        context.target_process_local_invalidation_version,
+                    build_frozen_source_revision = context.frozen_source_revision,
+                    persisted_build_state = %context.persisted_build_state,
+                    persisted_build_stage = %context.persisted_build_stage,
+                    error = %error,
+                    "console graph rebuild failed",
+                );
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    rebuild_output_scope = "anchors_and_all",
+                    rebuild_execution_scope = "persistent_shared",
+                    process_local_invalidation_version = source_version,
+                    build_context_available = false,
+                    error = %error,
+                    "console graph rebuild failed",
+                );
+            }
+            Err(context_error) => {
+                tracing::warn!(
+                    rebuild_output_scope = "anchors_and_all",
+                    rebuild_execution_scope = "persistent_shared",
+                    process_local_invalidation_version = source_version,
+                    build_context_available = false,
+                    build_context_lookup_error = %context_error,
+                    error = %error,
+                    "console graph rebuild failed",
+                );
             }
         }
     }
@@ -955,109 +1178,293 @@ where
         source_version: u64,
         invalidations: &ConsoleInvalidationBatch,
     ) -> crate::Result<GraphRefreshResult> {
-        if let Err(error) = snapshot_store.cleanup_abandoned_generations().await {
-            tracing::warn!(%error, "failed to clean abandoned console graph generations");
-        }
-        let lease = loop {
-            let anchors_version = snapshot_store
-                .latest_materialization_version(GraphMode::Anchors)
-                .await?;
-            let all_version = snapshot_store
-                .latest_materialization_version(GraphMode::All)
-                .await?;
-            if anchors_version.is_some_and(|version| version >= source_version)
-                && all_version.is_some_and(|version| version >= source_version)
-            {
-                return Ok(GraphRefreshResult { snapshots: None });
-            }
-            if let Some(lease) = snapshot_store
-                .acquire_incremental_build_lease(source_version)
-                .await?
-            {
-                break lease;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        };
-
-        let mut active_lease = ActiveBuildLease::new(snapshot_store.clone(), lease);
-        let lease = active_lease.lease().clone();
-        let result = {
-            let build = self.refresh_persistent_snapshot_set_with_lease(
-                store,
-                index,
-                snapshot_store,
-                source_version,
-                invalidations,
-                &lease,
+        for mode in [GraphMode::Anchors, GraphMode::All] {
+            set_rebuild_status!(
+                self,
+                rebuild_status(
+                    mode,
+                    source_version,
+                    ConsoleGraphRebuildState::Building,
+                    Some(crate::graph::GraphBuildPhase::Branches),
+                    0,
+                    0,
+                    "Refreshing graph source contributions",
+                )
             );
-            tokio::pin!(build);
-            let mut heartbeat = tokio::time::interval(INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL);
-            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            heartbeat.tick().await;
-            loop {
-                tokio::select! {
-                    result = &mut build => break result,
-                    _ = heartbeat.tick() => {
-                        match snapshot_store.renew_incremental_build_lease(&lease).await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                break crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                                    column: "incremental_build_lease",
-                                    value: format!(
-                                        "generation {} is no longer owned",
-                                        lease.generation(),
-                                    ),
-                                }
-                                .fail();
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    generation = lease.generation(),
-                                    %error,
-                                    "failed to renew console graph build lease",
-                                );
-                            }
-                        }
-                    }
+        }
+        {
+            let mut index = index.lock().await;
+            index.start_refresh().await?;
+            index
+                .refresh_invalidation_batch(store, invalidations)
+                .await?;
+        }
+        if let Err(error) = snapshot_store.cleanup_abandoned_generations().await {
+            tracing::warn!(
+                process_local_invalidation_version = source_version,
+                error = %error,
+                "failed to clean abandoned console graph build runs",
+            );
+        }
+        let mut prepared_snapshots = None;
+        loop {
+            let active = snapshot_store.active_publication_state().await?;
+            let active_has_both_modes =
+                active.anchors_source_version.is_some() && active.all_source_version.is_some();
+            if active_has_both_modes
+                && active.matches_current_source
+                && !active.overlay_compaction_pending
+            {
+                let active_version_is_current = active
+                    .anchors_source_version
+                    .is_some_and(|version| version >= source_version)
+                    && active
+                        .all_source_version
+                        .is_some_and(|version| version >= source_version);
+                if active_version_is_current {
+                    return Ok(GraphRefreshResult {
+                        snapshots: prepared_snapshots,
+                    });
+                }
+                if snapshot_store
+                    .advance_current_publication_version(source_version)
+                    .await?
+                {
+                    tracing::info!(
+                        rebuild_output_scope = "anchors_and_all",
+                        process_local_invalidation_version = source_version,
+                        active_graph_generation = active.graph_generation,
+                        published_source_revision = active.source_revision.unwrap_or_default(),
+                        "current console graph publication version advanced",
+                    );
+                    continue;
                 }
             }
-        };
-        if result.is_err() {
-            active_lease.abandon().await;
-        } else {
+            let Some(lease) = snapshot_store
+                .acquire_incremental_build_lease(source_version)
+                .await?
+            else {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            };
+            if lease.phase() == IncrementalBuildLeasePhase::Compacting {
+                let target_source_version = lease.target_source_version();
+                tracing::info!(
+                    rebuild_output_scope = "anchors_and_all",
+                    process_local_invalidation_version = source_version,
+                    build_target_process_local_invalidation_version = target_source_version,
+                    build_run_id = lease.generation(),
+                    build_lease_epoch = lease.lease_epoch(),
+                    build_frozen_source_revision = lease.frozen_source_revision(),
+                    "resuming interrupted console graph publication compaction",
+                );
+                let mut active_lease = ActiveBuildLease::new(snapshot_store.clone(), lease.clone());
+                let publication = match snapshot_store
+                    .publish_incremental_generation(&lease, target_source_version)
+                    .await
+                {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        active_lease.pause().await;
+                        return Err(error);
+                    }
+                };
+                active_lease.complete();
+                tracing::info!(
+                    rebuild_output_scope = "anchors_and_all",
+                    process_local_invalidation_version = source_version,
+                    build_target_process_local_invalidation_version = target_source_version,
+                    build_run_id = publication.build_run_id,
+                    build_lease_epoch = lease.lease_epoch(),
+                    build_frozen_source_revision = lease.frozen_source_revision(),
+                    published_graph_generation = publication.published_graph_generation,
+                    graph_publication_epoch = publication.publication_epoch,
+                    published_source_revision = publication.published_source_revision,
+                    "interrupted console graph publication compaction completed",
+                );
+                if let Err(error) = snapshot_store.cleanup_completed_build_work().await {
+                    tracing::warn!(
+                        build_run_id = publication.build_run_id,
+                        error = %error,
+                        "failed to clean recovered console graph build work",
+                    );
+                }
+                continue;
+            }
+            let target_source_version = lease.target_source_version();
+            tracing::info!(
+                rebuild_output_scope = "anchors_and_all",
+                process_local_invalidation_version = source_version,
+                build_target_process_local_invalidation_version = target_source_version,
+                build_run_id = lease.generation(),
+                build_lease_epoch = lease.lease_epoch(),
+                build_frozen_source_revision = lease.frozen_source_revision(),
+                resumed_build_run = lease.is_resumed(),
+                "console graph build lease acquired",
+            );
+            for mode in [GraphMode::Anchors, GraphMode::All] {
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Building,
+                        Some(crate::graph::GraphBuildPhase::Entries),
+                        0,
+                        0,
+                        if lease.is_resumed() {
+                            "Resuming incremental graph build"
+                        } else {
+                            "Initializing incremental graph build"
+                        },
+                    )
+                );
+            }
+
+            let mut active_lease = ActiveBuildLease::new(snapshot_store.clone(), lease);
+            let lease = active_lease.lease().clone();
+            let prepared = {
+                let build = self.refresh_persistent_snapshot_set_with_lease(
+                    store,
+                    index,
+                    snapshot_store,
+                    target_source_version,
+                    &lease,
+                );
+                tokio::pin!(build);
+                let progress_cache = self.clone();
+                let report_progress = move |progress: IncrementalBuildProgress| {
+                    for mode in [GraphMode::Anchors, GraphMode::All] {
+                        let status = rebuild_status(
+                            mode,
+                            source_version,
+                            ConsoleGraphRebuildState::Building,
+                            Some(progress.phase),
+                            progress.completed_units,
+                            progress.total_units,
+                            progress.message,
+                        );
+                        progress_cache.set_rebuild_status(&status);
+                    }
+                };
+                let heartbeat =
+                    maintain_build_lease(snapshot_store, &lease, source_version, report_progress);
+                tokio::pin!(heartbeat);
+                tokio::select! {
+                    result = &mut build => result,
+                    result = &mut heartbeat => {
+                        result?;
+                        unreachable!("build lease heartbeat only exits after losing the lease")
+                    }
+                }
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    active_lease.pause().await;
+                    return Err(error);
+                }
+            };
+
+            let publication = match snapshot_store
+                .publish_incremental_generation(&lease, target_source_version)
+                .await
+            {
+                Ok(publication) => publication,
+                Err(error) => {
+                    active_lease.pause().await;
+                    return Err(error);
+                }
+            };
             active_lease.complete();
+
+            let build_run_id = publication.build_run_id;
+            let published_graph_generation = publication.published_graph_generation;
+            let stats = prepared.stats;
+            tracing::info!(
+                rebuild_output_scope = "anchors_and_all",
+                process_local_invalidation_version = source_version,
+                build_target_process_local_invalidation_version = target_source_version,
+                build_run_id,
+                published_graph_generation,
+                graph_publication_epoch = publication.publication_epoch,
+                published_source_revision = publication.published_source_revision,
+                publication_outcome = if publication.replayed {
+                    "replayed"
+                } else {
+                    "committed"
+                },
+                build_lease_epoch = lease.lease_epoch(),
+                build_frozen_source_revision = lease.frozen_source_revision(),
+                run_completed_node_count = stats.processed_nodes,
+                published_all_node_count = stats.all_nodes,
+                published_anchors_node_count = stats.anchors_nodes,
+                graph_build_kind = if stats.reused_baseline {
+                    "append"
+                } else {
+                    "full"
+                },
+                graph_build_classification_reason = stats.classification_reason.as_str(),
+                lease_session_frontier_hot_to_spilled_count = stats.frontier.hot_to_spilled,
+                lease_session_frontier_spilled_to_hot_count = stats.frontier.spilled_to_hot,
+                "console graph publication completed",
+            );
+
+            {
+                let index = index.lock().await;
+                if let Err(error) = index.prune_published_orphans().await {
+                    tracing::warn!(
+                        published_graph_generation,
+                        error = %error,
+                        "failed to prune published console graph source orphans",
+                    );
+                }
+            }
+            if let Err(error) = snapshot_store.cleanup_abandoned_generations().await {
+                tracing::warn!(
+                    published_graph_generation,
+                    error = %error,
+                    "failed to clean abandoned console graph build runs",
+                );
+            }
+            if let Err(error) = snapshot_store.cleanup_obsolete_generations().await {
+                tracing::warn!(
+                    published_graph_generation,
+                    error = %error,
+                    "failed to clean obsolete console graph generations",
+                );
+            }
+            if let Err(error) = snapshot_store.cleanup_completed_build_work().await {
+                tracing::warn!(
+                    build_run_id,
+                    error = %error,
+                    "failed to clean completed console graph build work",
+                );
+            }
+            prepared_snapshots = prepared.snapshots;
         }
-        result
     }
 
     async fn refresh_persistent_snapshot_set_with_lease(
         &self,
         store: &SqliteGraphStore,
-        index: &Arc<tokio::sync::Mutex<PersistentGraphIndex>>,
+        _index: &Arc<tokio::sync::Mutex<PersistentGraphIndex>>,
         snapshot_store: &ConsoleGraphSnapshotStore,
         source_version: u64,
-        invalidations: &ConsoleInvalidationBatch,
         lease: &IncrementalBuildLease,
-    ) -> crate::Result<GraphRefreshResult> {
+    ) -> crate::Result<PreparedPersistentRefresh> {
         let baseline_generation = snapshot_store.active_generation().await?;
-        let mut index = index.lock().await;
-        index.start_refresh().await?;
-
-        if invalidations.full || index.is_empty().await? {
-            index.refresh_all_branches_bounded(store).await?;
-        } else {
-            let names = invalidations.branches.iter().cloned().collect::<Vec<_>>();
-            index.refresh_named_batch(store, &names).await?;
-        }
-
         ensure!(
             snapshot_store.renew_incremental_build_lease(lease).await?,
             crate::error::InvalidGraphSnapshotStoreValueSnafu {
                 column: "incremental_build_lease",
-                value: format!("generation {} is no longer owned", lease.generation()),
+                value: format!(
+                    "build run {} lease epoch {} is no longer owned",
+                    lease.generation(),
+                    lease.lease_epoch(),
+                ),
             }
         );
-        let generation = lease.generation();
         let stats = build_incremental_generation(
             snapshot_store,
             &store.root_id(),
@@ -1069,7 +1476,7 @@ where
 
         #[cfg(test)]
         let final_snapshots = {
-            let graph_store = index.graph_store();
+            let graph_store = _index.lock().await.graph_store();
             let anchors = self
                 .build_snapshot_for_mode(Some(&graph_store), GraphMode::Anchors, source_version)
                 .await?;
@@ -1080,33 +1487,9 @@ where
         };
         #[cfg(not(test))]
         let final_snapshots = None;
-
-        snapshot_store
-            .publish_incremental_generation(lease, source_version)
-            .await?;
-        tracing::info!(
-            source_version,
-            generation,
-            processed_nodes = stats.processed_nodes,
-            all_nodes = stats.all_nodes,
-            anchors_nodes = stats.anchors_nodes,
-            reused_baseline = stats.reused_baseline,
-            frontier_hot_to_spilled = stats.frontier.hot_to_spilled,
-            frontier_spilled_to_hot = stats.frontier.spilled_to_hot,
-            "console graph incremental generation activated",
-        );
-
-        if let Err(error) = index.prune_published_orphans().await {
-            tracing::warn!(%error, "failed to prune published console graph source orphans");
-        }
-        if let Err(error) = snapshot_store.cleanup_obsolete_generations().await {
-            tracing::warn!(%error, "failed to clean obsolete console graph generations");
-        }
-        if let Err(error) = snapshot_store.cleanup_completed_build_work().await {
-            tracing::warn!(%error, "failed to clean completed console graph build work");
-        }
-        Ok(GraphRefreshResult {
+        Ok(PreparedPersistentRefresh {
             snapshots: final_snapshots,
+            stats,
         })
     }
 
@@ -1154,7 +1537,7 @@ where
             .await
             .ok()
             .flatten()
-            == Some(source_version)
+            .is_some_and(|version| version >= source_version)
     }
 
     fn fail_if_materialization_failed(
@@ -1216,6 +1599,35 @@ fn should_log_rebuild_status_at_info(status: &ConsoleGraphRebuildStatus) -> bool
     })
 }
 
+fn rebuild_state_name(state: ConsoleGraphRebuildState) -> &'static str {
+    match state {
+        ConsoleGraphRebuildState::Scheduled => "scheduled",
+        ConsoleGraphRebuildState::Building => "building",
+        ConsoleGraphRebuildState::Ready => "ready",
+        ConsoleGraphRebuildState::Failed => "failed",
+    }
+}
+
+fn rebuild_phase_name(phase: Option<crate::graph::GraphBuildPhase>) -> &'static str {
+    match phase {
+        Some(crate::graph::GraphBuildPhase::Branches) => "branches",
+        Some(crate::graph::GraphBuildPhase::ProviderContexts) => "provider_contexts",
+        Some(crate::graph::GraphBuildPhase::Entries) => "entries",
+        Some(crate::graph::GraphBuildPhase::Snapshot) => "snapshot",
+        None => "not_started",
+    }
+}
+
+fn rebuild_phase_progress_unit(phase: Option<crate::graph::GraphBuildPhase>) -> &'static str {
+    match phase {
+        Some(crate::graph::GraphBuildPhase::Branches)
+        | Some(crate::graph::GraphBuildPhase::ProviderContexts) => "source_branch",
+        Some(crate::graph::GraphBuildPhase::Entries) => "graph_node",
+        Some(crate::graph::GraphBuildPhase::Snapshot) => "snapshot_step",
+        None => "not_applicable",
+    }
+}
+
 fn rebuild_progress_percent(status: &ConsoleGraphRebuildStatus) -> usize {
     if status.total == 0 {
         return 0;
@@ -1261,6 +1673,15 @@ impl CacheState {
             GraphMode::All => &mut self.all_rebuild,
         }
     }
+}
+
+fn take_refresh_worker_batch(
+    invalidations: &ConsolePublisher,
+    before_take: impl FnOnce(),
+) -> (u64, ConsoleInvalidationBatch) {
+    before_take();
+    let batch = invalidations.take_invalidations();
+    (batch.version, batch)
 }
 
 fn rebuild_status(
@@ -1377,14 +1798,67 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use crate::graph::build_graph_snapshot_with_mode;
     use coco_mem::{BranchStore, Kind, NewNode, NodeStore, Role, SessionState, SqliteStore};
+    use diesel::prelude::*;
+    use diesel::sql_types::BigInt;
+
+    #[derive(Clone, Default)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedLogWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(
+                self.0
+                    .lock()
+                    .expect("shared log writer lock poisoned")
+                    .clone(),
+            )
+            .expect("tracing output should be UTF-8")
+        }
+    }
+
+    impl Write for SharedLogBuffer {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared log buffer lock poisoned")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedLogWriter {
+        type Writer = SharedLogBuffer;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedLogBuffer(self.0.clone())
+        }
+    }
+
+    #[derive(Debug, QueryableByName)]
+    struct PublicationRevisionRangeRow {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+        #[diesel(sql_type = BigInt)]
+        minimum_revision: i64,
+        #[diesel(sql_type = BigInt)]
+        maximum_revision: i64,
+    }
 
     #[test]
     fn dropped_rebuild_restores_taken_invalidations() {
         let publisher = ConsolePublisher::new();
-        publisher.mark_branch_changed("main");
+        publisher.mark_changed();
         let batch = publisher.take_invalidations();
 
         drop(TakenInvalidations::new(publisher.clone(), batch.clone()));
@@ -1392,8 +1866,22 @@ mod tests {
         assert_eq!(publisher.take_invalidations(), batch);
     }
 
+    #[test]
+    fn worker_batch_captures_the_published_version() {
+        let publisher = ConsolePublisher::new();
+        publisher.notify_durable_change();
+
+        let (source_version, batch) = take_refresh_worker_batch(&publisher, || {
+            publisher.notify_durable_change();
+        });
+
+        assert_eq!(source_version, 2);
+        assert_eq!(batch.version, 2);
+        assert!(!batch.full);
+    }
+
     #[tokio::test]
-    async fn cancelled_build_releases_lease_promptly() {
+    async fn cancelled_build_pauses_and_resumes_lease_promptly() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let store = ConsoleGraphSnapshotStore::open(writer.store_path())
             .await
@@ -1403,6 +1891,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let build_run_id = lease.generation();
+        let lease_epoch = lease.lease_epoch();
+        let frozen_source_revision = lease.frozen_source_revision();
+        let context = store
+            .latest_incremental_build_diagnostic_context()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.build_run_id, build_run_id);
+        assert_eq!(context.build_lease_epoch, lease_epoch);
+        assert_eq!(context.frozen_source_revision, frozen_source_revision);
+        assert_eq!(context.target_process_local_invalidation_version, 1);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let guarded_store = store.clone();
         let build = tokio::spawn(async move {
@@ -1413,7 +1913,7 @@ mod tests {
         started_rx.await.unwrap();
         assert!(
             store
-                .acquire_incremental_build_lease(2)
+                .acquire_incremental_build_lease(1)
                 .await
                 .unwrap()
                 .is_none()
@@ -1423,14 +1923,17 @@ mod tests {
         assert!(build.await.unwrap_err().is_cancelled());
         let replacement = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(lease) = store.acquire_incremental_build_lease(2).await.unwrap() {
+                if let Some(lease) = store.acquire_incremental_build_lease(1).await.unwrap() {
                     return lease;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("cancelled build lease should be cleaned before its TTL");
+        .expect("cancelled build lease should be paused before its TTL");
+        assert_eq!(replacement.generation(), build_run_id);
+        assert_eq!(replacement.lease_epoch(), lease_epoch + 1);
+        assert_eq!(replacement.frozen_source_revision(), frozen_source_revision);
 
         assert!(store.abandon_incremental_build(&replacement).await.unwrap());
         store.cleanup_abandoned_generations().await.unwrap();
@@ -1471,7 +1974,257 @@ mod tests {
         let pending = second_invalidations.take_invalidations();
         assert_eq!(pending.version, 1);
         assert!(!pending.full);
-        assert!(pending.branches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_without_source_changes_advances_versioned_viewports_in_place() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        writer.fork("main", &writer.root_id()).await.unwrap();
+        let first = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            ConsolePublisher::new(),
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        first.rebuild_requested_modes().await.unwrap();
+        let initial = first
+            .viewport_current_ready_or_schedule(GraphMode::All, GraphViewportRequest::default())
+            .await
+            .unwrap();
+        let generation = first
+            .snapshots
+            .as_ref()
+            .unwrap()
+            .active_generation()
+            .await
+            .unwrap();
+        drop(first);
+
+        let second = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            ConsolePublisher::new(),
+            path,
+        )
+        .await
+        .unwrap();
+        second.rebuild_requested_modes().await.unwrap();
+        let current = tokio::time::timeout(
+            Duration::from_secs(2),
+            second.viewport_after(
+                GraphMode::All,
+                initial.version,
+                GraphViewportRequest::default(),
+            ),
+        )
+        .await
+        .expect("versioned viewport should observe the restart version")
+        .unwrap();
+
+        assert!(current.version > initial.version);
+        assert_eq!(
+            second
+                .snapshots
+                .as_ref()
+                .unwrap()
+                .active_generation()
+                .await
+                .unwrap(),
+            generation
+        );
+        assert_eq!(
+            second
+                .materialized_shell_current_ready_or_schedule(GraphMode::All)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            current.version
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_finishes_expired_active_overlay_compaction_before_fast_path() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        writer.fork("main", &writer.root_id()).await.unwrap();
+        let first = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            ConsolePublisher::new(),
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        first.rebuild_requested_modes().await.unwrap();
+        let snapshots = first.snapshots.as_ref().unwrap();
+        let active = snapshots.active_publication_state().await.unwrap();
+        let base_generation = active.graph_generation;
+        let source_revision = active.source_revision.unwrap();
+        let publication_epoch = active.publication_epoch.unwrap();
+        let source_version = active.all_source_version.unwrap() as i64;
+        let database = snapshots.database();
+        database
+            .with_write_connection(
+                "seed expired active overlay compaction",
+                move |connection| {
+                    connection
+                        .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                            diesel::sql_query(
+                                "INSERT INTO console_graph_build_runs ( \
+                                 run_id, source_version, status, owner_id, lease_expires_at_ms, \
+                                 lease_epoch, dag_source_revision \
+                             ) VALUES (900000020, ?, 'compacting', 'expired-overlay', 0, 1, ?)",
+                            )
+                            .bind::<BigInt, _>(source_version)
+                            .bind::<BigInt, _>(source_revision)
+                            .execute(connection)?;
+                            diesel::sql_query(
+                                "INSERT INTO console_graph_overlay_runs ( \
+                                 run_id, base_generation, baseline_source_revision, \
+                                 baseline_publication_epoch, target_source_version, \
+                                 target_source_revision, target_publication_epoch, status, phase, \
+                                 owner_id, lease_epoch, lease_expires_at_ms \
+                             ) VALUES (900000020, ?, ?, ?, ?, ?, ?, 'compacting', 'finalize', \
+                                       'expired-overlay', 1, 0)",
+                            )
+                            .bind::<BigInt, _>(base_generation)
+                            .bind::<BigInt, _>(source_revision)
+                            .bind::<BigInt, _>(publication_epoch)
+                            .bind::<BigInt, _>(source_version)
+                            .bind::<BigInt, _>(source_revision)
+                            .bind::<BigInt, _>(publication_epoch + 1)
+                            .execute(connection)?;
+                            diesel::sql_query(
+                                "INSERT INTO console_graph_build_publications ( \
+                                 build_run_id, published_graph_generation, publication_epoch, \
+                                 build_kind, source_version, source_revision \
+                             ) VALUES (900000020, ?, ?, 'append', ?, ?)",
+                            )
+                            .bind::<BigInt, _>(base_generation)
+                            .bind::<BigInt, _>(publication_epoch + 1)
+                            .bind::<BigInt, _>(source_version)
+                            .bind::<BigInt, _>(source_revision)
+                            .execute(connection)?;
+                            diesel::sql_query(
+                                "INSERT INTO console_graph_materializations ( \
+                                 generation, mode, source_version, coordinate_space, \
+                                 world_min_x, world_min_y, world_max_x, world_max_y \
+                             ) \
+                             SELECT 900000020, mode, source_version, coordinate_space, \
+                                    world_min_x, world_min_y, world_max_x, world_max_y \
+                             FROM console_graph_materializations WHERE generation = ?",
+                            )
+                            .bind::<BigInt, _>(base_generation)
+                            .execute(connection)?;
+                            diesel::sql_query(
+                                "UPDATE console_graph_generation_state \
+                             SET active_overlay_run_id = 900000020 WHERE id = 1",
+                            )
+                            .execute(connection)?;
+                            Ok(())
+                        })
+                        .context(crate::error::QueryGraphSnapshotStoreSnafu {
+                            path: PathBuf::from("expired-active-overlay-test"),
+                        })
+                },
+            )
+            .await
+            .unwrap();
+        drop(first);
+
+        let restarted = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            ConsolePublisher::new(),
+            path,
+        )
+        .await
+        .unwrap();
+        restarted.rebuild_requested_modes().await.unwrap();
+        let recovered = restarted
+            .snapshots
+            .as_ref()
+            .unwrap()
+            .active_publication_state()
+            .await
+            .unwrap();
+        assert!(!recovered.overlay_compaction_pending);
+        assert_eq!(recovered.graph_generation, base_generation);
+        assert!(recovered.matches_current_source);
+    }
+
+    #[tokio::test]
+    async fn newer_source_revision_finishes_frozen_run_before_serial_catchup() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let first = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            ConsolePublisher::new(),
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        first.rebuild_requested_modes().await.unwrap();
+        let snapshots = first.snapshots.as_ref().unwrap();
+        let baseline_generation = snapshots.active_generation().await.unwrap();
+        let frozen = snapshots
+            .acquire_incremental_build_lease(2)
+            .await
+            .unwrap()
+            .unwrap();
+        build_incremental_generation(snapshots, &root, baseline_generation, &frozen, 2)
+            .await
+            .unwrap();
+        assert!(snapshots.pause_incremental_build(&frozen).await.unwrap());
+
+        let child = writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("newer durable source".to_owned()),
+            })
+            .await
+            .unwrap();
+        writer.set_branch_head("main", &root, &child).await.unwrap();
+        drop(first);
+
+        let restarted = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            ConsolePublisher::new(),
+            path,
+        )
+        .await
+        .unwrap();
+        restarted.rebuild_requested_modes().await.unwrap();
+        let active = restarted
+            .snapshots
+            .as_ref()
+            .unwrap()
+            .active_publication_state()
+            .await
+            .unwrap();
+        assert!(active.matches_current_source);
+
+        let database = restarted.snapshots.as_ref().unwrap().database();
+        let revisions = database
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "SELECT COUNT(*) AS count, MIN(source_revision) AS minimum_revision, \
+                            MAX(source_revision) AS maximum_revision \
+                     FROM console_graph_build_publications WHERE source_version = 2",
+                )
+                .get_result::<PublicationRevisionRangeRow>(connection)
+                .context(crate::error::QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("serial-catchup-publications"),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(revisions.count, 2);
+        assert!(revisions.minimum_revision < revisions.maximum_revision);
     }
 
     #[tokio::test]
@@ -1485,6 +2238,52 @@ mod tests {
 
         assert!(!cache.set_rebuild_status(&status));
         assert_eq!(cache.progress.current_version(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_rebuild_failure_updates_both_modes_and_logs_once() {
+        let store = SqliteStore::open_temporary().await.unwrap();
+        let cache = ConsoleGraphCache::new(store, ConsolePublisher::new());
+        let logs = SharedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        let error = crate::Error::InvalidGraphSnapshotStoreValue {
+            column: "test_failure",
+            value: "injected".to_owned(),
+        };
+
+        cache.record_refresh_worker_failure(7, &error).await;
+        drop(guard);
+
+        let statuses = cache.rebuild_statuses();
+        assert_eq!(statuses.len(), 2);
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.state == ConsoleGraphRebuildState::Failed)
+        );
+        let output = logs.contents();
+        assert_eq!(
+            output
+                .matches("\"message\":\"console graph rebuild failed\"")
+                .count(),
+            1,
+            "{output}",
+        );
+        assert!(
+            output.contains("\"rebuild_output_scope\":\"anchors_and_all\""),
+            "{output}",
+        );
+        assert!(
+            output.contains("\"rebuild_execution_scope\":\"in_memory_shared\""),
+            "{output}",
+        );
     }
 
     #[tokio::test]
@@ -1558,7 +2357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialized_shell_branches_switch_with_the_active_generation() {
+    async fn materialized_shell_branches_switch_with_incremental_publication() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let path = writer.store_path().to_owned();
         let root = writer.root_id();
@@ -1576,6 +2375,12 @@ mod tests {
         cache.snapshot_current(GraphMode::All).await.unwrap();
         let snapshots = cache.snapshots.as_ref().unwrap();
         let initial_generation = snapshots.active_generation().await.unwrap();
+        let initial_publication_epoch = snapshots
+            .active_publication_state()
+            .await
+            .unwrap()
+            .publication_epoch
+            .unwrap();
         let initial_shell = cache
             .materialized_shell_current_ready_or_schedule(GraphMode::All)
             .await
@@ -1611,14 +2416,39 @@ mod tests {
 
         publisher.mark_changed();
         cache.snapshot_current(GraphMode::All).await.unwrap();
-        let activated_generation = snapshots.active_generation().await.unwrap();
+        let activated_publication_epoch = snapshots
+            .active_publication_state()
+            .await
+            .unwrap()
+            .publication_epoch
+            .unwrap();
         let activated_shell = cache
             .materialized_shell_current_ready_or_schedule(GraphMode::All)
             .await
             .unwrap()
             .unwrap();
 
-        assert_ne!(activated_generation, initial_generation);
+        assert_eq!(
+            cache
+                .persistent_index
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .graph_store()
+                .get_branch_head("aaa")
+                .await
+                .unwrap(),
+            root
+        );
+        assert_eq!(
+            snapshots
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(publisher.current_version())
+        );
+        assert!(activated_publication_epoch > initial_publication_epoch);
         assert_eq!(
             activated_shell
                 .branches
@@ -1701,6 +2531,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_poll_detects_another_store_handle_without_publisher_payload() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            publisher.clone(),
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        cache.snapshot_current(GraphMode::All).await.unwrap();
+        let (initial_branch_refreshes, initial_traversed_nodes) = {
+            let index = cache.persistent_index.as_ref().unwrap().lock().await;
+            (index.branch_refresh_count(), index.traversed_node_count())
+        };
+        let process_local_version = publisher.current_version();
+
+        let second_writer = SqliteStore::open(&path).await.unwrap();
+        let child = second_writer
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("cross-handle durable mutation".to_owned()),
+            })
+            .await
+            .unwrap();
+        second_writer
+            .set_branch_head("main", &root, &child)
+            .await
+            .unwrap();
+        assert_eq!(publisher.current_version(), process_local_version);
+        assert!(cache.poll_durable_graph_mutations().await.unwrap());
+        assert!(!cache.poll_durable_graph_mutations().await.unwrap());
+
+        let (anchors, all) = tokio::join!(
+            cache.snapshot_current(GraphMode::Anchors),
+            cache.snapshot_current(GraphMode::All),
+        );
+        let anchors = anchors.unwrap();
+        let all = all.unwrap();
+        let expected_anchors =
+            build_graph_snapshot_with_mode(&second_writer, anchors.version, GraphMode::Anchors)
+                .await
+                .unwrap();
+        let expected_all =
+            build_graph_snapshot_with_mode(&second_writer, all.version, GraphMode::All)
+                .await
+                .unwrap();
+        assert_eq!(*anchors, expected_anchors);
+        assert_eq!(*all, expected_all);
+
+        let index = cache.persistent_index.as_ref().unwrap().lock().await;
+        assert_eq!(index.branch_refresh_count(), initial_branch_refreshes + 1);
+        assert_eq!(index.traversed_node_count(), initial_traversed_nodes + 1);
+        assert_eq!(
+            index.consumed_graph_mutation_revision().await.unwrap(),
+            cache
+                .persistent_graph_store
+                .as_ref()
+                .unwrap()
+                .graph_mutation_revision()
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn dirty_branch_refresh_matches_full_rebuild_for_both_modes() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let path = writer.store_path().to_owned();
@@ -1726,7 +2627,7 @@ mod tests {
             .await
             .unwrap();
         writer.set_branch_head("main", &root, &child).await.unwrap();
-        let version = publisher.mark_branch_changed("main");
+        let version = publisher.notify_durable_change();
 
         let (anchors, all) = tokio::join!(
             cache.snapshot_current(GraphMode::Anchors),
@@ -1755,7 +2656,7 @@ mod tests {
         );
 
         writer.delete_branch("main").await.unwrap();
-        let version = publisher.mark_branch_changed("main");
+        let version = publisher.notify_durable_change();
         let (anchors, all) = tokio::join!(
             cache.snapshot_current(GraphMode::Anchors),
             cache.snapshot_current(GraphMode::All),

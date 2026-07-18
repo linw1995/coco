@@ -41,7 +41,8 @@ pub struct FrontierMetrics {
     pub requested_pushes: u64,
     pub distinct_pushes: u64,
     pub inserted_pushes: u64,
-    pub duplicate_pushes: u64,
+    pub repeated_within_batch_pushes: u64,
+    pub already_seen_pushes: u64,
     pub pops: u64,
     pub hot_to_spilled: u64,
     pub spilled_to_hot: u64,
@@ -56,7 +57,8 @@ pub struct PushBatchStats {
     pub requested: usize,
     pub distinct: usize,
     pub inserted: usize,
-    pub duplicates: usize,
+    pub repeated_within_batch: usize,
+    pub already_seen: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +103,15 @@ where
         expected_min: Option<&T>,
         additions: &[T],
     ) -> Result<StoreReplace<T>, Self::Error>;
+
+    /// Completes the current minimum together with any work-store checkpoint
+    /// owned by the concrete store.
+    ///
+    /// Stores without an associated work checkpoint can use the frontier-only
+    /// replacement semantics.
+    async fn complete_minimum(&mut self, expected_min: &T) -> Result<StoreReplace<T>, Self::Error> {
+        self.replace(Some(expected_min), &[]).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +364,51 @@ where
         }
     }
 
+    /// Atomically completes the current minimum in the authoritative store.
+    ///
+    /// Unlike `replace_min`, a concrete external store may couple this with a
+    /// durable work checkpoint. This is the operation used by resumable DAG
+    /// traversal after the cursor's projection and child expansion are durable.
+    pub async fn complete_min(
+        &mut self,
+        expected_min: &T,
+    ) -> Result<ReplaceMinOutcome<T>, AdaptiveFrontierError<S::Error>> {
+        self.ensure_hot().await?;
+        let current = self.hot.first().cloned();
+        if current.as_ref() != Some(expected_min) {
+            self.metrics.stale_minimums = self.metrics.stale_minimums.saturating_add(1);
+            return Ok(ReplaceMinOutcome::StaleMinimum { current });
+        }
+
+        match self
+            .store
+            .complete_minimum(expected_min)
+            .await
+            .map_err(AdaptiveFrontierError::Store)?
+        {
+            StoreReplace::Applied(mutation) => {
+                let batch = Batch::new(std::iter::empty::<T>());
+                let pushed = self.validate_mutation(&batch, &mutation, true)?;
+                let removed = self.hot.remove(expected_min);
+                debug_assert!(removed, "expected minimum must exist in the hot prefix");
+                self.pending_len = mutation.pending_len;
+                self.metrics.pops = self.metrics.pops.saturating_add(1);
+                self.rebalance().await?;
+                Ok(ReplaceMinOutcome::Applied {
+                    popped: expected_min.clone(),
+                    pushed,
+                })
+            }
+            StoreReplace::StaleMinimum => {
+                self.metrics.stale_minimums = self.metrics.stale_minimums.saturating_add(1);
+                self.refresh_authoritative_state().await?;
+                Ok(ReplaceMinOutcome::StaleMinimum {
+                    current: self.hot.first().cloned(),
+                })
+            }
+        }
+    }
+
     fn validate_mutation(
         &self,
         batch: &Batch<T>,
@@ -380,7 +436,8 @@ where
             requested: batch.requested,
             distinct: batch.items.len(),
             inserted: inserted.len(),
-            duplicates: batch.requested.saturating_sub(inserted.len()),
+            repeated_within_batch: batch.requested.saturating_sub(batch.items.len()),
+            already_seen: batch.items.len().saturating_sub(inserted.len()),
         })
     }
 
@@ -514,10 +571,14 @@ where
             .metrics
             .inserted_pushes
             .saturating_add(saturating_u64(pushed.inserted));
-        self.metrics.duplicate_pushes = self
+        self.metrics.repeated_within_batch_pushes = self
             .metrics
-            .duplicate_pushes
-            .saturating_add(saturating_u64(pushed.duplicates));
+            .repeated_within_batch_pushes
+            .saturating_add(saturating_u64(pushed.repeated_within_batch));
+        self.metrics.already_seen_pushes = self
+            .metrics
+            .already_seen_pushes
+            .saturating_add(saturating_u64(pushed.already_seen));
     }
 
     fn record_hot_len(&mut self) {
@@ -730,7 +791,8 @@ mod tests {
                 requested: 4,
                 distinct: 3,
                 inserted: 3,
-                duplicates: 1,
+                repeated_within_batch: 1,
+                already_seen: 0,
             }
         );
         assert_eq!(frontier.mode(), FrontierMode::HotAll);
@@ -741,7 +803,8 @@ mod tests {
 
         let pushed_again = frontier.push_batch([1, 1]).await.unwrap();
         assert_eq!(pushed_again.inserted, 0);
-        assert_eq!(pushed_again.duplicates, 2);
+        assert_eq!(pushed_again.repeated_within_batch, 1);
+        assert_eq!(pushed_again.already_seen, 1);
         assert!(frontier.is_empty());
         assert_eq!(frontier.metrics().pops, 3);
     }
@@ -756,7 +819,8 @@ mod tests {
         assert_eq!(frontier.hot_len(), 4);
         let pushed = frontier.push_batch([30, 0, 15, 30]).await.unwrap();
         assert_eq!(pushed.inserted, 2);
-        assert_eq!(pushed.duplicates, 2);
+        assert_eq!(pushed.repeated_within_batch, 1);
+        assert_eq!(pushed.already_seen, 1);
         assert!(frontier.hot_len() <= 4);
 
         let mut popped = Vec::new();
@@ -813,7 +877,8 @@ mod tests {
         };
         assert_eq!(popped, 10);
         assert_eq!(pushed.inserted, 2);
-        assert_eq!(pushed.duplicates, 1);
+        assert_eq!(pushed.repeated_within_batch, 0);
+        assert_eq!(pushed.already_seen, 1);
         assert_eq!(frontier.pop_min().await.unwrap(), Some(5));
         assert_eq!(frontier.pop_min().await.unwrap(), Some(15));
         assert_eq!(frontier.pop_min().await.unwrap(), Some(20));
@@ -872,7 +937,8 @@ mod tests {
         let pushed = reopened.push_batch([1, 11]).await.unwrap();
 
         assert_eq!(pushed.inserted, 1);
-        assert_eq!(pushed.duplicates, 1);
+        assert_eq!(pushed.repeated_within_batch, 0);
+        assert_eq!(pushed.already_seen, 1);
         let mut popped = Vec::new();
         while let Some(item) = reopened.pop_min().await.unwrap() {
             popped.push(item);

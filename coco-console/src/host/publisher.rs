@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use coco_mem::GraphMutationReceipt;
 use tokio::sync::watch;
 
 #[derive(Clone)]
@@ -15,14 +15,12 @@ pub struct ConsolePublisher {
 #[derive(Debug, Default)]
 struct PendingInvalidations {
     full: bool,
-    branches: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConsoleInvalidationBatch {
     pub version: u64,
     pub full: bool,
-    pub branches: BTreeSet<String>,
 }
 
 impl Default for ConsolePublisher {
@@ -52,6 +50,15 @@ impl ConsolePublisher {
         )
     }
 
+    pub(crate) fn notify_durable_change(&self) -> u64 {
+        self.update_and_publish(|_| {}, |publisher| publisher.publish_change())
+    }
+
+    pub(crate) fn notify_durable_change_at_least(&self, target: u64) -> u64 {
+        self.update_and_publish(|_| {}, |publisher| publisher.advance_to_unlocked(target))
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_full_at_least(&self, target: u64) -> u64 {
         self.update_and_publish(
             |pending| pending.full = true,
@@ -59,18 +66,9 @@ impl ConsolePublisher {
         )
     }
 
-    pub(crate) fn mark_branch_changed(&self, branch: impl Into<String>) -> u64 {
+    pub(crate) fn publish_graph_mutation<T>(&self, receipt: &GraphMutationReceipt<T>) -> u64 {
         self.update_and_publish(
-            |pending| {
-                pending.branches.insert(branch.into());
-            },
-            |publisher| publisher.publish_change(),
-        )
-    }
-
-    pub(crate) fn mark_branches_changed(&self, branches: impl IntoIterator<Item = String>) -> u64 {
-        self.update_and_publish(
-            |pending| pending.branches.extend(branches),
+            |pending| pending.full |= !receipt.exact,
             |publisher| publisher.publish_change(),
         )
     }
@@ -114,7 +112,6 @@ impl ConsolePublisher {
         ConsoleInvalidationBatch {
             version: self.current_version(),
             full: std::mem::take(&mut pending.full),
-            branches: std::mem::take(&mut pending.branches),
         }
     }
 
@@ -124,7 +121,6 @@ impl ConsolePublisher {
             .lock()
             .expect("console invalidation lock poisoned");
         pending.full |= batch.full;
-        pending.branches.extend(batch.branches);
     }
 
     pub fn advance_to(&self, target: u64) -> u64 {
@@ -158,50 +154,53 @@ mod tests {
     use std::sync::TryLockError;
 
     #[test]
-    fn branch_invalidations_are_coalesced_and_restorable() {
+    fn durable_wakeups_have_constant_size_state() {
         let publisher = ConsolePublisher::new();
 
-        publisher.mark_branch_changed("main");
-        publisher.mark_branch_changed("main");
-        publisher.mark_branch_changed("worker");
+        publisher.notify_durable_change();
+        publisher.notify_durable_change();
+        publisher.notify_durable_change();
         let batch = publisher.take_invalidations();
 
         assert_eq!(batch.version, 3);
         assert!(!batch.full);
-        assert_eq!(
-            batch.branches,
-            BTreeSet::from(["main".to_owned(), "worker".to_owned()])
-        );
         publisher.restore_invalidations(batch.clone());
         assert_eq!(publisher.take_invalidations(), batch);
     }
 
     #[test]
-    fn full_invalidation_preserves_dirty_branches() {
+    fn full_invalidation_is_restorable() {
         let publisher = ConsolePublisher::new();
 
-        publisher.mark_branch_changed("main");
         publisher.mark_changed();
         let batch = publisher.take_invalidations();
 
-        assert_eq!(batch.version, 2);
+        assert_eq!(batch.version, 1);
         assert!(batch.full);
-        assert_eq!(batch.branches, BTreeSet::from(["main".to_owned()]));
+        publisher.restore_invalidations(batch);
+        assert!(publisher.take_invalidations().full);
     }
 
     #[test]
     fn full_invalidation_can_advance_without_incrementing_an_existing_version() {
         let publisher = ConsolePublisher::new();
-        publisher.mark_branch_changed("main");
+        publisher.notify_durable_change();
 
         assert_eq!(publisher.mark_full_at_least(1), 1);
-        let batch = publisher.take_invalidations();
-        assert!(batch.full);
-        assert_eq!(batch.branches, BTreeSet::from(["main".to_owned()]));
+        assert!(publisher.take_invalidations().full);
 
         assert_eq!(publisher.mark_full_at_least(4), 4);
         assert_eq!(publisher.current_version(), 4);
         assert!(publisher.take_invalidations().full);
+    }
+
+    #[test]
+    fn durable_wakeup_can_advance_without_requesting_full_reconciliation() {
+        let publisher = ConsolePublisher::new();
+
+        assert_eq!(publisher.notify_durable_change_at_least(4), 4);
+        assert_eq!(publisher.current_version(), 4);
+        assert!(!publisher.take_invalidations().full);
     }
 
     #[test]
@@ -215,9 +214,7 @@ mod tests {
             let allow_publish = allow_publish.clone();
             std::thread::spawn(move || {
                 publisher.update_and_publish_with_hook(
-                    |pending| {
-                        pending.branches.insert("main".to_owned());
-                    },
+                    |_| {},
                     || {
                         dirty.wait();
                         allow_publish.wait();
@@ -239,6 +236,5 @@ mod tests {
 
         assert_eq!(batch.version, 1);
         assert!(!batch.full);
-        assert_eq!(batch.branches, BTreeSet::from(["main".to_owned()]));
     }
 }

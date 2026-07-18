@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -8,6 +8,9 @@ use diesel::sql_types::{Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
+use super::graph_mutation::{
+    GraphMutationBranch, begin_graph_mutation, dirty_parent_ids, finish_graph_mutation,
+};
 use super::node::{
     load_ancestry_nodes, load_node_by_exact_id, persist_node_without_transaction, resolve_ref_id,
     upsert_node_without_transaction, validate_new_node,
@@ -21,7 +24,10 @@ use crate::error::{
     ParentNotFoundSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
 use crate::schema::{branches, nodes, sessions};
-use crate::store::{BranchAppendSessionState, BranchStore, SessionStore};
+use crate::store::{
+    BranchAppendSessionState, BranchStore, GraphBranchChange, GraphMutationReceipt, SessionStore,
+    inserted_parent_ids,
+};
 use crate::{
     Anchor, AnchorPayload, Kind, NewNodeContent, Node, PauseReason, Role, SessionAnchorPatch,
     SessionState, StoreResult as Result,
@@ -281,6 +287,18 @@ async fn create_branch(
             persist_session_state(connection, path, branch, &SessionState::Active)
                 .await
                 .map_err(SqliteTransactionError::Operation)?;
+            let revision = begin_graph_mutation(connection, path)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            finish_graph_mutation(
+                connection,
+                path,
+                revision,
+                &BTreeSet::new(),
+                &[GraphMutationBranch::Upserted(branch.to_owned())],
+            )
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
             Ok(head_id)
         })
         .await
@@ -330,7 +348,22 @@ async fn update_session_state(
 ) -> Result<SessionState> {
     connection
         .immediate_transaction::<SessionState, SqliteTransactionError, _>(async |connection| {
-            update_session_state_in_transaction(connection, path, branch, expected, next).await
+            let next =
+                update_session_state_in_transaction(connection, path, branch, expected, next)
+                    .await?;
+            let revision = begin_graph_mutation(connection, path)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            finish_graph_mutation(
+                connection,
+                path,
+                revision,
+                &BTreeSet::new(),
+                &[GraphMutationBranch::Upserted(branch.to_owned())],
+            )
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+            Ok(next)
         })
         .await
         .map_err(|error| error.into_store_error(path))
@@ -591,7 +624,19 @@ async fn update_branch_head_checked(
                 expected_old_head,
                 new_head,
             )
+            .await?;
+            let revision = begin_graph_mutation(connection, path)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            finish_graph_mutation(
+                connection,
+                path,
+                revision,
+                &BTreeSet::new(),
+                &[GraphMutationBranch::Upserted(branch.to_owned())],
+            )
             .await
+            .map_err(SqliteTransactionError::Operation)
         })
         .await
         .map_err(|error| error.into_store_error(path))
@@ -635,15 +680,28 @@ async fn update_branch_head_checked_in_transaction(
     Ok(())
 }
 
+struct BranchAppendTransaction<'a> {
+    branch: &'a str,
+    expected_old_head: &'a str,
+    parent: &'a str,
+    new_head: Option<&'a str>,
+    nodes: Vec<NewNodeContent>,
+    graph_mutation_revision: i64,
+}
+
 async fn append_nodes_and_set_branch_head_in_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
-    branch: &str,
-    expected_old_head: &str,
-    parent: &str,
-    new_head: Option<&str>,
-    nodes: Vec<NewNodeContent>,
-) -> std::result::Result<String, SqliteTransactionError> {
+    append: BranchAppendTransaction<'_>,
+) -> std::result::Result<(String, Vec<Node>), SqliteTransactionError> {
+    let BranchAppendTransaction {
+        branch,
+        expected_old_head,
+        parent,
+        new_head,
+        nodes,
+        graph_mutation_revision,
+    } = append;
     let actual = load_branch_head(connection, path, branch)
         .await
         .map_err(SqliteTransactionError::Operation)?;
@@ -662,9 +720,10 @@ async fn append_nodes_and_set_branch_head_in_transaction(
         .map_err(SqliteTransactionError::Operation)?;
 
     let mut head = parent.to_owned();
+    let mut appended_nodes = Vec::with_capacity(nodes.len());
     for content in nodes {
         let node = Node::new(
-            head,
+            head.clone(),
             content.role,
             content.metadata,
             content.kind,
@@ -673,10 +732,11 @@ async fn append_nodes_and_set_branch_head_in_transaction(
         validate_new_node(connection, path, &node)
             .await
             .map_err(SqliteTransactionError::Operation)?;
-        persist_node_without_transaction(connection, path, &node)
+        persist_node_without_transaction(connection, path, &node, graph_mutation_revision)
             .await
             .map_err(SqliteTransactionError::Operation)?;
-        head = node.id;
+        head = node.id.clone();
+        appended_nodes.push(node);
     }
 
     update_branch_head_checked_in_transaction(
@@ -687,22 +747,26 @@ async fn append_nodes_and_set_branch_head_in_transaction(
         new_head.unwrap_or(&head),
     )
     .await?;
-    Ok(head)
+    Ok((head, appended_nodes))
 }
 
 async fn append_nodes_and_set_branch_head_with_session_state_in_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     update: BranchAppendSessionState,
-) -> std::result::Result<String, SqliteTransactionError> {
-    let head = append_nodes_and_set_branch_head_in_transaction(
+    graph_mutation_revision: i64,
+) -> std::result::Result<(String, Vec<Node>), SqliteTransactionError> {
+    let (head, nodes) = append_nodes_and_set_branch_head_in_transaction(
         connection,
         path,
-        &update.branch,
-        &update.expected_old_head,
-        &update.parent,
-        update.new_head.as_deref(),
-        update.nodes,
+        BranchAppendTransaction {
+            branch: &update.branch,
+            expected_old_head: &update.expected_old_head,
+            parent: &update.parent,
+            new_head: update.new_head.as_deref(),
+            nodes: update.nodes,
+            graph_mutation_revision,
+        },
     )
     .await?;
     let next_session = update.next_session.into_session_state(&head);
@@ -714,7 +778,7 @@ async fn append_nodes_and_set_branch_head_with_session_state_in_transaction(
         next_session,
     )
     .await?;
-    Ok(head)
+    Ok((head, nodes))
 }
 
 async fn delete_branch_record(
@@ -736,8 +800,29 @@ async fn delete_branch_checked(
     path: &Path,
     branch: &str,
 ) -> Result<()> {
-    load_branch_head(connection, path, branch).await?;
-    delete_branch_record(connection, path, branch).await
+    connection
+        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+            load_branch_head(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            delete_branch_record(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            let revision = begin_graph_mutation(connection, path)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            finish_graph_mutation(
+                connection,
+                path,
+                revision,
+                &BTreeSet::new(),
+                &[GraphMutationBranch::Removed(branch.to_owned())],
+            )
+            .await
+            .map_err(SqliteTransactionError::Operation)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
 }
 
 #[cfg(test)]
@@ -775,8 +860,12 @@ async fn persist_session_nodes_and_branch_head_in_transaction(
     new_head: &str,
     nodes: &[Node],
 ) -> Result<()> {
+    let revision = begin_graph_mutation(connection, path).await?;
+    let mut inserted_nodes = Vec::new();
     for node in nodes {
-        upsert_node_without_transaction(connection, path, node).await?;
+        if upsert_node_without_transaction(connection, path, node, revision).await? {
+            inserted_nodes.push(node.clone());
+        }
     }
     let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
     ensure!(
@@ -786,6 +875,14 @@ async fn persist_session_nodes_and_branch_head_in_transaction(
             message: format!("SQLite branch {branch:?} did not match expected head"),
         }
     );
+    finish_graph_mutation(
+        connection,
+        path,
+        revision,
+        &dirty_parent_ids(&inserted_nodes),
+        &[GraphMutationBranch::Upserted(branch.to_owned())],
+    )
+    .await?;
     Ok(())
 }
 
@@ -929,23 +1026,71 @@ impl BranchStore for SqliteStore {
         parent: &str,
         nodes: Vec<NewNodeContent>,
     ) -> Result<String> {
+        self.append_nodes_and_set_branch_head_with_graph_mutation(
+            name,
+            expected_old_head,
+            parent,
+            nodes,
+        )
+        .await
+        .map(|receipt| receipt.value)
+    }
+
+    async fn append_nodes_and_set_branch_head_with_graph_mutation(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> Result<GraphMutationReceipt<String>> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
-        connection
-            .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
-                append_nodes_and_set_branch_head_in_transaction(
-                    connection,
-                    &self.database_path,
-                    name,
-                    expected_old_head,
-                    parent,
-                    None,
-                    nodes,
-                )
-                .await
-            })
+        let (head, nodes) = connection
+            .immediate_transaction::<(String, Vec<Node>), SqliteTransactionError, _>(
+                async |connection| {
+                    let revision = begin_graph_mutation(connection, &self.database_path)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                    let result = append_nodes_and_set_branch_head_in_transaction(
+                        connection,
+                        &self.database_path,
+                        BranchAppendTransaction {
+                            branch: name,
+                            expected_old_head,
+                            parent,
+                            new_head: None,
+                            nodes,
+                            graph_mutation_revision: revision,
+                        },
+                    )
+                    .await?;
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(&result.1),
+                        &[GraphMutationBranch::Upserted(name.to_owned())],
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                    Ok(result)
+                },
+            )
             .await
-            .map_err(|error| error.into_store_error(&self.database_path))
+            .map_err(|error| error.into_store_error(&self.database_path))?;
+        let inserted_parent_ids = inserted_parent_ids(
+            nodes.iter().map(|node| node.parent.as_str()),
+            nodes.iter().map(|node| &node.kind),
+        );
+        Ok(GraphMutationReceipt {
+            value: head.clone(),
+            branch_changes: vec![GraphBranchChange::Updated {
+                name: name.to_owned(),
+                head_id: head,
+            }],
+            inserted_parent_ids,
+            exact: true,
+        })
     }
 
     async fn append_nodes_and_set_branch_head_to(
@@ -956,42 +1101,144 @@ impl BranchStore for SqliteStore {
         new_head: &str,
         nodes: Vec<NewNodeContent>,
     ) -> Result<String> {
+        self.append_nodes_and_set_branch_head_to_with_graph_mutation(
+            name,
+            expected_old_head,
+            parent,
+            new_head,
+            nodes,
+        )
+        .await
+        .map(|receipt| receipt.value)
+    }
+
+    async fn append_nodes_and_set_branch_head_to_with_graph_mutation(
+        &self,
+        name: &str,
+        expected_old_head: &str,
+        parent: &str,
+        new_head: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> Result<GraphMutationReceipt<String>> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
-        connection
-            .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
-                append_nodes_and_set_branch_head_in_transaction(
-                    connection,
-                    &self.database_path,
-                    name,
-                    expected_old_head,
-                    parent,
-                    Some(new_head),
-                    nodes,
-                )
-                .await
-            })
+        let (tail, nodes) = connection
+            .immediate_transaction::<(String, Vec<Node>), SqliteTransactionError, _>(
+                async |connection| {
+                    let revision = begin_graph_mutation(connection, &self.database_path)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                    let result = append_nodes_and_set_branch_head_in_transaction(
+                        connection,
+                        &self.database_path,
+                        BranchAppendTransaction {
+                            branch: name,
+                            expected_old_head,
+                            parent,
+                            new_head: Some(new_head),
+                            nodes,
+                            graph_mutation_revision: revision,
+                        },
+                    )
+                    .await?;
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(&result.1),
+                        &[GraphMutationBranch::Upserted(name.to_owned())],
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                    Ok(result)
+                },
+            )
             .await
-            .map_err(|error| error.into_store_error(&self.database_path))
+            .map_err(|error| error.into_store_error(&self.database_path))?;
+        let inserted_parent_ids = inserted_parent_ids(
+            nodes.iter().map(|node| node.parent.as_str()),
+            nodes.iter().map(|node| &node.kind),
+        );
+        Ok(GraphMutationReceipt {
+            value: tail,
+            branch_changes: vec![GraphBranchChange::Updated {
+                name: name.to_owned(),
+                head_id: new_head.to_owned(),
+            }],
+            inserted_parent_ids,
+            exact: true,
+        })
     }
 
     async fn append_nodes_and_set_branch_head_with_session_state(
         &self,
         update: BranchAppendSessionState,
     ) -> Result<String> {
+        self.append_nodes_and_set_branch_head_with_session_state_and_graph_mutation(update)
+            .await
+            .map(|receipt| receipt.value)
+    }
+
+    async fn append_nodes_and_set_branch_head_with_session_state_and_graph_mutation(
+        &self,
+        update: BranchAppendSessionState,
+    ) -> Result<GraphMutationReceipt<String>> {
+        let branch = update.branch.clone();
+        let session_branch = update.session_branch.clone();
+        let requested_head = update.new_head.clone();
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
-        connection
-            .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
-                append_nodes_and_set_branch_head_with_session_state_in_transaction(
-                    connection,
-                    &self.database_path,
-                    update,
-                )
-                .await
-            })
+        let (tail, nodes) = connection
+            .immediate_transaction::<(String, Vec<Node>), SqliteTransactionError, _>(
+                async |connection| {
+                    let revision = begin_graph_mutation(connection, &self.database_path)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                    let result =
+                        append_nodes_and_set_branch_head_with_session_state_in_transaction(
+                            connection,
+                            &self.database_path,
+                            update,
+                            revision,
+                        )
+                        .await?;
+                    let mut changes = vec![GraphMutationBranch::Upserted(branch.clone())];
+                    if session_branch != branch {
+                        changes.push(GraphMutationBranch::Upserted(session_branch.clone()));
+                    }
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(&result.1),
+                        &changes,
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                    Ok(result)
+                },
+            )
             .await
-            .map_err(|error| error.into_store_error(&self.database_path))
+            .map_err(|error| error.into_store_error(&self.database_path))?;
+        let inserted_parent_ids = inserted_parent_ids(
+            nodes.iter().map(|node| node.parent.as_str()),
+            nodes.iter().map(|node| &node.kind),
+        );
+        let mut branch_changes = vec![GraphBranchChange::Updated {
+            name: branch.clone(),
+            head_id: requested_head.unwrap_or_else(|| tail.clone()),
+        }];
+        if session_branch != branch {
+            branch_changes.push(GraphBranchChange::MetadataUpdated {
+                name: session_branch,
+            });
+        }
+        Ok(GraphMutationReceipt {
+            value: tail,
+            branch_changes,
+            inserted_parent_ids,
+            exact: true,
+        })
     }
 }
 
@@ -1027,9 +1274,19 @@ impl SessionStore for SqliteStore {
     }
 
     async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> Result<String> {
+        self.rebase_session_with_graph_mutation(name, patch)
+            .await
+            .map(|receipt| receipt.value)
+    }
+
+    async fn rebase_session_with_graph_mutation(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+    ) -> Result<GraphMutationReceipt<String>> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
-        let (new_head, _) = connection
+        let (new_head, nodes) = connection
             .immediate_transaction::<(String, Vec<Node>), SqliteTransactionError, _>(
                 async |connection| {
                     let expected_old_head = load_branch_head(connection, &self.database_path, name)
@@ -1048,9 +1305,13 @@ impl SessionStore for SqliteStore {
                             .map_err(SqliteTransactionError::Operation)?;
                     let rebased_session_anchor = session_anchor.apply_patch(patch);
 
+                    let revision = begin_graph_mutation(connection, &self.database_path)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
                     let mut previous_new_id = None;
                     let mut new_head = String::new();
                     let mut nodes = Vec::with_capacity(chain.len());
+                    let mut inserted_nodes = Vec::with_capacity(chain.len());
                     for (index, node) in chain.into_iter().enumerate() {
                         let parent = previous_new_id
                             .clone()
@@ -1068,9 +1329,17 @@ impl SessionStore for SqliteStore {
                         };
                         let new_node =
                             Node::new(parent, node.role, node.metadata, kind, node.created_at);
-                        upsert_node_without_transaction(connection, &self.database_path, &new_node)
-                            .await
-                            .map_err(SqliteTransactionError::Operation)?;
+                        let inserted = upsert_node_without_transaction(
+                            connection,
+                            &self.database_path,
+                            &new_node,
+                            revision,
+                        )
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
+                        if inserted {
+                            inserted_nodes.push(new_node.clone());
+                        }
                         previous_new_id = Some(new_node.id.clone());
                         new_head = new_node.id.clone();
                         nodes.push(new_node);
@@ -1085,12 +1354,33 @@ impl SessionStore for SqliteStore {
                     )
                     .await
                     .map_err(SqliteTransactionError::Operation)?;
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(&inserted_nodes),
+                        &[GraphMutationBranch::Upserted(name.to_owned())],
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
                     Ok((new_head, nodes))
                 },
             )
             .await
             .map_err(|error| error.into_store_error(&self.database_path))?;
-        Ok(new_head)
+        let inserted_parent_ids = inserted_parent_ids(
+            nodes.iter().map(|node| node.parent.as_str()),
+            nodes.iter().map(|node| &node.kind),
+        );
+        Ok(GraphMutationReceipt {
+            value: new_head.clone(),
+            branch_changes: vec![GraphBranchChange::Updated {
+                name: name.to_owned(),
+                head_id: new_head,
+            }],
+            inserted_parent_ids,
+            exact: true,
+        })
     }
 
     async fn handoff_session(
@@ -1099,11 +1389,22 @@ impl SessionStore for SqliteStore {
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> Result<String> {
+        self.handoff_session_with_graph_mutation(name, patch, prompt)
+            .await
+            .map(|receipt| receipt.value)
+    }
+
+    async fn handoff_session_with_graph_mutation(
+        &self,
+        name: &str,
+        patch: &SessionAnchorPatch,
+        prompt: &str,
+    ) -> Result<GraphMutationReceipt<String>> {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
         let prompt = prompt.trim().to_owned();
         ensure!(!prompt.is_empty(), InvalidSessionHandoffPromptSnafu);
-        let (new_head, _) = connection
+        let (new_head, node) = connection
             .immediate_transaction::<(String, Node), SqliteTransactionError, _>(
                 async |connection| {
                     let expected_old_head = load_branch_head(connection, &self.database_path, name)
@@ -1119,6 +1420,9 @@ impl SessionStore for SqliteStore {
                     let mut handoff_session_anchor = session_anchor.apply_patch(patch);
                     handoff_session_anchor.prompt = prompt;
 
+                    let revision = begin_graph_mutation(connection, &self.database_path)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
                     let node = Node::new(
                         expected_old_head.clone(),
                         Role::System,
@@ -1129,9 +1433,14 @@ impl SessionStore for SqliteStore {
                     validate_new_node(connection, &self.database_path, &node)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
-                    persist_node_without_transaction(connection, &self.database_path, &node)
-                        .await
-                        .map_err(SqliteTransactionError::Operation)?;
+                    persist_node_without_transaction(
+                        connection,
+                        &self.database_path,
+                        &node,
+                        revision,
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
                     update_branch_head_after_session_write(
                         connection,
                         &self.database_path,
@@ -1141,11 +1450,29 @@ impl SessionStore for SqliteStore {
                     )
                     .await
                     .map_err(SqliteTransactionError::Operation)?;
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(std::slice::from_ref(&node)),
+                        &[GraphMutationBranch::Upserted(name.to_owned())],
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
                     Ok((node.id.clone(), node))
                 },
             )
             .await
             .map_err(|error| error.into_store_error(&self.database_path))?;
-        Ok(new_head)
+        let inserted_parent_ids = inserted_parent_ids([node.parent.as_str()], [&node.kind]);
+        Ok(GraphMutationReceipt {
+            value: new_head.clone(),
+            branch_changes: vec![GraphBranchChange::Updated {
+                name: name.to_owned(),
+                head_id: new_head,
+            }],
+            inserted_parent_ids,
+            exact: true,
+        })
     }
 }

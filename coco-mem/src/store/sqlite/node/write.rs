@@ -4,6 +4,7 @@ pub async fn persist_node_without_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     node: &Node,
+    graph_mutation_revision: i64,
 ) -> Result<()> {
     let row = NodeRow::from_node(node);
     diesel::insert_into(nodes::table)
@@ -29,13 +30,15 @@ pub async fn persist_node_without_transaction(
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
     persist_node_anchor_skill_result_row(connection, path, node).await?;
-    for relation in node_relations(node) {
+    let relations = node_relations(node);
+    for relation in relations {
         diesel::insert_into(node_relations::table)
             .values((
                 node_relations::child_node_id.eq(relation.child_node_id),
                 node_relations::parent_node_id.eq(relation.parent_node_id),
                 node_relations::kind.eq(relation.kind),
                 node_relations::ordinal.eq(relation.ordinal),
+                node_relations::created_revision.eq(graph_mutation_revision),
             ))
             .execute(connection)
             .await
@@ -53,9 +56,10 @@ pub async fn upsert_node_without_transaction(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     node: &Node,
-) -> Result<()> {
+    graph_mutation_revision: i64,
+) -> Result<bool> {
     let row = NodeRow::from_node(node);
-    diesel::insert_into(nodes::table)
+    let inserted = diesel::insert_into(nodes::table)
         .values((
             nodes::id.eq(row.id),
             nodes::parent_id.eq(row.parent_id),
@@ -66,46 +70,27 @@ pub async fn upsert_node_without_transaction(
             nodes::content.eq(row.content),
         ))
         .on_conflict(nodes::id)
-        .do_update()
-        .set((
-            nodes::parent_id.eq(diesel::upsert::excluded(nodes::parent_id)),
-            nodes::created_at.eq(diesel::upsert::excluded(nodes::created_at)),
-            nodes::role.eq(diesel::upsert::excluded(nodes::role)),
-            nodes::kind.eq(diesel::upsert::excluded(nodes::kind)),
-            nodes::metadata_present.eq(diesel::upsert::excluded(nodes::metadata_present)),
-            nodes::content.eq(diesel::upsert::excluded(nodes::content)),
-        ))
+        .do_nothing()
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })?;
 
-    delete_node_anchor_payload_rows(connection, path, &node.id).await?;
-    diesel::delete(node_relations::table.filter(node_relations::child_node_id.eq(&node.id)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-    diesel::delete(node_metadata::table.filter(node_metadata::node_id.eq(&node.id)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-    diesel::delete(node_tool_uses::table.filter(node_tool_uses::node_id.eq(&node.id)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-    diesel::delete(node_tool_results::table.filter(node_tool_results::node_id.eq(&node.id)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
+    if inserted == 0 {
+        let existing = load_node_by_exact_id(connection, path, &node.id).await?;
+        ensure!(
+            existing == *node,
+            CorruptedStoreSnafu {
+                path: path.to_owned(),
+                message: format!(
+                    "content-addressed SQLite node {:?} conflicts with immutable stored data",
+                    node.id
+                ),
+            }
+        );
+        return Ok(false);
+    }
 
     persist_node_anchor_session_row(connection, path, node).await?;
     persist_node_anchor_session_tool_rows(connection, path, node).await?;
@@ -114,13 +99,15 @@ pub async fn upsert_node_without_transaction(
     persist_node_anchor_prompt_attachment_rows(connection, path, node).await?;
     persist_node_anchor_skill_invocation_row(connection, path, node).await?;
     persist_node_anchor_skill_result_row(connection, path, node).await?;
-    for relation in node_relations(node) {
+    let relations = node_relations(node);
+    for relation in relations {
         diesel::insert_into(node_relations::table)
             .values((
                 node_relations::child_node_id.eq(relation.child_node_id),
                 node_relations::parent_node_id.eq(relation.parent_node_id),
                 node_relations::kind.eq(relation.kind),
                 node_relations::ordinal.eq(relation.ordinal),
+                node_relations::created_revision.eq(graph_mutation_revision),
             ))
             .execute(connection)
             .await
@@ -131,55 +118,7 @@ pub async fn upsert_node_without_transaction(
     persist_node_metadata_rows(connection, path, node).await?;
     persist_node_tool_use_rows(connection, path, node).await?;
     persist_node_tool_result_rows(connection, path, node).await?;
-    Ok(())
-}
-
-async fn delete_node_anchor_payload_rows(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    node_id: &str,
-) -> Result<()> {
-    diesel::delete(
-        node_anchor_prompt_attachments::table
-            .filter(node_anchor_prompt_attachments::node_id.eq(node_id)),
-    )
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
-    diesel::delete(node_anchor_sessions::table.filter(node_anchor_sessions::node_id.eq(node_id)))
-        .execute(connection)
-        .await
-        .context(QuerySqliteStoreSnafu {
-            path: path.to_owned(),
-        })?;
-    diesel::delete(
-        node_anchor_session_patches::table.filter(node_anchor_session_patches::node_id.eq(node_id)),
-    )
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
-    diesel::delete(
-        node_anchor_skill_invocations::table
-            .filter(node_anchor_skill_invocations::node_id.eq(node_id)),
-    )
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
-    diesel::delete(
-        node_anchor_skill_results::table.filter(node_anchor_skill_results::node_id.eq(node_id)),
-    )
-    .execute(connection)
-    .await
-    .context(QuerySqliteStoreSnafu {
-        path: path.to_owned(),
-    })?;
-    Ok(())
+    Ok(true)
 }
 
 async fn persist_node_anchor_session_row(

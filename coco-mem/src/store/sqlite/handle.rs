@@ -13,21 +13,32 @@ use snafu::prelude::*;
 #[cfg(any(test, feature = "test-utils"))]
 use super::OwnedStoreDirectory;
 use super::database::sqlite_database_path;
+use super::graph_mutation::{
+    begin_graph_mutation, dirty_parent_ids, finish_graph_mutation,
+    load_graph_branch_name_high_watermark_at_revision, load_graph_branch_names_at_revision_page,
+    load_graph_branches_at_revision_by_names, load_graph_mutation_branch_changes,
+    load_graph_mutation_dirty_parents, load_graph_mutation_events,
+};
 use super::node::{
-    load_child_ids_by_parent_ids, load_child_ids_page, load_node_by_exact_id,
-    load_node_by_prefix_or_branch, load_nodes_by_exact_ids, load_root_id, node_count,
-    persist_node_without_transaction,
+    load_child_high_watermark, load_child_high_watermark_at_revision, load_child_ids_by_parent_ids,
+    load_child_ids_page, load_child_ids_page_at_revision, load_child_ids_page_through,
+    load_child_ids_page_through_at_revision, load_graph_mutation_revision_bounds,
+    load_node_by_exact_id, load_node_by_prefix_or_branch, load_nodes_by_exact_ids, load_root_id,
+    node_count, persist_node_without_transaction,
 };
 use super::{
     AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchPage,
-    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor, SqliteDatabase,
-    SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore, SqliteTransactionError,
-    StoreAccess, migration,
+    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor,
+    GraphMutationBranchChangePage, GraphMutationBranchChangePageCursor,
+    GraphMutationDirtyParentPage, GraphMutationDirtyParentPageCursor, GraphMutationEventPage,
+    GraphMutationRevisionBounds, SqliteDatabase, SqliteGraphConnectionFuture, SqliteGraphStore,
+    SqliteStore, SqliteTransactionError, StoreAccess, migration,
 };
 use crate::StoreResult as Result;
 use crate::error::{
-    CorruptedStoreSnafu, GraphReadBatchTooLargeSnafu, QuerySqliteStoreSnafu,
-    StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
+    CorruptedStoreSnafu, GraphReadBatchTooLargeSnafu, GraphRevisionOutOfRangeSnafu,
+    QuerySqliteStoreSnafu, StorePathIsNotDirectorySnafu, StoreReadOnlySnafu,
+    WriteStoreDirectorySnafu,
 };
 use crate::schema::branches;
 use crate::store::ProcessShareableStore;
@@ -159,9 +170,26 @@ impl SqliteStore {
                     == 0
                 {
                     let root = initial_root_node();
-                    persist_node_without_transaction(connection, &self.database_path, &root)
+                    let revision = begin_graph_mutation(connection, &self.database_path)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
+                    persist_node_without_transaction(
+                        connection,
+                        &self.database_path,
+                        &root,
+                        revision,
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                    finish_graph_mutation(
+                        connection,
+                        &self.database_path,
+                        revision,
+                        &dirty_parent_ids(std::slice::from_ref(&root)),
+                        &[],
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
                 }
                 load_root_id(connection, &self.database_path)
                     .await
@@ -317,6 +345,214 @@ impl SqliteGraphStore {
         load_child_ids_by_parent_ids(&mut connection, &self.database_path, parent_ids).await
     }
 
+    pub async fn graph_relation_revision(&self) -> Result<i64> {
+        self.graph_mutation_revision().await
+    }
+
+    pub async fn graph_mutation_revision(&self) -> Result<i64> {
+        Ok(self
+            .graph_mutation_revision_bounds()
+            .await?
+            .current_revision)
+    }
+
+    pub async fn graph_mutation_revision_bounds(&self) -> Result<GraphMutationRevisionBounds> {
+        let mut connection = self.connect().await?;
+        load_graph_mutation_revision_bounds(&mut connection, &self.database_path).await
+    }
+
+    pub async fn graph_mutation_events_page(
+        &self,
+        after_revision: i64,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphMutationEventPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        ensure_graph_event_cursor_is_serviceable(
+            &mut connection,
+            &self.database_path,
+            after_revision,
+        )
+        .await?;
+        let mut events = load_graph_mutation_events(
+            &mut connection,
+            &self.database_path,
+            after_revision,
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = events.len() <= page_size.get();
+        if !complete {
+            events.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| {
+            events
+                .last()
+                .expect("non-empty graph mutation event page should have a cursor")
+                .revision
+        });
+        Ok(GraphMutationEventPage {
+            events,
+            next_cursor,
+            complete,
+        })
+    }
+
+    pub async fn graph_mutation_branch_changes_page(
+        &self,
+        revision: i64,
+        cursor: Option<&GraphMutationBranchChangePageCursor>,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphMutationBranchChangePage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        let mut changes = load_graph_mutation_branch_changes(
+            &mut connection,
+            &self.database_path,
+            revision,
+            cursor.map(|cursor| cursor.name.as_str()),
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = changes.len() <= page_size.get();
+        if !complete {
+            changes.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| GraphMutationBranchChangePageCursor {
+            name: changes
+                .last()
+                .expect("non-empty graph mutation branch page should have a cursor")
+                .name
+                .clone(),
+        });
+        Ok(GraphMutationBranchChangePage {
+            changes,
+            next_cursor,
+            complete,
+        })
+    }
+
+    pub async fn graph_mutation_dirty_parents_page(
+        &self,
+        revision: i64,
+        cursor: Option<&GraphMutationDirtyParentPageCursor>,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphMutationDirtyParentPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        let mut parent_ids = load_graph_mutation_dirty_parents(
+            &mut connection,
+            &self.database_path,
+            revision,
+            cursor.map(|cursor| cursor.parent_id.as_str()),
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = parent_ids.len() <= page_size.get();
+        if !complete {
+            parent_ids.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| GraphMutationDirtyParentPageCursor {
+            parent_id: parent_ids
+                .last()
+                .expect("non-empty graph mutation dirty parent page should have a cursor")
+                .clone(),
+        });
+        Ok(GraphMutationDirtyParentPage {
+            parent_ids,
+            next_cursor,
+            complete,
+        })
+    }
+
+    pub async fn graph_branches_at_revision_by_names(
+        &self,
+        revision: i64,
+        names: &[String],
+    ) -> Result<Vec<GraphBranchRecord>> {
+        ensure_graph_read_batch_size(names.len())?;
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        load_graph_branches_at_revision_by_names(
+            &mut connection,
+            &self.database_path,
+            revision,
+            names,
+        )
+        .await
+    }
+
+    pub async fn graph_branch_name_high_watermark_at_revision(
+        &self,
+        revision: i64,
+    ) -> Result<Option<String>> {
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        load_graph_branch_name_high_watermark_at_revision(
+            &mut connection,
+            &self.database_path,
+            revision,
+        )
+        .await
+    }
+
+    pub async fn graph_branches_at_revision_page(
+        &self,
+        revision: i64,
+        cursor: Option<&GraphBranchPageCursor>,
+        through: Option<&str>,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphBranchPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        let mut names = load_graph_branch_names_at_revision_page(
+            &mut connection,
+            &self.database_path,
+            revision,
+            cursor.map(|cursor| cursor.name.as_str()),
+            through,
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = names.len() <= page_size.get();
+        if !complete {
+            names.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| GraphBranchPageCursor {
+            name: names
+                .last()
+                .expect("non-empty graph branch name page should have a cursor")
+                .clone(),
+        });
+        let mut branches_by_name = load_graph_branches_at_revision_by_names(
+            &mut connection,
+            &self.database_path,
+            revision,
+            &names,
+        )
+        .await?
+        .into_iter()
+        .map(|branch| (branch.name.clone(), branch))
+        .collect::<HashMap<_, _>>();
+        let branches = names
+            .iter()
+            .filter_map(|name| branches_by_name.remove(name))
+            .collect();
+        Ok(GraphBranchPage {
+            branches,
+            next_cursor,
+            complete,
+        })
+    }
+
     pub async fn graph_child_ids_page(
         &self,
         parent_id: &str,
@@ -329,7 +565,7 @@ impl SqliteGraphStore {
             &mut connection,
             &self.database_path,
             parent_id,
-            cursor.map(|cursor| (cursor.created_at.as_str(), cursor.node_id.as_str())),
+            cursor.map(|cursor| (cursor.relation_revision, cursor.node_id.as_str())),
             page_size.get() + 1,
         )
         .await?;
@@ -338,11 +574,169 @@ impl SqliteGraphStore {
             rows.truncate(page_size.get());
         }
         let next_cursor = (!complete).then(|| {
-            let (created_at, node_id) = rows
+            let (relation_revision, node_id) = rows
                 .last()
                 .expect("non-empty graph child page should have a cursor");
             GraphChildPageCursor {
-                created_at: created_at.clone(),
+                relation_revision: *relation_revision,
+                node_id: node_id.clone(),
+            }
+        });
+        Ok(GraphChildPage {
+            child_ids: rows.into_iter().map(|(_, node_id)| node_id).collect(),
+            next_cursor,
+            complete,
+        })
+    }
+
+    pub async fn graph_child_ids_page_at_revision(
+        &self,
+        parent_id: &str,
+        cursor: Option<&GraphChildPageCursor>,
+        revision: i64,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphChildPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        let mut rows = load_child_ids_page_at_revision(
+            &mut connection,
+            &self.database_path,
+            parent_id,
+            cursor.map(|cursor| (cursor.relation_revision, cursor.node_id.as_str())),
+            revision,
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = rows.len() <= page_size.get();
+        if !complete {
+            rows.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| {
+            let (relation_revision, node_id) = rows
+                .last()
+                .expect("non-empty graph child page should have a cursor");
+            GraphChildPageCursor {
+                relation_revision: *relation_revision,
+                node_id: node_id.clone(),
+            }
+        });
+        Ok(GraphChildPage {
+            child_ids: rows.into_iter().map(|(_, node_id)| node_id).collect(),
+            next_cursor,
+            complete,
+        })
+    }
+
+    pub async fn graph_child_high_watermark(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<GraphChildPageCursor>> {
+        let mut connection = self.connect().await?;
+        load_child_high_watermark(&mut connection, &self.database_path, parent_id)
+            .await
+            .map(|watermark| {
+                watermark.map(|(relation_revision, node_id)| GraphChildPageCursor {
+                    relation_revision,
+                    node_id,
+                })
+            })
+    }
+
+    pub async fn graph_child_high_watermark_at_revision(
+        &self,
+        parent_id: &str,
+        revision: i64,
+    ) -> Result<Option<GraphChildPageCursor>> {
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        load_child_high_watermark_at_revision(
+            &mut connection,
+            &self.database_path,
+            parent_id,
+            revision,
+        )
+        .await
+        .map(|watermark| {
+            watermark.map(|(relation_revision, node_id)| GraphChildPageCursor {
+                relation_revision,
+                node_id,
+            })
+        })
+    }
+
+    pub async fn graph_child_ids_page_through(
+        &self,
+        parent_id: &str,
+        cursor: Option<&GraphChildPageCursor>,
+        through: &GraphChildPageCursor,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphChildPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        let mut rows = load_child_ids_page_through(
+            &mut connection,
+            &self.database_path,
+            parent_id,
+            cursor.map(|cursor| (cursor.relation_revision, cursor.node_id.as_str())),
+            Some((through.relation_revision, through.node_id.as_str())),
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = rows.len() <= page_size.get();
+        if !complete {
+            rows.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| {
+            let (relation_revision, node_id) = rows
+                .last()
+                .expect("non-empty graph child page should have a cursor");
+            GraphChildPageCursor {
+                relation_revision: *relation_revision,
+                node_id: node_id.clone(),
+            }
+        });
+        Ok(GraphChildPage {
+            child_ids: rows.into_iter().map(|(_, node_id)| node_id).collect(),
+            next_cursor,
+            complete,
+        })
+    }
+
+    pub async fn graph_child_ids_page_through_at_revision(
+        &self,
+        parent_id: &str,
+        cursor: Option<&GraphChildPageCursor>,
+        through: &GraphChildPageCursor,
+        revision: i64,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphChildPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        ensure_graph_revision_is_serviceable(&mut connection, &self.database_path, revision)
+            .await?;
+        let mut rows = load_child_ids_page_through_at_revision(
+            &mut connection,
+            &self.database_path,
+            parent_id,
+            cursor.map(|cursor| (cursor.relation_revision, cursor.node_id.as_str())),
+            Some((through.relation_revision, through.node_id.as_str())),
+            revision,
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = rows.len() <= page_size.get();
+        if !complete {
+            rows.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| {
+            let (relation_revision, node_id) = rows
+                .last()
+                .expect("non-empty graph child page should have a cursor");
+            GraphChildPageCursor {
+                relation_revision: *relation_revision,
                 node_id: node_id.clone(),
             }
         });
@@ -442,6 +836,40 @@ fn ensure_graph_read_batch_size(actual: usize) -> Result<()> {
         }
     );
     Ok(())
+}
+
+async fn ensure_graph_revision_is_serviceable(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    requested: i64,
+) -> Result<GraphMutationRevisionBounds> {
+    let bounds = load_graph_mutation_revision_bounds(connection, path).await?;
+    ensure!(
+        (bounds.baseline_revision..=bounds.current_revision).contains(&requested),
+        GraphRevisionOutOfRangeSnafu {
+            requested,
+            minimum: bounds.baseline_revision,
+            maximum: bounds.current_revision,
+        }
+    );
+    Ok(bounds)
+}
+
+async fn ensure_graph_event_cursor_is_serviceable(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    requested: i64,
+) -> Result<GraphMutationRevisionBounds> {
+    let bounds = load_graph_mutation_revision_bounds(connection, path).await?;
+    ensure!(
+        (bounds.baseline_revision..=bounds.current_revision).contains(&requested),
+        GraphRevisionOutOfRangeSnafu {
+            requested,
+            minimum: bounds.baseline_revision,
+            maximum: bounds.current_revision,
+        }
+    );
+    Ok(bounds)
 }
 
 fn initial_root_node() -> Node {

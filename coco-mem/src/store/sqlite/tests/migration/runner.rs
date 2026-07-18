@@ -8,7 +8,7 @@ async fn open_creates_sqlite_database_and_schema() {
     let store = SqliteStore::open(&path).await.unwrap();
 
     assert!(store.database_path().is_file());
-    assert_eq!(store.schema_version().await.unwrap(), 23);
+    assert_eq!(store.schema_version().await.unwrap(), 25);
     assert!(!nodes_have_anchor_columns(&store).await);
     assert!(!node_has_kind_json_column(&store).await);
     assert!(!node_anchor_table_exists(&store).await);
@@ -25,7 +25,7 @@ async fn open_read_only_accepts_current_schema() {
 
     let store = SqliteStore::open_read_only(&path).await.unwrap();
 
-    assert_eq!(store.schema_version().await.unwrap(), 23);
+    assert_eq!(store.schema_version().await.unwrap(), 25);
 }
 
 #[tokio::test]
@@ -53,7 +53,7 @@ async fn open_read_only_or_upgrade_schema_rejects_old_diesel_schema_version() {
 
     assert!(
         err.to_string()
-            .contains("unsupported SQLite schema version 5, expected 6..=23")
+            .contains("unsupported SQLite schema version 5, expected 6..=25")
     );
 }
 
@@ -68,7 +68,7 @@ async fn open_rejects_old_diesel_schema_version() {
 
     assert!(
         err.to_string()
-            .contains("unsupported SQLite schema version 5, expected 6..=23")
+            .contains("unsupported SQLite schema version 5, expected 6..=25")
     );
 }
 

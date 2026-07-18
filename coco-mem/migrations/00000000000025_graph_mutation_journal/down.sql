@@ -1,0 +1,11 @@
+DROP INDEX graph_branch_history_revision_name_idx;
+DROP TRIGGER graph_branch_history_insert_name;
+DROP INDEX graph_branch_names_revision_name_idx;
+DROP TABLE graph_branch_names;
+DROP TABLE graph_branch_history;
+DROP TABLE graph_mutation_event_dirty_parent_prune_staging;
+DROP TABLE graph_mutation_event_branch_change_prune_staging;
+DROP TABLE graph_mutation_event_dirty_parents;
+DROP TABLE graph_mutation_event_branch_changes;
+DROP TABLE graph_mutation_events;
+ALTER TABLE graph_relation_state DROP COLUMN baseline_revision;

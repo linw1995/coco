@@ -10,17 +10,21 @@ use snafu::prelude::*;
 
 use super::branch::maybe_load_branch_head;
 use super::codec::{parse_json_column, parse_session_role, parse_u64_column};
-use super::{AsyncSqliteConnection, SqliteGraphStore, SqliteStore, SqliteTransactionError};
+use super::graph_mutation::{begin_graph_mutation, dirty_parent_ids, finish_graph_mutation};
+use super::{
+    AsyncSqliteConnection, GraphMutationRevisionBounds, SqliteGraphStore, SqliteStore,
+    SqliteTransactionError,
+};
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, CorruptedStoreSnafu, DuplicateMergeParentSnafu,
     MergeParentMatchesParentSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,
     ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu, StoreError,
 };
 use crate::schema::{
-    node_anchor_prompt_attachments, node_anchor_session_patch_tools, node_anchor_session_patches,
-    node_anchor_session_tools, node_anchor_sessions, node_anchor_skill_invocations,
-    node_anchor_skill_results, node_metadata, node_relations, node_tool_results, node_tool_uses,
-    nodes,
+    graph_child_adjacency, graph_relation_state, node_anchor_prompt_attachments,
+    node_anchor_session_patch_tools, node_anchor_session_patches, node_anchor_session_tools,
+    node_anchor_sessions, node_anchor_skill_invocations, node_anchor_skill_results, node_metadata,
+    node_relations, node_tool_results, node_tool_uses, nodes,
 };
 use crate::store::NodeStore;
 use crate::{
@@ -35,9 +39,12 @@ mod row;
 mod write;
 
 pub use read::{
-    load_ancestry_nodes, load_child_ids_by_parent_ids, load_child_ids_page, load_child_nodes,
-    load_log_nodes, load_node_by_exact_id, load_node_by_prefix_or_branch, load_nodes_by_exact_ids,
-    load_root_id, node_count, resolve_ref_id, validate_new_node,
+    load_ancestry_nodes, load_child_high_watermark, load_child_high_watermark_at_revision,
+    load_child_ids_by_parent_ids, load_child_ids_page, load_child_ids_page_at_revision,
+    load_child_ids_page_through, load_child_ids_page_through_at_revision, load_child_nodes,
+    load_graph_mutation_revision_bounds, load_log_nodes, load_node_by_exact_id,
+    load_node_by_prefix_or_branch, load_nodes_by_exact_ids, load_root_id, node_count,
+    resolve_ref_id, validate_new_node,
 };
 pub use row::*;
 #[cfg(test)]
@@ -117,9 +124,21 @@ impl NodeStore for SqliteStore {
                 validate_new_node(connection, &self.database_path, &node)
                     .await
                     .map_err(SqliteTransactionError::Operation)?;
-                persist_node_without_transaction(connection, &self.database_path, &node)
+                let revision = begin_graph_mutation(connection, &self.database_path)
                     .await
-                    .map_err(SqliteTransactionError::Operation)
+                    .map_err(SqliteTransactionError::Operation)?;
+                persist_node_without_transaction(connection, &self.database_path, &node, revision)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                finish_graph_mutation(
+                    connection,
+                    &self.database_path,
+                    revision,
+                    &dirty_parent_ids(std::slice::from_ref(&node)),
+                    &[],
+                )
+                .await
+                .map_err(SqliteTransactionError::Operation)
             })
             .await
             .map_err(|error| error.into_store_error(&self.database_path))?;

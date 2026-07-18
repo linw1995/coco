@@ -649,10 +649,10 @@ impl<S: NodeStore> VisibleGraphCollector<'_, S> {
                 tokio::task::yield_now().await;
                 if last_reported_at.elapsed() >= Duration::from_secs(10) {
                     tracing::info!(
-                        mode = ?self.mode,
-                        branch = self.branch,
-                        processed_nodes = self.visited.len(),
-                        elapsed_ms = started_at.elapsed().as_millis(),
+                        graph_mode = self.mode.as_query_value(),
+                        source_branch_name = self.branch,
+                        branch_traversal_completed_node_count = self.visited.len(),
+                        branch_traversal_elapsed_ms = started_at.elapsed().as_millis(),
                         "console graph branch collection progress",
                     );
                     last_reported_at = Instant::now();

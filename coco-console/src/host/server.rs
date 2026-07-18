@@ -157,28 +157,58 @@ where
 {
     let mut invalidations = cache.subscribe_invalidations();
     let mut retry_delay = REBUILD_RETRY_MIN_DELAY;
+    let mut consecutive_rebuild_failure_count = 0u64;
+    let mut durable_poll = tokio::time::interval(std::time::Duration::from_secs(1));
+    durable_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let source_version = *invalidations.borrow_and_update();
         if source_version == 0 {
-            invalidations
-                .changed()
-                .await
-                .expect("console graph cache retains the invalidation publisher");
+            tokio::select! {
+                changed = invalidations.changed() => {
+                    changed.expect("console graph cache retains the invalidation publisher");
+                }
+                _ = durable_poll.tick() => {
+                    if let Err(error) = cache.poll_durable_graph_mutations().await {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to poll durable console graph mutations",
+                        );
+                    }
+                }
+            }
             continue;
         }
-        tracing::info!(source_version, "console graph invalidation received");
+        tracing::info!(
+            process_local_invalidation_version = source_version,
+            "console graph invalidation received"
+        );
         match cache.rebuild_requested_modes().await {
             Ok(()) => {
                 retry_delay = REBUILD_RETRY_MIN_DELAY;
-                invalidations
-                    .changed()
-                    .await
-                    .expect("console graph cache retains the invalidation publisher");
+                consecutive_rebuild_failure_count = 0;
+                tokio::select! {
+                    changed = invalidations.changed() => {
+                        changed.expect("console graph cache retains the invalidation publisher");
+                    }
+                    _ = durable_poll.tick() => {
+                        if let Err(error) = cache.poll_durable_graph_mutations().await {
+                            tracing::warn!(
+                                error = %error,
+                                "failed to poll durable console graph mutations",
+                            );
+                        }
+                    }
+                }
             }
             Err(error) => {
+                consecutive_rebuild_failure_count =
+                    consecutive_rebuild_failure_count.saturating_add(1);
                 tracing::warn!(
-                    source_version,
-                    retry_delay_ms = retry_delay.as_millis(),
+                    rebuild_output_scope = "anchors_and_all",
+                    process_local_invalidation_version = source_version,
+                    consecutive_rebuild_failure_count,
+                    rebuild_retry_reason = rebuild_retry_reason(&error),
+                    retry_delay_ms = u64::try_from(retry_delay.as_millis()).unwrap_or(u64::MAX),
                     %error,
                     "retrying console graph rebuild",
                 );
@@ -187,10 +217,30 @@ where
                     changed = invalidations.changed() => {
                         changed.expect("console graph cache retains the invalidation publisher");
                     }
+                    _ = durable_poll.tick() => {
+                        if let Err(poll_error) = cache.poll_durable_graph_mutations().await {
+                            tracing::warn!(
+                                error = %poll_error,
+                                "failed to poll durable console graph mutations",
+                            );
+                        }
+                    }
                 }
                 retry_delay = (retry_delay * 2).min(REBUILD_RETRY_MAX_DELAY);
             }
         }
+    }
+}
+
+fn rebuild_retry_reason(error: &crate::Error) -> &'static str {
+    let detail = error.to_string().to_ascii_lowercase();
+    if detail.contains("database is locked")
+        || detail.contains("database table is locked")
+        || detail.contains("database schema is locked")
+    {
+        "sqlite_database_locked"
+    } else {
+        "rebuild_failed"
     }
 }
 
@@ -1064,8 +1114,9 @@ mod tests {
     use super::{
         AppState, fragment, graph_json, graph_viewport_diff_response,
         graph_viewport_items_diff_response_from_query, index_page, node_detail, parse_query,
-        provider_context, start_console_server, start_console_server_with_cache,
-        viewport_diff_has_changes, viewport_diff_request_from_query,
+        provider_context, rebuild_retry_reason, start_console_server,
+        start_console_server_with_cache, viewport_diff_has_changes,
+        viewport_diff_request_from_query,
     };
     use crate::api::{
         GraphBezierRoute, GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge,
@@ -1093,6 +1144,21 @@ mod tests {
         SqliteStore::open_temporary()
             .await
             .expect("temporary SQLite store should open")
+    }
+
+    #[test]
+    fn rebuild_retry_reason_identifies_sqlite_lock_contention() {
+        let locked = crate::Error::InvalidGraphSnapshotStoreValue {
+            column: "test_error",
+            value: "database is locked".to_owned(),
+        };
+        let other = crate::Error::InvalidGraphSnapshotStoreValue {
+            column: "test_error",
+            value: "other failure".to_owned(),
+        };
+
+        assert_eq!(rebuild_retry_reason(&locked), "sqlite_database_locked");
+        assert_eq!(rebuild_retry_reason(&other), "rebuild_failed");
     }
 
     fn test_config() -> ConsoleConfig {

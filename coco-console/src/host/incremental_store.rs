@@ -8,9 +8,9 @@ use super::snapshot_store::SnapshotDatabase;
 use crate::error::QueryGraphSnapshotStoreSnafu;
 
 const SELECT_PENDING_COUNT: &str = "
-    SELECT COUNT(*) AS count
-    FROM console_graph_build_frontier
-    WHERE run_id = ? AND pending = 1
+    SELECT dag_frontier_pending_count AS count
+    FROM console_graph_build_runs
+    WHERE run_id = ?
 ";
 const SELECT_PENDING_PREFIX: &str = "
     SELECT created_at_ns, node_id
@@ -69,11 +69,32 @@ impl FrontierNode {
 pub struct SqliteFrontierStore {
     database: SnapshotDatabase,
     run_id: i64,
+    lease_owner: Option<String>,
+    lease_epoch: Option<i64>,
 }
 
 impl SqliteFrontierStore {
     pub fn new(database: SnapshotDatabase, run_id: i64) -> Self {
-        Self { database, run_id }
+        Self {
+            database,
+            run_id,
+            lease_owner: None,
+            lease_epoch: None,
+        }
+    }
+
+    pub fn new_leased(
+        database: SnapshotDatabase,
+        run_id: i64,
+        lease_owner: String,
+        lease_epoch: i64,
+    ) -> Self {
+        Self {
+            database,
+            run_id,
+            lease_owner: Some(lease_owner),
+            lease_epoch: Some(lease_epoch),
+        }
     }
 }
 
@@ -160,11 +181,19 @@ impl ExternalFrontierStore<FrontierNode> for SqliteFrontierStore {
         let run_id = self.run_id;
         let expected_min = expected_min.cloned();
         let additions = additions.to_vec();
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
         let path = self.database.path().to_owned();
         self.database
-            .with_connection(move |connection| {
+            .with_write_connection("replace DAG frontier minimum", move |connection| {
                 connection
                     .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                        require_lease_fence(
+                            connection,
+                            run_id,
+                            lease_owner.as_deref(),
+                            lease_epoch,
+                        )?;
                         let current_min = diesel::sql_query(SELECT_PENDING_MINIMUM)
                             .bind::<BigInt, _>(run_id)
                             .get_result::<FrontierRow>(connection)
@@ -196,15 +225,26 @@ impl ExternalFrontierStore<FrontierNode> for SqliteFrontierStore {
                                 .bind::<BigInt, _>(addition.created_at_ns)
                                 .bind::<Text, _>(&addition.node_id)
                                 .execute(connection)?;
+                            diesel::sql_query(
+                                "UPDATE console_graph_build_nodes \
+                                 SET frontier_enqueued = 1 \
+                                 WHERE run_id = ? AND node_id = ? \
+                                   AND frontier_enqueued = 0",
+                            )
+                            .bind::<BigInt, _>(run_id)
+                            .bind::<Text, _>(&addition.node_id)
+                            .execute(connection)?;
                             if affected == 1 {
                                 inserted.push(addition);
                             }
                         }
 
-                        let pending_len = diesel::sql_query(SELECT_PENDING_COUNT)
-                            .bind::<BigInt, _>(run_id)
-                            .get_result::<CountRow>(connection)
-                            .map(|row| count_as_usize(row.count))?;
+                        let removed = usize::from(expected_min.is_some());
+                        let pending_len = adjust_pending_count(
+                            connection,
+                            run_id,
+                            inserted.len() as i64 - removed as i64,
+                        )?;
 
                         Ok(StoreReplace::Applied(StoreMutation {
                             inserted,
@@ -215,6 +255,132 @@ impl ExternalFrontierStore<FrontierNode> for SqliteFrontierStore {
             })
             .await
     }
+
+    async fn complete_minimum(
+        &mut self,
+        expected_min: &FrontierNode,
+    ) -> Result<StoreReplace<FrontierNode>, Self::Error> {
+        let run_id = self.run_id;
+        let expected_min = expected_min.clone();
+        let lease_owner = self.lease_owner.clone();
+        let lease_epoch = self.lease_epoch;
+        let path = self.database.path().to_owned();
+        self.database
+            .with_write_connection("complete DAG frontier minimum", move |connection| {
+                connection
+                    .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                        require_lease_fence(
+                            connection,
+                            run_id,
+                            lease_owner.as_deref(),
+                            lease_epoch,
+                        )?;
+                        let current_min = diesel::sql_query(SELECT_PENDING_MINIMUM)
+                            .bind::<BigInt, _>(run_id)
+                            .get_result::<FrontierRow>(connection)
+                            .optional()?
+                            .map(FrontierNode::from);
+                        if current_min.as_ref() != Some(&expected_min) {
+                            return Ok(StoreReplace::StaleMinimum);
+                        }
+
+                        let completed = diesel::sql_query(
+                            "UPDATE console_graph_build_nodes \
+                             SET processed = 1 \
+                             WHERE run_id = ? AND node_id = ? \
+                               AND processed = 0 AND remaining_parents = 0 \
+                               AND projection_complete = 1 \
+                               AND EXISTS ( \
+                                   SELECT 1 FROM console_graph_build_parent_expansions \
+                                   WHERE run_id = ? AND parent_id = ? AND complete = 1 \
+                               )",
+                        )
+                        .bind::<BigInt, _>(run_id)
+                        .bind::<Text, _>(&expected_min.node_id)
+                        .bind::<BigInt, _>(run_id)
+                        .bind::<Text, _>(&expected_min.node_id)
+                        .execute(connection)?;
+                        if completed != 1 {
+                            return Err(diesel::result::Error::NotFound);
+                        }
+                        let progress_updated = diesel::sql_query(
+                            "UPDATE console_graph_build_runs \
+                             SET dag_processed_node_count = dag_processed_node_count + 1 \
+                             WHERE run_id = ? \
+                               AND dag_processed_node_count < dag_discovered_node_count",
+                        )
+                        .bind::<BigInt, _>(run_id)
+                        .execute(connection)?;
+                        if progress_updated != 1 {
+                            return Err(diesel::result::Error::NotFound);
+                        }
+
+                        let updated = diesel::sql_query(MARK_SEEN)
+                            .bind::<BigInt, _>(run_id)
+                            .bind::<BigInt, _>(expected_min.created_at_ns)
+                            .bind::<Text, _>(&expected_min.node_id)
+                            .execute(connection)?;
+                        if updated != 1 {
+                            return Err(diesel::result::Error::RollbackTransaction);
+                        }
+                        let pending_len = adjust_pending_count(connection, run_id, -1)?;
+                        Ok(StoreReplace::Applied(StoreMutation {
+                            inserted: Vec::new(),
+                            pending_len,
+                        }))
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await
+    }
+}
+
+fn require_lease_fence(
+    connection: &mut SqliteConnection,
+    run_id: i64,
+    lease_owner: Option<&str>,
+    lease_epoch: Option<i64>,
+) -> QueryResult<()> {
+    let (Some(lease_owner), Some(lease_epoch)) = (lease_owner, lease_epoch) else {
+        return Ok(());
+    };
+    let owned = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM console_graph_build_runs \
+         WHERE run_id = ? AND owner_id = ? AND lease_epoch = ? AND status = 'building'",
+    )
+    .bind::<BigInt, _>(run_id)
+    .bind::<Text, _>(lease_owner)
+    .bind::<BigInt, _>(lease_epoch)
+    .get_result::<CountRow>(connection)?
+    .count
+        == 1;
+    if !owned {
+        return Err(diesel::result::Error::NotFound);
+    }
+    Ok(())
+}
+
+fn adjust_pending_count(
+    connection: &mut SqliteConnection,
+    run_id: i64,
+    delta: i64,
+) -> QueryResult<usize> {
+    let updated = diesel::sql_query(
+        "UPDATE console_graph_build_runs \
+         SET dag_frontier_pending_count = dag_frontier_pending_count + ? \
+         WHERE run_id = ? AND dag_frontier_pending_count + ? >= 0",
+    )
+    .bind::<BigInt, _>(delta)
+    .bind::<BigInt, _>(run_id)
+    .bind::<BigInt, _>(delta)
+    .execute(connection)?;
+    if updated != 1 {
+        return Err(diesel::result::Error::NotFound);
+    }
+    diesel::sql_query(SELECT_PENDING_COUNT)
+        .bind::<BigInt, _>(run_id)
+        .get_result::<CountRow>(connection)
+        .map(|row| count_as_usize(row.count))
 }
 
 fn count_as_usize(count: i64) -> usize {
