@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::Arc;
@@ -12,13 +14,15 @@ use snafu::prelude::*;
 use super::OwnedStoreDirectory;
 use super::database::sqlite_database_path;
 use super::node::{
-    load_child_ids_by_parent_ids, load_node_by_exact_id, load_node_by_prefix_or_branch,
-    load_nodes_by_exact_ids, load_root_id, node_count, persist_node_without_transaction,
+    load_child_ids_by_parent_ids, load_child_ids_page, load_node_by_exact_id,
+    load_node_by_prefix_or_branch, load_nodes_by_exact_ids, load_root_id, node_count,
+    persist_node_without_transaction,
 };
 use super::{
-    AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
-    SqliteDatabase, SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore,
-    SqliteTransactionError, StoreAccess, migration,
+    AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchPage,
+    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor, SqliteDatabase,
+    SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore, SqliteTransactionError,
+    StoreAccess, migration,
 };
 use crate::StoreResult as Result;
 use crate::error::{
@@ -28,7 +32,6 @@ use crate::error::{
 use crate::schema::branches;
 use crate::store::ProcessShareableStore;
 use crate::{Kind, Node, Role};
-use std::collections::HashMap;
 
 impl std::fmt::Debug for SqliteGraphStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -230,7 +233,15 @@ impl SqliteGraphStore {
 
     pub async fn graph_branches(&self) -> Result<Vec<GraphBranchRecord>> {
         let mut connection = self.connect().await?;
-        super::branch::load_graph_branch_records(&mut connection, &self.database_path, None).await
+        super::branch::load_graph_branch_records(
+            &mut connection,
+            &self.database_path,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn graph_branches_by_names(
@@ -239,8 +250,56 @@ impl SqliteGraphStore {
     ) -> Result<Vec<GraphBranchRecord>> {
         ensure_graph_read_batch_size(names.len())?;
         let mut connection = self.connect().await?;
-        super::branch::load_graph_branch_records(&mut connection, &self.database_path, Some(names))
+        super::branch::load_graph_branch_records(
+            &mut connection,
+            &self.database_path,
+            Some(names),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn graph_branch_name_high_watermark(&self) -> Result<Option<String>> {
+        let mut connection = self.connect().await?;
+        super::branch::load_graph_branch_name_high_watermark(&mut connection, &self.database_path)
             .await
+    }
+
+    pub async fn graph_branches_page(
+        &self,
+        cursor: Option<&GraphBranchPageCursor>,
+        through: &str,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphBranchPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        let mut branches = super::branch::load_graph_branch_records(
+            &mut connection,
+            &self.database_path,
+            None,
+            cursor.map(|cursor| cursor.name.as_str()),
+            Some(through),
+            Some(page_size.get() + 1),
+        )
+        .await?;
+        let complete = branches.len() <= page_size.get();
+        if !complete {
+            branches.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| GraphBranchPageCursor {
+            name: branches
+                .last()
+                .expect("non-empty graph branch page should have a cursor")
+                .name
+                .clone(),
+        });
+        Ok(GraphBranchPage {
+            branches,
+            next_cursor,
+            complete,
+        })
     }
 
     pub async fn graph_nodes_by_ids(&self, ids: &[String]) -> Result<Vec<Node>> {
@@ -256,6 +315,42 @@ impl SqliteGraphStore {
         ensure_graph_read_batch_size(parent_ids.len())?;
         let mut connection = self.connect().await?;
         load_child_ids_by_parent_ids(&mut connection, &self.database_path, parent_ids).await
+    }
+
+    pub async fn graph_child_ids_page(
+        &self,
+        parent_id: &str,
+        cursor: Option<&GraphChildPageCursor>,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphChildPage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        let mut rows = load_child_ids_page(
+            &mut connection,
+            &self.database_path,
+            parent_id,
+            cursor.map(|cursor| (cursor.created_at.as_str(), cursor.node_id.as_str())),
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = rows.len() <= page_size.get();
+        if !complete {
+            rows.truncate(page_size.get());
+        }
+        let next_cursor = (!complete).then(|| {
+            let (created_at, node_id) = rows
+                .last()
+                .expect("non-empty graph child page should have a cursor");
+            GraphChildPageCursor {
+                created_at: created_at.clone(),
+                node_id: node_id.clone(),
+            }
+        });
+        Ok(GraphChildPage {
+            child_ids: rows.into_iter().map(|(_, node_id)| node_id).collect(),
+            next_cursor,
+            complete,
+        })
     }
 
     async fn new(path: &Path) -> Result<Self> {

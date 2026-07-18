@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use diesel::prelude::*;
-#[cfg(test)]
-use diesel::sql_types::BigInt;
+use diesel::sql_types::{BigInt, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_async::pooled_connection::bb8::Pool as AsyncSqlitePool;
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
@@ -25,8 +25,9 @@ use crate::error::{
 use crate::graph::{GraphEdgeKind, GraphMode, GraphSnapshot};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::layout::{
-    GraphLayout, GraphLayoutEdge, GraphLayoutNode, LayoutHint, diff_graph_viewport_responses,
-    edge_bounds, edge_key, node_bounds, node_key, try_graph_ranks, try_layout_graph_with_hints,
+    GRAPH_PADDING, GraphLayout, GraphLayoutEdge, GraphLayoutNode, LayoutHint,
+    diff_graph_viewport_responses, edge_bounds, edge_key, node_bounds, node_key, try_graph_ranks,
+    try_layout_graph_with_hints,
 };
 use crate::schema::{
     console_graph_edge_routes, console_graph_generation_state, console_graph_materializations,
@@ -37,7 +38,11 @@ const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
 const SQLITE_POOL_MAX_SIZE: u32 = 4;
 const MATERIALIZATION_WRITE_BATCH_SIZE: usize = 128;
 const COORDINATE_SPACE: &str = "graph_layout_v2";
+const INCREMENTAL_BUILD_LEASE_TTL: Duration = Duration::from_secs(120);
+pub(crate) const INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const CONSOLE_GRAPH_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+static INCREMENTAL_BUILD_OWNER_NONCE: AtomicU64 = AtomicU64::new(0);
 
 type AsyncSnapshotConnection = SyncConnectionWrapper<SqliteConnection>;
 type AsyncSnapshotPool = AsyncSqlitePool<AsyncSnapshotConnection>;
@@ -51,6 +56,22 @@ pub struct ConsoleGraphSnapshotStore {
     path: Arc<PathBuf>,
     database: SnapshotDatabase,
     policy: GraphLayoutPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IncrementalBuildLease {
+    generation: i64,
+    owner_id: String,
+}
+
+impl IncrementalBuildLease {
+    pub(crate) fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    pub(crate) fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +98,14 @@ enum MaterializationStrategy {
     Full,
     Local,
     PayloadOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalPublishOutcome {
+    Published,
+    Incomplete,
+    LeaseLost,
+    Superseded,
 }
 
 impl MaterializationStrategy {
@@ -164,7 +193,6 @@ struct StoredEdgeRow {
     max_y: i32,
 }
 
-#[cfg(test)]
 #[derive(Debug, QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = BigInt)]
@@ -191,6 +219,24 @@ struct StoredShellFacts {
     materialization: MaterializationRow,
     nodes: Vec<StoredNodeRow>,
     edge_count: i64,
+    branches: Vec<StoredShellBranchRow>,
+}
+
+#[derive(Debug, Clone, QueryableByName, PartialEq, Eq)]
+struct StoredShellBranchRow {
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    head_id: String,
+    #[diesel(sql_type = Text)]
+    state_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedMaterializationBranch {
+    name: String,
+    head_id: String,
+    state_json: String,
 }
 
 #[derive(Debug, Clone, Insertable, AsChangeset, PartialEq, Eq)]
@@ -255,6 +301,7 @@ pub struct MaterializedGraphShellFacts {
     pub version: u64,
     pub nodes: Vec<MaterializedGraphShellNode>,
     pub edge_count: usize,
+    pub branches: Vec<MaterializedGraphShellBranchFact>,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +310,13 @@ pub struct MaterializedGraphShellNode {
     pub point: Point,
     pub created_at: String,
     pub created_at_ns: i128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializedGraphShellBranchFact {
+    pub name: String,
+    pub head_id: String,
+    pub state: coco_mem::SessionState,
 }
 
 pub struct MaterializedNodeReference {
@@ -347,93 +401,580 @@ impl ConsoleGraphSnapshotStore {
         .await
     }
 
-    pub(crate) async fn prune_inactive_generations(&self) -> crate::Result<()> {
-        let active_generation = self.active_generation().await?;
-        loop {
-            let path = self.path.as_ref().clone();
-            let deleted = self
-                .with_connection(move |connection| {
-                    connection
-                        .transaction::<_, diesel::result::Error, _>(|connection| {
-                            let keys = console_graph_node_locations::table
-                                .filter(
-                                    console_graph_node_locations::generation.ne(active_generation),
-                                )
-                                .select((
-                                    console_graph_node_locations::generation,
-                                    console_graph_node_locations::mode,
-                                    console_graph_node_locations::node_id,
-                                ))
-                                .limit(MATERIALIZATION_WRITE_BATCH_SIZE as i64)
-                                .load::<(i64, String, String)>(connection)?;
-                            for (generation, mode, node_id) in &keys {
-                                diesel::delete(
-                                    console_graph_node_locations::table
-                                        .filter(
-                                            console_graph_node_locations::generation.eq(generation),
-                                        )
-                                        .filter(console_graph_node_locations::mode.eq(mode))
-                                        .filter(console_graph_node_locations::node_id.eq(node_id)),
-                                )
-                                .execute(connection)?;
-                            }
-                            Ok(keys.len())
-                        })
-                        .context(QueryGraphSnapshotStoreSnafu { path })
+    pub(crate) async fn acquire_incremental_build_lease(
+        &self,
+        source_version: u64,
+    ) -> crate::Result<Option<IncrementalBuildLease>> {
+        let path = self.path.as_ref().clone();
+        let owner_id = new_incremental_build_owner_id();
+        let now_ms = unix_time_millis();
+        let expires_at_ms = incremental_build_lease_deadline(now_ms);
+        let expected_version = source_version.min(i64::MAX as u64) as i64;
+        self.with_connection(move |connection| {
+            connection
+                .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                    diesel::sql_query(
+                        "UPDATE console_graph_build_runs SET status = 'abandoned' \
+                         WHERE status = 'building' AND lease_expires_at_ms <= ?",
+                    )
+                    .bind::<BigInt, _>(now_ms)
+                    .execute(connection)?;
+                    let active_builds = diesel::sql_query(
+                        "SELECT COUNT(*) AS count FROM console_graph_build_runs \
+                         WHERE status = 'building'",
+                    )
+                    .get_result::<CountRow>(connection)?
+                    .count;
+                    if active_builds != 0 {
+                        return Ok(None);
+                    }
+
+                    let generation = console_graph_generation_state::table
+                        .filter(console_graph_generation_state::id.eq(1))
+                        .select(console_graph_generation_state::next_generation)
+                        .first::<i64>(connection)?;
+                    diesel::update(
+                        console_graph_generation_state::table
+                            .filter(console_graph_generation_state::id.eq(1)),
+                    )
+                    .set(
+                        console_graph_generation_state::next_generation
+                            .eq(generation.saturating_add(1)),
+                    )
+                    .execute(connection)?;
+                    diesel::sql_query(
+                        "INSERT INTO console_graph_build_runs \
+                         (run_id, source_version, status, owner_id, lease_expires_at_ms) \
+                         VALUES (?, ?, 'building', ?, ?)",
+                    )
+                    .bind::<BigInt, _>(generation)
+                    .bind::<BigInt, _>(expected_version)
+                    .bind::<diesel::sql_types::Text, _>(&owner_id)
+                    .bind::<BigInt, _>(expires_at_ms)
+                    .execute(connection)?;
+                    Ok(Some(IncrementalBuildLease {
+                        generation,
+                        owner_id,
+                    }))
                 })
-                .await?;
-            if deleted == 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        loop {
-            let path = self.path.as_ref().clone();
-            let deleted = self
-                .with_connection(move |connection| {
-                    connection
-                        .transaction::<_, diesel::result::Error, _>(|connection| {
-                            let keys = console_graph_edge_routes::table
-                                .filter(console_graph_edge_routes::generation.ne(active_generation))
-                                .select((
-                                    console_graph_edge_routes::generation,
-                                    console_graph_edge_routes::mode,
-                                    console_graph_edge_routes::edge_key,
-                                ))
-                                .limit(MATERIALIZATION_WRITE_BATCH_SIZE as i64)
-                                .load::<(i64, String, String)>(connection)?;
-                            for (generation, mode, edge_key) in &keys {
-                                diesel::delete(
-                                    console_graph_edge_routes::table
-                                        .filter(
-                                            console_graph_edge_routes::generation.eq(generation),
-                                        )
-                                        .filter(console_graph_edge_routes::mode.eq(mode))
-                                        .filter(console_graph_edge_routes::edge_key.eq(edge_key)),
-                                )
-                                .execute(connection)?;
-                            }
-                            Ok(keys.len())
-                        })
-                        .context(QueryGraphSnapshotStoreSnafu { path })
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn renew_incremental_build_lease(
+        &self,
+        lease: &IncrementalBuildLease,
+    ) -> crate::Result<bool> {
+        let path = self.path.as_ref().clone();
+        let generation = lease.generation;
+        let owner_id = lease.owner_id.clone();
+        let expires_at_ms = incremental_build_lease_deadline(unix_time_millis());
+        self.with_connection(move |connection| {
+            diesel::sql_query(
+                "UPDATE console_graph_build_runs SET lease_expires_at_ms = ? \
+                 WHERE run_id = ? AND owner_id = ? AND status = 'building'",
+            )
+            .bind::<BigInt, _>(expires_at_ms)
+            .bind::<BigInt, _>(generation)
+            .bind::<diesel::sql_types::Text, _>(owner_id)
+            .execute(connection)
+            .map(|updated| updated == 1)
+            .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn abandon_incremental_build(
+        &self,
+        lease: &IncrementalBuildLease,
+    ) -> crate::Result<bool> {
+        let path = self.path.as_ref().clone();
+        let generation = lease.generation;
+        let owner_id = lease.owner_id.clone();
+        self.with_connection(move |connection| {
+            connection
+                .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                    let updated = diesel::sql_query(
+                        "UPDATE console_graph_build_runs SET status = 'abandoned' \
+                         WHERE run_id = ? AND owner_id = ? AND status = 'building'",
+                    )
+                    .bind::<BigInt, _>(generation)
+                    .bind::<diesel::sql_types::Text, _>(owner_id)
+                    .execute(connection)?;
+                    if updated == 1 {
+                        diesel::sql_query(
+                            "UPDATE console_graph_branch_build_state \
+                             SET inflight_head_id = NULL, build_generation = NULL \
+                             WHERE build_generation = ?",
+                        )
+                        .bind::<BigInt, _>(generation)
+                        .execute(connection)?;
+                    }
+                    Ok(updated == 1)
                 })
-                .await?;
-            if deleted == 0 {
-                break;
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn cleanup_abandoned_generations(&self) -> crate::Result<()> {
+        let path = self.path.as_ref().clone();
+        let now_ms = unix_time_millis();
+        self.with_connection(move |connection| {
+            connection
+                .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                    diesel::sql_query(
+                        "UPDATE console_graph_build_runs SET status = 'abandoned' \
+                         WHERE status = 'building' AND lease_expires_at_ms <= ?",
+                    )
+                    .bind::<BigInt, _>(now_ms)
+                    .execute(connection)?;
+                    diesel::sql_query(
+                        "UPDATE console_graph_branch_build_state \
+                         SET inflight_head_id = NULL, build_generation = NULL \
+                         WHERE build_generation IN (\
+                             SELECT run_id FROM console_graph_build_runs \
+                             WHERE status = 'abandoned'\
+                         )",
+                    )
+                    .execute(connection)?;
+                    Ok(())
+                })
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await?;
+
+        for table in [
+            "console_graph_node_locations",
+            "console_graph_edge_routes",
+            "console_graph_edge_ports",
+            "console_graph_anchor_scopes",
+            "console_graph_anchor_scope_manifests",
+            "console_graph_materializations",
+            "console_graph_materialization_branches",
+        ] {
+            loop {
+                let path = self.path.as_ref().clone();
+                let query = format!(
+                    "DELETE FROM {table} WHERE rowid IN (\
+                         SELECT rows.rowid FROM {table} AS rows \
+                         INNER JOIN console_graph_build_runs AS runs \
+                             ON runs.run_id = rows.generation \
+                         INNER JOIN console_graph_generation_state AS state ON state.id = 1 \
+                         WHERE runs.status = 'abandoned' \
+                           AND rows.generation <> state.active_generation \
+                         LIMIT ?\
+                     )"
+                );
+                let deleted = self
+                    .with_connection(move |connection| {
+                        diesel::sql_query(query)
+                            .bind::<BigInt, _>(MATERIALIZATION_WRITE_BATCH_SIZE as i64)
+                            .execute(connection)
+                            .context(QueryGraphSnapshotStoreSnafu { path })
+                    })
+                    .await?;
+                if deleted == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
         }
+
         let path = self.path.as_ref().clone();
         self.with_connection(move |connection| {
-            diesel::delete(
-                console_graph_materializations::table
-                    .filter(console_graph_materializations::generation.ne(active_generation)),
+            diesel::sql_query(
+                "DELETE FROM console_graph_build_runs \
+                 WHERE status = 'abandoned' \
+                   AND run_id <> (\
+                       SELECT active_generation FROM console_graph_generation_state WHERE id = 1\
+                   )",
             )
             .execute(connection)
             .map(|_| ())
             .context(QueryGraphSnapshotStoreSnafu { path })
         })
         .await
+    }
+
+    pub(crate) async fn cleanup_completed_build_work(&self) -> crate::Result<()> {
+        for table in [
+            "console_graph_build_nodes",
+            "console_graph_build_anchor_edges",
+            "console_graph_build_frontier",
+            "console_graph_build_rank_slots",
+            "console_graph_build_edge_ports",
+        ] {
+            loop {
+                let path = self.path.as_ref().clone();
+                let query = format!(
+                    "DELETE FROM {table} WHERE rowid IN (\
+                         SELECT rows.rowid FROM {table} AS rows \
+                         INNER JOIN console_graph_build_runs AS runs \
+                             ON runs.run_id = rows.run_id \
+                         WHERE runs.status = 'completed' \
+                         LIMIT ?\
+                     )"
+                );
+                let deleted = self
+                    .with_connection(move |connection| {
+                        diesel::sql_query(query)
+                            .bind::<BigInt, _>(MATERIALIZATION_WRITE_BATCH_SIZE as i64)
+                            .execute(connection)
+                            .context(QueryGraphSnapshotStoreSnafu { path })
+                    })
+                    .await?;
+                if deleted == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            diesel::sql_query(
+                "DELETE FROM console_graph_build_runs \
+                 WHERE status = 'completed' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM console_graph_build_nodes \
+                       WHERE run_id = console_graph_build_runs.run_id \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM console_graph_build_anchor_edges \
+                       WHERE run_id = console_graph_build_runs.run_id \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM console_graph_build_frontier \
+                       WHERE run_id = console_graph_build_runs.run_id \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM console_graph_build_rank_slots \
+                       WHERE run_id = console_graph_build_runs.run_id \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM console_graph_build_edge_ports \
+                       WHERE run_id = console_graph_build_runs.run_id \
+                   )",
+            )
+            .execute(connection)
+            .map(|_| ())
+            .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn cleanup_obsolete_generations(&self) -> crate::Result<()> {
+        for table in [
+            "console_graph_node_locations",
+            "console_graph_edge_routes",
+            "console_graph_edge_ports",
+            "console_graph_anchor_scopes",
+            "console_graph_anchor_scope_manifests",
+            "console_graph_materializations",
+            "console_graph_materialization_branches",
+        ] {
+            loop {
+                let path = self.path.as_ref().clone();
+                let query = format!(
+                    "DELETE FROM {table} WHERE rowid IN (\
+                         SELECT rows.rowid FROM {table} AS rows \
+                         INNER JOIN console_graph_generation_state AS state ON state.id = 1 \
+                         WHERE rows.generation <> state.active_generation \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM console_graph_build_runs AS runs \
+                               WHERE runs.run_id = rows.generation \
+                                 AND runs.status = 'building' \
+                           ) \
+                         LIMIT ?\
+                     )"
+                );
+                let deleted = self
+                    .with_connection(move |connection| {
+                        connection
+                            .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                                diesel::sql_query(query)
+                                    .bind::<BigInt, _>(MATERIALIZATION_WRITE_BATCH_SIZE as i64)
+                                    .execute(connection)
+                            })
+                            .context(QueryGraphSnapshotStoreSnafu { path })
+                    })
+                    .await?;
+                if deleted == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn write_incremental_batch(
+        &self,
+        generation: i64,
+        mode: GraphMode,
+        nodes: Vec<GraphLayoutNode>,
+        edges: Vec<GraphLayoutEdge>,
+    ) -> crate::Result<()> {
+        let nodes = nodes
+            .iter()
+            .map(PersistedNode::try_from)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let edges = edges.iter().map(PersistedEdge::from).collect::<Vec<_>>();
+
+        for batch in nodes.chunks(MATERIALIZATION_WRITE_BATCH_SIZE) {
+            let batch = batch.to_vec();
+            let path = self.path.as_ref().clone();
+            self.with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        for node in &batch {
+                            upsert_node(connection, generation, mode, node)?;
+                        }
+                        Ok(())
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await?;
+            tokio::task::yield_now().await;
+        }
+
+        for batch in edges.chunks(MATERIALIZATION_WRITE_BATCH_SIZE) {
+            let batch = batch.to_vec();
+            let path = self.path.as_ref().clone();
+            self.with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        for edge in &batch {
+                            upsert_edge(connection, generation, mode, edge)?;
+                        }
+                        Ok(())
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await?;
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_incremental_mode(
+        &self,
+        generation: i64,
+        source_version: u64,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            connection
+                .transaction::<_, diesel::result::Error, _>(|connection| {
+                    let node_max_x = console_graph_node_locations::table
+                        .filter(console_graph_node_locations::generation.eq(generation))
+                        .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+                        .select(diesel::dsl::max(console_graph_node_locations::max_x))
+                        .first::<Option<i32>>(connection)?;
+                    let node_max_y = console_graph_node_locations::table
+                        .filter(console_graph_node_locations::generation.eq(generation))
+                        .filter(console_graph_node_locations::mode.eq(mode.as_query_value()))
+                        .select(diesel::dsl::max(console_graph_node_locations::max_y))
+                        .first::<Option<i32>>(connection)?;
+                    let edge_max_x = console_graph_edge_routes::table
+                        .filter(console_graph_edge_routes::generation.eq(generation))
+                        .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+                        .select(diesel::dsl::max(console_graph_edge_routes::max_x))
+                        .first::<Option<i32>>(connection)?;
+                    let edge_max_y = console_graph_edge_routes::table
+                        .filter(console_graph_edge_routes::generation.eq(generation))
+                        .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
+                        .select(diesel::dsl::max(console_graph_edge_routes::max_y))
+                        .first::<Option<i32>>(connection)?;
+                    let width = node_max_x
+                        .into_iter()
+                        .chain(edge_max_x)
+                        .max()
+                        .unwrap_or(GRAPH_PADDING)
+                        .max(GRAPH_PADDING)
+                        .saturating_add(GRAPH_PADDING);
+                    let height = node_max_y
+                        .into_iter()
+                        .chain(edge_max_y)
+                        .max()
+                        .unwrap_or(GRAPH_PADDING)
+                        .max(GRAPH_PADDING)
+                        .saturating_add(GRAPH_PADDING);
+                    upsert_materialization(
+                        connection,
+                        generation,
+                        mode,
+                        source_version,
+                        width,
+                        height,
+                    )
+                })
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn publish_incremental_ports(
+        &self,
+        generation: i64,
+        run_id: i64,
+    ) -> crate::Result<()> {
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            connection
+                .transaction::<_, diesel::result::Error, _>(|connection| {
+                    diesel::sql_query("DELETE FROM console_graph_edge_ports WHERE generation = ?")
+                        .bind::<BigInt, _>(generation)
+                        .execute(connection)?;
+                    diesel::sql_query(
+                        "INSERT INTO console_graph_edge_ports (\
+                             generation, mode, edge_key, source_id, target_id, \
+                             source_slot, target_slot\
+                         ) \
+                         SELECT ?, mode, edge_key, source_id, target_id, source_slot, target_slot \
+                         FROM console_graph_build_edge_ports \
+                         WHERE run_id = ? AND active = 1",
+                    )
+                    .bind::<BigInt, _>(generation)
+                    .bind::<BigInt, _>(run_id)
+                    .execute(connection)?;
+                    Ok(())
+                })
+                .context(QueryGraphSnapshotStoreSnafu { path })
+        })
+        .await
+    }
+
+    pub(crate) async fn publish_incremental_generation(
+        &self,
+        lease: &IncrementalBuildLease,
+        source_version: u64,
+    ) -> crate::Result<()> {
+        let path = self.path.as_ref().clone();
+        let generation = lease.generation;
+        let owner_id = lease.owner_id.clone();
+        let expected_version = source_version.min(i64::MAX as u64) as i64;
+        let now_ms = unix_time_millis();
+        let outcome = self
+            .with_connection(move |connection| {
+                connection
+                    .immediate_transaction::<_, diesel::result::Error, _>(|connection| {
+                        let owned = diesel::sql_query(
+                            "SELECT COUNT(*) AS count FROM console_graph_build_runs \
+                             WHERE run_id = ? AND owner_id = ? AND status = 'building' \
+                               AND lease_expires_at_ms > ?",
+                        )
+                        .bind::<BigInt, _>(generation)
+                        .bind::<diesel::sql_types::Text, _>(&owner_id)
+                        .bind::<BigInt, _>(now_ms)
+                        .get_result::<CountRow>(connection)?
+                        .count
+                            == 1;
+                        if !owned {
+                            return Ok(IncrementalPublishOutcome::LeaseLost);
+                        }
+
+                        let active_generation = query_active_generation(connection)?;
+                        let active_version = console_graph_materializations::table
+                            .filter(
+                                console_graph_materializations::generation.eq(active_generation),
+                            )
+                            .select(diesel::dsl::max(
+                                console_graph_materializations::source_version,
+                            ))
+                            .first::<Option<i64>>(connection)?;
+                        if active_version.is_some_and(|version| version > expected_version) {
+                            return Ok(IncrementalPublishOutcome::Superseded);
+                        }
+
+                        let modes = console_graph_materializations::table
+                            .filter(console_graph_materializations::generation.eq(generation))
+                            .filter(
+                                console_graph_materializations::source_version.eq(expected_version),
+                            )
+                            .filter(
+                                console_graph_materializations::coordinate_space
+                                    .eq(COORDINATE_SPACE),
+                            )
+                            .select(console_graph_materializations::mode)
+                            .load::<String>(connection)?;
+                        let complete = modes.into_iter().collect::<BTreeSet<_>>()
+                            == BTreeSet::from([
+                                GraphMode::Anchors.as_query_value().to_owned(),
+                                GraphMode::All.as_query_value().to_owned(),
+                            ]);
+                        if !complete {
+                            return Ok(IncrementalPublishOutcome::Incomplete);
+                        }
+
+                        diesel::update(
+                            console_graph_generation_state::table
+                                .filter(console_graph_generation_state::id.eq(1)),
+                        )
+                        .set(console_graph_generation_state::active_generation.eq(generation))
+                        .execute(connection)?;
+                        diesel::sql_query(
+                            "UPDATE console_graph_branch_build_state \
+                             SET published_head_id = inflight_head_id, \
+                                 inflight_head_id = NULL, build_generation = NULL \
+                             WHERE build_generation = ?",
+                        )
+                        .bind::<BigInt, _>(generation)
+                        .execute(connection)?;
+                        diesel::sql_query(
+                            "DELETE FROM console_graph_branch_build_state \
+                             WHERE NOT EXISTS ( \
+                                 SELECT 1 FROM console_graph_source_branches AS branches \
+                                 WHERE branches.name = \
+                                     console_graph_branch_build_state.branch_name \
+                             )",
+                        )
+                        .execute(connection)?;
+                        let completed = diesel::sql_query(
+                            "UPDATE console_graph_build_runs \
+                             SET status = 'completed', \
+                                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                             WHERE run_id = ? AND owner_id = ? AND status = 'building'",
+                        )
+                        .bind::<BigInt, _>(generation)
+                        .bind::<diesel::sql_types::Text, _>(owner_id)
+                        .execute(connection)?;
+                        if completed != 1 {
+                            return Err(diesel::result::Error::NotFound);
+                        }
+                        Ok(IncrementalPublishOutcome::Published)
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu { path })
+            })
+            .await?;
+        ensure!(
+            outcome != IncrementalPublishOutcome::LeaseLost,
+            InvalidGraphSnapshotStoreValueSnafu {
+                column: "incremental_build_lease",
+                value: format!("generation {generation} is not owned by the publisher"),
+            }
+        );
+        ensure!(
+            outcome != IncrementalPublishOutcome::Incomplete,
+            InvalidGraphSnapshotStoreValueSnafu {
+                column: "generation",
+                value: format!(
+                    "{generation} does not contain both graph modes for source version {source_version}"
+                ),
+            }
+        );
+        ensure!(
+            outcome != IncrementalPublishOutcome::Superseded,
+            InvalidGraphSnapshotStoreValueSnafu {
+                column: "source_version",
+                value: format!(
+                    "generation {generation} source version {source_version} is older than the active generation"
+                ),
+            }
+        );
+        Ok(())
     }
 
     pub(crate) async fn activate_generation(
@@ -571,6 +1112,10 @@ impl ConsoleGraphSnapshotStore {
         let outcome = self
             .write_materialization(generation, snapshot.version, snapshot.mode, plan, previous)
             .await?;
+        if matches!(&outcome, MaterializationWriteOutcome::Committed { .. }) {
+            self.snapshot_materialization_branches(generation, snapshot)
+                .await?;
+        }
         match outcome {
             MaterializationWriteOutcome::Committed {
                 strategy,
@@ -680,6 +1225,8 @@ impl ConsoleGraphSnapshotStore {
                 .context(QueryGraphSnapshotStoreSnafu { path })
         })
         .await?;
+        self.snapshot_materialization_branches(generation, snapshot)
+            .await?;
         tracing::info!(
             mode = ?snapshot.mode,
             source_version = snapshot.version,
@@ -830,6 +1377,22 @@ impl ConsoleGraphSnapshotStore {
                     .cmp(&right.created_at_ns)
                     .then_with(|| left.node_id.cmp(&right.node_id))
             });
+            let branches = stored
+                .branches
+                .into_iter()
+                .map(|row| {
+                    let state = serde_json::from_str(&row.state_json).context(
+                        ParseGraphSnapshotStoreValueSnafu {
+                            column: "state_json",
+                        },
+                    )?;
+                    Ok(MaterializedGraphShellBranchFact {
+                        name: row.name,
+                        head_id: row.head_id,
+                        state,
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
             Ok(Some(MaterializedGraphShellFacts {
                 version: stored.materialization.source_version.max(0) as u64,
                 nodes: stored
@@ -843,7 +1406,57 @@ impl ConsoleGraphSnapshotStore {
                     })
                     .collect(),
                 edge_count: stored.edge_count.max(0) as usize,
+                branches,
             }))
+        })
+        .await
+    }
+
+    async fn snapshot_materialization_branches(
+        &self,
+        generation: i64,
+        snapshot: &GraphSnapshot,
+    ) -> crate::Result<()> {
+        let branches = snapshot
+            .branches
+            .iter()
+            .map(|branch| {
+                Ok(PersistedMaterializationBranch {
+                    name: branch.name.clone(),
+                    head_id: branch.head_id.clone(),
+                    state_json: serde_json::to_string(&branch.state).context(
+                        SerializeGraphSnapshotStoreValueSnafu {
+                            column: "state_json",
+                        },
+                    )?,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let path = self.path.as_ref().clone();
+        self.with_connection(move |connection| {
+            connection
+                .transaction::<_, diesel::result::Error, _>(|connection| {
+                    diesel::sql_query(
+                        "DELETE FROM console_graph_materialization_branches \
+                         WHERE generation = ?",
+                    )
+                    .bind::<BigInt, _>(generation)
+                    .execute(connection)?;
+                    for branch in branches {
+                        diesel::sql_query(
+                            "INSERT INTO console_graph_materialization_branches \
+                             (generation, name, head_id, state_json) \
+                             VALUES (?, ?, ?, ?)",
+                        )
+                        .bind::<BigInt, _>(generation)
+                        .bind::<Text, _>(branch.name)
+                        .bind::<Text, _>(branch.head_id)
+                        .bind::<Text, _>(branch.state_json)
+                        .execute(connection)?;
+                    }
+                    Ok(())
+                })
+                .context(QueryGraphSnapshotStoreSnafu { path })
         })
         .await
     }
@@ -1105,10 +1718,19 @@ fn query_shell_facts(
         .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
         .count()
         .get_result(connection)?;
+    let branches = diesel::sql_query(
+        "SELECT name, head_id, state_json \
+         FROM console_graph_materialization_branches \
+         WHERE generation = ? \
+         ORDER BY CASE WHEN name = 'main' THEN 0 ELSE 1 END, name",
+    )
+    .bind::<BigInt, _>(generation)
+    .load::<StoredShellBranchRow>(connection)?;
     Ok(Some(StoredShellFacts {
         materialization,
         nodes,
         edge_count,
+        branches,
     }))
 }
 
@@ -1669,6 +2291,30 @@ fn saturating_i64(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+fn unix_time_millis() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    millis.min(i64::MAX as u128) as i64
+}
+
+fn incremental_build_lease_deadline(now_ms: i64) -> i64 {
+    let ttl_ms = INCREMENTAL_BUILD_LEASE_TTL
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    now_ms.saturating_add(ttl_ms)
+}
+
+fn new_incremental_build_owner_id() -> String {
+    let nonce = INCREMENTAL_BUILD_OWNER_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{now_ms}-{nonce}",
+        std::process::id(),
+        now_ms = unix_time_millis(),
+    )
+}
+
 pub fn database_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(SQLITE_DATABASE_FILE_NAME)
 }
@@ -1684,6 +2330,20 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, QueryableByName)]
+    struct IncrementalPublishStateRow {
+        #[diesel(sql_type = BigInt)]
+        active_generation: i64,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        status: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        published_head_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        inflight_head_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
+        build_generation: Option<i64>,
+    }
 
     fn node(index: usize) -> GraphNode {
         let id = format!("node-{index:04}");
@@ -1830,6 +2490,15 @@ mod tests {
             .iter()
             .map(PersistedEdge::from)
             .collect::<Vec<_>>();
+        let branches = snapshot
+            .branches
+            .iter()
+            .map(|branch| PersistedMaterializationBranch {
+                name: branch.name.clone(),
+                head_id: branch.head_id.clone(),
+                state_json: serde_json::to_string(&branch.state).unwrap(),
+            })
+            .collect::<Vec<_>>();
         connection.transaction(|connection| {
             let generation = query_active_generation(connection)?;
             delete_mode_rows(connection, generation, snapshot.mode)?;
@@ -1838,6 +2507,22 @@ mod tests {
             }
             for edge in &edges {
                 upsert_edge(connection, generation, snapshot.mode, edge)?;
+            }
+            diesel::sql_query(
+                "DELETE FROM console_graph_materialization_branches WHERE generation = ?",
+            )
+            .bind::<BigInt, _>(generation)
+            .execute(connection)?;
+            for branch in &branches {
+                diesel::sql_query(
+                    "INSERT INTO console_graph_materialization_branches \
+                     (generation, name, head_id, state_json) VALUES (?, ?, ?, ?)",
+                )
+                .bind::<BigInt, _>(generation)
+                .bind::<Text, _>(&branch.name)
+                .bind::<Text, _>(&branch.head_id)
+                .bind::<Text, _>(&branch.state_json)
+                .execute(connection)?;
             }
             upsert_materialization(
                 connection,
@@ -1993,6 +2678,9 @@ mod tests {
         assert_eq!(facts.materialization.source_version, 1);
         assert_eq!(facts.nodes.len(), 2);
         assert_eq!(facts.edge_count, 1);
+        assert_eq!(facts.branches.len(), 1);
+        assert_eq!(facts.branches[0].name, "main");
+        assert_eq!(facts.branches[0].head_id, "node-0001");
         assert_eq!(
             query_materialization_row(&mut reader, GraphMode::All)
                 .unwrap()
@@ -2224,6 +2912,389 @@ mod tests {
                 .unwrap(),
             Some(2)
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incremental_staging_is_invisible_and_supports_an_empty_mode() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::Anchors, 2))
+            .await
+            .unwrap();
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::All, 2))
+            .await
+            .unwrap();
+
+        let baseline_generation = store.active_generation().await.unwrap();
+        let generation = store.allocate_staging_generation().await.unwrap();
+        let layout = layout_graph(&linear_snapshot(2, GraphMode::All, 3));
+        store
+            .write_incremental_batch(generation, GraphMode::All, layout.nodes, layout.edges)
+            .await
+            .unwrap();
+        store
+            .finish_incremental_mode(generation, 2, GraphMode::All)
+            .await
+            .unwrap();
+        store
+            .finish_incremental_mode(generation, 2, GraphMode::Anchors)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.active_generation().await.unwrap(),
+            baseline_generation
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::All)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .latest_materialization_version(GraphMode::Anchors)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        store.activate_generation(generation, 2).await.unwrap();
+
+        let all = store
+            .latest_viewport(GraphMode::All, GraphViewportRequest::default())
+            .await
+            .unwrap()
+            .unwrap();
+        let anchors = store
+            .latest_viewport(GraphMode::Anchors, GraphViewportRequest::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all.version, 2);
+        assert_eq!(all.nodes.len(), 3);
+        assert_eq!(anchors.version, 2);
+        assert_eq!(anchors.nodes, Vec::new());
+        assert_eq!(anchors.edges, Vec::new());
+        assert_eq!(
+            anchors.canvas,
+            GraphCanvas {
+                width: GRAPH_PADDING * 2,
+                height: GRAPH_PADDING * 2,
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incremental_port_publication_and_pruning_track_active_generation() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        let lease = store
+            .acquire_incremental_build_lease(2)
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = lease.generation();
+        store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "INSERT INTO console_graph_build_edge_ports \
+                     (run_id, mode, edge_key, source_id, target_id, source_slot, target_slot, active) \
+                     VALUES \
+                     (?, 'all', 'edge:active', 'source', 'active', 0, 0, 1), \
+                     (?, 'all', 'edge:inactive', 'source', 'inactive', 1, 1, 0)",
+                )
+                .bind::<BigInt, _>(generation)
+                .bind::<BigInt, _>(generation)
+                .execute(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("port-publication"),
+                })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        store
+            .publish_incremental_ports(generation, generation)
+            .await
+            .unwrap();
+
+        let published = store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM console_graph_edge_ports \
+                     WHERE generation = ?",
+                )
+                .bind::<BigInt, _>(generation)
+                .get_result::<CountRow>(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("port-publication"),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(published.count, 1);
+
+        store.cleanup_abandoned_generations().await.unwrap();
+        let retained = store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM console_graph_edge_ports \
+                     WHERE generation = ?",
+                )
+                .bind::<BigInt, _>(generation)
+                .get_result::<CountRow>(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("port-retention"),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(retained.count, 1);
+
+        assert!(store.abandon_incremental_build(&lease).await.unwrap());
+        store.cleanup_abandoned_generations().await.unwrap();
+
+        let remaining = store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM console_graph_edge_ports \
+                     WHERE generation = ?",
+                )
+                .bind::<BigInt, _>(generation)
+                .get_result::<CountRow>(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("port-pruning"),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining.count, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn incremental_publish_atomically_switches_generation_branch_state_and_run() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        let baseline_generation = store.active_generation().await.unwrap();
+        let lease = store
+            .acquire_incremental_build_lease(11)
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = lease.generation();
+        store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "INSERT INTO console_graph_source_branches \
+                     (name, head_id, state_json, contribution_generation) \
+                     VALUES ('main', 'head-new', '{}', 1)",
+                )
+                .execute(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("atomic-publish-setup"),
+                })?;
+                diesel::sql_query(
+                    "INSERT INTO console_graph_branch_build_state \
+                     (branch_name, desired_head_id, inflight_head_id, \
+                      published_head_id, build_generation) \
+                     VALUES ('main', 'head-new', 'head-new', 'head-old', ?)",
+                )
+                .bind::<BigInt, _>(generation)
+                .execute(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("atomic-publish-setup"),
+                })?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .finish_incremental_mode(generation, 11, GraphMode::All)
+            .await
+            .unwrap();
+
+        let error = store
+            .publish_incremental_generation(&lease, 11)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::InvalidGraphSnapshotStoreValue { .. }
+        ));
+        let before = incremental_publish_state(&store, generation).await;
+        assert_eq!(before.active_generation, baseline_generation);
+        assert_eq!(before.status, "building");
+        assert_eq!(before.published_head_id.as_deref(), Some("head-old"));
+        assert_eq!(before.inflight_head_id.as_deref(), Some("head-new"));
+        assert_eq!(before.build_generation, Some(generation));
+
+        store
+            .finish_incremental_mode(generation, 11, GraphMode::Anchors)
+            .await
+            .unwrap();
+        store
+            .publish_incremental_generation(&lease, 11)
+            .await
+            .unwrap();
+
+        let after = incremental_publish_state(&store, generation).await;
+        assert_eq!(after.active_generation, generation);
+        assert_eq!(after.status, "completed");
+        assert_eq!(after.published_head_id.as_deref(), Some("head-new"));
+        assert_eq!(after.inflight_head_id, None);
+        assert_eq!(after.build_generation, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_lease_excludes_competitors_and_only_expired_staging_is_cleaned() {
+        let dir = temp_dir();
+        let first_store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        let second_store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        let first = first_store
+            .acquire_incremental_build_lease(7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            second_store
+                .acquire_incremental_build_lease(7)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        first_store
+            .finish_incremental_mode(first.generation(), 7, GraphMode::All)
+            .await
+            .unwrap();
+
+        second_store.cleanup_abandoned_generations().await.unwrap();
+        assert_eq!(
+            generation_materialization_count(&second_store, first.generation()).await,
+            1
+        );
+
+        let expired_generation = first.generation();
+        first_store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "UPDATE console_graph_build_runs SET lease_expires_at_ms = 0 \
+                     WHERE run_id = ?",
+                )
+                .bind::<BigInt, _>(expired_generation)
+                .execute(connection)
+                .map(|_| ())
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("expire-build-lease"),
+                })
+            })
+            .await
+            .unwrap();
+        let second = second_store
+            .acquire_incremental_build_lease(8)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.generation(), second.generation());
+        assert!(
+            !first_store
+                .renew_incremental_build_lease(&first)
+                .await
+                .unwrap()
+        );
+
+        second_store.cleanup_abandoned_generations().await.unwrap();
+        assert_eq!(
+            generation_materialization_count(&second_store, first.generation()).await,
+            0
+        );
+        assert!(
+            second_store
+                .renew_incremental_build_lease(&second)
+                .await
+                .unwrap()
+        );
+        assert!(
+            second_store
+                .abandon_incremental_build(&second)
+                .await
+                .unwrap()
+        );
+        second_store.cleanup_abandoned_generations().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn obsolete_cleanup_keeps_the_active_and_leased_generations() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+
+        let first = store
+            .acquire_incremental_build_lease(1)
+            .await
+            .unwrap()
+            .unwrap();
+        for mode in [GraphMode::Anchors, GraphMode::All] {
+            store
+                .finish_incremental_mode(first.generation(), 1, mode)
+                .await
+                .unwrap();
+        }
+        store
+            .publish_incremental_generation(&first, 1)
+            .await
+            .unwrap();
+
+        let second = store
+            .acquire_incremental_build_lease(2)
+            .await
+            .unwrap()
+            .unwrap();
+        for mode in [GraphMode::Anchors, GraphMode::All] {
+            store
+                .finish_incremental_mode(second.generation(), 2, mode)
+                .await
+                .unwrap();
+        }
+        store
+            .publish_incremental_generation(&second, 2)
+            .await
+            .unwrap();
+
+        let staging = store
+            .acquire_incremental_build_lease(3)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish_incremental_mode(staging.generation(), 3, GraphMode::All)
+            .await
+            .unwrap();
+
+        store.cleanup_obsolete_generations().await.unwrap();
+        assert_eq!(
+            generation_materialization_count(&store, first.generation()).await,
+            0
+        );
+        assert_eq!(
+            generation_materialization_count(&store, second.generation()).await,
+            2
+        );
+        assert_eq!(
+            generation_materialization_count(&store, staging.generation()).await,
+            1
+        );
+
+        assert!(store.abandon_incremental_build(&staging).await.unwrap());
+        store.cleanup_abandoned_generations().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2521,6 +3592,55 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    async fn incremental_publish_state(
+        store: &ConsoleGraphSnapshotStore,
+        generation: i64,
+    ) -> IncrementalPublishStateRow {
+        store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "SELECT generation_state.active_generation AS active_generation, \
+                            runs.status AS status, \
+                            branches.published_head_id AS published_head_id, \
+                            branches.inflight_head_id AS inflight_head_id, \
+                            branches.build_generation AS build_generation \
+                     FROM console_graph_generation_state AS generation_state \
+                     INNER JOIN console_graph_build_runs AS runs ON runs.run_id = ? \
+                     INNER JOIN console_graph_branch_build_state AS branches \
+                         ON branches.branch_name = 'main' \
+                     WHERE generation_state.id = 1",
+                )
+                .bind::<BigInt, _>(generation)
+                .get_result::<IncrementalPublishStateRow>(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("incremental-publish-state"),
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn generation_materialization_count(
+        store: &ConsoleGraphSnapshotStore,
+        generation: i64,
+    ) -> i64 {
+        store
+            .with_connection(move |connection| {
+                diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM console_graph_materializations \
+                     WHERE generation = ?",
+                )
+                .bind::<BigInt, _>(generation)
+                .get_result::<CountRow>(connection)
+                .context(QueryGraphSnapshotStoreSnafu {
+                    path: PathBuf::from("generation-materialization-count"),
+                })
+            })
+            .await
+            .unwrap()
+            .count
     }
 
     fn temp_dir() -> PathBuf {

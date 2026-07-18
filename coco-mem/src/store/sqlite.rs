@@ -20,6 +20,31 @@ pub struct GraphBranchRecord {
     pub state: SessionState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBranchPageCursor {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBranchPage {
+    pub branches: Vec<GraphBranchRecord>,
+    pub next_cursor: Option<GraphBranchPageCursor>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphChildPageCursor {
+    pub created_at: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphChildPage {
+    pub child_ids: Vec<String>,
+    pub next_cursor: Option<GraphChildPageCursor>,
+    pub complete: bool,
+}
+
 mod branch;
 mod codec;
 mod database;
@@ -69,6 +94,7 @@ struct SqliteDatabase {
 struct SqliteDatabaseInner {
     database_path: PathBuf,
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
+    wal_journal_mode_enabled: tokio::sync::OnceCell<()>,
     initialized_root_id: tokio::sync::OnceCell<String>,
 }
 

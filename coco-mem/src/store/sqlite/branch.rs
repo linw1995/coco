@@ -58,6 +58,9 @@ pub async fn load_graph_branch_records(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     names: Option<&[String]>,
+    after: Option<&str>,
+    through: Option<&str>,
+    limit: Option<usize>,
 ) -> Result<Vec<GraphBranchRecord>> {
     let mut query = branches::table
         .inner_join(sessions::table.on(sessions::branch_name.eq(branches::name)))
@@ -76,6 +79,15 @@ pub async fn load_graph_branch_records(
             return Ok(Vec::new());
         }
         query = query.filter(branches::name.eq_any(names));
+    }
+    if let Some(after) = after {
+        query = query.filter(branches::name.gt(after));
+    }
+    if let Some(through) = through {
+        query = query.filter(branches::name.le(through));
+    }
+    if let Some(limit) = limit {
+        query = query.limit(limit as i64);
     }
     query
         .order(branches::name)
@@ -104,6 +116,22 @@ pub async fn load_graph_branch_records(
             })
         })
         .collect()
+}
+
+pub async fn load_graph_branch_name_high_watermark(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<Option<String>> {
+    branches::table
+        .inner_join(sessions::table.on(sessions::branch_name.eq(branches::name)))
+        .select(branches::name)
+        .order(branches::name.desc())
+        .first::<String>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
 }
 
 async fn load_session_states(

@@ -9,12 +9,22 @@ mod host {
     pub mod cache;
     pub mod config;
     pub mod error;
+    #[allow(dead_code)]
+    pub mod frontier;
     pub mod graph;
+    pub mod incremental_build;
+    #[allow(dead_code)]
+    pub mod incremental_layout;
+    #[allow(dead_code)]
+    pub mod incremental_store;
+    #[allow(dead_code)]
     pub mod layout;
     pub mod publisher;
     pub mod render;
     pub mod server;
+    #[allow(dead_code)]
     pub mod snapshot_store;
+    #[allow(dead_code)]
     pub mod source_cache;
     pub mod store;
 

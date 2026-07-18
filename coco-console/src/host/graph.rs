@@ -13,7 +13,7 @@ use crate::error::StoreSnafu;
 
 const SUMMARY_LIMIT: usize = 140;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphMode {
     Anchors,
@@ -1191,10 +1191,14 @@ pub fn node_target_id(node_id: &str) -> String {
 fn render_graph_labels(labels: &[GraphBranchLabel]) -> Vec<String> {
     let mut labels = labels
         .iter()
-        .map(|label| format!("{}{}", label.branch, format_state_suffix(&label.state)))
+        .map(|label| graph_branch_label(&label.branch, &label.state))
         .collect::<Vec<_>>();
     labels.sort();
     labels
+}
+
+pub(crate) fn graph_branch_label(branch: &str, state: &SessionState) -> String {
+    format!("{branch}{}", format_state_suffix(state))
 }
 
 fn format_state_suffix(state: &SessionState) -> String {

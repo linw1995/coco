@@ -23,6 +23,7 @@ use diesel::connection::InstrumentationEvent;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tokio::sync::{Barrier, oneshot};
@@ -789,6 +790,199 @@ async fn graph_read_api_loads_branches_nodes_and_children_in_bounded_calls() {
 }
 
 #[tokio::test]
+async fn graph_branch_pages_are_ordered_and_mark_an_exact_final_page_complete() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    for index in 0..4 {
+        let name = format!("branch-{index:02}");
+        store.fork(&name, &root).await.unwrap();
+    }
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let high_watermark = graph
+        .graph_branch_name_high_watermark()
+        .await
+        .unwrap()
+        .unwrap();
+    let page_size = NonZeroUsize::new(2).unwrap();
+
+    let first = graph
+        .graph_branches_page(None, &high_watermark, page_size)
+        .await
+        .unwrap();
+    assert!(!first.complete);
+    assert_eq!(
+        first
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["branch-00", "branch-01"]
+    );
+    assert_eq!(
+        first
+            .next_cursor
+            .as_ref()
+            .map(|cursor| cursor.name.as_str()),
+        Some("branch-01")
+    );
+
+    let second = graph
+        .graph_branches_page(first.next_cursor.as_ref(), &high_watermark, page_size)
+        .await
+        .unwrap();
+    assert!(second.complete);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        second
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["branch-02", "branch-03"]
+    );
+
+    let names = first
+        .branches
+        .into_iter()
+        .chain(second.branches)
+        .map(|branch| branch.name)
+        .collect::<Vec<_>>();
+    assert!(names.is_sorted());
+    assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
+}
+
+#[tokio::test]
+async fn graph_child_ids_page_is_stable_across_high_fan_out_and_relation_kinds() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let alternate_parent = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("alternate parent".to_owned()),
+        })
+        .await
+        .unwrap();
+    let mut expected_ids = vec![alternate_parent.clone()];
+    for index in 0..=GRAPH_READ_BATCH_SIZE {
+        expected_ids.push(
+            store
+                .append(NewNode {
+                    parent: root.clone(),
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text(format!("fan-out child {index}")),
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let merge_child = store
+        .append(rich_session_anchor_node(
+            &alternate_parent,
+            vec![MergeParent::merge(root.clone())],
+        ))
+        .await
+        .unwrap();
+    let shadow_child = store
+        .append(rich_session_anchor_node(
+            &alternate_parent,
+            vec![MergeParent::shadow(root.clone())],
+        ))
+        .await
+        .unwrap();
+    expected_ids.extend([merge_child.clone(), shadow_child.clone()]);
+
+    let early_id = expected_ids[0].clone();
+    let late_id = expected_ids[1].clone();
+    let duplicate_id = expected_ids[2].clone();
+    let early_created_at = "2026-01-01T00:00:00Z";
+    let shared_created_at = "2026-01-01T00:00:01Z";
+    let late_created_at = "2026-01-01T00:00:02Z";
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq_any(&expected_ids)))
+        .set(nodes::created_at.eq(shared_created_at))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&early_id)))
+        .set(nodes::created_at.eq(early_created_at))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&late_id)))
+        .set(nodes::created_at.eq(late_created_at))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::insert_into(node_relations::table)
+        .values((
+            node_relations::child_node_id.eq(&duplicate_id),
+            node_relations::parent_node_id.eq(&root),
+            node_relations::kind.eq("merge"),
+            node_relations::ordinal.eq(0),
+        ))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    let mut expected = expected_ids
+        .into_iter()
+        .map(|node_id| {
+            let created_at = if node_id == early_id {
+                early_created_at
+            } else if node_id == late_id {
+                late_created_at
+            } else {
+                shared_created_at
+            };
+            (created_at, node_id)
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    let expected = expected
+        .into_iter()
+        .map(|(_, node_id)| node_id)
+        .collect::<Vec<_>>();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let page_size = NonZeroUsize::new(17).unwrap();
+    let mut cursor = None;
+    let mut actual = Vec::new();
+    loop {
+        let page = graph
+            .graph_child_ids_page(&root, cursor.as_ref(), page_size)
+            .await
+            .unwrap();
+        assert!(page.child_ids.len() <= page_size.get());
+        if page.complete {
+            assert!(page.next_cursor.is_none());
+        } else {
+            assert_eq!(page.child_ids.len(), page_size.get());
+            assert_eq!(
+                page.next_cursor.as_ref().map(|cursor| &cursor.node_id),
+                page.child_ids.last()
+            );
+        }
+        actual.extend(page.child_ids);
+        cursor = page.next_cursor;
+        if page.complete {
+            break;
+        }
+    }
+
+    assert!(actual.contains(&merge_child));
+    assert!(actual.contains(&shadow_child));
+    assert_eq!(actual.iter().collect::<HashSet<_>>().len(), actual.len());
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
 async fn graph_read_api_rejects_oversized_batches() {
     let store = SqliteStore::open_temporary().await.unwrap();
     let graph = SqliteGraphStore::open_read_only(store.store_path())
@@ -799,6 +993,40 @@ async fn graph_read_api_rejects_oversized_batches() {
         .collect::<Vec<_>>();
 
     let error = graph.graph_nodes_by_ids(&ids).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::GraphReadBatchTooLarge {
+            actual,
+            maximum: GRAPH_READ_BATCH_SIZE,
+        } if actual == GRAPH_READ_BATCH_SIZE + 1
+    ));
+
+    let error = graph
+        .graph_child_ids_page(
+            &store.root_id(),
+            None,
+            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE + 1).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::GraphReadBatchTooLarge {
+            actual,
+            maximum: GRAPH_READ_BATCH_SIZE,
+        } if actual == GRAPH_READ_BATCH_SIZE + 1
+    ));
+
+    let error = graph
+        .graph_branches_page(
+            None,
+            "",
+            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE + 1).unwrap(),
+        )
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         error,
