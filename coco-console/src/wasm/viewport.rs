@@ -18,8 +18,8 @@ impl ViewportState {
             "x={}&y={}&width={}&height={}&overscan={}",
             rounded_i32(self.x),
             rounded_i32(self.y),
-            rounded_i32(self.width),
-            rounded_i32(self.height),
+            wire_dimension(self.width),
+            wire_dimension(self.height),
             self.render_overscan()
         )
     }
@@ -34,8 +34,10 @@ impl ViewportState {
     }
 
     pub fn render_overscan(self) -> i32 {
-        ((self.width.max(self.height) / 2.0)
-            .max(self.height * VERTICAL_PREFETCH_MULTIPLIER)
+        let width = f64::from(wire_dimension(self.width));
+        let height = f64::from(wire_dimension(self.height));
+        ((width.max(height) / 2.0)
+            .max(height * VERTICAL_PREFETCH_MULTIPLIER)
             .ceil() as i32)
             .max(MIN_OVERSCAN)
     }
@@ -80,8 +82,8 @@ impl ViewportBounds {
 pub fn same_viewport(left: ViewportState, right: ViewportState) -> bool {
     rounded_i32(left.x) == rounded_i32(right.x)
         && rounded_i32(left.y) == rounded_i32(right.y)
-        && rounded_i32(left.width) == rounded_i32(right.width)
-        && rounded_i32(left.height) == rounded_i32(right.height)
+        && wire_dimension(left.width) == wire_dimension(right.width)
+        && wire_dimension(left.height) == wire_dimension(right.height)
         && left.overscan == right.overscan
 }
 
@@ -99,6 +101,10 @@ fn needs_full_fetch(rendered: ViewportBounds, current: ViewportState) -> bool {
 
 pub fn rounded_i32(value: f64) -> i32 {
     value.round().clamp(0.0, f64::from(i32::MAX)) as i32
+}
+
+fn wire_dimension(value: f64) -> i32 {
+    rounded_i32(value).max(1)
 }
 
 pub fn short_canvas_auto_zoom(
@@ -220,6 +226,48 @@ mod tests {
             viewport.request_query(),
             "x=1&y=3&width=401&height=240&overscan=720"
         );
+    }
+
+    #[test]
+    fn render_overscan_uses_wire_rounded_dimensions() {
+        let mut viewport = ViewportState {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 594.1,
+            overscan: 0,
+        };
+        viewport.refresh_render_overscan();
+
+        assert_eq!(viewport.overscan, 1782);
+        assert_eq!(
+            viewport.request_query(),
+            "x=0&y=0&width=800&height=594&overscan=1782"
+        );
+    }
+
+    #[test]
+    fn wire_dimensions_match_server_minimum() {
+        let current = ViewportState {
+            x: 0.0,
+            y: 0.0,
+            width: 0.4,
+            height: 0.49,
+            overscan: 0,
+        }
+        .with_render_overscan();
+        let rendered = ViewportState {
+            width: 1.0,
+            height: 1.0,
+            ..current
+        }
+        .with_render_overscan();
+
+        assert_eq!(
+            current.request_query(),
+            "x=0&y=0&width=1&height=1&overscan=180"
+        );
+        assert!(same_viewport(current, rendered));
     }
 
     #[test]

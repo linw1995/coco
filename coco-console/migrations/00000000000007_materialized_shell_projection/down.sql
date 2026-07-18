@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS console_graph_materialization_time_ticks;
+DROP TABLE IF EXISTS console_graph_materialization_shells;

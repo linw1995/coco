@@ -44,6 +44,28 @@ diesel::table! {
 }
 
 diesel::table! {
+    console_graph_materialization_shells (generation, mode) {
+        generation -> BigInt,
+        mode -> Text,
+        node_count -> BigInt,
+        edge_count -> BigInt,
+    }
+}
+
+diesel::table! {
+    console_graph_materialization_time_ticks (generation, mode, sample_index) {
+        generation -> BigInt,
+        mode -> Text,
+        sample_index -> Integer,
+        node_target -> Text,
+        x -> Integer,
+        y -> Integer,
+        created_at -> Text,
+        created_at_ns -> BigInt,
+    }
+}
+
+diesel::table! {
     console_graph_node_locations (generation, mode, node_id) {
         generation -> BigInt,
         mode -> Text,
@@ -120,6 +142,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     console_graph_edge_routes,
     console_graph_generation_state,
     console_graph_materializations,
+    console_graph_materialization_shells,
+    console_graph_materialization_time_ticks,
     console_graph_node_locations,
     console_graph_source_branch_nodes,
     console_graph_source_branches,
