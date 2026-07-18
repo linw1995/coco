@@ -155,6 +155,18 @@ enum BranchChangeCompatibility {
     RequiresFull(BuildClassificationReason),
 }
 
+enum BranchUpdatePlan<'a> {
+    Apply {
+        target_generation: i64,
+        head_id: &'a str,
+        state_json: &'a str,
+        delta_refresh: Option<(i64, &'static str)>,
+        staged_change_kind: String,
+    },
+    PendingReset,
+    RequiresFull(BuildClassificationReason),
+}
+
 #[derive(Debug)]
 struct BufferedModeItems {
     mode: GraphMode,
@@ -297,6 +309,20 @@ struct ProjectionWorkNodeRow {
     projection_edge_source_cursor: String,
     #[diesel(sql_type = Integer)]
     projection_required_rank: i32,
+}
+
+fn validate_ready_projection_node(node: &Node, state: &ProjectionWorkNodeRow) -> crate::Result<()> {
+    ensure!(
+        state.remaining_parents == 0 && state.processed == 0 && state.projection_complete == 0,
+        crate::error::InvalidGraphSnapshotStoreValueSnafu {
+            column: "ready_node",
+            value: format!(
+                "{} remaining={} processed={} projection_complete={}",
+                node.id, state.remaining_parents, state.processed, state.projection_complete
+            ),
+        }
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, QueryableByName)]
@@ -1498,188 +1524,42 @@ fn stage_branch_journal_change(
     };
 
     if change.change_kind == "delete" {
-        if change.base_contribution_generation != current_generation {
-            return Ok(BranchChangeCompatibility::RequiresFull(
-                BuildClassificationReason::SourceChangeJournalInvalid,
-            ));
-        }
-        if !reset_staged_branch_change(connection, run_id, &change.branch_name)? {
-            return Ok(BranchChangeCompatibility::PendingReset);
-        }
-        diesel::sql_query(
-            "DELETE FROM console_graph_build_source_manifest \
-             WHERE run_id = ? AND branch_name = ?",
-        )
-        .bind::<BigInt, _>(run_id)
-        .bind::<Text, _>(&change.branch_name)
-        .execute(connection)?;
-        if baseline.is_none() {
-            diesel::sql_query(
-                "DELETE FROM console_graph_build_changed_branches \
-                 WHERE run_id = ? AND branch_name = ?",
-            )
-            .bind::<BigInt, _>(run_id)
-            .bind::<Text, _>(&change.branch_name)
-            .execute(connection)?;
-            return Ok(BranchChangeCompatibility::Compatible);
-        }
-        diesel::sql_query(
-            "INSERT INTO console_graph_build_changed_branches ( \
-                 run_id, branch_name, baseline_contribution_generation, \
-                 target_contribution_generation, change_kind, removal_complete, \
-                 scope_removal_complete \
-             ) VALUES (?, ?, ?, NULL, 'delete', 0, 0) \
-             ON CONFLICT(run_id, branch_name) DO UPDATE SET \
-                 target_contribution_generation = NULL, change_kind = 'delete', \
-                 removal_cursor = '', removal_refresh_id_cursor = -1, \
-                 removal_refresh_id_upper_bound = -1, removal_bound_frozen = 0, \
-                 removal_complete = 0, \
-                 scope_removal_cursor = '', scope_removal_complete = 0, \
-                 scope_reuses_baseline = 0",
-        )
-        .bind::<BigInt, _>(run_id)
-        .bind::<Text, _>(&change.branch_name)
-        .bind::<BigInt, _>(
-            baseline
-                .as_ref()
-                .expect("baseline branch checked above")
-                .contribution_generation,
-        )
-        .execute(connection)?;
-        return Ok(BranchChangeCompatibility::Compatible);
+        return stage_branch_deletion(
+            connection,
+            run_id,
+            baseline.as_ref(),
+            current_generation,
+            change,
+        );
     }
 
-    let Some(target_generation) = change.target_contribution_generation else {
-        return Ok(BranchChangeCompatibility::RequiresFull(
-            BuildClassificationReason::SourceChangeJournalInvalid,
-        ));
-    };
-    let Some(head_id) = change.head_id.as_deref() else {
-        return Ok(BranchChangeCompatibility::RequiresFull(
-            BuildClassificationReason::SourceChangeJournalInvalid,
-        ));
-    };
-    let Some(state_json) = change.state_json.as_deref() else {
-        return Ok(BranchChangeCompatibility::RequiresFull(
-            BuildClassificationReason::SourceChangeJournalInvalid,
-        ));
-    };
-
-    let (delta_refresh, staged_change_kind) = match change.change_kind.as_str() {
-        "replace" => {
-            let Some(refresh_id) = change.refresh_id else {
-                return Ok(BranchChangeCompatibility::RequiresFull(
-                    BuildClassificationReason::SourceChangeJournalInvalid,
-                ));
-            };
-            let valid_full_refresh = diesel::sql_query(
-                "SELECT CASE WHEN EXISTS ( \
-                     SELECT 1 FROM console_graph_source_refresh_runs \
-                     WHERE refresh_id = ? AND branch_name = ? \
-                       AND target_contribution_generation = ? \
-                       AND refresh_kind = 'full' AND status = 'published' \
-                       AND published_source_revision = ? \
-                 ) THEN 1 ELSE 0 END AS value",
-            )
-            .bind::<BigInt, _>(refresh_id)
-            .bind::<Text, _>(&change.branch_name)
-            .bind::<BigInt, _>(target_generation)
-            .bind::<BigInt, _>(change.source_revision)
-            .get_result::<IntegerRow>(connection)?
-            .value
-                == 1;
-            if !valid_full_refresh {
-                return Ok(BranchChangeCompatibility::RequiresFull(
-                    BuildClassificationReason::SourceChangeJournalInvalid,
-                ));
+    let (target_generation, head_id, state_json, delta_refresh, staged_change_kind) =
+        match classify_branch_update(
+            connection,
+            run_id,
+            baseline.as_ref(),
+            staged.as_ref(),
+            current_generation,
+            change,
+        )? {
+            BranchUpdatePlan::Apply {
+                target_generation,
+                head_id,
+                state_json,
+                delta_refresh,
+                staged_change_kind,
+            } => (
+                target_generation,
+                head_id,
+                state_json,
+                delta_refresh,
+                staged_change_kind,
+            ),
+            BranchUpdatePlan::PendingReset => return Ok(BranchChangeCompatibility::PendingReset),
+            BranchUpdatePlan::RequiresFull(reason) => {
+                return Ok(BranchChangeCompatibility::RequiresFull(reason));
             }
-            if !reset_staged_branch_change(connection, run_id, &change.branch_name)? {
-                return Ok(BranchChangeCompatibility::PendingReset);
-            }
-            (
-                Some((refresh_id, "full")),
-                if baseline.is_some() {
-                    "replace"
-                } else {
-                    "added"
-                },
-            )
-        }
-        "append" => {
-            if change.base_contribution_generation != current_generation {
-                return Ok(BranchChangeCompatibility::RequiresFull(
-                    BuildClassificationReason::SourceAppendBaseMismatch,
-                ));
-            }
-            let Some(refresh_id) = change.refresh_id else {
-                return Ok(BranchChangeCompatibility::RequiresFull(
-                    BuildClassificationReason::SourceChangeJournalInvalid,
-                ));
-            };
-            let valid_append_refresh = diesel::sql_query(
-                "SELECT CASE WHEN EXISTS ( \
-                     SELECT 1 FROM console_graph_source_refresh_runs \
-                     WHERE refresh_id = ? AND branch_name = ? \
-                       AND target_contribution_generation = ? \
-                       AND refresh_kind = 'append' AND status = 'published' \
-                       AND published_source_revision = ? \
-                 ) THEN 1 ELSE 0 END AS value",
-            )
-            .bind::<BigInt, _>(refresh_id)
-            .bind::<Text, _>(&change.branch_name)
-            .bind::<BigInt, _>(target_generation)
-            .bind::<BigInt, _>(change.source_revision)
-            .get_result::<IntegerRow>(connection)?
-            .value
-                == 1;
-            if !valid_append_refresh {
-                return Ok(BranchChangeCompatibility::RequiresFull(
-                    BuildClassificationReason::SourceChangeJournalInvalid,
-                ));
-            }
-            let staged_change_kind = staged
-                .as_ref()
-                .map(|staged| staged.change_kind.as_str())
-                .filter(|kind| matches!(*kind, "added" | "replace"))
-                .unwrap_or("append");
-            (Some((refresh_id, "append")), staged_change_kind)
-        }
-        "metadata" => {
-            let Some(expected_generation) = current_generation else {
-                return Ok(BranchChangeCompatibility::RequiresFull(
-                    BuildClassificationReason::SourceMetadataBaselineMismatch,
-                ));
-            };
-            let staged_head = diesel::sql_query(
-                "SELECT head_id AS value FROM console_graph_build_source_manifest \
-                 WHERE run_id = ? AND branch_name = ?",
-            )
-            .bind::<BigInt, _>(run_id)
-            .bind::<Text, _>(&change.branch_name)
-            .get_result::<TextValueRow>(connection)
-            .optional()?
-            .map(|row| row.value);
-            let expected_head = staged_head
-                .as_deref()
-                .or_else(|| baseline.as_ref().map(|branch| branch.head_id.as_str()));
-            if expected_head != Some(head_id) || target_generation != expected_generation {
-                return Ok(BranchChangeCompatibility::RequiresFull(
-                    BuildClassificationReason::SourceMetadataBaselineMismatch,
-                ));
-            }
-            let staged_change_kind = staged
-                .as_ref()
-                .map(|staged| staged.change_kind.as_str())
-                .filter(|kind| matches!(*kind, "added" | "append" | "replace"))
-                .unwrap_or("metadata");
-            (None, staged_change_kind)
-        }
-        _ => {
-            return Ok(BranchChangeCompatibility::RequiresFull(
-                BuildClassificationReason::SourceChangeJournalInvalid,
-            ));
-        }
-    };
+        };
 
     diesel::sql_query(
         "INSERT INTO console_graph_build_source_manifest ( \
@@ -1696,7 +1576,7 @@ fn stage_branch_journal_change(
     .bind::<Text, _>(state_json)
     .execute(connection)?;
     let remove_baseline_scope =
-        baseline.is_some() && matches!(staged_change_kind, "append" | "replace");
+        baseline.is_some() && matches!(staged_change_kind.as_str(), "append" | "replace");
     diesel::sql_query(
         "INSERT INTO console_graph_build_changed_branches ( \
              run_id, branch_name, baseline_contribution_generation, \
@@ -1721,7 +1601,7 @@ fn stage_branch_journal_change(
             .map(|branch| branch.contribution_generation),
     )
     .bind::<BigInt, _>(target_generation)
-    .bind::<Text, _>(staged_change_kind)
+    .bind::<Text, _>(&staged_change_kind)
     .bind::<Integer, _>(i32::from(staged_change_kind != "replace"))
     .bind::<Integer, _>(i32::from(!remove_baseline_scope))
     .execute(connection)?;
@@ -1749,6 +1629,214 @@ fn stage_branch_journal_change(
     }
     Ok(BranchChangeCompatibility::Compatible)
 }
+
+fn stage_branch_deletion(
+    connection: &mut SqliteConnection,
+    run_id: i64,
+    baseline: Option<&ManifestBranchRow>,
+    current_generation: Option<i64>,
+    change: &BranchChangeJournalRow,
+) -> QueryResult<BranchChangeCompatibility> {
+    if change.base_contribution_generation != current_generation {
+        return Ok(BranchChangeCompatibility::RequiresFull(
+            BuildClassificationReason::SourceChangeJournalInvalid,
+        ));
+    }
+    if !reset_staged_branch_change(connection, run_id, &change.branch_name)? {
+        return Ok(BranchChangeCompatibility::PendingReset);
+    }
+    diesel::sql_query(
+        "DELETE FROM console_graph_build_source_manifest \
+         WHERE run_id = ? AND branch_name = ?",
+    )
+    .bind::<BigInt, _>(run_id)
+    .bind::<Text, _>(&change.branch_name)
+    .execute(connection)?;
+    let Some(baseline) = baseline else {
+        diesel::sql_query(
+            "DELETE FROM console_graph_build_changed_branches \
+             WHERE run_id = ? AND branch_name = ?",
+        )
+        .bind::<BigInt, _>(run_id)
+        .bind::<Text, _>(&change.branch_name)
+        .execute(connection)?;
+        return Ok(BranchChangeCompatibility::Compatible);
+    };
+    diesel::sql_query(
+        "INSERT INTO console_graph_build_changed_branches ( \
+             run_id, branch_name, baseline_contribution_generation, \
+             target_contribution_generation, change_kind, removal_complete, \
+             scope_removal_complete \
+         ) VALUES (?, ?, ?, NULL, 'delete', 0, 0) \
+         ON CONFLICT(run_id, branch_name) DO UPDATE SET \
+             target_contribution_generation = NULL, change_kind = 'delete', \
+             removal_cursor = '', removal_refresh_id_cursor = -1, \
+             removal_refresh_id_upper_bound = -1, removal_bound_frozen = 0, \
+             removal_complete = 0, \
+             scope_removal_cursor = '', scope_removal_complete = 0, \
+             scope_reuses_baseline = 0",
+    )
+    .bind::<BigInt, _>(run_id)
+    .bind::<Text, _>(&change.branch_name)
+    .bind::<BigInt, _>(baseline.contribution_generation)
+    .execute(connection)?;
+    Ok(BranchChangeCompatibility::Compatible)
+}
+
+fn classify_branch_update<'a>(
+    connection: &mut SqliteConnection,
+    run_id: i64,
+    baseline: Option<&ManifestBranchRow>,
+    staged: Option<&StagedBranchChangeRow>,
+    current_generation: Option<i64>,
+    change: &'a BranchChangeJournalRow,
+) -> QueryResult<BranchUpdatePlan<'a>> {
+    let Some(target_generation) = change.target_contribution_generation else {
+        return Ok(BranchUpdatePlan::RequiresFull(
+            BuildClassificationReason::SourceChangeJournalInvalid,
+        ));
+    };
+    let Some(head_id) = change.head_id.as_deref() else {
+        return Ok(BranchUpdatePlan::RequiresFull(
+            BuildClassificationReason::SourceChangeJournalInvalid,
+        ));
+    };
+    let Some(state_json) = change.state_json.as_deref() else {
+        return Ok(BranchUpdatePlan::RequiresFull(
+            BuildClassificationReason::SourceChangeJournalInvalid,
+        ));
+    };
+    let (delta_refresh, staged_change_kind) = match change.change_kind.as_str() {
+        "replace" => {
+            let Some(refresh_id) = change.refresh_id else {
+                return Ok(BranchUpdatePlan::RequiresFull(
+                    BuildClassificationReason::SourceChangeJournalInvalid,
+                ));
+            };
+            let valid = published_refresh_matches_change(
+                connection,
+                refresh_id,
+                change,
+                target_generation,
+                "full",
+            )?;
+            if !valid {
+                return Ok(BranchUpdatePlan::RequiresFull(
+                    BuildClassificationReason::SourceChangeJournalInvalid,
+                ));
+            }
+            if !reset_staged_branch_change(connection, run_id, &change.branch_name)? {
+                return Ok(BranchUpdatePlan::PendingReset);
+            }
+            (
+                Some((refresh_id, "full")),
+                if baseline.is_some() {
+                    "replace"
+                } else {
+                    "added"
+                },
+            )
+        }
+        "append" => {
+            if change.base_contribution_generation != current_generation {
+                return Ok(BranchUpdatePlan::RequiresFull(
+                    BuildClassificationReason::SourceAppendBaseMismatch,
+                ));
+            }
+            let Some(refresh_id) = change.refresh_id else {
+                return Ok(BranchUpdatePlan::RequiresFull(
+                    BuildClassificationReason::SourceChangeJournalInvalid,
+                ));
+            };
+            let valid = published_refresh_matches_change(
+                connection,
+                refresh_id,
+                change,
+                target_generation,
+                "append",
+            )?;
+            if !valid {
+                return Ok(BranchUpdatePlan::RequiresFull(
+                    BuildClassificationReason::SourceChangeJournalInvalid,
+                ));
+            }
+            let staged_change_kind = staged
+                .map(|staged| staged.change_kind.as_str())
+                .filter(|kind| matches!(*kind, "added" | "replace"))
+                .unwrap_or("append");
+            (Some((refresh_id, "append")), staged_change_kind)
+        }
+        "metadata" => {
+            let Some(expected_generation) = current_generation else {
+                return Ok(BranchUpdatePlan::RequiresFull(
+                    BuildClassificationReason::SourceMetadataBaselineMismatch,
+                ));
+            };
+            let staged_head = diesel::sql_query(
+                "SELECT head_id AS value FROM console_graph_build_source_manifest \
+                 WHERE run_id = ? AND branch_name = ?",
+            )
+            .bind::<BigInt, _>(run_id)
+            .bind::<Text, _>(&change.branch_name)
+            .get_result::<TextValueRow>(connection)
+            .optional()?
+            .map(|row| row.value);
+            let expected_head = staged_head
+                .as_deref()
+                .or_else(|| baseline.map(|branch| branch.head_id.as_str()));
+            if expected_head != Some(head_id) || target_generation != expected_generation {
+                return Ok(BranchUpdatePlan::RequiresFull(
+                    BuildClassificationReason::SourceMetadataBaselineMismatch,
+                ));
+            }
+            let staged_change_kind = staged
+                .map(|staged| staged.change_kind.as_str())
+                .filter(|kind| matches!(*kind, "added" | "append" | "replace"))
+                .unwrap_or("metadata");
+            (None, staged_change_kind)
+        }
+        _ => {
+            return Ok(BranchUpdatePlan::RequiresFull(
+                BuildClassificationReason::SourceChangeJournalInvalid,
+            ));
+        }
+    };
+    Ok(BranchUpdatePlan::Apply {
+        target_generation,
+        head_id,
+        state_json,
+        delta_refresh,
+        staged_change_kind: staged_change_kind.to_owned(),
+    })
+}
+
+fn published_refresh_matches_change(
+    connection: &mut SqliteConnection,
+    refresh_id: i64,
+    change: &BranchChangeJournalRow,
+    target_generation: i64,
+    refresh_kind: &str,
+) -> QueryResult<bool> {
+    let valid = diesel::sql_query(
+        "SELECT CASE WHEN EXISTS ( \
+             SELECT 1 FROM console_graph_source_refresh_runs \
+             WHERE refresh_id = ? AND branch_name = ? \
+               AND target_contribution_generation = ? \
+               AND refresh_kind = ? AND status = 'published' \
+               AND published_source_revision = ? \
+         ) THEN 1 ELSE 0 END AS value",
+    )
+    .bind::<BigInt, _>(refresh_id)
+    .bind::<Text, _>(&change.branch_name)
+    .bind::<BigInt, _>(target_generation)
+    .bind::<Text, _>(refresh_kind)
+    .bind::<BigInt, _>(change.source_revision)
+    .get_result::<IntegerRow>(connection)?
+    .value
+        == 1;
+    Ok(valid)
+}
+
 fn expand_scope_item(
     connection: &mut SqliteConnection,
     run_id: i64,
@@ -2098,76 +2186,87 @@ impl IncrementalWorkStore {
     async fn begin(&mut self) -> crate::Result<()> {
         loop {
             let state = self.dag_run_state().await?;
-            if state.dag_initialized == 1 {
-                ensure!(
-                    state.dag_baseline_generation == Some(self.baseline_generation)
-                        && state.dag_root_id.as_deref() == Some(self.root_id.as_str()),
-                    crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                        column: "dag_build_identity",
-                        value: format!("run_id={}", self.run_id),
-                    }
-                );
-                self.kind = stored_build_kind(state.dag_build_kind.as_deref()).map_err(|()| {
-                    crate::Error::InvalidGraphSnapshotStoreValue {
-                        column: "dag_build_kind",
-                        value: state.dag_build_kind.unwrap_or_default(),
-                    }
-                })?;
+            if self.accept_initialized_dag(&state)? {
                 return Ok(());
             }
+            self.advance_dag_initialization(&state).await?;
+        }
+    }
 
-            match state.dag_init_phase.as_str() {
-                "new"
-                | "full_reset"
-                | "manifest_refresh_reset"
-                | "manifest_branch_reset"
-                | "manifest_copy"
-                | "manifest_refresh_copy"
-                | "manifest_reset"
-                | "manifest_seed" => {
-                    self.initialize_source_manifest(&state).await?;
+    fn accept_initialized_dag(&mut self, state: &DagRunRow) -> crate::Result<bool> {
+        if state.dag_initialized != 1 {
+            return Ok(false);
+        }
+        ensure!(
+            state.dag_baseline_generation == Some(self.baseline_generation)
+                && state.dag_root_id.as_deref() == Some(self.root_id.as_str()),
+            crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                column: "dag_build_identity",
+                value: format!("run_id={}", self.run_id),
+            }
+        );
+        self.kind = stored_build_kind(state.dag_build_kind.as_deref()).map_err(|()| {
+            crate::Error::InvalidGraphSnapshotStoreValue {
+                column: "dag_build_kind",
+                value: state.dag_build_kind.clone().unwrap_or_default(),
+            }
+        })?;
+        Ok(true)
+    }
+
+    async fn advance_dag_initialization(&mut self, state: &DagRunRow) -> crate::Result<()> {
+        match state.dag_init_phase.as_str() {
+            "new"
+            | "full_reset"
+            | "manifest_refresh_reset"
+            | "manifest_branch_reset"
+            | "manifest_copy"
+            | "manifest_refresh_copy"
+            | "manifest_reset"
+            | "manifest_seed" => {
+                self.initialize_source_manifest(state).await?;
+                tokio::task::yield_now().await;
+            }
+            "scope" => {
+                if self.process_scope_batch().await? > 0 {
                     tokio::task::yield_now().await;
-                }
-                "scope" => {
-                    if self.process_scope_batch().await? > 0 {
-                        tokio::task::yield_now().await;
-                    }
-                }
-                phase if phase.starts_with("kind") => {
-                    self.choose_build_kind().await?;
-                    tokio::task::yield_now().await;
-                }
-                "delta_remove" => {
-                    self.populate_delta_removal_batch().await?;
-                    tokio::task::yield_now().await;
-                }
-                "delta_scope_remove" => {
-                    self.populate_delta_scope_removal_batch().await?;
-                    tokio::task::yield_now().await;
-                }
-                "delta_seed" => {
-                    self.populate_delta_node_batch().await?;
-                    tokio::task::yield_now().await;
-                }
-                "rank_slots" | "nodes" | "edges" | "ports" => {
-                    self.advance_layout_initialization(&state.dag_init_phase)
-                        .await?;
-                    tokio::task::yield_now().await;
-                }
-                "branches" => {
-                    self.initialize_branch_metadata(&state.dag_init_text_cursor)
-                        .await?;
-                    tokio::task::yield_now().await;
-                }
-                value => {
-                    return crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                        column: "dag_init_phase",
-                        value: value.to_owned(),
-                    }
-                    .fail();
                 }
             }
+            phase if phase.starts_with("kind") => {
+                self.choose_build_kind().await?;
+                tokio::task::yield_now().await;
+            }
+            "delta_remove" => {
+                self.populate_delta_removal_batch().await?;
+                tokio::task::yield_now().await;
+            }
+            "delta_scope_remove" => {
+                self.populate_delta_scope_removal_batch().await?;
+                tokio::task::yield_now().await;
+            }
+            "delta_seed" => {
+                self.populate_delta_node_batch().await?;
+                tokio::task::yield_now().await;
+            }
+            "rank_slots" | "nodes" | "edges" | "ports" => {
+                self.advance_layout_initialization(&state.dag_init_phase)
+                    .await?;
+                tokio::task::yield_now().await;
+            }
+            "branches" => {
+                self.initialize_branch_metadata(&state.dag_init_text_cursor)
+                    .await?;
+                tokio::task::yield_now().await;
+            }
+            value => {
+                return crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                    column: "dag_init_phase",
+                    value: value.to_owned(),
+                }
+                .fail();
+            }
         }
+        Ok(())
     }
 
     async fn dag_run_state(&self) -> crate::Result<DagRunRow> {
@@ -4341,116 +4440,24 @@ impl IncrementalWorkStore {
                 column: "work_node",
                 value: node.id.clone(),
             })?;
-        ensure!(
-            state.remaining_parents == 0 && state.processed == 0 && state.projection_complete == 0,
-            crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                column: "ready_node",
-                value: format!(
-                    "{} remaining={} processed={} projection_complete={}",
-                    node.id, state.remaining_parents, state.processed, state.projection_complete
-                ),
-            }
-        );
-        if node.is_root() {
-            self.complete_node_projection(&node.id, &state.projection_phase)
-                .await?;
+        validate_ready_projection_node(node, &state)?;
+        if self.process_root_projection(node, &state).await? {
             return Ok(());
         }
 
         match state.projection_phase.as_str() {
-            "all_prepare" => {
-                let page = self.raw_projection_edge_page(node, state.projection_raw_cursor);
-                if page.is_empty() {
-                    self.advance_node_projection_phase(&node.id, "all_prepare", "all_rank")
-                        .await?;
-                } else {
-                    self.commit_all_projection_edge_page(
-                        &node.id,
-                        state.projection_raw_cursor,
-                        &page,
-                    )
-                    .await?;
-                }
-            }
+            "all_prepare" => self.process_all_projection_prepare(node, &state).await?,
             "all_rank" => {
-                let page = self
-                    .projection_edge_page(
-                        GraphMode::All,
-                        &node.id,
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                    )
-                    .await?;
-                if page.is_empty() {
-                    self.advance_node_projection_phase(&node.id, "all_rank", "all_node")
-                        .await?;
-                } else {
-                    let required_rank = self
-                        .projection_page_required_rank(GraphMode::All, &page)
-                        .await?;
-                    self.checkpoint_projection_rank_page(
-                        &node.id,
-                        "all_rank",
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                        required_rank,
-                        &page,
-                    )
-                    .await?;
-                }
+                self.process_projection_rank(node, &state, GraphMode::All)
+                    .await?
             }
             "all_node" => {
-                self.buffer_projection_node(
-                    node,
-                    GraphMode::All,
-                    state.projection_required_rank,
-                    snapshots,
-                    lease,
-                    buffer,
-                )
-                .await?;
-                flush_graph_buffer(snapshots, lease, buffer).await?;
-                self.advance_node_projection_phase(&node.id, "all_node", "all_edges")
-                    .await?;
+                self.process_projection_node(node, &state, GraphMode::All, snapshots, lease, buffer)
+                    .await?
             }
             "all_edges" => {
-                let page = self
-                    .projection_edge_page(
-                        GraphMode::All,
-                        &node.id,
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                    )
-                    .await?;
-                if page.is_empty() {
-                    if matches!(node.kind, Kind::Anchor(_))
-                        && self.is_visible_anchor(&node.id).await?
-                    {
-                        self.advance_node_projection_phase(&node.id, "all_edges", "anchor_prepare")
-                            .await?;
-                    } else {
-                        self.complete_node_projection(&node.id, "all_edges").await?;
-                    }
-                } else {
-                    self.buffer_projection_edge_page(
-                        node,
-                        GraphMode::All,
-                        &page,
-                        snapshots,
-                        lease,
-                        buffer,
-                    )
-                    .await?;
-                    flush_graph_buffer(snapshots, lease, buffer).await?;
-                    self.checkpoint_projection_edge_page(
-                        &node.id,
-                        "all_edges",
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                        &page,
-                    )
-                    .await?;
-                }
+                self.process_all_projection_edges(node, &state, snapshots, lease, buffer)
+                    .await?
             }
             "anchor_prepare" => {
                 if self.advance_anchor_resolution(node).await? {
@@ -4459,78 +4466,23 @@ impl IncrementalWorkStore {
                 }
             }
             "anchor_rank" => {
-                let page = self
-                    .projection_edge_page(
-                        GraphMode::Anchors,
-                        &node.id,
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                    )
-                    .await?;
-                if page.is_empty() {
-                    self.advance_node_projection_phase(&node.id, "anchor_rank", "anchor_node")
-                        .await?;
-                } else {
-                    let required_rank = self
-                        .projection_page_required_rank(GraphMode::Anchors, &page)
-                        .await?;
-                    self.checkpoint_projection_rank_page(
-                        &node.id,
-                        "anchor_rank",
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                        required_rank,
-                        &page,
-                    )
-                    .await?;
-                }
+                self.process_projection_rank(node, &state, GraphMode::Anchors)
+                    .await?
             }
             "anchor_node" => {
-                self.buffer_projection_node(
+                self.process_projection_node(
                     node,
+                    &state,
                     GraphMode::Anchors,
-                    state.projection_required_rank,
                     snapshots,
                     lease,
                     buffer,
                 )
-                .await?;
-                flush_graph_buffer(snapshots, lease, buffer).await?;
-                self.advance_node_projection_phase(&node.id, "anchor_node", "anchor_edges")
-                    .await?;
+                .await?
             }
             "anchor_edges" => {
-                let page = self
-                    .projection_edge_page(
-                        GraphMode::Anchors,
-                        &node.id,
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                    )
-                    .await?;
-                if page.is_empty() {
-                    self.complete_node_projection(&node.id, "anchor_edges")
-                        .await?;
-                } else {
-                    self.buffer_projection_edge_page(
-                        node,
-                        GraphMode::Anchors,
-                        &page,
-                        snapshots,
-                        lease,
-                        buffer,
-                    )
-                    .await?;
-                    flush_graph_buffer(snapshots, lease, buffer).await?;
-                    self.checkpoint_projection_edge_page(
-                        &node.id,
-                        "anchor_edges",
-                        state.projection_edge_order_cursor,
-                        &state.projection_edge_source_cursor,
-                        &page,
-                    )
-                    .await?;
-                }
+                self.process_anchor_projection_edges(node, &state, snapshots, lease, buffer)
+                    .await?
             }
             "complete" if state.projection_complete == 1 => {}
             phase => {
@@ -4542,6 +4494,175 @@ impl IncrementalWorkStore {
             }
         }
         Ok(())
+    }
+
+    async fn process_root_projection(
+        &self,
+        node: &Node,
+        state: &ProjectionWorkNodeRow,
+    ) -> crate::Result<bool> {
+        if !node.is_root() {
+            return Ok(false);
+        }
+        self.complete_node_projection(&node.id, &state.projection_phase)
+            .await?;
+        Ok(true)
+    }
+
+    async fn process_all_projection_prepare(
+        &self,
+        node: &Node,
+        state: &ProjectionWorkNodeRow,
+    ) -> crate::Result<()> {
+        let page = self.raw_projection_edge_page(node, state.projection_raw_cursor);
+        if page.is_empty() {
+            self.advance_node_projection_phase(&node.id, "all_prepare", "all_rank")
+                .await
+        } else {
+            self.commit_all_projection_edge_page(&node.id, state.projection_raw_cursor, &page)
+                .await
+        }
+    }
+
+    async fn process_projection_rank(
+        &self,
+        node: &Node,
+        state: &ProjectionWorkNodeRow,
+        mode: GraphMode,
+    ) -> crate::Result<()> {
+        let (current_phase, next_phase) = match mode {
+            GraphMode::All => ("all_rank", "all_node"),
+            GraphMode::Anchors => ("anchor_rank", "anchor_node"),
+        };
+        let page = self
+            .projection_edge_page(
+                mode,
+                &node.id,
+                state.projection_edge_order_cursor,
+                &state.projection_edge_source_cursor,
+            )
+            .await?;
+        if page.is_empty() {
+            self.advance_node_projection_phase(&node.id, current_phase, next_phase)
+                .await
+        } else {
+            let required_rank = self.projection_page_required_rank(mode, &page).await?;
+            self.checkpoint_projection_rank_page(
+                &node.id,
+                current_phase,
+                state.projection_edge_order_cursor,
+                &state.projection_edge_source_cursor,
+                required_rank,
+                &page,
+            )
+            .await
+        }
+    }
+
+    async fn process_projection_node(
+        &self,
+        node: &Node,
+        state: &ProjectionWorkNodeRow,
+        mode: GraphMode,
+        snapshots: &ConsoleGraphSnapshotStore,
+        lease: &IncrementalBuildLease,
+        buffer: &mut GraphBuffer,
+    ) -> crate::Result<()> {
+        let (current_phase, next_phase) = match mode {
+            GraphMode::All => ("all_node", "all_edges"),
+            GraphMode::Anchors => ("anchor_node", "anchor_edges"),
+        };
+        self.buffer_projection_node(
+            node,
+            mode,
+            state.projection_required_rank,
+            snapshots,
+            lease,
+            buffer,
+        )
+        .await?;
+        flush_graph_buffer(snapshots, lease, buffer).await?;
+        self.advance_node_projection_phase(&node.id, current_phase, next_phase)
+            .await
+    }
+
+    async fn process_all_projection_edges(
+        &self,
+        node: &Node,
+        state: &ProjectionWorkNodeRow,
+        snapshots: &ConsoleGraphSnapshotStore,
+        lease: &IncrementalBuildLease,
+        buffer: &mut GraphBuffer,
+    ) -> crate::Result<()> {
+        let page = self
+            .projection_edge_page(
+                GraphMode::All,
+                &node.id,
+                state.projection_edge_order_cursor,
+                &state.projection_edge_source_cursor,
+            )
+            .await?;
+        if !page.is_empty() {
+            self.buffer_projection_edge_page(node, GraphMode::All, &page, snapshots, lease, buffer)
+                .await?;
+            flush_graph_buffer(snapshots, lease, buffer).await?;
+            return self
+                .checkpoint_projection_edge_page(
+                    &node.id,
+                    "all_edges",
+                    state.projection_edge_order_cursor,
+                    &state.projection_edge_source_cursor,
+                    &page,
+                )
+                .await;
+        }
+        if matches!(node.kind, Kind::Anchor(_)) && self.is_visible_anchor(&node.id).await? {
+            self.advance_node_projection_phase(&node.id, "all_edges", "anchor_prepare")
+                .await
+        } else {
+            self.complete_node_projection(&node.id, "all_edges").await
+        }
+    }
+
+    async fn process_anchor_projection_edges(
+        &self,
+        node: &Node,
+        state: &ProjectionWorkNodeRow,
+        snapshots: &ConsoleGraphSnapshotStore,
+        lease: &IncrementalBuildLease,
+        buffer: &mut GraphBuffer,
+    ) -> crate::Result<()> {
+        let page = self
+            .projection_edge_page(
+                GraphMode::Anchors,
+                &node.id,
+                state.projection_edge_order_cursor,
+                &state.projection_edge_source_cursor,
+            )
+            .await?;
+        if page.is_empty() {
+            self.complete_node_projection(&node.id, "anchor_edges")
+                .await
+        } else {
+            self.buffer_projection_edge_page(
+                node,
+                GraphMode::Anchors,
+                &page,
+                snapshots,
+                lease,
+                buffer,
+            )
+            .await?;
+            flush_graph_buffer(snapshots, lease, buffer).await?;
+            self.checkpoint_projection_edge_page(
+                &node.id,
+                "anchor_edges",
+                state.projection_edge_order_cursor,
+                &state.projection_edge_source_cursor,
+                &page,
+            )
+            .await
+        }
     }
 
     fn raw_projection_edge_page(&self, node: &Node, cursor: i64) -> Vec<ProjectionEdgeRow> {

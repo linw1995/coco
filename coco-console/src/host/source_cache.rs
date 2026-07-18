@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use coco_mem::{
     BranchAppendSessionState, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchPageCursor,
     GraphBranchRecord, GraphChildPageCursor, GraphMutationBranchChangeKind,
-    GraphMutationBranchChangePageCursor, GraphMutationDirtyParentPageCursor, Kind, NewNode,
-    NewNodeContent, Node, NodeStore, SessionAnchorPatch, SessionState, SessionStore,
-    SqliteGraphStore, StoreError, StoreResult,
+    GraphMutationBranchChangePageCursor, GraphMutationBranchChangeRecord,
+    GraphMutationDirtyParentPageCursor, Kind, NewNode, NewNodeContent, Node, NodeStore,
+    SessionAnchorPatch, SessionState, SessionStore, SqliteGraphStore, StoreError, StoreResult,
 };
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
@@ -440,6 +440,23 @@ struct RefreshRun {
     target_invalidation_kind: String,
     relation_revision: i64,
     resumed: bool,
+}
+
+#[derive(Default)]
+struct RefreshSessionStats {
+    batches: usize,
+    traversed_work_items: usize,
+    reused_work_items: usize,
+    child_pages: usize,
+    parent_pages: usize,
+}
+
+enum SourceRefreshPreparation {
+    Completed,
+    Ready {
+        previous: Option<PublishedBranch>,
+        refresh: RefreshRun,
+    },
 }
 
 #[derive(Debug)]
@@ -1306,6 +1323,49 @@ fn source_node_is_gc_protected(
     .bind::<BigInt, _>(source_time_ms())
     .get_result::<FlagRow>(connection)
     .map(|row| row.value != 0)
+}
+
+fn invalidation_receipt_matches(
+    receipt: &InvalidationReceiptRow,
+    record: &GraphBranchRecord,
+    target_state_json: &str,
+    invalidation_kind: &str,
+    relation_revision: i64,
+) -> bool {
+    receipt.target_head_id == record.head_id
+        && receipt.target_state_json == target_state_json
+        && receipt.invalidation_kind == invalidation_kind
+        && receipt.relation_revision == relation_revision
+}
+
+fn invalidation_receipt_seeds_match(
+    persisted: &[InvalidationReceiptSeedRow],
+    current: &[DirtySeed],
+) -> bool {
+    persisted.len() == current.len()
+        && persisted
+            .iter()
+            .zip(current)
+            .all(|(persisted, current)| invalidation_receipt_seed_matches(persisted, current))
+}
+
+fn invalidation_receipt_seed_matches(
+    persisted: &InvalidationReceiptSeedRow,
+    current: &DirtySeed,
+) -> bool {
+    let persisted_watermark = match (
+        persisted.child_high_watermark_relation_revision,
+        persisted.child_high_watermark_node_id.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(relation_revision), Some(node_id)) => Some((relation_revision, node_id)),
+        _ => return false,
+    };
+    let current_watermark = current
+        .child_high_watermark
+        .as_ref()
+        .map(|watermark| (watermark.relation_revision, watermark.node_id.as_str()));
+    persisted.node_id == current.node_id && persisted_watermark == current_watermark
 }
 
 impl PersistentGraphIndex {
@@ -2436,83 +2496,9 @@ impl PersistentGraphIndex {
         );
         let page_size = NonZeroUsize::new(SOURCE_CACHE_BATCH_SIZE)
             .expect("source mutation page size should be non-zero");
-        while run.phase == "branch_changes" {
-            let cursor = run
-                .branch_cursor
-                .as_ref()
-                .map(|name| GraphMutationBranchChangePageCursor { name: name.clone() });
-            let page = store
-                .graph_mutation_branch_changes_page(mutation_revision, cursor.as_ref(), page_size)
-                .await
-                .context(crate::error::StoreSnafu)?;
-            if page.changes.is_empty() {
-                self.transition_mutation_event_to_dirty_parents(mutation_revision)
-                    .await?;
-                run = self
-                    .mutation_event_run(mutation_revision)
-                    .await?
-                    .expect("active source mutation event should remain persisted");
-                continue;
-            }
-            for change in page.changes {
-                match change.kind {
-                    GraphMutationBranchChangeKind::Upserted => {
-                        let head_id = change.head_id.with_context(|| {
-                            crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                                column: "graph_mutation_branch_head_id",
-                                value: change.name.clone(),
-                            }
-                        })?;
-                        let state = change.state.with_context(|| {
-                            crate::error::InvalidGraphSnapshotStoreValueSnafu {
-                                column: "graph_mutation_branch_state",
-                                value: change.name.clone(),
-                            }
-                        })?;
-                        self.refresh_branch_event(
-                            store,
-                            GraphBranchRecord {
-                                name: change.name.clone(),
-                                head_id,
-                                state,
-                            },
-                            SourceInvalidation {
-                                incarnation: DURABLE_MUTATION_INCARNATION,
-                                version: mutation_revision,
-                                relation_revision: mutation_revision,
-                            },
-                            &BTreeSet::new(),
-                            false,
-                        )
-                        .await?;
-                    }
-                    GraphMutationBranchChangeKind::Removed => {
-                        self.remove_branch_event(
-                            &change.name,
-                            DURABLE_MUTATION_INCARNATION,
-                            mutation_revision,
-                            mutation_revision,
-                        )
-                        .await?;
-                    }
-                }
-                self.checkpoint_mutation_branch_cursor(
-                    mutation_revision,
-                    run.branch_cursor.as_deref(),
-                    &change.name,
-                )
-                .await?;
-                run.branch_cursor = Some(change.name);
-            }
-            if page.complete {
-                self.transition_mutation_event_to_dirty_parents(mutation_revision)
-                    .await?;
-            }
-            run = self
-                .mutation_event_run(mutation_revision)
-                .await?
-                .expect("active source mutation event should remain persisted");
-        }
+        run = self
+            .consume_mutation_branch_changes(store, mutation_revision, run, page_size)
+            .await?;
 
         loop {
             if run.active_dirty_parent_id.is_none() {
@@ -2605,6 +2591,109 @@ impl PersistentGraphIndex {
                 .await?
                 .expect("active source mutation event should remain persisted");
         }
+    }
+
+    async fn consume_mutation_branch_changes(
+        &mut self,
+        store: &SqliteGraphStore,
+        mutation_revision: i64,
+        mut run: MutationEventRunRow,
+        page_size: NonZeroUsize,
+    ) -> crate::Result<MutationEventRunRow> {
+        while run.phase == "branch_changes" {
+            let cursor = run
+                .branch_cursor
+                .as_ref()
+                .map(|name| GraphMutationBranchChangePageCursor { name: name.clone() });
+            let page = store
+                .graph_mutation_branch_changes_page(mutation_revision, cursor.as_ref(), page_size)
+                .await
+                .context(crate::error::StoreSnafu)?;
+            if page.changes.is_empty() {
+                self.transition_mutation_event_to_dirty_parents(mutation_revision)
+                    .await?;
+                run = self.active_mutation_event_run(mutation_revision).await?;
+                continue;
+            }
+            for change in page.changes {
+                self.apply_mutation_branch_change(store, mutation_revision, &change)
+                    .await?;
+                self.checkpoint_mutation_branch_cursor(
+                    mutation_revision,
+                    run.branch_cursor.as_deref(),
+                    &change.name,
+                )
+                .await?;
+                run.branch_cursor = Some(change.name);
+            }
+            if page.complete {
+                self.transition_mutation_event_to_dirty_parents(mutation_revision)
+                    .await?;
+            }
+            run = self.active_mutation_event_run(mutation_revision).await?;
+        }
+        Ok(run)
+    }
+
+    async fn apply_mutation_branch_change(
+        &mut self,
+        store: &SqliteGraphStore,
+        mutation_revision: i64,
+        change: &GraphMutationBranchChangeRecord,
+    ) -> crate::Result<()> {
+        match change.kind {
+            GraphMutationBranchChangeKind::Upserted => {
+                let head_id = change.head_id.clone().with_context(|| {
+                    crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                        column: "graph_mutation_branch_head_id",
+                        value: change.name.clone(),
+                    }
+                })?;
+                let state = change.state.clone().with_context(|| {
+                    crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                        column: "graph_mutation_branch_state",
+                        value: change.name.clone(),
+                    }
+                })?;
+                self.refresh_branch_event(
+                    store,
+                    GraphBranchRecord {
+                        name: change.name.clone(),
+                        head_id,
+                        state,
+                    },
+                    SourceInvalidation {
+                        incarnation: DURABLE_MUTATION_INCARNATION,
+                        version: mutation_revision,
+                        relation_revision: mutation_revision,
+                    },
+                    &BTreeSet::new(),
+                    false,
+                )
+                .await
+            }
+            GraphMutationBranchChangeKind::Removed => {
+                self.remove_branch_event(
+                    &change.name,
+                    DURABLE_MUTATION_INCARNATION,
+                    mutation_revision,
+                    mutation_revision,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn active_mutation_event_run(
+        &self,
+        mutation_revision: i64,
+    ) -> crate::Result<MutationEventRunRow> {
+        self.mutation_event_run(mutation_revision)
+            .await?
+            .with_context(|| crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                column: "source_mutation_event_run",
+                value: mutation_revision.to_string(),
+            })
     }
 
     async fn dynamic_peer_branch_page(
@@ -3286,69 +3375,8 @@ impl PersistentGraphIndex {
     ) -> crate::Result<()> {
         let page_size = self.full_refresh_branch_page_size();
         if sweep.phase == "enumerate" {
-            loop {
-                let cursor = sweep
-                    .page_cursor
-                    .as_ref()
-                    .map(|name| GraphBranchPageCursor { name: name.clone() });
-                let page = store
-                    .graph_branches_at_revision_page(
-                        sweep.relation_revision,
-                        cursor.as_ref(),
-                        None,
-                        page_size,
-                    )
-                    .await
-                    .context(crate::error::StoreSnafu)?;
-                let complete = page.complete;
-                let next_scan_cursor = page.next_cursor.map(|cursor| cursor.name);
-                if page.branches.is_empty() {
-                    let Some(next_scan_cursor) = next_scan_cursor else {
-                        break;
-                    };
-                    self.checkpoint_source_sweep(
-                        &mut sweep,
-                        "enumerate",
-                        Some(next_scan_cursor),
-                        false,
-                    )
-                    .await?;
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                for record in page.branches {
-                    let name = record.name.clone();
-                    self.refresh_branch_event(
-                        store,
-                        record,
-                        SourceInvalidation {
-                            incarnation: &sweep.target_invalidation_incarnation,
-                            version: sweep.target_invalidation_version,
-                            relation_revision: sweep.relation_revision,
-                        },
-                        &BTreeSet::new(),
-                        true,
-                    )
-                    .await?;
-                    self.checkpoint_source_sweep(&mut sweep, "enumerate", Some(name), false)
-                        .await?;
-                }
-                if let Some(next_scan_cursor) = next_scan_cursor
-                    && sweep.page_cursor.as_deref() != Some(next_scan_cursor.as_str())
-                {
-                    self.checkpoint_source_sweep(
-                        &mut sweep,
-                        "enumerate",
-                        Some(next_scan_cursor),
-                        false,
-                    )
-                    .await?;
-                }
-                if complete {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+            self.enumerate_source_sweep(store, &mut sweep, page_size)
+                .await?;
             self.checkpoint_source_sweep(&mut sweep, "reconcile", None, false)
                 .await?;
         }
@@ -3360,6 +3388,78 @@ impl PersistentGraphIndex {
             }
             .fail();
         }
+        self.reconcile_source_sweep(store, &mut sweep, page_size)
+            .await
+    }
+
+    async fn enumerate_source_sweep(
+        &mut self,
+        store: &SqliteGraphStore,
+        sweep: &mut SourceSweepRun,
+        page_size: NonZeroUsize,
+    ) -> crate::Result<()> {
+        loop {
+            let cursor = sweep
+                .page_cursor
+                .as_ref()
+                .map(|name| GraphBranchPageCursor { name: name.clone() });
+            let page = store
+                .graph_branches_at_revision_page(
+                    sweep.relation_revision,
+                    cursor.as_ref(),
+                    None,
+                    page_size,
+                )
+                .await
+                .context(crate::error::StoreSnafu)?;
+            let complete = page.complete;
+            let next_scan_cursor = page.next_cursor.map(|cursor| cursor.name);
+            if page.branches.is_empty() {
+                let Some(next_scan_cursor) = next_scan_cursor else {
+                    break;
+                };
+                self.checkpoint_source_sweep(sweep, "enumerate", Some(next_scan_cursor), false)
+                    .await?;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            for record in page.branches {
+                let name = record.name.clone();
+                self.refresh_branch_event(
+                    store,
+                    record,
+                    SourceInvalidation {
+                        incarnation: &sweep.target_invalidation_incarnation,
+                        version: sweep.target_invalidation_version,
+                        relation_revision: sweep.relation_revision,
+                    },
+                    &BTreeSet::new(),
+                    true,
+                )
+                .await?;
+                self.checkpoint_source_sweep(sweep, "enumerate", Some(name), false)
+                    .await?;
+            }
+            if let Some(next_scan_cursor) = next_scan_cursor
+                && sweep.page_cursor.as_deref() != Some(next_scan_cursor.as_str())
+            {
+                self.checkpoint_source_sweep(sweep, "enumerate", Some(next_scan_cursor), false)
+                    .await?;
+            }
+            if complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_source_sweep(
+        &mut self,
+        store: &SqliteGraphStore,
+        sweep: &mut SourceSweepRun,
+        page_size: NonZeroUsize,
+    ) -> crate::Result<()> {
         loop {
             let names = self
                 .tracked_branch_name_page(sweep.page_cursor.as_deref(), page_size)
@@ -3385,7 +3485,7 @@ impl PersistentGraphIndex {
                     )
                     .await?;
                 }
-                self.checkpoint_source_sweep(&mut sweep, "reconcile", Some(name), false)
+                self.checkpoint_source_sweep(sweep, "reconcile", Some(name), false)
                     .await?;
             }
             if complete {
@@ -3394,7 +3494,7 @@ impl PersistentGraphIndex {
             tokio::task::yield_now().await;
         }
         let final_cursor = sweep.page_cursor.clone();
-        self.checkpoint_source_sweep(&mut sweep, "reconcile", final_cursor, true)
+        self.checkpoint_source_sweep(sweep, "reconcile", final_cursor, true)
             .await
     }
 
@@ -4919,11 +5019,13 @@ impl PersistentGraphIndex {
         let Some(receipt) = receipt else {
             return Ok(None);
         };
-        if receipt.target_head_id != record.head_id
-            || receipt.target_state_json != target_state_json
-            || receipt.invalidation_kind != invalidation_kind
-            || receipt.relation_revision != relation_revision
-        {
+        if !invalidation_receipt_matches(
+            &receipt,
+            record,
+            &target_state_json,
+            &invalidation_kind,
+            relation_revision,
+        ) {
             return Ok(None);
         }
         let receipt_id = receipt.receipt_id;
@@ -4943,25 +5045,8 @@ impl PersistentGraphIndex {
                 .context(QueryGraphSnapshotStoreSnafu { path })
             })
             .await?;
-        if persisted.len() != dirty_seeds.len() {
+        if !invalidation_receipt_seeds_match(&persisted, dirty_seeds) {
             return Ok(None);
-        }
-        for (persisted, current) in persisted.iter().zip(dirty_seeds) {
-            let persisted_watermark = match (
-                persisted.child_high_watermark_relation_revision,
-                persisted.child_high_watermark_node_id.as_ref(),
-            ) {
-                (None, None) => None,
-                (Some(relation_revision), Some(node_id)) => Some((relation_revision, node_id)),
-                _ => return Ok(None),
-            };
-            let current_watermark = current
-                .child_high_watermark
-                .as_ref()
-                .map(|watermark| (watermark.relation_revision, &watermark.node_id));
-            if persisted.node_id != current.node_id || persisted_watermark != current_watermark {
-                return Ok(None);
-            }
         }
         Ok(Some(receipt.source_revision))
     }
@@ -5189,26 +5274,13 @@ impl PersistentGraphIndex {
         dirty_seeds: &[DirtySeed],
         force_full: bool,
     ) -> crate::Result<()> {
-        let SourceInvalidation {
-            incarnation: target_invalidation_incarnation,
-            version: target_invalidation_version,
-            relation_revision,
-        } = invalidation;
         let invalidation_kind = if force_full { "full" } else { "targeted" };
-        if target_invalidation_version > 0
-            && let Some(published_source_revision) = self
-                .source_invalidation_receipt_exists(
-                    target_invalidation_incarnation,
-                    target_invalidation_version,
-                    &record,
-                    dirty_seeds,
-                    invalidation_kind,
-                    relation_revision,
-                )
-                .await?
+        if let Some(published_source_revision) = self
+            .replayed_source_refresh_revision(&record, invalidation, dirty_seeds, invalidation_kind)
+            .await?
         {
             tracing::info!(
-                source_mutation_revision = relation_revision,
+                source_mutation_revision = invalidation.relation_revision,
                 source_branch_name = %record.name,
                 target_head_id = %record.head_id,
                 published_source_revision,
@@ -5218,94 +5290,20 @@ impl PersistentGraphIndex {
             );
             return Ok(());
         }
-        let target_state_json = serde_json::to_string(&record.state).context(
-            SerializeGraphSnapshotStoreValueSnafu {
-                column: "state_json",
-            },
-        )?;
-        let (previous, same_head, existing_refresh) = loop {
-            let previous = self.published_branch(&record.name).await?;
-            let same_head = previous
-                .as_ref()
-                .is_some_and(|published| published.head_id == record.head_id);
-            let existing_refresh = self.matching_refresh(&record).await?;
-            if existing_refresh.is_some() || !same_head || force_full {
-                break (previous, same_head, existing_refresh);
-            }
-            let published = previous
-                .as_ref()
-                .expect("same-head refresh should have a previous branch");
-            if dirty_seeds.is_empty() && published.state_json != target_state_json {
-                if self
-                    .update_published_branch_state(
-                        &record,
-                        published,
-                        target_invalidation_incarnation,
-                        target_invalidation_version,
-                        "targeted",
-                        relation_revision,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-                continue;
-            }
-            if !dirty_seeds.is_empty() {
-                break (previous, same_head, existing_refresh);
-            }
-            self.commit_noop_invalidation_receipt(
-                target_invalidation_incarnation,
-                target_invalidation_version,
+        let SourceRefreshPreparation::Ready {
+            previous,
+            mut refresh,
+        } = self
+            .prepare_source_refresh(
                 &record,
-                dirty_seeds,
-                "targeted",
-                relation_revision,
-            )
-            .await?;
-            return Ok(());
-        };
-        let mut initial_work = dirty_seeds
-            .iter()
-            .map(|seed| {
-                (
-                    QueueItem {
-                        node_id: seed.node_id.clone(),
-                        traversal: TraversalKind::Graph,
-                    },
-                    true,
-                )
-            })
-            .collect::<Vec<_>>();
-        if !same_head || force_full {
-            initial_work.push((
-                QueueItem {
-                    node_id: record.head_id.clone(),
-                    traversal: TraversalKind::Graph,
-                },
-                force_full,
-            ));
-        }
-        initial_work.sort_by(|left, right| left.0.cmp(&right.0));
-        initial_work.dedup_by(|left, right| left.0 == right.0);
-        let mut refresh = if let Some(refresh) = existing_refresh {
-            refresh
-        } else {
-            self.begin_or_resume_refresh(RefreshStart {
-                record: &record,
-                base_generation: (same_head && !force_full).then(|| {
-                    previous
-                        .as_ref()
-                        .expect("same-head refresh should have a previous branch")
-                        .contribution_generation
-                }),
                 invalidation,
-                target_invalidation_kind: invalidation_kind,
-                previous: previous.as_ref(),
-                initial_work: &initial_work,
                 dirty_seeds,
-            })
+                force_full,
+                invalidation_kind,
+            )
             .await?
+        else {
+            return Ok(());
         };
         let source_invalidation_scope = refresh.target_invalidation_kind.clone();
         tracing::info!(
@@ -5336,6 +5334,174 @@ impl PersistentGraphIndex {
             "console graph source refresh stage started",
         );
 
+        let refresh_session = self
+            .traverse_source_refresh(
+                store,
+                &record,
+                &previous,
+                &mut refresh,
+                &source_invalidation_scope,
+            )
+            .await?;
+        let published_source_revision = self.commit_branch(&refresh, record.clone()).await?;
+        tracing::info!(
+            source_refresh_id = refresh.refresh_id,
+            target_source_contribution_generation = refresh.target_contribution_generation,
+            base_contribution_generation = refresh.base_generation.unwrap_or_default(),
+            base_contribution_generation_available = refresh.base_generation.is_some(),
+            source_refresh_lease_epoch = refresh.lease_epoch,
+            source_mutation_revision = refresh.relation_revision,
+            source_invalidation_scope = %source_invalidation_scope,
+            source_branch_name = %record.name,
+            target_head_id = %record.head_id,
+            source_refresh_stage = "complete",
+            refresh_session_committed_batch_count = refresh_session.batches,
+            refresh_session_traversed_work_item_count = refresh_session.traversed_work_items,
+            refresh_session_traversal_skipped_base_completed_work_item_count =
+                refresh_session.reused_work_items,
+            refresh_session_committed_child_page_count = refresh_session.child_pages,
+            refresh_session_committed_parent_page_count = refresh_session.parent_pages,
+            published_source_revision,
+            source_publication_outcome = "committed",
+            source_contribution_build_kind = if refresh.base_generation.is_some() {
+                "append"
+            } else {
+                "full"
+            },
+            "console graph source contribution published",
+        );
+        self.cleanup_stale_refreshes_bounded().await
+    }
+
+    async fn replayed_source_refresh_revision(
+        &self,
+        record: &GraphBranchRecord,
+        invalidation: SourceInvalidation<'_>,
+        dirty_seeds: &[DirtySeed],
+        invalidation_kind: &str,
+    ) -> crate::Result<Option<i64>> {
+        if invalidation.version <= 0 {
+            return Ok(None);
+        }
+        self.source_invalidation_receipt_exists(
+            invalidation.incarnation,
+            invalidation.version,
+            record,
+            dirty_seeds,
+            invalidation_kind,
+            invalidation.relation_revision,
+        )
+        .await
+    }
+
+    async fn prepare_source_refresh(
+        &mut self,
+        record: &GraphBranchRecord,
+        invalidation: SourceInvalidation<'_>,
+        dirty_seeds: &[DirtySeed],
+        force_full: bool,
+        invalidation_kind: &str,
+    ) -> crate::Result<SourceRefreshPreparation> {
+        let target_state_json = serde_json::to_string(&record.state).context(
+            SerializeGraphSnapshotStoreValueSnafu {
+                column: "state_json",
+            },
+        )?;
+        let (previous, same_head, existing_refresh) = loop {
+            let previous = self.published_branch(&record.name).await?;
+            let same_head = previous
+                .as_ref()
+                .is_some_and(|published| published.head_id == record.head_id);
+            let existing_refresh = self.matching_refresh(record).await?;
+            if existing_refresh.is_some() || !same_head || force_full {
+                break (previous, same_head, existing_refresh);
+            }
+            let published = previous
+                .as_ref()
+                .expect("same-head refresh should have a previous branch");
+            if dirty_seeds.is_empty() && published.state_json != target_state_json {
+                if self
+                    .update_published_branch_state(
+                        record,
+                        published,
+                        invalidation.incarnation,
+                        invalidation.version,
+                        "targeted",
+                        invalidation.relation_revision,
+                    )
+                    .await?
+                {
+                    return Ok(SourceRefreshPreparation::Completed);
+                }
+                continue;
+            }
+            if !dirty_seeds.is_empty() {
+                break (previous, same_head, existing_refresh);
+            }
+            self.commit_noop_invalidation_receipt(
+                invalidation.incarnation,
+                invalidation.version,
+                record,
+                dirty_seeds,
+                "targeted",
+                invalidation.relation_revision,
+            )
+            .await?;
+            return Ok(SourceRefreshPreparation::Completed);
+        };
+        let mut initial_work = dirty_seeds
+            .iter()
+            .map(|seed| {
+                (
+                    QueueItem {
+                        node_id: seed.node_id.clone(),
+                        traversal: TraversalKind::Graph,
+                    },
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !same_head || force_full {
+            initial_work.push((
+                QueueItem {
+                    node_id: record.head_id.clone(),
+                    traversal: TraversalKind::Graph,
+                },
+                force_full,
+            ));
+        }
+        initial_work.sort_by(|left, right| left.0.cmp(&right.0));
+        initial_work.dedup_by(|left, right| left.0 == right.0);
+        let refresh = if let Some(refresh) = existing_refresh {
+            refresh
+        } else {
+            self.begin_or_resume_refresh(RefreshStart {
+                record,
+                base_generation: (same_head && !force_full).then(|| {
+                    previous
+                        .as_ref()
+                        .expect("same-head refresh should have a previous branch")
+                        .contribution_generation
+                }),
+                invalidation,
+                target_invalidation_kind: invalidation_kind,
+                previous: previous.as_ref(),
+                initial_work: &initial_work,
+                dirty_seeds,
+            })
+            .await?
+        };
+        Ok(SourceRefreshPreparation::Ready { previous, refresh })
+    }
+
+    async fn traverse_source_refresh(
+        &mut self,
+        store: &SqliteGraphStore,
+        record: &GraphBranchRecord,
+        previous: &Option<PublishedBranch>,
+        refresh: &mut RefreshRun,
+        source_invalidation_scope: &str,
+    ) -> crate::Result<RefreshSessionStats> {
         let mut refresh_session_batches = 0usize;
         let mut refresh_session_traversed_work_items = 0usize;
         let mut refresh_session_reused_work_items = 0usize;
@@ -5357,7 +5523,7 @@ impl PersistentGraphIndex {
                 let previous = previous
                     .as_ref()
                     .expect("previous branch should exist when its head is reached");
-                self.set_refresh_base(&refresh, previous.contribution_generation)
+                self.set_refresh_base(refresh, previous.contribution_generation)
                     .await?;
                 refresh.base_generation = Some(previous.contribution_generation);
                 refresh.target_contribution_generation = previous.contribution_generation;
@@ -5382,7 +5548,7 @@ impl PersistentGraphIndex {
                 })
                 .map(|work| work.item.clone())
                 .collect::<Vec<_>>();
-            self.commit_reused_work(&refresh, &reused).await?;
+            self.commit_reused_work(refresh, &reused).await?;
 
             let traversal_batch = batch
                 .iter()
@@ -5408,7 +5574,7 @@ impl PersistentGraphIndex {
                     child_rechecks.push(item.clone());
                 }
             }
-            self.commit_refresh_batch(&refresh, &record.name, &traversal_batch, &child_rechecks)
+            self.commit_refresh_batch(refresh, &record.name, &traversal_batch, &child_rechecks)
                 .await?;
 
             let mut enqueued_parents = 0usize;
@@ -5422,7 +5588,7 @@ impl PersistentGraphIndex {
                     .await?;
                 let node = required_node(&node, "node_id", &work.item.node_id)?;
                 enqueued_parents += self
-                    .process_parent_page(&refresh, &record.name, work, node)
+                    .process_parent_page(refresh, &record.name, work, node)
                     .await?;
                 refresh_session_parent_pages = refresh_session_parent_pages.saturating_add(1);
             }
@@ -5430,7 +5596,7 @@ impl PersistentGraphIndex {
                 work.node_committed && work.parent_traversal_complete && work.child_scan_required
             }) {
                 enqueued_children += self
-                    .process_child_page(store, &refresh, &record.name, work)
+                    .process_child_page(store, refresh, &record.name, work)
                     .await?;
                 refresh_session_child_pages = refresh_session_child_pages.saturating_add(1);
             }
@@ -5490,34 +5656,13 @@ impl PersistentGraphIndex {
             tokio::task::yield_now().await;
         }
 
-        let published_source_revision = self.commit_branch(&refresh, record.clone()).await?;
-        tracing::info!(
-            source_refresh_id = refresh.refresh_id,
-            target_source_contribution_generation = refresh.target_contribution_generation,
-            base_contribution_generation = refresh.base_generation.unwrap_or_default(),
-            base_contribution_generation_available = refresh.base_generation.is_some(),
-            source_refresh_lease_epoch = refresh.lease_epoch,
-            source_mutation_revision = refresh.relation_revision,
-            source_invalidation_scope = %source_invalidation_scope,
-            source_branch_name = %record.name,
-            target_head_id = %record.head_id,
-            source_refresh_stage = "complete",
-            refresh_session_committed_batch_count = refresh_session_batches,
-            refresh_session_traversed_work_item_count = refresh_session_traversed_work_items,
-            refresh_session_traversal_skipped_base_completed_work_item_count =
-                refresh_session_reused_work_items,
-            refresh_session_committed_child_page_count = refresh_session_child_pages,
-            refresh_session_committed_parent_page_count = refresh_session_parent_pages,
-            published_source_revision,
-            source_publication_outcome = "committed",
-            source_contribution_build_kind = if refresh.base_generation.is_some() {
-                "append"
-            } else {
-                "full"
-            },
-            "console graph source contribution published",
-        );
-        self.cleanup_stale_refreshes_bounded().await
+        Ok(RefreshSessionStats {
+            batches: refresh_session_batches,
+            traversed_work_items: refresh_session_traversed_work_items,
+            reused_work_items: refresh_session_reused_work_items,
+            child_pages: refresh_session_child_pages,
+            parent_pages: refresh_session_parent_pages,
+        })
     }
 
     async fn active_refresh_record(

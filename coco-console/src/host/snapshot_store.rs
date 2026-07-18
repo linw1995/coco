@@ -3636,13 +3636,7 @@ fn advance_overlay_edge_tombstones(
         return Ok(());
     }
 
-    let removed_table = match state.cursor_work_kind.as_str() {
-        "global" => "console_graph_build_node_tombstones",
-        "anchor_only" if state.cursor_mode == "anchors" => {
-            "console_graph_build_anchor_node_tombstones"
-        }
-        _ => return Err(diesel::result::Error::NotFound),
-    };
+    let removed_table = overlay_removed_node_table(state)?;
     if state.cursor_endpoint.is_empty() {
         let next = diesel::sql_query(format!(
             "SELECT node_id AS value FROM {removed_table} \
@@ -3653,12 +3647,7 @@ fn advance_overlay_edge_tombstones(
         .get_result::<ScalarTextRow>(connection)
         .optional()?;
         let Some(next) = next else {
-            let next_work = match (state.cursor_work_kind.as_str(), state.cursor_mode.as_str()) {
-                ("global", "all") => Some(("global", "anchors")),
-                ("global", "anchors") => Some(("anchor_only", "anchors")),
-                ("anchor_only", "anchors") => None,
-                _ => return Err(diesel::result::Error::NotFound),
-            };
+            let next_work = next_overlay_tombstone_work(state)?;
             if let Some((work_kind, mode)) = next_work {
                 let updated = diesel::sql_query(
                     "UPDATE console_graph_overlay_runs \
@@ -3799,6 +3788,27 @@ fn advance_overlay_edge_tombstones(
         return Err(diesel::result::Error::NotFound);
     }
     Ok(())
+}
+
+fn overlay_removed_node_table(state: &OverlayRunStateRow) -> QueryResult<&'static str> {
+    match state.cursor_work_kind.as_str() {
+        "global" => Ok("console_graph_build_node_tombstones"),
+        "anchor_only" if state.cursor_mode == "anchors" => {
+            Ok("console_graph_build_anchor_node_tombstones")
+        }
+        _ => Err(diesel::result::Error::NotFound),
+    }
+}
+
+fn next_overlay_tombstone_work(
+    state: &OverlayRunStateRow,
+) -> QueryResult<Option<(&'static str, &'static str)>> {
+    match (state.cursor_work_kind.as_str(), state.cursor_mode.as_str()) {
+        ("global", "all") => Ok(Some(("global", "anchors"))),
+        ("global", "anchors") => Ok(Some(("anchor_only", "anchors"))),
+        ("anchor_only", "anchors") => Ok(None),
+        _ => Err(diesel::result::Error::NotFound),
+    }
 }
 
 fn require_overlay_compaction_fence(
@@ -7000,162 +7010,183 @@ fn incremental_build_progress_from_row(
     row: &IncrementalBuildProgressRow,
 ) -> IncrementalBuildProgress {
     if let Some(overlay_phase) = row.overlay_phase.as_deref() {
-        let (stage, message) = match overlay_phase {
-            "route_tombstones" => (
-                "overlay_prepare_edge_routes",
-                "Preparing removed graph edge routes",
-            ),
-            "port_tombstones" => (
-                "overlay_prepare_edge_ports",
-                "Preparing removed graph edge ports",
-            ),
-            "ready" => ("overlay_activation", "Activating incremental graph overlay"),
-            "branch_delete" | "scope_delete" | "route_delete" | "port_delete" | "node_delete"
-            | "assignment_delete" | "tick_delete" => (
-                "overlay_compaction_delete",
-                "Compacting removed graph publication rows",
-            ),
-            "node_upsert" | "route_upsert" | "port_upsert" | "branch_upsert" | "scope_upsert"
-            | "assignment_upsert" | "manifest" | "materialization" | "shell" | "tick_upsert" => (
-                "overlay_compaction_upsert",
-                "Compacting updated graph publication rows",
-            ),
-            "finalize" => (
-                "overlay_compaction_finalize",
-                "Finalizing incremental graph publication",
-            ),
-            _ => (
-                "overlay_publication",
-                "Publishing incremental graph overlay",
-            ),
-        };
-        return IncrementalBuildProgress {
-            stage,
-            phase: GraphBuildPhase::Snapshot,
-            unit: "publication_page",
-            completed_units: 0,
-            total_units: 0,
-            message,
-        };
+        return overlay_build_progress(overlay_phase);
     }
     debug_assert_eq!(row.build_status, "building");
     if row.dag_initialized == 0 {
-        let (stage, unit, message) = match row.dag_init_phase.as_str() {
-            "new"
-            | "full_reset"
-            | "manifest_refresh_reset"
-            | "manifest_branch_reset"
-            | "manifest_copy"
-            | "manifest_refresh_copy"
-            | "manifest_reset"
-            | "manifest_seed" => (
-                "source_manifest",
-                "source_branch",
-                "Preparing graph source manifest",
-            ),
-            "scope" => (
-                "branch_scope",
-                "scope_entry",
-                "Expanding graph branch scopes",
-            ),
-            "kind" => (
-                "baseline_validation",
-                "validation_step",
-                "Validating incremental graph baseline",
-            ),
-            "kind_journal" => (
-                "source_change_journal",
-                "source_change",
-                "Reading incremental source changes",
-            ),
-            "delta_remove" => (
-                "delta_tombstones",
-                "graph_node",
-                "Capturing removed graph nodes",
-            ),
-            "delta_scope_remove" => (
-                "delta_scope_tombstones",
-                "scope_entry",
-                "Capturing removed graph branch scopes",
-            ),
-            "delta_seed" => (
-                "delta_membership",
-                "graph_node",
-                "Capturing changed graph nodes",
-            ),
-            "rank_slots" | "nodes" | "edges" | "ports" => (
-                "layout_initialization",
-                "layout_checkpoint",
-                "Preparing stable graph layout",
-            ),
-            "branches" => (
-                "branch_metadata",
-                "source_branch",
-                "Copying graph branch metadata",
-            ),
-            _ => (
-                "initialization",
-                "checkpoint_row",
-                "Initializing incremental graph build",
-            ),
-        };
-        return IncrementalBuildProgress {
-            stage,
-            phase: GraphBuildPhase::Branches,
-            unit,
-            completed_units: nonnegative_usize(row.dag_init_counter),
-            total_units: 0,
-            message,
-        };
+        return dag_initialization_progress(&row.dag_init_phase, row.dag_init_counter);
     }
 
     let completed_units = nonnegative_usize(row.dag_processed_node_count);
     let total_units = nonnegative_usize(row.dag_discovered_node_count).max(completed_units);
-    let (stage, phase, unit, message, completed_units, total_units) =
-        match row.dag_finalize_phase.as_str() {
-            "traversal" => (
-                "dag_traversal",
-                GraphBuildPhase::Entries,
-                "graph_node",
-                "Traversing and laying out graph nodes",
-                completed_units,
-                total_units,
-            ),
-            "ports" => (
-                "edge_port_finalization",
-                GraphBuildPhase::Snapshot,
-                "graph_edge",
-                "Finalizing graph edge ports",
-                0,
-                0,
-            ),
-            "labels" => (
-                "branch_label_finalization",
-                GraphBuildPhase::Snapshot,
-                "source_branch",
-                "Finalizing graph branch labels",
-                0,
-                0,
-            ),
-            "anchors" => shell_progress("anchors", row.shell_phase.as_deref()),
-            "all" => shell_progress("all", row.shell_phase.as_deref()),
-            "ready" => (
-                "publish_ready",
-                GraphBuildPhase::Snapshot,
-                "publish_step",
-                "Graph generation ready to publish",
-                0,
-                0,
-            ),
-            _ => (
-                "finalization",
-                GraphBuildPhase::Snapshot,
-                "checkpoint_row",
-                "Finalizing graph generation",
-                0,
-                0,
-            ),
-        };
+    dag_finalization_progress(
+        &row.dag_finalize_phase,
+        row.shell_phase.as_deref(),
+        completed_units,
+        total_units,
+    )
+}
+
+fn overlay_build_progress(overlay_phase: &str) -> IncrementalBuildProgress {
+    let (stage, message) = match overlay_phase {
+        "route_tombstones" => (
+            "overlay_prepare_edge_routes",
+            "Preparing removed graph edge routes",
+        ),
+        "port_tombstones" => (
+            "overlay_prepare_edge_ports",
+            "Preparing removed graph edge ports",
+        ),
+        "ready" => ("overlay_activation", "Activating incremental graph overlay"),
+        "branch_delete" | "scope_delete" | "route_delete" | "port_delete" | "node_delete"
+        | "assignment_delete" | "tick_delete" => (
+            "overlay_compaction_delete",
+            "Compacting removed graph publication rows",
+        ),
+        "node_upsert" | "route_upsert" | "port_upsert" | "branch_upsert" | "scope_upsert"
+        | "assignment_upsert" | "manifest" | "materialization" | "shell" | "tick_upsert" => (
+            "overlay_compaction_upsert",
+            "Compacting updated graph publication rows",
+        ),
+        "finalize" => (
+            "overlay_compaction_finalize",
+            "Finalizing incremental graph publication",
+        ),
+        _ => (
+            "overlay_publication",
+            "Publishing incremental graph overlay",
+        ),
+    };
+    IncrementalBuildProgress {
+        stage,
+        phase: GraphBuildPhase::Snapshot,
+        unit: "publication_page",
+        completed_units: 0,
+        total_units: 0,
+        message,
+    }
+}
+
+fn dag_initialization_progress(phase: &str, completed_units: i64) -> IncrementalBuildProgress {
+    let (stage, unit, message) = match phase {
+        "new"
+        | "full_reset"
+        | "manifest_refresh_reset"
+        | "manifest_branch_reset"
+        | "manifest_copy"
+        | "manifest_refresh_copy"
+        | "manifest_reset"
+        | "manifest_seed" => (
+            "source_manifest",
+            "source_branch",
+            "Preparing graph source manifest",
+        ),
+        "scope" => (
+            "branch_scope",
+            "scope_entry",
+            "Expanding graph branch scopes",
+        ),
+        "kind" => (
+            "baseline_validation",
+            "validation_step",
+            "Validating incremental graph baseline",
+        ),
+        "kind_journal" => (
+            "source_change_journal",
+            "source_change",
+            "Reading incremental source changes",
+        ),
+        "delta_remove" => (
+            "delta_tombstones",
+            "graph_node",
+            "Capturing removed graph nodes",
+        ),
+        "delta_scope_remove" => (
+            "delta_scope_tombstones",
+            "scope_entry",
+            "Capturing removed graph branch scopes",
+        ),
+        "delta_seed" => (
+            "delta_membership",
+            "graph_node",
+            "Capturing changed graph nodes",
+        ),
+        "rank_slots" | "nodes" | "edges" | "ports" => (
+            "layout_initialization",
+            "layout_checkpoint",
+            "Preparing stable graph layout",
+        ),
+        "branches" => (
+            "branch_metadata",
+            "source_branch",
+            "Copying graph branch metadata",
+        ),
+        _ => (
+            "initialization",
+            "checkpoint_row",
+            "Initializing incremental graph build",
+        ),
+    };
+    IncrementalBuildProgress {
+        stage,
+        phase: GraphBuildPhase::Branches,
+        unit,
+        completed_units: nonnegative_usize(completed_units),
+        total_units: 0,
+        message,
+    }
+}
+
+fn dag_finalization_progress(
+    phase: &str,
+    shell_phase: Option<&str>,
+    completed_units: usize,
+    total_units: usize,
+) -> IncrementalBuildProgress {
+    let (stage, phase, unit, message, completed_units, total_units) = match phase {
+        "traversal" => (
+            "dag_traversal",
+            GraphBuildPhase::Entries,
+            "graph_node",
+            "Traversing and laying out graph nodes",
+            completed_units,
+            total_units,
+        ),
+        "ports" => (
+            "edge_port_finalization",
+            GraphBuildPhase::Snapshot,
+            "graph_edge",
+            "Finalizing graph edge ports",
+            0,
+            0,
+        ),
+        "labels" => (
+            "branch_label_finalization",
+            GraphBuildPhase::Snapshot,
+            "source_branch",
+            "Finalizing graph branch labels",
+            0,
+            0,
+        ),
+        "anchors" => shell_progress("anchors", shell_phase),
+        "all" => shell_progress("all", shell_phase),
+        "ready" => (
+            "publish_ready",
+            GraphBuildPhase::Snapshot,
+            "publish_step",
+            "Graph generation ready to publish",
+            0,
+            0,
+        ),
+        _ => (
+            "finalization",
+            GraphBuildPhase::Snapshot,
+            "checkpoint_row",
+            "Finalizing graph generation",
+            0,
+            0,
+        ),
+    };
     IncrementalBuildProgress {
         stage,
         phase,
@@ -7280,6 +7311,70 @@ mod tests {
         active_generation: i64,
         #[diesel(sql_type = diesel::sql_types::Text)]
         status: String,
+    }
+
+    #[test]
+    fn incremental_progress_mapping_covers_every_persisted_stage() {
+        let overlay_cases = [
+            ("route_tombstones", "overlay_prepare_edge_routes"),
+            ("port_tombstones", "overlay_prepare_edge_ports"),
+            ("ready", "overlay_activation"),
+            ("branch_delete", "overlay_compaction_delete"),
+            ("node_upsert", "overlay_compaction_upsert"),
+            ("finalize", "overlay_compaction_finalize"),
+            ("unknown", "overlay_publication"),
+        ];
+        for (phase, expected_stage) in overlay_cases {
+            assert_eq!(overlay_build_progress(phase).stage, expected_stage);
+        }
+
+        let initialization_cases = [
+            ("new", "source_manifest"),
+            ("scope", "branch_scope"),
+            ("kind", "baseline_validation"),
+            ("kind_journal", "source_change_journal"),
+            ("delta_remove", "delta_tombstones"),
+            ("delta_scope_remove", "delta_scope_tombstones"),
+            ("delta_seed", "delta_membership"),
+            ("rank_slots", "layout_initialization"),
+            ("branches", "branch_metadata"),
+            ("unknown", "initialization"),
+        ];
+        for (phase, expected_stage) in initialization_cases {
+            let progress = dag_initialization_progress(phase, -1);
+            assert_eq!(progress.stage, expected_stage);
+            assert_eq!(progress.completed_units, 0);
+        }
+
+        let finalization_cases = [
+            ("traversal", None, "dag_traversal"),
+            ("ports", None, "edge_port_finalization"),
+            ("labels", None, "branch_label_finalization"),
+            ("anchors", Some("nodes"), "anchors_shell_nodes"),
+            ("all", Some("edges"), "all_shell_edges"),
+            ("ready", None, "publish_ready"),
+            ("unknown", None, "finalization"),
+        ];
+        for (phase, shell_phase, expected_stage) in finalization_cases {
+            assert_eq!(
+                dag_finalization_progress(phase, shell_phase, 2, 3).stage,
+                expected_stage
+            );
+        }
+
+        let shell_cases = [
+            ("anchors", Some("nodes"), "anchors_shell_nodes"),
+            ("anchors", Some("edges"), "anchors_shell_edges"),
+            ("anchors", Some("ticks"), "anchors_shell_timeline"),
+            ("all", Some("nodes"), "all_shell_nodes"),
+            ("all", Some("edges"), "all_shell_edges"),
+            ("all", Some("ticks"), "all_shell_timeline"),
+            ("anchors", None, "anchors_materialization"),
+            ("all", None, "all_materialization"),
+        ];
+        for (mode, phase, expected_stage) in shell_cases {
+            assert_eq!(shell_progress(mode, phase).0, expected_stage);
+        }
     }
 
     #[derive(Debug, QueryableByName)]
