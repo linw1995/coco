@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::incremental_build::build_incremental_generation;
 use super::snapshot_store::{
@@ -52,6 +53,7 @@ pub struct ConsoleGraphCache<S> {
     snapshots: Option<ConsoleGraphSnapshotStore>,
     persistent_graph_store: Option<SqliteGraphStore>,
     persistent_index: Option<Arc<tokio::sync::Mutex<PersistentGraphIndex>>>,
+    rebuild_lock: Arc<tokio::sync::Mutex<()>>,
     publish_lock: Arc<Mutex<()>>,
     state: Arc<Mutex<CacheState>>,
 }
@@ -69,7 +71,6 @@ struct CacheState {
     all: Option<CachedGraphSnapshot>,
     anchors_rebuild: Option<ConsoleGraphRebuildStatus>,
     all_rebuild: Option<ConsoleGraphRebuildStatus>,
-    refresh_worker_running: bool,
 }
 
 struct CachedGraphSnapshot {
@@ -84,6 +85,135 @@ struct GraphSnapshotSet {
 
 struct GraphRefreshResult {
     snapshots: Option<GraphSnapshotSet>,
+}
+
+struct TakenInvalidations {
+    publisher: ConsolePublisher,
+    batch: Option<ConsoleInvalidationBatch>,
+}
+
+const BUILD_LEASE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ActiveBuildLease {
+    store: ConsoleGraphSnapshotStore,
+    lease: Option<IncrementalBuildLease>,
+}
+
+impl ActiveBuildLease {
+    fn new(store: ConsoleGraphSnapshotStore, lease: IncrementalBuildLease) -> Self {
+        Self {
+            store,
+            lease: Some(lease),
+        }
+    }
+
+    fn lease(&self) -> &IncrementalBuildLease {
+        self.lease
+            .as_ref()
+            .expect("active build lease should remain available until completion")
+    }
+
+    fn complete(mut self) {
+        self.lease = None;
+    }
+
+    async fn abandon(&mut self) {
+        let Some(lease) = self.lease.as_ref().cloned() else {
+            return;
+        };
+        if abandon_build_lease(&self.store, &lease).await {
+            self.lease = None;
+        }
+    }
+}
+
+impl Drop for ActiveBuildLease {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                generation = lease.generation(),
+                "could not schedule console graph build lease cleanup outside a Tokio runtime",
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            let cleanup = async {
+                let mut retry_delay = Duration::from_millis(25);
+                loop {
+                    if abandon_build_lease(&store, &lease).await {
+                        return;
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_millis(500));
+                }
+            };
+            if tokio::time::timeout(BUILD_LEASE_CLEANUP_TIMEOUT, cleanup)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    generation = lease.generation(),
+                    "timed out cleaning cancelled console graph build lease",
+                );
+            }
+        });
+    }
+}
+
+async fn abandon_build_lease(
+    store: &ConsoleGraphSnapshotStore,
+    lease: &IncrementalBuildLease,
+) -> bool {
+    match store.abandon_incremental_build(lease).await {
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                generation = lease.generation(),
+                %error,
+                "failed to abandon console graph build lease",
+            );
+            return false;
+        }
+    }
+    if let Err(error) = store.cleanup_abandoned_generations().await {
+        tracing::warn!(
+            generation = lease.generation(),
+            %error,
+            "failed to clean abandoned console graph generation",
+        );
+    }
+    true
+}
+
+impl TakenInvalidations {
+    fn new(publisher: ConsolePublisher, batch: ConsoleInvalidationBatch) -> Self {
+        Self {
+            publisher,
+            batch: Some(batch),
+        }
+    }
+
+    fn batch(&self) -> &ConsoleInvalidationBatch {
+        self.batch
+            .as_ref()
+            .expect("taken invalidations should remain available until committed")
+    }
+
+    fn commit(mut self) {
+        self.batch = None;
+    }
+}
+
+impl Drop for TakenInvalidations {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.take() {
+            self.publisher.restore_invalidations(batch);
+        }
+    }
 }
 
 macro_rules! log_rebuild_status {
@@ -151,6 +281,7 @@ where
             snapshots: None,
             persistent_graph_store: None,
             persistent_index: None,
+            rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
         }
@@ -185,6 +316,7 @@ where
             snapshots: Some(snapshots),
             persistent_graph_store: Some(persistent_graph_store),
             persistent_index: Some(Arc::new(tokio::sync::Mutex::new(persistent_index))),
+            rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
             publish_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(CacheState::default())),
         })
@@ -229,8 +361,28 @@ where
         self.invalidations.subscribe()
     }
 
-    pub async fn rebuild_requested_modes(&self) {
-        self.ensure_graph_current();
+    #[cfg(test)]
+    pub(crate) async fn fail_next_branch_refresh(&self, branch: impl Into<String>) {
+        self.persistent_index
+            .as_ref()
+            .expect("persistent graph index should be available")
+            .lock()
+            .await
+            .fail_next_branch_refresh(branch);
+    }
+
+    pub async fn rebuild_requested_modes(&self) -> crate::Result<()> {
+        let _guard = self.rebuild_lock.lock().await;
+        let source_version = self.invalidations.current_version();
+        if self.graph_current(source_version).await {
+            let invalidations = self.invalidations.take_invalidations();
+            if invalidations.version <= source_version {
+                self.publish_graph_ready(source_version);
+                return Ok(());
+            }
+            self.invalidations.restore_invalidations(invalidations);
+        }
+        self.run_refresh_worker().await
     }
 
     #[cfg(test)]
@@ -238,19 +390,13 @@ where
         &self,
         mode: GraphMode,
     ) -> crate::Result<Arc<GraphSnapshot>> {
-        self.ensure_graph_current();
         loop {
+            self.rebuild_requested_modes().await?;
             let source_version = self.invalidations.current_version();
             if let Some(snapshot) = self.cached_snapshot(mode, source_version) {
                 return Ok(snapshot);
             }
             self.fail_if_materialization_failed(mode, source_version)?;
-            let mut ready = self.ready.subscribe();
-            let mut progress = self.progress.subscribe();
-            tokio::select! {
-                _ = ready.changed() => {}
-                _ = progress.changed() => {}
-            }
         }
     }
 
@@ -262,7 +408,6 @@ where
         if let Some(snapshot) = self.cached_snapshot(mode, source_version) {
             return Some(snapshot);
         }
-        self.ensure_snapshot_current(mode);
         self.latest_cached_snapshot(mode)
     }
 
@@ -302,7 +447,6 @@ where
                         })
                 }));
         };
-        self.ensure_viewport_current(mode).await;
         let reference = snapshots.materialized_node_reference(mode, target).await?;
         let (node_id, labels) = match reference {
             Some(reference) => (reference.node_id, reference.labels),
@@ -361,7 +505,6 @@ where
         let Some(snapshots) = &self.snapshots else {
             return Ok(None);
         };
-        self.ensure_viewport_current(mode).await;
         let materialized_reference = snapshots.materialized_node_reference(mode, target).await?;
         let target_was_materialized = materialized_reference.is_some();
         let Some(target_node_id) = materialized_reference
@@ -409,19 +552,18 @@ where
         Ok(Some(items))
     }
 
-    pub(crate) async fn materialized_fragment_current_ready_or_schedule(
+    pub(crate) async fn materialized_shell_current_ready_or_schedule(
         &self,
         mode: GraphMode,
     ) -> crate::Result<Option<MaterializedGraphShell>> {
         let Some(snapshots) = &self.snapshots else {
             return Ok(None);
         };
-        self.ensure_viewport_current(mode).await;
         let Some(facts) = snapshots.materialized_shell_facts(mode).await? else {
             return Ok(None);
         };
         let version = facts.version;
-        let node_count = facts.nodes.len();
+        let node_count = facts.node_count;
         let edge_count = facts.edge_count;
         let branches = facts
             .branches
@@ -457,6 +599,7 @@ where
         mode: GraphMode,
         observed_version: u64,
     ) -> crate::Result<Arc<GraphSnapshot>> {
+        self.rebuild_requested_modes().await?;
         loop {
             let mut rx = self.ready.subscribe();
             let mut invalidations = self.invalidations.subscribe();
@@ -475,7 +618,7 @@ where
                     if changed.is_err() {
                         continue;
                     }
-                    self.ensure_viewport_current(mode).await;
+                    self.rebuild_requested_modes().await?;
                 }
             }
         }
@@ -487,7 +630,6 @@ where
         request: GraphViewportRequest,
     ) -> Option<GraphViewportResponse> {
         if let Some(snapshots) = &self.snapshots {
-            self.ensure_viewport_current(mode).await;
             return snapshots
                 .latest_viewport(mode, request)
                 .await
@@ -510,7 +652,6 @@ where
         }
         loop {
             let mut rx = self.ready.subscribe();
-            let mut invalidations = self.invalidations.subscribe();
             let mut progress = self.progress.subscribe();
             if let Some(response) = self.viewport_current_ready_or_schedule(mode, request).await
                 && response.version > observed_version
@@ -529,12 +670,6 @@ where
                         continue;
                     }
                 }
-                changed = invalidations.changed() => {
-                    if changed.is_err() {
-                        continue;
-                    }
-                    self.ensure_viewport_current(mode).await;
-                }
             }
         }
     }
@@ -545,7 +680,6 @@ where
         request: GraphViewportDiffRequest,
     ) -> Option<GraphViewportDiffResponse> {
         if let Some(snapshots) = &self.snapshots {
-            self.ensure_viewport_current(mode).await;
             return snapshots
                 .latest_viewport_diff(mode, request)
                 .await
@@ -568,7 +702,6 @@ where
         }
         loop {
             let mut rx = self.ready.subscribe();
-            let mut invalidations = self.invalidations.subscribe();
             let mut progress = self.progress.subscribe();
             if let Some(response) = self
                 .viewport_diff_current_ready_or_schedule(mode, request.clone())
@@ -588,12 +721,6 @@ where
                     if changed.is_err() {
                         continue;
                     }
-                }
-                changed = invalidations.changed() => {
-                    if changed.is_err() {
-                        continue;
-                    }
-                    self.ensure_viewport_current(mode).await;
                 }
             }
         }
@@ -615,7 +742,6 @@ where
         if self.snapshots.is_none() {
             return;
         }
-        self.ensure_viewport_current(mode).await;
         for _ in 0..50 {
             if self.materialization_current(mode, source_version).await {
                 return;
@@ -683,73 +809,46 @@ where
         });
     }
 
-    fn ensure_snapshot_current(&self, mode: GraphMode) {
-        let source_version = self.invalidations.current_version();
-        if self.cached_snapshot(mode, source_version).is_some() {
-            set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
-            return;
-        }
-        self.ensure_graph_current();
-    }
-
-    async fn ensure_viewport_current(&self, mode: GraphMode) {
-        let source_version = self.invalidations.current_version();
-        if (self.snapshots.is_none() && self.cached_snapshot(mode, source_version).is_some())
-            || self.materialization_current(mode, source_version).await
-        {
-            set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
-            return;
-        }
-        self.ensure_graph_current();
-    }
-
-    fn ensure_graph_current(&self) {
-        let source_version = self.invalidations.current_version();
-        let should_start = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("console graph cache lock poisoned");
-            if state.refresh_worker_running {
-                false
-            } else {
-                state.refresh_worker_running = true;
-                true
+    async fn graph_current(&self, source_version: u64) -> bool {
+        if self.snapshots.is_some() {
+            for mode in [GraphMode::Anchors, GraphMode::All] {
+                if !self.materialization_current(mode, source_version).await {
+                    return false;
+                }
             }
-        };
-        if !should_start {
-            return;
+            return true;
         }
-        for mode in [GraphMode::Anchors, GraphMode::All] {
-            set_rebuild_status!(
-                self,
-                rebuild_status(
-                    mode,
-                    source_version,
-                    ConsoleGraphRebuildState::Scheduled,
-                    None,
-                    0,
-                    0,
-                    "Graph snapshot scheduled",
-                )
-            );
-        }
-        let cache = self.clone();
-        tokio::spawn(async move {
-            cache.run_refresh_worker().await;
-        });
+        [GraphMode::Anchors, GraphMode::All]
+            .into_iter()
+            .all(|mode| self.cached_snapshot(mode, source_version).is_some())
     }
 
-    async fn run_refresh_worker(&self) {
+    async fn run_refresh_worker(&self) -> crate::Result<()> {
         loop {
             let source_version = self.invalidations.current_version();
-            let mut invalidations = self.invalidations.take_invalidations();
-            invalidations.version = source_version;
+            for mode in [GraphMode::Anchors, GraphMode::All] {
+                set_rebuild_status!(
+                    self,
+                    rebuild_status(
+                        mode,
+                        source_version,
+                        ConsoleGraphRebuildState::Scheduled,
+                        None,
+                        0,
+                        0,
+                        "Graph snapshot scheduled",
+                    )
+                );
+            }
+            let mut batch = self.invalidations.take_invalidations();
+            batch.version = source_version;
+            let invalidations = TakenInvalidations::new(self.invalidations.clone(), batch);
             let result = self
-                .refresh_snapshot_set(source_version, &invalidations)
+                .refresh_snapshot_set(source_version, invalidations.batch())
                 .await;
             match result {
                 Ok(result) => {
+                    invalidations.commit();
                     if let Some(snapshots) = result.snapshots {
                         self.store_cached_snapshot(
                             GraphMode::Anchors,
@@ -762,13 +861,9 @@ where
                             Arc::new(snapshots.all),
                         );
                     }
-                    self.publish_ready_version(source_version);
-                    for mode in [GraphMode::Anchors, GraphMode::All] {
-                        set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
-                    }
+                    self.publish_graph_ready(source_version);
                 }
                 Err(error) => {
-                    self.invalidations.restore_invalidations(invalidations);
                     for mode in [GraphMode::Anchors, GraphMode::All] {
                         set_rebuild_status!(
                             self,
@@ -783,26 +878,21 @@ where
                             )
                         );
                     }
-                    self.finish_refresh_worker();
-                    return;
+                    return Err(error);
                 }
             }
 
             if self.invalidations.current_version() <= source_version {
-                self.finish_refresh_worker();
-                if self.invalidations.current_version() > source_version {
-                    self.ensure_graph_current();
-                }
-                return;
+                return Ok(());
             }
         }
     }
 
-    fn finish_refresh_worker(&self) {
-        self.state
-            .lock()
-            .expect("console graph cache lock poisoned")
-            .refresh_worker_running = false;
+    fn publish_graph_ready(&self, source_version: u64) {
+        self.publish_ready_version(source_version);
+        for mode in [GraphMode::Anchors, GraphMode::All] {
+            set_rebuild_status!(self, ready_rebuild_status(mode, source_version));
+        }
     }
 
     async fn refresh_snapshot_set(
@@ -889,54 +979,53 @@ where
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         };
 
-        let heartbeat_store = snapshot_store.clone();
-        let heartbeat_lease = lease.clone();
-        let heartbeat = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                match heartbeat_store
-                    .renew_incremental_build_lease(&heartbeat_lease)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(error) => {
-                        tracing::warn!(
-                            generation = heartbeat_lease.generation(),
-                            %error,
-                            "failed to renew console graph build lease",
-                        );
-                    }
-                }
-            }
-        });
-
-        let result = self
-            .refresh_persistent_snapshot_set_with_lease(
+        let mut active_lease = ActiveBuildLease::new(snapshot_store.clone(), lease);
+        let lease = active_lease.lease().clone();
+        let result = {
+            let build = self.refresh_persistent_snapshot_set_with_lease(
                 store,
                 index,
                 snapshot_store,
                 source_version,
                 invalidations,
                 &lease,
-            )
-            .await;
-        heartbeat.abort();
-        let _ = heartbeat.await;
+            );
+            tokio::pin!(build);
+            let mut heartbeat = tokio::time::interval(INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            loop {
+                tokio::select! {
+                    result = &mut build => break result,
+                    _ = heartbeat.tick() => {
+                        match snapshot_store.renew_incremental_build_lease(&lease).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                break crate::error::InvalidGraphSnapshotStoreValueSnafu {
+                                    column: "incremental_build_lease",
+                                    value: format!(
+                                        "generation {} is no longer owned",
+                                        lease.generation(),
+                                    ),
+                                }
+                                .fail();
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    generation = lease.generation(),
+                                    %error,
+                                    "failed to renew console graph build lease",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
         if result.is_err() {
-            if let Err(error) = snapshot_store.abandon_incremental_build(&lease).await {
-                tracing::warn!(
-                    generation = lease.generation(),
-                    %error,
-                    "failed to abandon console graph build lease",
-                );
-            }
-            if let Err(error) = snapshot_store.cleanup_abandoned_generations().await {
-                tracing::warn!(%error, "failed to clean abandoned console graph generation");
-            }
+            active_lease.abandon().await;
+        } else {
+            active_lease.complete();
         }
         result
     }
@@ -1292,6 +1381,99 @@ mod tests {
     use crate::graph::build_graph_snapshot_with_mode;
     use coco_mem::{BranchStore, Kind, NewNode, NodeStore, Role, SessionState, SqliteStore};
 
+    #[test]
+    fn dropped_rebuild_restores_taken_invalidations() {
+        let publisher = ConsolePublisher::new();
+        publisher.mark_branch_changed("main");
+        let batch = publisher.take_invalidations();
+
+        drop(TakenInvalidations::new(publisher.clone(), batch.clone()));
+
+        assert_eq!(publisher.take_invalidations(), batch);
+    }
+
+    #[tokio::test]
+    async fn cancelled_build_releases_lease_promptly() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let store = ConsoleGraphSnapshotStore::open(writer.store_path())
+            .await
+            .unwrap();
+        let lease = store
+            .acquire_incremental_build_lease(1)
+            .await
+            .unwrap()
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let guarded_store = store.clone();
+        let build = tokio::spawn(async move {
+            let _active_lease = ActiveBuildLease::new(guarded_store, lease);
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        assert!(
+            store
+                .acquire_incremental_build_lease(2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        build.abort();
+        assert!(build.await.unwrap_err().is_cancelled());
+        let replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lease) = store.acquire_incremental_build_lease(2).await.unwrap() {
+                    return lease;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled build lease should be cleaned before its TTL");
+
+        assert!(store.abandon_incremental_build(&replacement).await.unwrap());
+        store.cleanup_abandoned_generations().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_materialization_publishes_ready_and_consumes_invalidations() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let path = writer.store_path().to_owned();
+        writer.fork("main", &writer.root_id()).await.unwrap();
+        let first_invalidations = ConsolePublisher::new();
+        let second_invalidations = ConsolePublisher::new();
+        let first = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            first_invalidations,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        let second = ConsoleGraphCache::new_with_persistent_store_path(
+            writer.clone(),
+            second_invalidations.clone(),
+            path,
+        )
+        .await
+        .unwrap();
+        let mut ready = second.subscribe();
+
+        first.rebuild_requested_modes().await.unwrap();
+        second.rebuild_requested_modes().await.unwrap();
+
+        assert_eq!(*ready.borrow_and_update(), 1);
+        let statuses = second.rebuild_statuses();
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.iter().all(|status| {
+            status.source_version == 1 && status.state == ConsoleGraphRebuildState::Ready
+        }));
+        let pending = second_invalidations.take_invalidations();
+        assert_eq!(pending.version, 1);
+        assert!(!pending.full);
+        assert!(pending.branches.is_empty());
+    }
+
     #[tokio::test]
     async fn identical_rebuild_status_is_not_republished() {
         let store = SqliteStore::open_temporary().await.unwrap();
@@ -1395,7 +1577,7 @@ mod tests {
         let snapshots = cache.snapshots.as_ref().unwrap();
         let initial_generation = snapshots.active_generation().await.unwrap();
         let initial_shell = cache
-            .materialized_fragment_current_ready_or_schedule(GraphMode::All)
+            .materialized_shell_current_ready_or_schedule(GraphMode::All)
             .await
             .unwrap()
             .unwrap();
@@ -1410,7 +1592,7 @@ mod tests {
 
         writer.fork("aaa", &root).await.unwrap();
         let shell_while_old_generation_is_active = cache
-            .materialized_fragment_current_ready_or_schedule(GraphMode::All)
+            .materialized_shell_current_ready_or_schedule(GraphMode::All)
             .await
             .unwrap()
             .unwrap();
@@ -1431,7 +1613,7 @@ mod tests {
         cache.snapshot_current(GraphMode::All).await.unwrap();
         let activated_generation = snapshots.active_generation().await.unwrap();
         let activated_shell = cache
-            .materialized_fragment_current_ready_or_schedule(GraphMode::All)
+            .materialized_shell_current_ready_or_schedule(GraphMode::All)
             .await
             .unwrap()
             .unwrap();

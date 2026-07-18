@@ -30,13 +30,15 @@ use crate::layout::{
     try_layout_graph_with_hints,
 };
 use crate::schema::{
-    console_graph_edge_routes, console_graph_generation_state, console_graph_materializations,
-    console_graph_node_locations,
+    console_graph_edge_routes, console_graph_generation_state,
+    console_graph_materialization_shells, console_graph_materialization_time_ticks,
+    console_graph_materializations, console_graph_node_locations,
 };
 
 const SQLITE_DATABASE_FILE_NAME: &str = "console-graph.sqlite3";
 const SQLITE_POOL_MAX_SIZE: u32 = 4;
 const MATERIALIZATION_WRITE_BATCH_SIZE: usize = 128;
+const MATERIALIZED_SHELL_TIME_TICK_LIMIT: usize = 256;
 const COORDINATE_SPACE: &str = "graph_layout_v2";
 const INCREMENTAL_BUILD_LEASE_TTL: Duration = Duration::from_secs(120);
 pub(crate) const INCREMENTAL_BUILD_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -217,9 +219,21 @@ struct StoredViewport {
 #[derive(Debug)]
 struct StoredShellFacts {
     materialization: MaterializationRow,
-    nodes: Vec<StoredNodeRow>,
+    node_count: i64,
+    nodes: Vec<StoredShellTickRow>,
     edge_count: i64,
     branches: Vec<StoredShellBranchRow>,
+}
+
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = console_graph_materialization_time_ticks)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+struct StoredShellTickRow {
+    node_target: String,
+    x: i32,
+    y: i32,
+    created_at: String,
+    created_at_ns: i64,
 }
 
 #[derive(Debug, Clone, QueryableByName, PartialEq, Eq)]
@@ -299,6 +313,7 @@ struct PersistedMaterialization<'a> {
 #[derive(Clone, Debug)]
 pub struct MaterializedGraphShellFacts {
     pub version: u64,
+    pub node_count: usize,
     pub nodes: Vec<MaterializedGraphShellNode>,
     pub edge_count: usize,
     pub branches: Vec<MaterializedGraphShellBranchFact>,
@@ -551,6 +566,8 @@ impl ConsoleGraphSnapshotStore {
             "console_graph_edge_ports",
             "console_graph_anchor_scopes",
             "console_graph_anchor_scope_manifests",
+            "console_graph_materialization_time_ticks",
+            "console_graph_materialization_shells",
             "console_graph_materializations",
             "console_graph_materialization_branches",
         ] {
@@ -671,6 +688,8 @@ impl ConsoleGraphSnapshotStore {
             "console_graph_edge_ports",
             "console_graph_anchor_scopes",
             "console_graph_anchor_scope_manifests",
+            "console_graph_materialization_time_ticks",
+            "console_graph_materialization_shells",
             "console_graph_materializations",
             "console_graph_materialization_branches",
         ] {
@@ -809,7 +828,8 @@ impl ConsoleGraphSnapshotStore {
                         source_version,
                         width,
                         height,
-                    )
+                    )?;
+                    write_materialized_shell_projection(connection, generation, mode)
                 })
                 .context(QueryGraphSnapshotStoreSnafu { path })
         })
@@ -890,6 +910,16 @@ impl ConsoleGraphSnapshotStore {
                         }
 
                         let modes = console_graph_materializations::table
+                            .inner_join(
+                                console_graph_materialization_shells::table.on(
+                                    console_graph_materializations::generation
+                                        .eq(console_graph_materialization_shells::generation)
+                                        .and(
+                                            console_graph_materializations::mode
+                                                .eq(console_graph_materialization_shells::mode),
+                                        ),
+                                ),
+                            )
                             .filter(console_graph_materializations::generation.eq(generation))
                             .filter(
                                 console_graph_materializations::source_version.eq(expected_version),
@@ -989,6 +1019,16 @@ impl ConsoleGraphSnapshotStore {
                 connection
                     .transaction::<_, diesel::result::Error, _>(|connection| {
                         let modes = console_graph_materializations::table
+                            .inner_join(
+                                console_graph_materialization_shells::table.on(
+                                    console_graph_materializations::generation
+                                        .eq(console_graph_materialization_shells::generation)
+                                        .and(
+                                            console_graph_materializations::mode
+                                                .eq(console_graph_materialization_shells::mode),
+                                        ),
+                                ),
+                            )
                             .filter(console_graph_materializations::generation.eq(generation))
                             .filter(
                                 console_graph_materializations::source_version.eq(expected_version),
@@ -1221,7 +1261,18 @@ impl ConsoleGraphSnapshotStore {
         let path = self.path.as_ref().clone();
         let source_version = snapshot.version;
         self.with_connection(move |connection| {
-            upsert_materialization(connection, generation, mode, source_version, width, height)
+            connection
+                .transaction::<_, diesel::result::Error, _>(|connection| {
+                    upsert_materialization(
+                        connection,
+                        generation,
+                        mode,
+                        source_version,
+                        width,
+                        height,
+                    )?;
+                    write_materialized_shell_projection(connection, generation, mode)
+                })
                 .context(QueryGraphSnapshotStoreSnafu { path })
         })
         .await?;
@@ -1369,14 +1420,9 @@ impl ConsoleGraphSnapshotStore {
             let stored =
                 read_snapshot(connection, |connection| query_shell_facts(connection, mode))
                     .context(QueryGraphSnapshotStoreSnafu { path })?;
-            let Some(mut stored) = stored else {
+            let Some(stored) = stored else {
                 return Ok(None);
             };
-            stored.nodes.sort_by(|left, right| {
-                left.created_at_ns
-                    .cmp(&right.created_at_ns)
-                    .then_with(|| left.node_id.cmp(&right.node_id))
-            });
             let branches = stored
                 .branches
                 .into_iter()
@@ -1395,6 +1441,7 @@ impl ConsoleGraphSnapshotStore {
                 .collect::<crate::Result<Vec<_>>>()?;
             Ok(Some(MaterializedGraphShellFacts {
                 version: stored.materialization.source_version.max(0) as u64,
+                node_count: stored.node_count.max(0) as usize,
                 nodes: stored
                     .nodes
                     .into_iter()
@@ -1573,6 +1620,7 @@ impl ConsoleGraphSnapshotStore {
                         width,
                         height,
                     )?;
+                    write_materialized_shell_projection(connection, generation, mode)?;
                     Ok(MaterializationWriteOutcome::Committed {
                         strategy: effective_strategy,
                         fallback_reason: baseline_changed
@@ -1712,12 +1760,20 @@ fn query_shell_facts(
     else {
         return Ok(None);
     };
-    let nodes = query_nodes_for_generation(connection, generation, mode)?;
-    let edge_count = console_graph_edge_routes::table
-        .filter(console_graph_edge_routes::generation.eq(generation))
-        .filter(console_graph_edge_routes::mode.eq(mode.as_query_value()))
-        .count()
-        .get_result(connection)?;
+    let (node_count, edge_count) = console_graph_materialization_shells::table
+        .filter(console_graph_materialization_shells::generation.eq(generation))
+        .filter(console_graph_materialization_shells::mode.eq(mode.as_query_value()))
+        .select((
+            console_graph_materialization_shells::node_count,
+            console_graph_materialization_shells::edge_count,
+        ))
+        .first(connection)?;
+    let nodes = console_graph_materialization_time_ticks::table
+        .filter(console_graph_materialization_time_ticks::generation.eq(generation))
+        .filter(console_graph_materialization_time_ticks::mode.eq(mode.as_query_value()))
+        .order(console_graph_materialization_time_ticks::sample_index)
+        .select(StoredShellTickRow::as_select())
+        .load(connection)?;
     let branches = diesel::sql_query(
         "SELECT name, head_id, state_json \
          FROM console_graph_materialization_branches \
@@ -1728,6 +1784,7 @@ fn query_shell_facts(
     .load::<StoredShellBranchRow>(connection)?;
     Ok(Some(StoredShellFacts {
         materialization,
+        node_count,
         nodes,
         edge_count,
         branches,
@@ -2207,6 +2264,81 @@ fn upsert_materialization(
         .map(|_| ())
 }
 
+fn write_materialized_shell_projection(
+    connection: &mut SqliteConnection,
+    generation: i64,
+    mode: GraphMode,
+) -> QueryResult<()> {
+    let mode = mode.as_query_value();
+    let node_count = console_graph_node_locations::table
+        .filter(console_graph_node_locations::generation.eq(generation))
+        .filter(console_graph_node_locations::mode.eq(mode))
+        .count()
+        .get_result::<i64>(connection)?;
+    let edge_count = console_graph_edge_routes::table
+        .filter(console_graph_edge_routes::generation.eq(generation))
+        .filter(console_graph_edge_routes::mode.eq(mode))
+        .count()
+        .get_result::<i64>(connection)?;
+
+    diesel::insert_into(console_graph_materialization_shells::table)
+        .values((
+            console_graph_materialization_shells::generation.eq(generation),
+            console_graph_materialization_shells::mode.eq(mode),
+            console_graph_materialization_shells::node_count.eq(node_count),
+            console_graph_materialization_shells::edge_count.eq(edge_count),
+        ))
+        .on_conflict((
+            console_graph_materialization_shells::generation,
+            console_graph_materialization_shells::mode,
+        ))
+        .do_update()
+        .set((
+            console_graph_materialization_shells::node_count.eq(node_count),
+            console_graph_materialization_shells::edge_count.eq(edge_count),
+        ))
+        .execute(connection)?;
+    diesel::delete(
+        console_graph_materialization_time_ticks::table
+            .filter(console_graph_materialization_time_ticks::generation.eq(generation))
+            .filter(console_graph_materialization_time_ticks::mode.eq(mode)),
+    )
+    .execute(connection)?;
+
+    let sample_span = MATERIALIZED_SHELL_TIME_TICK_LIMIT - 1;
+    diesel::sql_query(format!(
+        "WITH ordered_nodes AS (\
+             SELECT node_target, x, y, created_at, created_at_ns, \
+                    ROW_NUMBER() OVER (ORDER BY created_at_ns, node_id) AS row_number \
+             FROM console_graph_node_locations \
+             WHERE generation = ? AND mode = ?\
+         ) \
+         INSERT INTO console_graph_materialization_time_ticks (\
+             generation, mode, sample_index, node_target, x, y, created_at, created_at_ns\
+         ) \
+         SELECT ?, ?, \
+                CASE WHEN ? <= {MATERIALIZED_SHELL_TIME_TICK_LIMIT} THEN row_number - 1 \
+                     ELSE (row_number - 1) * {sample_span} / (? - 1) END, \
+                node_target, x, y, created_at, created_at_ns \
+         FROM ordered_nodes \
+         WHERE ? <= {MATERIALIZED_SHELL_TIME_TICK_LIMIT} \
+            OR row_number = 1 \
+            OR ((row_number - 1) * {sample_span} / (? - 1)) \
+               > ((row_number - 2) * {sample_span} / (? - 1))"
+    ))
+    .bind::<BigInt, _>(generation)
+    .bind::<Text, _>(mode)
+    .bind::<BigInt, _>(generation)
+    .bind::<Text, _>(mode)
+    .bind::<BigInt, _>(node_count)
+    .bind::<BigInt, _>(node_count)
+    .bind::<BigInt, _>(node_count)
+    .bind::<BigInt, _>(node_count)
+    .bind::<BigInt, _>(node_count)
+    .execute(connection)?;
+    Ok(())
+}
+
 fn stored_viewport_node(row: StoredNodeRow) -> crate::Result<GraphViewportNode> {
     Ok(GraphViewportNode {
         key: row.node_key,
@@ -2531,7 +2663,8 @@ mod tests {
                 snapshot.version,
                 layout.width,
                 layout.height,
-            )
+            )?;
+            write_materialized_shell_projection(connection, generation, snapshot.mode)
         })
     }
 
@@ -2676,6 +2809,7 @@ mod tests {
         writer.join().unwrap();
 
         assert_eq!(facts.materialization.source_version, 1);
+        assert_eq!(facts.node_count, 2);
         assert_eq!(facts.nodes.len(), 2);
         assert_eq!(facts.edge_count, 1);
         assert_eq!(facts.branches.len(), 1);
@@ -2687,6 +2821,100 @@ mod tests {
                 .unwrap()
                 .source_version,
             2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_facts_bound_time_ticks_without_losing_node_count() {
+        let dir = temp_dir();
+        let store = ConsoleGraphSnapshotStore::open(&dir).await.unwrap();
+        let node_count = MATERIALIZED_SHELL_TIME_TICK_LIMIT * 2 + 17;
+        store
+            .materialize_snapshot(&linear_snapshot(1, GraphMode::All, node_count))
+            .await
+            .unwrap();
+
+        let facts = store
+            .materialized_shell_facts(GraphMode::All)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(facts.node_count, node_count);
+        assert_eq!(facts.edge_count, node_count - 1);
+        assert_eq!(facts.nodes.len(), MATERIALIZED_SHELL_TIME_TICK_LIMIT);
+        let sample_span = MATERIALIZED_SHELL_TIME_TICK_LIMIT - 1;
+        let node_span = node_count - 1;
+        let expected_time_ticks = (0..node_count)
+            .filter(|index| {
+                let index = *index;
+                index == 0
+                    || index * sample_span / node_span > (index - 1) * sample_span / node_span
+            })
+            .map(|index| index as i128)
+            .collect::<Vec<_>>();
+        let actual_time_ticks = facts
+            .nodes
+            .iter()
+            .map(|node| node.created_at_ns)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_time_ticks, expected_time_ticks);
+        assert_eq!(actual_time_ticks.first(), Some(&0));
+        assert_eq!(actual_time_ticks.last().copied(), Some(node_span as i128));
+        let expected_targets = facts
+            .nodes
+            .iter()
+            .map(|node| node.node_target.clone())
+            .collect::<Vec<_>>();
+        let generation = store.active_generation().await.unwrap();
+        store
+            .with_connection(move |connection| {
+                connection
+                    .transaction::<_, diesel::result::Error, _>(|connection| {
+                        diesel::delete(
+                            console_graph_edge_routes::table
+                                .filter(console_graph_edge_routes::generation.eq(generation))
+                                .filter(console_graph_edge_routes::mode.eq("all")),
+                        )
+                        .execute(connection)?;
+                        diesel::delete(
+                            console_graph_node_locations::table
+                                .filter(console_graph_node_locations::generation.eq(generation))
+                                .filter(console_graph_node_locations::mode.eq("all")),
+                        )
+                        .execute(connection)?;
+                        Ok(())
+                    })
+                    .context(QueryGraphSnapshotStoreSnafu {
+                        path: PathBuf::from("shell-projection-source-removal"),
+                    })
+            })
+            .await
+            .unwrap();
+
+        let projected = store
+            .materialized_shell_facts(GraphMode::All)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected.node_count, node_count);
+        assert_eq!(projected.edge_count, node_count - 1);
+        assert_eq!(
+            projected
+                .nodes
+                .iter()
+                .map(|node| node.created_at_ns)
+                .collect::<Vec<_>>(),
+            expected_time_ticks
+        );
+        assert_eq!(
+            projected
+                .nodes
+                .iter()
+                .map(|node| node.node_target.clone())
+                .collect::<Vec<_>>(),
+            expected_targets
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2980,6 +3208,22 @@ mod tests {
         assert_eq!(anchors.version, 2);
         assert_eq!(anchors.nodes, Vec::new());
         assert_eq!(anchors.edges, Vec::new());
+        let all_shell = store
+            .materialized_shell_facts(GraphMode::All)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all_shell.node_count, 3);
+        assert_eq!(all_shell.edge_count, 2);
+        assert_eq!(all_shell.nodes.len(), 3);
+        let anchors_shell = store
+            .materialized_shell_facts(GraphMode::Anchors)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchors_shell.node_count, 0);
+        assert_eq!(anchors_shell.edge_count, 0);
+        assert!(anchors_shell.nodes.is_empty());
         assert_eq!(
             anchors.canvas,
             GraphCanvas {
@@ -3292,9 +3536,19 @@ mod tests {
             generation_materialization_count(&store, staging.generation()).await,
             1
         );
+        assert_eq!(generation_shell_count(&store, first.generation()).await, 0);
+        assert_eq!(generation_shell_count(&store, second.generation()).await, 2);
+        assert_eq!(
+            generation_shell_count(&store, staging.generation()).await,
+            1
+        );
 
         assert!(store.abandon_incremental_build(&staging).await.unwrap());
         store.cleanup_abandoned_generations().await.unwrap();
+        assert_eq!(
+            generation_shell_count(&store, staging.generation()).await,
+            0
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3592,6 +3846,36 @@ mod tests {
                 .unwrap(),
             1
         );
+
+        connection
+            .batch_execute(include_str!(
+                "../../migrations/00000000000007_materialized_shell_projection/up.sql"
+            ))
+            .unwrap();
+        assert_eq!(
+            console_graph_materialization_shells::table
+                .filter(console_graph_materialization_shells::generation.eq(0))
+                .filter(console_graph_materialization_shells::mode.eq("all"))
+                .select((
+                    console_graph_materialization_shells::node_count,
+                    console_graph_materialization_shells::edge_count,
+                ))
+                .first::<(i64, i64)>(&mut connection)
+                .unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            console_graph_materialization_time_ticks::table
+                .filter(console_graph_materialization_time_ticks::generation.eq(0))
+                .filter(console_graph_materialization_time_ticks::mode.eq("all"))
+                .select((
+                    console_graph_materialization_time_ticks::sample_index,
+                    console_graph_materialization_time_ticks::node_target,
+                ))
+                .first::<(i32, String)>(&mut connection)
+                .unwrap(),
+            (0, "detail-node-1".to_owned())
+        );
     }
 
     async fn incremental_publish_state(
@@ -3641,6 +3925,21 @@ mod tests {
             .await
             .unwrap()
             .count
+    }
+
+    async fn generation_shell_count(store: &ConsoleGraphSnapshotStore, generation: i64) -> i64 {
+        store
+            .with_connection(move |connection| {
+                console_graph_materialization_shells::table
+                    .filter(console_graph_materialization_shells::generation.eq(generation))
+                    .count()
+                    .get_result::<i64>(connection)
+                    .context(QueryGraphSnapshotStoreSnafu {
+                        path: PathBuf::from("generation-shell-count"),
+                    })
+            })
+            .await
+            .unwrap()
     }
 
     fn temp_dir() -> PathBuf {

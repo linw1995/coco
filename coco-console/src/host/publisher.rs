@@ -46,37 +46,58 @@ impl ConsolePublisher {
     }
 
     pub fn mark_changed(&self) -> u64 {
-        self.pending
-            .lock()
-            .expect("console invalidation lock poisoned")
-            .full = true;
-        self.publish_change()
+        self.update_and_publish(
+            |pending| pending.full = true,
+            |publisher| publisher.publish_change(),
+        )
     }
 
     pub(crate) fn mark_full_at_least(&self, target: u64) -> u64 {
-        self.pending
-            .lock()
-            .expect("console invalidation lock poisoned")
-            .full = true;
-        self.advance_to(target)
+        self.update_and_publish(
+            |pending| pending.full = true,
+            |publisher| publisher.advance_to_unlocked(target),
+        )
     }
 
     pub(crate) fn mark_branch_changed(&self, branch: impl Into<String>) -> u64 {
-        self.pending
-            .lock()
-            .expect("console invalidation lock poisoned")
-            .branches
-            .insert(branch.into());
-        self.publish_change()
+        self.update_and_publish(
+            |pending| {
+                pending.branches.insert(branch.into());
+            },
+            |publisher| publisher.publish_change(),
+        )
     }
 
     pub(crate) fn mark_branches_changed(&self, branches: impl IntoIterator<Item = String>) -> u64 {
-        self.pending
+        self.update_and_publish(
+            |pending| pending.branches.extend(branches),
+            |publisher| publisher.publish_change(),
+        )
+    }
+
+    fn update_and_publish(
+        &self,
+        update: impl FnOnce(&mut PendingInvalidations),
+        publish: impl FnOnce(&Self) -> u64,
+    ) -> u64 {
+        self.update_and_publish_with_hook(update, || {}, publish)
+    }
+
+    fn update_and_publish_with_hook(
+        &self,
+        update: impl FnOnce(&mut PendingInvalidations),
+        before_publish: impl FnOnce(),
+        publish: impl FnOnce(&Self) -> u64,
+    ) -> u64 {
+        let mut pending = self
+            .pending
             .lock()
-            .expect("console invalidation lock poisoned")
-            .branches
-            .extend(branches);
-        self.publish_change()
+            .expect("console invalidation lock poisoned");
+        update(&mut pending);
+        before_publish();
+        let version = publish(self);
+        drop(pending);
+        version
     }
 
     fn publish_change(&self) -> u64 {
@@ -107,6 +128,16 @@ impl ConsolePublisher {
     }
 
     pub fn advance_to(&self, target: u64) -> u64 {
+        let pending = self
+            .pending
+            .lock()
+            .expect("console invalidation lock poisoned");
+        let version = self.advance_to_unlocked(target);
+        drop(pending);
+        version
+    }
+
+    fn advance_to_unlocked(&self, target: u64) -> u64 {
         let previous = self.version.fetch_max(target, Ordering::SeqCst);
         let version = previous.max(target);
         if previous < target {
@@ -123,6 +154,8 @@ impl ConsolePublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::sync::TryLockError;
 
     #[test]
     fn branch_invalidations_are_coalesced_and_restorable() {
@@ -169,5 +202,43 @@ mod tests {
         assert_eq!(publisher.mark_full_at_least(4), 4);
         assert_eq!(publisher.current_version(), 4);
         assert!(publisher.take_invalidations().full);
+    }
+
+    #[test]
+    fn invalidation_cannot_be_taken_before_its_version_is_published() {
+        let publisher = ConsolePublisher::new();
+        let dirty = Arc::new(Barrier::new(2));
+        let allow_publish = Arc::new(Barrier::new(2));
+        let marker = {
+            let publisher = publisher.clone();
+            let dirty = dirty.clone();
+            let allow_publish = allow_publish.clone();
+            std::thread::spawn(move || {
+                publisher.update_and_publish_with_hook(
+                    |pending| {
+                        pending.branches.insert("main".to_owned());
+                    },
+                    || {
+                        dirty.wait();
+                        allow_publish.wait();
+                    },
+                    |publisher| publisher.publish_change(),
+                )
+            })
+        };
+        dirty.wait();
+        assert_eq!(publisher.current_version(), 0);
+        assert!(matches!(
+            publisher.pending.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+
+        allow_publish.wait();
+        assert_eq!(marker.join().unwrap(), 1);
+        let batch = publisher.take_invalidations();
+
+        assert_eq!(batch.version, 1);
+        assert!(!batch.full);
+        assert_eq!(batch.branches, BTreeSet::from(["main".to_owned()]));
     }
 }

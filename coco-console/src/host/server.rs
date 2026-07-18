@@ -15,7 +15,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::Result;
 use crate::api::{
@@ -32,15 +32,17 @@ use crate::host::cache::ConsoleGraphCache;
 use crate::publisher::ConsolePublisher;
 use crate::render::{
     render_fragment, render_graph_node_detail_fragment, render_loading_fragment,
-    render_loading_index_page, render_materialized_fragment, render_node_detail_fragment,
-    render_provider_context_fragment, render_provider_context_items_fragment,
-    render_provider_context_missing_fragment,
+    render_loading_index_page, render_materialized_fragment, render_materialized_index_page,
+    render_node_detail_fragment, render_provider_context_fragment,
+    render_provider_context_items_fragment, render_provider_context_missing_fragment,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
+const REBUILD_RETRY_MIN_DELAY: Duration = Duration::from_millis(250);
+const REBUILD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct AppState<S> {
@@ -135,11 +137,61 @@ async fn serve_console<S>(listener: tokio::net::TcpListener, state: AppState<S>)
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
+    let cache = state.cache.clone();
+    let server = async move {
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    };
+    tokio::select! {
+        result = server => result,
+        never = drive_graph_rebuilds(cache) => match never {},
+    }
+}
+
+async fn drive_graph_rebuilds<S>(cache: ConsoleGraphCache<S>) -> Infallible
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let mut invalidations = cache.subscribe_invalidations();
+    let mut retry_delay = REBUILD_RETRY_MIN_DELAY;
+    loop {
+        let source_version = *invalidations.borrow_and_update();
+        if source_version == 0 {
+            invalidations
+                .changed()
+                .await
+                .expect("console graph cache retains the invalidation publisher");
+            continue;
+        }
+        tracing::info!(source_version, "console graph invalidation received");
+        match cache.rebuild_requested_modes().await {
+            Ok(()) => {
+                retry_delay = REBUILD_RETRY_MIN_DELAY;
+                invalidations
+                    .changed()
+                    .await
+                    .expect("console graph cache retains the invalidation publisher");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    source_version,
+                    retry_delay_ms = retry_delay.as_millis(),
+                    %error,
+                    "retrying console graph rebuild",
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {}
+                    changed = invalidations.changed() => {
+                        changed.expect("console graph cache retains the invalidation publisher");
+                    }
+                }
+                retry_delay = (retry_delay * 2).min(REBUILD_RETRY_MAX_DELAY);
+            }
+        }
+    }
 }
 
 fn router<S>(state: AppState<S>) -> Router
@@ -234,6 +286,20 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
+    if state.cache.has_materialized_viewports() {
+        return match state
+            .cache
+            .materialized_shell_current_ready_or_schedule(mode)
+            .await
+        {
+            Ok(Some(shell)) => html_response(render_materialized_index_page(&shell)),
+            Ok(None) => html_response(render_loading_index_page(
+                mode,
+                state.cache.current_viewport_version(mode).await,
+            )),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
     html_response(render_loading_index_page(
         mode,
         state.cache.current_viewport_version(mode).await,
@@ -495,7 +561,7 @@ where
         }
         return match state
             .cache
-            .materialized_fragment_current_ready_or_schedule(mode)
+            .materialized_shell_current_ready_or_schedule(mode)
             .await
         {
             Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
@@ -635,10 +701,10 @@ async fn event_stream<S>(State(state): State<AppState<S>>) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let current_version = state.cache.current_version();
-    let rx = state.cache.subscribe();
-    let progress_rx = state.cache.subscribe_progress();
-    let invalidations = state.cache.subscribe_invalidations();
+    let mut rx = state.cache.subscribe();
+    let current_version = *rx.borrow_and_update();
+    let mut progress_rx = state.cache.subscribe_progress();
+    progress_rx.borrow_and_update();
     let cache = state.cache.clone();
     let initial_progress = graph_progress_event(&cache);
     let initial = stream::iter([
@@ -650,40 +716,30 @@ where
         Ok::<_, Infallible>(initial_progress),
     ]);
     let changes = stream::unfold(
-        (rx, progress_rx, invalidations, cache),
-        |(mut rx, mut progress_rx, mut invalidations, cache)| async move {
-            loop {
-                tokio::select! {
-                    changed = rx.changed() => {
-                        if changed.is_err() {
-                            return None;
-                        }
-                        let version = *rx.borrow_and_update();
-                        return Some((
-                            Ok::<_, Infallible>(
-                                Event::default().event("graph").data(version.to_string()),
-                            ),
-                            (rx, progress_rx, invalidations, cache),
-                        ));
+        (rx, progress_rx, cache),
+        |(mut rx, mut progress_rx, cache)| async move {
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return None;
                     }
-                    changed = progress_rx.changed() => {
-                        if changed.is_err() {
-                            return None;
-                        }
-                        progress_rx.borrow_and_update();
-                        return Some((
-                            Ok::<_, Infallible>(
-                                graph_progress_event(&cache),
-                            ),
-                            (rx, progress_rx, invalidations, cache),
-                        ));
+                    let version = *rx.borrow_and_update();
+                    Some((
+                        Ok::<_, Infallible>(
+                            Event::default().event("graph").data(version.to_string()),
+                        ),
+                        (rx, progress_rx, cache),
+                    ))
+                }
+                changed = progress_rx.changed() => {
+                    if changed.is_err() {
+                        return None;
                     }
-                    changed = invalidations.changed() => {
-                        if changed.is_err() {
-                            return None;
-                        }
-                        cache.rebuild_requested_modes().await;
-                    }
+                    progress_rx.borrow_and_update();
+                    Some((
+                        Ok::<_, Infallible>(graph_progress_event(&cache)),
+                        (rx, progress_rx, cache),
+                    ))
                 }
             }
         },
@@ -1008,8 +1064,8 @@ mod tests {
     use super::{
         AppState, fragment, graph_json, graph_viewport_diff_response,
         graph_viewport_items_diff_response_from_query, index_page, node_detail, parse_query,
-        provider_context, start_console_server, viewport_diff_has_changes,
-        viewport_diff_request_from_query,
+        provider_context, start_console_server, start_console_server_with_cache,
+        viewport_diff_has_changes, viewport_diff_request_from_query,
     };
     use crate::api::{
         GraphBezierRoute, GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge,
@@ -1017,7 +1073,7 @@ mod tests {
     };
     use crate::graph::{GraphMode, build_graph_snapshot, node_target_id};
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
-    use crate::host::cache::ConsoleGraphCache;
+    use crate::host::cache::{ConsoleGraphCache, ConsoleGraphRebuildState};
     use crate::layout::layout_graph_viewport;
     use crate::{ConsoleConfig, ConsolePublisher, ConsoleStore};
     use axum::body::to_bytes;
@@ -1166,6 +1222,70 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("content-type: text/css; charset=utf-8"));
+    }
+
+    #[tokio::test]
+    async fn server_rebuilds_without_an_http_client() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).await.unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(writer.clone(), publisher.clone());
+        let cache = ConsoleGraphCache::new_with_persistent_store_path(
+            store.clone(),
+            publisher,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        let mut ready = cache.subscribe();
+        let handle = start_console_server_with_cache(test_config(), cache.clone()).unwrap();
+
+        timeout(Duration::from_secs(1), ready.changed())
+            .await
+            .expect("initial materialization should finish without an HTTP client")
+            .unwrap();
+        assert_eq!(*ready.borrow_and_update(), 1);
+
+        cache.fail_next_branch_refresh("worker").await;
+        let mut progress = cache.subscribe_progress();
+        store.fork("worker", &root).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                progress.changed().await.unwrap();
+                if cache
+                    .rebuild_statuses()
+                    .iter()
+                    .any(|status| status.state == ConsoleGraphRebuildState::Failed)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the injected branch refresh failure should be observable");
+        timeout(Duration::from_secs(3), ready.changed())
+            .await
+            .expect("failed rebuild should retry without a new invalidation")
+            .unwrap();
+        assert_eq!(*ready.borrow_and_update(), 2);
+        assert_eq!(cache.current_viewport_version(GraphMode::All).await, 2);
+
+        let mut client = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        client.write_all(get_request("/").as_bytes()).await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("data-version=\"2\""), "{response}");
+        assert!(response.contains("<strong>main</strong>"), "{response}");
+        assert!(response.contains("<strong>worker</strong>"), "{response}");
+        assert!(!response.contains("Loading graph / Anchors"), "{response}");
+
+        handle.shutdown().await.unwrap();
+        drop(cache);
+        drop(store);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -1744,6 +1864,7 @@ mod tests {
             .await
             .unwrap(),
         };
+        state.cache.rebuild_requested_modes().await.unwrap();
         let all = state
             .cache
             .viewport_after(GraphMode::All, 0, GraphViewportRequest::default())
@@ -2032,6 +2153,7 @@ mod tests {
             .await
             .unwrap(),
         };
+        state.cache.rebuild_requested_modes().await.unwrap();
         let query = format!("target={}&mode=all", node_target_id(&text));
 
         let response = node_detail(State(state.clone()), RawQuery(Some(query))).await;
@@ -2187,15 +2309,14 @@ mod tests {
             .await
             .unwrap();
         publisher.mark_changed();
-        state
-            .cache
-            .viewport_after(
-                GraphMode::Anchors,
-                initial.version,
-                crate::host::api::GraphViewportRequest::default(),
-            )
-            .await
-            .unwrap();
+        state.cache.rebuild_requested_modes().await.unwrap();
+        assert!(
+            state
+                .cache
+                .current_viewport_version(GraphMode::Anchors)
+                .await
+                > initial.version
+        );
 
         let detail = state
             .cache

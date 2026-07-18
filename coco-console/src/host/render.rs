@@ -17,6 +17,10 @@ pub fn render_loading_index_page(mode: GraphMode, version: u64) -> String {
     render_document(render_loading_root(mode, version), true)
 }
 
+pub(crate) fn render_materialized_index_page(shell: &MaterializedGraphShell) -> String {
+    render_document(render_materialized_root(shell), true)
+}
+
 pub fn render_loading_fragment(mode: GraphMode, version: u64) -> String {
     render_loading_root(mode, version).to_html()
 }

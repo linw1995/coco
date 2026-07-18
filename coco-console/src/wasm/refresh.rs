@@ -179,6 +179,28 @@ mod tests {
     }
 
     #[test]
+    fn wire_rounded_viewport_stops_patch_fetching() {
+        let current = ViewportState {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 594.1,
+            overscan: 0,
+        }
+        .with_render_overscan();
+        let rendered = ViewportState {
+            height: 594.0,
+            ..current
+        }
+        .with_render_overscan();
+
+        assert_eq!(
+            next_viewport_fetch(rendered, current, PendingViewportUpdate::None),
+            ViewportFetch::None
+        );
+    }
+
+    #[test]
     fn viewport_update_stays_active_after_pending_update_is_consumed() {
         assert!(viewport_update_active(true, PendingViewportUpdate::None));
     }
