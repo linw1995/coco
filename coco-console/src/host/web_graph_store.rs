@@ -22,12 +22,14 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!("web-graph-migrations")
 
 mod database;
 mod schema;
+mod spatial;
 
 use database::{AsyncSqliteConnection, Database};
 use schema::{
     web_graph_edge_routes, web_graph_edges, web_graph_layouts, web_graph_node_placements,
     web_graph_nodes, web_graph_state,
 };
+pub use spatial::{Viewport, ViewportCursor, ViewportPage};
 
 #[derive(Clone)]
 pub struct WebGraphStore {
@@ -240,6 +242,38 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
+    pub async fn viewport_page(
+        &self,
+        kind: LayoutKind,
+        viewport: Viewport,
+        cursor: Option<&ViewportCursor>,
+        limit_per_kind: NonZeroUsize,
+    ) -> Result<Option<GraphRead<ViewportPage>>> {
+        validate_read_batch_size(limit_per_kind.get())?;
+        viewport.validate()?;
+        let path = self.path.clone();
+        let cursor = cursor.cloned();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let page = spatial::load_viewport_page(
+                    connection,
+                    kind,
+                    viewport,
+                    cursor,
+                    limit_per_kind,
+                    state.revision,
+                )
+                .await?;
+                Ok(Some(GraphRead { state, value: page }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
     pub async fn replace(&self, graph: &Graph) -> Result<()> {
         let snapshot = graph.snapshot();
         let path = self.path.clone();
@@ -341,6 +375,7 @@ struct SnapshotRows {
     layouts: Vec<LayoutRow>,
     placements: Vec<PlacementRow>,
     routes: Vec<RouteRow>,
+    spatial: spatial::SnapshotSpatialRows,
 }
 
 #[derive(Debug, Snafu)]
@@ -397,6 +432,13 @@ pub enum Error {
 
     #[snafu(display("Web graph page cursor belongs to a different query"))]
     CursorQueryMismatch,
+
+    #[snafu(display("Invalid web graph viewport {width}x{height} with overscan {overscan}"))]
+    InvalidViewport {
+        width: i32,
+        height: i32,
+        overscan: i32,
+    },
 
     #[snafu(display("Stored web graph is invalid: {source}"))]
     InvalidGraph { source: crate::web_graph::Error },
@@ -756,6 +798,7 @@ async fn replace_snapshot(
     use diesel_async::RunQueryDsl;
 
     let rows = snapshot_rows(snapshot)?;
+    spatial::clear(connection).await?;
     diesel::delete(web_graph_edge_routes::table)
         .execute(connection)
         .await?;
@@ -807,6 +850,7 @@ async fn replace_snapshot(
                     connection,
                 )?;
             }
+            spatial::insert_snapshot(connection, &rows.spatial)?;
             diesel::RunQueryDsl::execute(
                 diesel::insert_into(web_graph_state::table).values(&rows.state),
                 connection,
@@ -1385,6 +1429,7 @@ async fn remove_layout_rows(
 
     let layout = layout_kind_value(kind);
     for edge in &patch.remove_edges {
+        spatial::remove_route(connection, kind, edge).await?;
         let changed = diesel::delete(
             web_graph_edge_routes::table
                 .filter(web_graph_edge_routes::layout_kind.eq(layout))
@@ -1397,6 +1442,7 @@ async fn remove_layout_rows(
         expect_row_count("remove_layout_edge", 1, changed)?;
     }
     for node in &patch.remove_nodes {
+        spatial::remove_node(connection, kind, node).await?;
         let changed = diesel::delete(
             web_graph_node_placements::table
                 .filter(web_graph_node_placements::layout_kind.eq(layout))
@@ -1506,6 +1552,7 @@ async fn upsert_layout_rows(
             .execute(connection)
             .await?;
         expect_row_count("upsert_layout_node", 1, changed)?;
+        spatial::upsert_node(connection, kind, placement).await?;
     }
     for routed in &patch.upsert_edges {
         let row = route_row(kind, routed);
@@ -1531,6 +1578,7 @@ async fn upsert_layout_rows(
             .execute(connection)
             .await?;
         expect_row_count("upsert_layout_edge", 1, changed)?;
+        spatial::upsert_route(connection, kind, routed).await?;
     }
     Ok(())
 }
@@ -1571,6 +1619,7 @@ fn snapshot_rows(snapshot: &Snapshot) -> std::result::Result<SnapshotRows, Trans
         &mut placements,
         &mut routes,
     );
+    let spatial = spatial::snapshot_rows(&placements, &routes)?;
     Ok(SnapshotRows {
         state: StateRow {
             id: 1,
@@ -1595,6 +1644,7 @@ fn snapshot_rows(snapshot: &Snapshot) -> std::result::Result<SnapshotRows, Trans
         layouts,
         placements,
         routes,
+        spatial,
     })
 }
 
@@ -1679,6 +1729,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use diesel::sqlite::SqliteConnection;
+    use diesel::{Connection, RunQueryDsl};
+    use diesel_migrations::MigrationHarness;
     use tokio::sync::Barrier;
 
     use super::*;
@@ -1934,6 +1987,74 @@ mod tests {
         )
     }
 
+    fn create_v1_store(path: &Path, graph: &Graph) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut connection = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        connection.run_pending_migrations(MIGRATIONS).unwrap();
+        connection.revert_last_migration(MIGRATIONS).unwrap();
+        let rows = snapshot_rows(&graph.snapshot()).unwrap();
+        connection
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                diesel::insert_into(web_graph_nodes::table)
+                    .values(&rows.nodes)
+                    .execute(connection)?;
+                diesel::insert_into(web_graph_edges::table)
+                    .values(&rows.edges)
+                    .execute(connection)?;
+                diesel::insert_into(web_graph_layouts::table)
+                    .values(&rows.layouts)
+                    .execute(connection)?;
+                diesel::insert_into(web_graph_node_placements::table)
+                    .values(&rows.placements)
+                    .execute(connection)?;
+                diesel::insert_into(web_graph_edge_routes::table)
+                    .values(&rows.routes)
+                    .execute(connection)?;
+                diesel::insert_into(web_graph_state::table)
+                    .values(&rows.state)
+                    .execute(connection)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn viewport(x: i32, y: i32, width: i32, height: i32) -> Viewport {
+        Viewport {
+            x,
+            y,
+            width,
+            height,
+            overscan: 0,
+        }
+    }
+
+    async fn load_viewport_for_test(
+        store: &WebGraphStore,
+        kind: LayoutKind,
+        viewport: Viewport,
+        limit: usize,
+    ) -> (Vec<NodePlacement>, Vec<RoutedEdge>) {
+        let limit = NonZeroUsize::new(limit).unwrap();
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = store
+                .viewport_page(kind, viewport, cursor.as_ref(), limit)
+                .await
+                .unwrap()
+                .unwrap()
+                .value;
+            nodes.extend(page.nodes);
+            edges.extend(page.edges);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        (nodes, edges)
+    }
+
     #[tokio::test]
     async fn new_store_is_empty() {
         let directory = TestDirectory::new();
@@ -2027,6 +2148,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_backfills_spatial_indexes_for_a_v1_store() {
+        let directory = TestDirectory::new();
+        let mut snapshot = graph().snapshot();
+        snapshot.topology.nodes.push(node("minimum"));
+        snapshot
+            .layouts
+            .all
+            .nodes
+            .push(placement("minimum", i32::MIN, i32::MIN));
+        let expected = Graph::from_snapshot(snapshot).unwrap();
+        create_v1_store(&directory.path.join(DATABASE_FILE_NAME), &expected);
+
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        let (nodes, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(0, 0, 1_000, 1_000), 2).await;
+
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(edges.len(), 2);
+        let (minimum, _) = load_viewport_for_test(
+            &store,
+            LayoutKind::All,
+            viewport(i32::MIN, i32::MIN, 1, 1),
+            2,
+        )
+        .await;
+        assert_eq!(minimum[0].node, node("minimum"));
+        assert_eq!(load_graph_for_test(&store).await, Some(expected));
+    }
+
+    #[tokio::test]
     async fn filtered_queries_return_only_requested_layout_data() {
         let directory = TestDirectory::new();
         let store = WebGraphStore::open(&directory.path).await.unwrap();
@@ -2105,6 +2256,187 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn viewport_query_uses_node_hitboxes_and_route_bounds() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+
+        let (nodes, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(150, 100, 10, 10), 10).await;
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|placement| placement.node.clone())
+                .collect::<Vec<_>>(),
+            vec![node("b")]
+        );
+        assert!(edges.is_empty());
+        let (anchor_nodes, anchor_edges) =
+            load_viewport_for_test(&store, LayoutKind::Anchors, viewport(150, 100, 10, 10), 10)
+                .await;
+        assert!(anchor_nodes.is_empty());
+        assert!(anchor_edges.is_empty());
+
+        let (nodes, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(100, 101, 6, 6), 10).await;
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|placement| placement.node.clone())
+                .collect::<Vec<_>>(),
+            vec![node("a")]
+        );
+        assert_eq!(
+            edges
+                .iter()
+                .map(|routed| routed.edge.clone())
+                .collect::<Vec<_>>(),
+            vec![edge(EdgeKind::Primary, "b", "c")]
+        );
+
+        let (nodes, _) = load_viewport_for_test(
+            &store,
+            LayoutKind::All,
+            Viewport {
+                overscan: 11,
+                ..viewport(145, 100, 1, 1)
+            },
+            10,
+        )
+        .await;
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|placement| placement.node.clone())
+                .collect::<Vec<_>>(),
+            vec![node("a"), node("b")]
+        );
+    }
+
+    #[tokio::test]
+    async fn viewport_pagination_is_bounded_and_query_scoped() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let viewport = viewport(0, 0, 1_000, 1_000);
+        let limit = NonZeroUsize::new(1).unwrap();
+
+        let first = store
+            .viewport_page(LayoutKind::All, viewport, None, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.value.nodes.len(), 1);
+        assert_eq!(first.value.edges.len(), 1);
+        assert_eq!(first.value.canvas, graph().layout(LayoutKind::All).canvas());
+        let cursor = first.value.next_cursor.unwrap();
+        assert_eq!(cursor.revision(), Revision::new(1));
+
+        let error = store
+            .viewport_page(LayoutKind::Anchors, viewport, Some(&cursor), limit)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CursorQueryMismatch));
+        let error = store
+            .viewport_page(
+                LayoutKind::All,
+                Viewport { x: 1, ..viewport },
+                Some(&cursor),
+                limit,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CursorQueryMismatch));
+
+        let (nodes, edges) = load_viewport_for_test(&store, LayoutKind::All, viewport, 1).await;
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn patch_atomically_updates_viewport_spatial_indexes() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let old_node_viewport = viewport(350, 110, 1, 1);
+        let old_route_viewport = viewport(100, 101, 6, 6);
+        let first = store
+            .viewport_page(
+                LayoutKind::All,
+                viewport(0, 0, 1_000, 1_000),
+                None,
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_cursor = first.value.next_cursor.unwrap();
+
+        store.apply_patch(relayout_patch()).await.unwrap();
+
+        let error = store
+            .viewport_page(
+                LayoutKind::All,
+                viewport(0, 0, 1_000, 1_000),
+                Some(&stale_cursor),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::StaleCursor { .. }));
+        let (nodes, _) =
+            load_viewport_for_test(&store, LayoutKind::All, old_node_viewport, 10).await;
+        assert!(!nodes.iter().any(|placement| placement.node == node("c")));
+        let (nodes, _) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(400, 180, 1, 1), 10).await;
+        assert!(nodes.iter().any(|placement| placement.node == node("c")));
+        let (_, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, old_route_viewport, 10).await;
+        assert!(
+            !edges
+                .iter()
+                .any(|routed| routed.edge == edge(EdgeKind::Primary, "b", "c"))
+        );
+        let (_, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(500, 501, 6, 6), 10).await;
+        assert!(
+            edges
+                .iter()
+                .any(|routed| routed.edge == edge(EdgeKind::Primary, "b", "c"))
+        );
+
+        store.replace(&empty_graph(3, 11)).await.unwrap();
+        let (nodes, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(0, 0, 1_000, 1_000), 10).await;
+        assert!(nodes.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn viewport_query_rejects_invalid_geometry() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+
+        let error = store
+            .viewport_page(
+                LayoutKind::All,
+                Viewport {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 100,
+                    overscan: 0,
+                },
+                None,
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidViewport { width: 0, .. }));
     }
 
     #[tokio::test]
@@ -2193,6 +2525,15 @@ mod tests {
         assert_eq!(actual.revision, expected.revision());
         assert_eq!(actual.source_version, expected.source_version());
         assert_eq!(load_graph_for_test(&store).await, Some(expected));
+        let (removed, _) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(220, 120, 1, 1), 10).await;
+        assert!(removed.is_empty());
+        let (added, _) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(500, 140, 1, 1), 10).await;
+        assert_eq!(added[0].node, node("d"));
+        let (_, added_routes) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(300, 301, 6, 6), 10).await;
+        assert_eq!(added_routes[0].edge, edge(EdgeKind::Primary, "c", "d"));
     }
 
     #[tokio::test]
@@ -2231,7 +2572,7 @@ mod tests {
             layouts: LayoutPatches {
                 anchors: LayoutPatch::default(),
                 all: LayoutPatch {
-                    upsert_edges: vec![routed(cycle, 600)],
+                    upsert_edges: vec![routed(cycle.clone(), 600)],
                     ..LayoutPatch::default()
                 },
             },
@@ -2249,6 +2590,9 @@ mod tests {
             }
         ));
         assert_eq!(load_graph_for_test(&store).await, Some(original));
+        let (_, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(600, 601, 6, 6), 10).await;
+        assert!(!edges.iter().any(|routed| routed.edge == cycle));
     }
 
     #[tokio::test]

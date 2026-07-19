@@ -3,3 +3,6 @@ dir = "web-graph-migrations"
 
 [print_schema]
 file = "src/host/web_graph_store/schema.rs"
+filter = { except_tables = [
+  "web_graph_(node|route)_spatial_index_(node|parent|rowid)",
+] }

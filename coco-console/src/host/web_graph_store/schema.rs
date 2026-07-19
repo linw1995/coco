@@ -43,8 +43,50 @@ diesel::table! {
 }
 
 diesel::table! {
+    web_graph_node_spatial_index (rowid) {
+        rowid -> Integer,
+        spatial_id -> Nullable<Integer>,
+        min_x -> Nullable<Integer>,
+        max_x -> Nullable<Integer>,
+        min_y -> Nullable<Integer>,
+        max_y -> Nullable<Integer>,
+        layout_kind -> Nullable<Binary>,
+    }
+}
+
+diesel::table! {
+    web_graph_node_spatial_items (spatial_id) {
+        spatial_id -> Integer,
+        layout_kind -> Text,
+        node_id -> Text,
+    }
+}
+
+diesel::table! {
     web_graph_nodes (node_id) {
         node_id -> Text,
+    }
+}
+
+diesel::table! {
+    web_graph_route_spatial_index (rowid) {
+        rowid -> Integer,
+        spatial_id -> Nullable<Integer>,
+        min_x -> Nullable<Integer>,
+        max_x -> Nullable<Integer>,
+        min_y -> Nullable<Integer>,
+        max_y -> Nullable<Integer>,
+        layout_kind -> Nullable<Binary>,
+    }
+}
+
+diesel::table! {
+    web_graph_route_spatial_items (spatial_id) {
+        spatial_id -> Integer,
+        layout_kind -> Text,
+        edge_kind -> Text,
+        source_id -> Text,
+        target_id -> Text,
     }
 }
 
@@ -66,6 +108,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     web_graph_edges,
     web_graph_layouts,
     web_graph_node_placements,
+    web_graph_node_spatial_index,
+    web_graph_node_spatial_items,
     web_graph_nodes,
+    web_graph_route_spatial_index,
+    web_graph_route_spatial_items,
     web_graph_state,
 );
