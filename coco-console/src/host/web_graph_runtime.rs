@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coco_mem::{GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore};
 use snafu::{IntoError, prelude::*};
@@ -36,6 +36,7 @@ use crate::web_graph::{
 const RETRY_MIN_DELAY: Duration = Duration::from_millis(25);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const CATCH_UP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 // Full node payloads can be large, so release the source connection between small batches.
 const SOURCE_NODE_HYDRATION_BATCH_SIZE: usize = 16;
 
@@ -57,6 +58,110 @@ enum EnsureStep {
 struct ParentEdge {
     kind: EdgeKind,
     node_id: String,
+}
+
+#[derive(Debug)]
+struct CatchUpProgress {
+    started_at: Instant,
+    last_logged_at: Instant,
+    start_row_id: i64,
+    high_watermark_row_id: i64,
+    processed_nodes: u64,
+    changed_source_nodes: u64,
+    pages: u64,
+}
+
+impl CatchUpProgress {
+    fn new(cursor: Option<&GraphNodeCursor>, through: &GraphNodeCursor) -> Self {
+        let now = Instant::now();
+        Self {
+            started_at: now,
+            last_logged_at: now,
+            start_row_id: cursor.map_or(0, |cursor| cursor.row_id),
+            high_watermark_row_id: through.row_id,
+            processed_nodes: 0,
+            changed_source_nodes: 0,
+            pages: 0,
+        }
+    }
+
+    fn observe_high_watermark(&mut self, through: &GraphNodeCursor) {
+        self.high_watermark_row_id = self.high_watermark_row_id.max(through.row_id);
+    }
+
+    fn record_page(&mut self, processed_nodes: usize, changed_source_nodes: u64) {
+        self.processed_nodes = self.processed_nodes.saturating_add(
+            u64::try_from(processed_nodes).expect("graph page size should fit in u64"),
+        );
+        self.changed_source_nodes = self
+            .changed_source_nodes
+            .saturating_add(changed_source_nodes);
+        self.pages = self.pages.saturating_add(1);
+    }
+
+    fn total_nodes(&self) -> u64 {
+        row_id_distance(self.start_row_id, self.high_watermark_row_id)
+    }
+
+    fn pending_nodes(&self, current_row_id: i64) -> u64 {
+        row_id_distance(current_row_id, self.high_watermark_row_id)
+    }
+
+    fn unchanged_source_nodes(&self) -> u64 {
+        self.processed_nodes
+            .saturating_sub(self.changed_source_nodes)
+    }
+
+    fn elapsed_millis(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn nodes_per_second(&self) -> u64 {
+        let elapsed_millis = self.started_at.elapsed().as_millis().max(1);
+        let rate = u128::from(self.processed_nodes).saturating_mul(1_000) / elapsed_millis;
+        u64::try_from(rate).unwrap_or(u64::MAX)
+    }
+
+    fn log_started(&self, current_revision: u64) {
+        self.log("started", self.start_row_id, current_revision);
+    }
+
+    fn log_progress_if_due(&mut self, current_row_id: i64, current_revision: u64) {
+        if self.last_logged_at.elapsed() < CATCH_UP_PROGRESS_INTERVAL {
+            return;
+        }
+        self.last_logged_at = Instant::now();
+        self.log("progress", current_row_id, current_revision);
+    }
+
+    fn log_completed(&self, current_row_id: i64, current_revision: u64) {
+        self.log("completed", current_row_id, current_revision);
+    }
+
+    fn log(&self, phase: &'static str, current_row_id: i64, current_revision: u64) {
+        tracing::info!(
+            phase,
+            elapsed_ms = self.elapsed_millis(),
+            total_nodes = self.total_nodes(),
+            processed_nodes = self.processed_nodes,
+            pending_nodes = self.pending_nodes(current_row_id),
+            changed_source_nodes = self.changed_source_nodes,
+            unchanged_source_nodes = self.unchanged_source_nodes(),
+            pages = self.pages,
+            nodes_per_second = self.nodes_per_second(),
+            current_revision,
+            source_start_row_id = self.start_row_id,
+            source_current_row_id = current_row_id,
+            source_high_watermark_row_id = self.high_watermark_row_id,
+            "web graph catch-up"
+        );
+    }
+}
+
+fn row_id_distance(start: i64, end: i64) -> u64 {
+    // Source nodes are append-only, so implicit SQLite row IDs are contiguous while the maximum
+    // row remains present. This keeps backlog reporting exact without holding a COUNT query open.
+    u64::try_from(end.saturating_sub(start)).unwrap_or_default()
 }
 
 impl WebGraphRuntime {
@@ -158,6 +263,7 @@ impl WebGraphRuntime {
     pub async fn catch_up(&self) -> crate::Result<()> {
         let page_size =
             NonZeroUsize::new(GRAPH_READ_BATCH_SIZE).expect("graph read batch size is non-zero");
+        let mut progress: Option<CatchUpProgress> = None;
         loop {
             let state = self
                 .store
@@ -195,7 +301,20 @@ impl WebGraphRuntime {
                     .fail();
                 }
                 if cursor == &through {
+                    if let Some(progress) = progress.as_mut() {
+                        progress.observe_high_watermark(&through);
+                        progress.log_completed(cursor.row_id, self.current_revision());
+                    }
                     return Ok(());
+                }
+            }
+
+            match progress.as_mut() {
+                Some(progress) => progress.observe_high_watermark(&through),
+                None => {
+                    let started = CatchUpProgress::new(state.source_cursor.as_ref(), &through);
+                    started.log_started(self.current_revision());
+                    progress = Some(started);
                 }
             }
 
@@ -212,9 +331,23 @@ impl WebGraphRuntime {
                 }
                 .fail();
             }
-            for entry in page.entries {
-                self.ensure_source_node(&entry).await?;
+            let processed_nodes = page.entries.len();
+            let mut changed_source_nodes = 0_u64;
+            for entry in &page.entries {
+                if self.ensure_source_node(entry).await? {
+                    changed_source_nodes = changed_source_nodes.saturating_add(1);
+                }
             }
+            let current_row_id = page
+                .entries
+                .last()
+                .expect("non-empty graph page should end with a cursor")
+                .row_id;
+            let progress = progress
+                .as_mut()
+                .expect("catch-up progress starts before reading a graph page");
+            progress.record_page(processed_nodes, changed_source_nodes);
+            progress.log_progress_if_due(current_row_id, self.current_revision());
             tokio::task::yield_now().await;
         }
     }
@@ -940,6 +1073,33 @@ mod tests {
 
     use super::*;
     use crate::host::store::ConsoleStore;
+
+    #[test]
+    fn catch_up_progress_tracks_dynamic_backlog_and_page_stats() {
+        let cursor = GraphNodeCursor {
+            row_id: 4,
+            node_id: "cursor".to_owned(),
+        };
+        let mut through = GraphNodeCursor {
+            row_id: 9,
+            node_id: "through".to_owned(),
+        };
+        let mut progress = CatchUpProgress::new(Some(&cursor), &through);
+
+        assert_eq!(progress.total_nodes(), 5);
+        assert_eq!(progress.pending_nodes(cursor.row_id), 5);
+        progress.record_page(2, 1);
+        assert_eq!(progress.processed_nodes, 2);
+        assert_eq!(progress.changed_source_nodes, 1);
+        assert_eq!(progress.unchanged_source_nodes(), 1);
+        assert_eq!(progress.pages, 1);
+        assert_eq!(progress.pending_nodes(6), 3);
+
+        through.row_id = 12;
+        progress.observe_high_watermark(&through);
+        assert_eq!(progress.total_nodes(), 8);
+        assert_eq!(progress.pending_nodes(6), 6);
+    }
 
     #[tokio::test]
     async fn synchronization_builds_global_topology_and_both_layouts_incrementally() {
