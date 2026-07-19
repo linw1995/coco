@@ -586,29 +586,38 @@ impl WebGraphRuntime {
         parents: &[ParentEdge],
         revision: Revision,
     ) -> crate::Result<Option<LayoutPatch>> {
+        let parent_ids = parents
+            .iter()
+            .map(|parent| NodeId::new(parent.node_id.clone()).context(WebGraphModelSnafu))
+            .collect::<crate::Result<BTreeSet<_>>>()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let read = self
+            .store
+            .layout_node_states(kind, &parent_ids)
+            .await
+            .context(WebGraphStoreSnafu)?
+            .context(WebGraphNotInitializedSnafu)?;
+        if read.state.revision != revision {
+            return Ok(None);
+        }
+        let parent_states = read
+            .value
+            .into_iter()
+            .map(|state| (state.placement.node.to_string(), state))
+            .collect::<BTreeMap<_, _>>();
         let mut parent_points = BTreeMap::new();
+        let mut source_slots = BTreeMap::<String, usize>::new();
         for parent in parents {
-            let parent_id = NodeId::new(parent.node_id.clone()).context(WebGraphModelSnafu)?;
-            let read = self
-                .store
-                .node_placements(kind, std::slice::from_ref(&parent_id))
-                .await
-                .context(WebGraphStoreSnafu)?
-                .context(WebGraphNotInitializedSnafu)?;
-            if read.state.revision != revision {
-                return Ok(None);
-            }
-            let point = read
-                .value
-                .into_iter()
-                .next()
-                .with_context(|| WebGraphParentPlacementMissingSnafu {
+            let state = parent_states.get(&parent.node_id).with_context(|| {
+                WebGraphParentPlacementMissingSnafu {
                     layout: layout_name(kind),
                     node_id: node_id.to_string(),
                     parent_id: parent.node_id.clone(),
-                })?
-                .point;
-            parent_points.insert(parent.node_id.clone(), point);
+                }
+            })?;
+            parent_points.insert(parent.node_id.clone(), state.placement.point);
+            source_slots.insert(parent.node_id.clone(), state.outgoing_edge_count);
         }
 
         let x = parent_points
@@ -643,26 +652,13 @@ impl WebGraphRuntime {
             height: canvas.value.height.max(y.saturating_add(GRAPH_PADDING)),
         };
         let point = Point { x, y };
-        let mut source_slots = BTreeMap::<String, usize>::new();
         let mut routes = Vec::with_capacity(parents.len());
         for (target_slot, parent) in parents.iter().enumerate() {
-            let source_slot = match source_slots.get_mut(&parent.node_id) {
-                Some(slot) => {
-                    let current = *slot;
-                    *slot = slot.saturating_add(1);
-                    current
-                }
-                None => {
-                    let Some(count) = self
-                        .outgoing_route_count(kind, &parent.node_id, revision)
-                        .await?
-                    else {
-                        return Ok(None);
-                    };
-                    source_slots.insert(parent.node_id.clone(), count.saturating_add(1));
-                    count
-                }
-            };
+            let slot = source_slots
+                .get_mut(&parent.node_id)
+                .expect("parent layout state is loaded before routing");
+            let source_slot = *slot;
+            *slot = slot.saturating_add(1);
             let edge = EdgeId::new(
                 parent.kind,
                 NodeId::new(parent.node_id.clone()).context(WebGraphModelSnafu)?,
@@ -693,50 +689,6 @@ impl WebGraphRuntime {
             upsert_edges: routes,
             ..LayoutPatch::default()
         }))
-    }
-
-    async fn outgoing_route_count(
-        &self,
-        kind: LayoutKind,
-        node_id: &str,
-        revision: Revision,
-    ) -> crate::Result<Option<usize>> {
-        let node_id = NodeId::new(node_id).context(WebGraphModelSnafu)?;
-        let limit =
-            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE).expect("graph read batch size is non-zero");
-        let mut cursor = None;
-        let mut count = 0_usize;
-        loop {
-            let page = match self
-                .store
-                .incident_edge_routes_page(
-                    kind,
-                    std::slice::from_ref(&node_id),
-                    cursor.as_ref(),
-                    limit,
-                )
-                .await
-            {
-                Ok(Some(page)) => page,
-                Ok(None) => return Err(WebGraphNotInitializedSnafu.build()),
-                Err(StoreError::StaleCursor { .. }) => return Ok(None),
-                Err(source) => return Err(source).context(WebGraphStoreSnafu),
-            };
-            if page.state.revision != revision {
-                return Ok(None);
-            }
-            count = count.saturating_add(
-                page.value
-                    .items
-                    .iter()
-                    .filter(|route| route.edge.source == node_id)
-                    .count(),
-            );
-            cursor = page.value.next_cursor;
-            if cursor.is_none() {
-                return Ok(Some(count));
-            }
-        }
     }
 
     async fn anchor_parent_edges(&self, parents: &[ParentEdge]) -> crate::Result<Vec<ParentEdge>> {

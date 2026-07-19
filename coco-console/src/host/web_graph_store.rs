@@ -53,6 +53,12 @@ pub struct GraphRead<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutNodeState {
+    pub placement: NodePlacement,
+    pub outgoing_edge_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor<T> {
     revision: Revision,
     layout: LayoutKind,
@@ -179,6 +185,34 @@ impl WebGraphStore {
                 Ok(Some(GraphRead {
                     state,
                     value: placements,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn layout_node_states(
+        &self,
+        kind: LayoutKind,
+        node_ids: &[NodeId],
+    ) -> Result<Option<GraphRead<Vec<LayoutNodeState>>>> {
+        validate_read_batch_size(node_ids.len())?;
+        let path = self.path.clone();
+        let node_ids = node_ids
+            .iter()
+            .map(|node| node.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let nodes =
+                    load_layout_node_states_by_node_ids(connection, kind, &node_ids).await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: nodes,
                 }))
             })
             .await
@@ -419,6 +453,7 @@ struct PlacementRow {
     node_id: String,
     x: i32,
     y: i32,
+    outgoing_edge_count: i64,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable)]
@@ -696,6 +731,28 @@ async fn load_placements_by_node_ids(
         .collect()
 }
 
+async fn load_layout_node_states_by_node_ids(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    node_ids: &[String],
+) -> std::result::Result<Vec<LayoutNodeState>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    web_graph_node_placements::table
+        .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+        .filter(web_graph_node_placements::node_id.eq_any(node_ids))
+        .order(web_graph_node_placements::node_id.asc())
+        .select(PlacementRow::as_select())
+        .load::<PlacementRow>(connection)
+        .await?
+        .into_iter()
+        .map(stored_layout_node_state)
+        .collect()
+}
+
 async fn load_placements_page(
     connection: &mut AsyncSqliteConnection,
     kind: LayoutKind,
@@ -823,6 +880,24 @@ fn stored_placement(row: PlacementRow) -> std::result::Result<NodePlacement, Tra
     Ok(NodePlacement {
         node: stored_node_id(row.node_id)?,
         point: Point { x: row.x, y: row.y },
+    })
+}
+
+fn stored_layout_node_state(
+    row: PlacementRow,
+) -> std::result::Result<LayoutNodeState, TransactionError> {
+    let outgoing_edge_count = usize::try_from(row.outgoing_edge_count).map_err(|_| {
+        invalid_value(
+            "web_graph_node_placements.outgoing_edge_count",
+            row.outgoing_edge_count,
+        )
+    })?;
+    Ok(LayoutNodeState {
+        placement: NodePlacement {
+            node: stored_node_id(row.node_id)?,
+            point: Point { x: row.x, y: row.y },
+        },
+        outgoing_edge_count,
     })
 }
 
@@ -1582,6 +1657,7 @@ async fn remove_layout_rows(
         .execute(connection)
         .await?;
         expect_row_count("remove_layout_edge", 1, changed)?;
+        decrement_outgoing_edge_count(connection, kind, &edge.source).await?;
     }
     for node in &patch.remove_nodes {
         spatial::remove_node(connection, kind, node).await?;
@@ -1679,7 +1755,7 @@ async fn upsert_layout_rows(
         expect_row_count("update_layout_canvas", 1, changed)?;
     }
     for placement in &patch.upsert_nodes {
-        let row = placement_row(kind, placement);
+        let row = placement_row(kind, placement, 0);
         let changed = diesel::insert_into(web_graph_node_placements::table)
             .values(&row)
             .on_conflict((
@@ -1697,6 +1773,7 @@ async fn upsert_layout_rows(
         spatial::upsert_node(connection, kind, placement).await?;
     }
     for routed in &patch.upsert_edges {
+        let is_new = !layout_edge_exists(connection, kind, &routed.edge).await?;
         let row = route_row(kind, routed);
         let changed = diesel::insert_into(web_graph_edge_routes::table)
             .values(&row)
@@ -1720,9 +1797,55 @@ async fn upsert_layout_rows(
             .execute(connection)
             .await?;
         expect_row_count("upsert_layout_edge", 1, changed)?;
+        if is_new {
+            increment_outgoing_edge_count(connection, kind, &routed.edge.source).await?;
+        }
         spatial::upsert_route(connection, kind, routed).await?;
     }
     Ok(())
+}
+
+async fn increment_outgoing_edge_count(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    node: &NodeId,
+) -> std::result::Result<(), TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let changed = diesel::update(
+        web_graph_node_placements::table
+            .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+            .filter(web_graph_node_placements::node_id.eq(node.as_str())),
+    )
+    .set(
+        web_graph_node_placements::outgoing_edge_count
+            .eq(web_graph_node_placements::outgoing_edge_count + 1_i64),
+    )
+    .execute(connection)
+    .await?;
+    expect_row_count("increment_outgoing_edge_count", 1, changed)
+}
+
+async fn decrement_outgoing_edge_count(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    node: &NodeId,
+) -> std::result::Result<(), TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let changed = diesel::update(
+        web_graph_node_placements::table
+            .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+            .filter(web_graph_node_placements::node_id.eq(node.as_str()))
+            .filter(web_graph_node_placements::outgoing_edge_count.gt(0_i64)),
+    )
+    .set(
+        web_graph_node_placements::outgoing_edge_count
+            .eq(web_graph_node_placements::outgoing_edge_count - 1_i64),
+    )
+    .execute(connection)
+    .await?;
+    expect_row_count("decrement_outgoing_edge_count", 1, changed)
 }
 
 fn expect_row_count(
@@ -1753,14 +1876,14 @@ fn snapshot_rows(snapshot: &Snapshot) -> std::result::Result<SnapshotRows, Trans
         &mut layouts,
         &mut placements,
         &mut routes,
-    );
+    )?;
     append_layout_rows(
         LayoutKind::All,
         &snapshot.layouts.all,
         &mut layouts,
         &mut placements,
         &mut routes,
-    );
+    )?;
     let spatial = spatial::snapshot_rows(&placements, &routes)?;
     Ok(SnapshotRows {
         state: StateRow {
@@ -1798,19 +1921,31 @@ fn append_layout_rows(
     layouts: &mut Vec<LayoutRow>,
     placements: &mut Vec<PlacementRow>,
     routes: &mut Vec<RouteRow>,
-) {
+) -> std::result::Result<(), TransactionError> {
     layouts.push(LayoutRow {
         layout_kind: layout_kind_value(kind).to_owned(),
         canvas_width: layout.canvas.width,
         canvas_height: layout.canvas.height,
     });
-    placements.extend(
-        layout
-            .nodes
-            .iter()
-            .map(|placement| placement_row(kind, placement)),
-    );
+    let mut outgoing_edge_counts = std::collections::BTreeMap::<&str, usize>::new();
+    for routed in &layout.edges {
+        *outgoing_edge_counts
+            .entry(routed.edge.source.as_str())
+            .or_default() += 1;
+    }
+    for placement in &layout.nodes {
+        let count = outgoing_edge_counts
+            .get(placement.node.as_str())
+            .copied()
+            .unwrap_or_default();
+        placements.push(placement_row(
+            kind,
+            placement,
+            sqlite_usize(count, "outgoing_edge_count")?,
+        ));
+    }
     routes.extend(layout.edges.iter().map(|routed| route_row(kind, routed)));
+    Ok(())
 }
 
 fn edge_row(edge: &EdgeId) -> EdgeRow {
@@ -1821,12 +1956,17 @@ fn edge_row(edge: &EdgeId) -> EdgeRow {
     }
 }
 
-fn placement_row(kind: LayoutKind, placement: &NodePlacement) -> PlacementRow {
+fn placement_row(
+    kind: LayoutKind,
+    placement: &NodePlacement,
+    outgoing_edge_count: i64,
+) -> PlacementRow {
     PlacementRow {
         layout_kind: layout_kind_value(kind).to_owned(),
         node_id: placement.node.as_str().to_owned(),
         x: placement.point.x,
         y: placement.point.y,
+        outgoing_edge_count,
     }
 }
 
@@ -1867,8 +2007,18 @@ fn sqlite_integer(value: u64, column: &'static str) -> std::result::Result<i64, 
         .map_err(|_| TransactionError::Operation(Error::IntegerOutOfRange { column, value }))
 }
 
+fn sqlite_usize(value: usize, column: &'static str) -> std::result::Result<i64, TransactionError> {
+    i64::try_from(value).map_err(|_| {
+        TransactionError::Operation(Error::IntegerOutOfRange {
+            column,
+            value: u64::try_from(value).unwrap_or(u64::MAX),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -2137,6 +2287,7 @@ mod tests {
         connection.run_pending_migrations(MIGRATIONS).unwrap();
         connection.revert_last_migration(MIGRATIONS).unwrap();
         connection.revert_last_migration(MIGRATIONS).unwrap();
+        connection.revert_last_migration(MIGRATIONS).unwrap();
         let rows = snapshot_rows(&graph.snapshot()).unwrap();
         connection
             .transaction::<_, diesel::result::Error, _>(|connection| {
@@ -2149,9 +2300,16 @@ mod tests {
                 diesel::insert_into(web_graph_layouts::table)
                     .values(&rows.layouts)
                     .execute(connection)?;
-                diesel::insert_into(web_graph_node_placements::table)
-                    .values(&rows.placements)
-                    .execute(connection)?;
+                for row in &rows.placements {
+                    diesel::insert_into(web_graph_node_placements::table)
+                        .values((
+                            web_graph_node_placements::layout_kind.eq(&row.layout_kind),
+                            web_graph_node_placements::node_id.eq(&row.node_id),
+                            web_graph_node_placements::x.eq(row.x),
+                            web_graph_node_placements::y.eq(row.y),
+                        ))
+                        .execute(connection)?;
+                }
                 diesel::insert_into(web_graph_edge_routes::table)
                     .values(&rows.routes)
                     .execute(connection)?;
@@ -2353,6 +2511,22 @@ mod tests {
         .await;
         assert_eq!(minimum[0].node, node("minimum"));
         assert_eq!(load_graph_for_test(&store).await, Some(expected));
+        assert_eq!(
+            store
+                .layout_node_states(LayoutKind::All, &[node("a"), node("b"), node("c")])
+                .await
+                .unwrap()
+                .unwrap()
+                .value
+                .into_iter()
+                .map(|state| (state.placement.node.to_string(), state.outgoing_edge_count))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                ("a".to_owned(), 1),
+                ("b".to_owned(), 1),
+                ("c".to_owned(), 0),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -2374,6 +2548,20 @@ mod tests {
                 .map(|placement| placement.node.clone())
                 .collect::<Vec<_>>(),
             vec![node("a"), node("c")]
+        );
+        let node_states = store
+            .layout_node_states(LayoutKind::All, &[node("c"), node("missing"), node("a")])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_states.state.revision, Revision::new(1));
+        assert_eq!(
+            node_states
+                .value
+                .into_iter()
+                .map(|state| (state.placement.node, state.outgoing_edge_count))
+                .collect::<Vec<_>>(),
+            vec![(node("a"), 1), (node("c"), 0)]
         );
 
         let routes = store
@@ -2554,6 +2742,16 @@ mod tests {
         let stale_cursor = first.value.next_cursor.unwrap();
 
         store.apply_patch(relayout_patch()).await.unwrap();
+        assert_eq!(
+            store
+                .layout_node_states(LayoutKind::All, &[node("b")])
+                .await
+                .unwrap()
+                .unwrap()
+                .value[0]
+                .outgoing_edge_count,
+            1
+        );
 
         let error = store
             .viewport_page(
@@ -2712,6 +2910,18 @@ mod tests {
         let (_, added_routes) =
             load_viewport_for_test(&store, LayoutKind::All, viewport(300, 301, 6, 6), 10).await;
         assert_eq!(added_routes[0].edge, edge(EdgeKind::Primary, "c", "d"));
+        assert_eq!(
+            store
+                .layout_node_states(LayoutKind::All, &[node("a"), node("c"), node("d")])
+                .await
+                .unwrap()
+                .unwrap()
+                .value
+                .into_iter()
+                .map(|state| (state.placement.node, state.outgoing_edge_count))
+                .collect::<Vec<_>>(),
+            vec![(node("a"), 0), (node("c"), 1), (node("d"), 0)]
+        );
     }
 
     #[tokio::test]

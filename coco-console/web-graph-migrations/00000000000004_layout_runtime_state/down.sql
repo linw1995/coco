@@ -1,0 +1,4 @@
+DROP INDEX web_graph_node_placements_column_idx;
+
+ALTER TABLE web_graph_node_placements
+DROP COLUMN outgoing_edge_count;

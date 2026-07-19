@@ -39,6 +39,7 @@ diesel::table! {
         node_id -> Text,
         x -> Integer,
         y -> Integer,
+        outgoing_edge_count -> BigInt,
     }
 }
 
