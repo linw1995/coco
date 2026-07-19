@@ -1581,7 +1581,7 @@ fn install_mouse_pan_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     let down_did_pan = did_pan.clone();
     let down_suppress_click = suppress_click.clone();
     let down_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
-        if event.button() != 0 {
+        if event.button() != 0 || mouse_pan_starts_on_control(&event) {
             return;
         }
         event.prevent_default();
@@ -1654,6 +1654,19 @@ fn install_mouse_pan_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     )?;
     click_closure.forget();
     Ok(())
+}
+
+fn mouse_pan_starts_on_control(event: &MouseEvent) -> bool {
+    event
+        .target()
+        .and_then(|target| target.dyn_into::<Element>().ok())
+        .and_then(|target| {
+            target
+                .closest("button, input, select, textarea, [contenteditable=\"true\"]")
+                .ok()
+                .flatten()
+        })
+        .is_some()
 }
 
 fn install_follow_toggle_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -2689,7 +2702,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn graph_items_mouse_pan_updates_viewport_and_suppresses_drag_click() {
         let fixture = GraphFixture::new();
-        let (graph_wrap, window) = {
+        let (graph_wrap, follow_toggle, window) = {
             let mut graph = fixture.graph.borrow_mut();
             graph.viewport = ViewportState {
                 x: 100.0,
@@ -2706,10 +2719,35 @@ mod tests {
             });
             graph.auto_follow = true;
             graph.patch_in_flight = true;
-            (graph.graph_wrap.clone(), graph.window.clone())
+            (
+                graph.graph_wrap.clone(),
+                graph.follow_toggle.clone(),
+                graph.window.clone(),
+            )
         };
         install_mouse_pan_listener(fixture.graph.clone())
             .expect_throw("mouse pan listener should install");
+
+        let control_down = mouse_event("mousedown", 0, 1, 40, 30);
+        follow_toggle
+            .dispatch_event(&control_down)
+            .expect_throw("control mouse down should dispatch");
+        assert!(!control_down.default_prevented());
+        let control_move = mouse_event("mousemove", 0, 1, 60, 50);
+        window
+            .dispatch_event(&control_move)
+            .expect_throw("control mouse move should dispatch");
+        let control_up = mouse_event("mouseup", 0, 0, 60, 50);
+        window
+            .dispatch_event(&control_up)
+            .expect_throw("control mouse up should dispatch");
+        let control_click = mouse_event("click", 0, 0, 60, 50);
+        assert!(
+            follow_toggle
+                .dispatch_event(&control_click)
+                .expect_throw("control click should dispatch")
+        );
+        assert_eq!(fixture.graph.borrow().viewport.x, 100.0);
 
         let right_down = mouse_event("mousedown", 2, 2, 40, 30);
         graph_wrap
