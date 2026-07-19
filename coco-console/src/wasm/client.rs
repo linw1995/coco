@@ -2530,6 +2530,7 @@ mod tests {
 
     use wasm_bindgen::UnwrapThrowExt;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+    use web_sys::MouseEventInit;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -2682,6 +2683,105 @@ mod tests {
         assert!(
             set_selected_node_hash(&window, "detail-aaaaaaaa")
                 .expect_throw("provider context selection should be cleared")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_mouse_pan_updates_viewport_and_suppresses_drag_click() {
+        let fixture = GraphFixture::new();
+        let (graph_wrap, window) = {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport = ViewportState {
+                x: 100.0,
+                y: 80.0,
+                width: 200.0,
+                height: 100.0,
+                overscan: MIN_OVERSCAN,
+            };
+            graph.rendered_viewport = graph.viewport;
+            graph.zoom = 2.0;
+            graph.canvas = Some(GraphCanvas {
+                width: 640,
+                height: 360,
+            });
+            graph.auto_follow = true;
+            graph.patch_in_flight = true;
+            (graph.graph_wrap.clone(), graph.window.clone())
+        };
+        install_mouse_pan_listener(fixture.graph.clone())
+            .expect_throw("mouse pan listener should install");
+
+        let right_down = mouse_event("mousedown", 2, 2, 40, 30);
+        graph_wrap
+            .dispatch_event(&right_down)
+            .expect_throw("right mouse down should dispatch");
+        assert!(!right_down.default_prevented());
+
+        let move_without_drag = mouse_event("mousemove", 0, 1, 60, 50);
+        window
+            .dispatch_event(&move_without_drag)
+            .expect_throw("orphan mouse move should dispatch");
+        assert_eq!(fixture.graph.borrow().viewport.x, 100.0);
+
+        let left_down = mouse_event("mousedown", 0, 1, 40, 30);
+        graph_wrap
+            .dispatch_event(&left_down)
+            .expect_throw("left mouse down should dispatch");
+        assert!(left_down.default_prevented());
+
+        let below_threshold = mouse_event("mousemove", 0, 1, 42, 32);
+        window
+            .dispatch_event(&below_threshold)
+            .expect_throw("small mouse move should dispatch");
+        assert!(!below_threshold.default_prevented());
+        assert_eq!(fixture.graph.borrow().viewport.x, 100.0);
+
+        let drag_move = mouse_event("mousemove", 0, 1, 60, 50);
+        window
+            .dispatch_event(&drag_move)
+            .expect_throw("drag mouse move should dispatch");
+        assert!(drag_move.default_prevented());
+        {
+            let graph = fixture.graph.borrow();
+            assert!(!graph.auto_follow);
+            assert_eq!(graph.viewport.x, 90.0);
+            assert_eq!(graph.viewport.y, 70.0);
+            assert_eq!(graph.pending_viewport_update, PendingViewportUpdate::Patch);
+        }
+
+        let left_up = mouse_event("mouseup", 0, 0, 60, 50);
+        window
+            .dispatch_event(&left_up)
+            .expect_throw("left mouse up should dispatch");
+
+        let suppressed_click = mouse_event("click", 0, 0, 60, 50);
+        assert!(
+            !graph_wrap
+                .dispatch_event(&suppressed_click)
+                .expect_throw("suppressed click should dispatch")
+        );
+        assert!(suppressed_click.default_prevented());
+
+        let next_click = mouse_event("click", 0, 0, 60, 50);
+        assert!(
+            graph_wrap
+                .dispatch_event(&next_click)
+                .expect_throw("next click should dispatch")
+        );
+
+        let next_down = mouse_event("mousedown", 0, 1, 60, 50);
+        graph_wrap
+            .dispatch_event(&next_down)
+            .expect_throw("next mouse down should dispatch");
+        let lost_button_move = mouse_event("mousemove", 0, 0, 70, 60);
+        window
+            .dispatch_event(&lost_button_move)
+            .expect_throw("lost-button mouse move should dispatch");
+        let unsuppressed_click = mouse_event("click", 0, 0, 70, 60);
+        assert!(
+            graph_wrap
+                .dispatch_event(&unsuppressed_click)
+                .expect_throw("unsuppressed click should dispatch")
         );
     }
 
@@ -2904,5 +3004,23 @@ mod tests {
             height: 240,
             overscan: MIN_OVERSCAN,
         }
+    }
+
+    fn mouse_event(
+        event_type: &str,
+        button: i16,
+        buttons: u16,
+        client_x: i32,
+        client_y: i32,
+    ) -> MouseEvent {
+        let init = MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        init.set_button(button);
+        init.set_buttons(buttons);
+        init.set_client_x(client_x);
+        init.set_client_y(client_y);
+        MouseEvent::new_with_mouse_event_init_dict(event_type, &init)
+            .expect_throw("mouse event should be created")
     }
 }
