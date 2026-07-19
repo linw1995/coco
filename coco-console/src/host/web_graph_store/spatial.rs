@@ -2,8 +2,8 @@ use std::num::NonZeroUsize;
 
 use diesel::sqlite::SqliteConnection;
 use diesel::{
-    BoolExpressionMethods, ExpressionMethods, Insertable, JoinOnDsl, OptionalExtension, QueryDsl,
-    SelectableHelper,
+    BoolExpressionMethods, ExpressionMethods, Insertable, JoinOnDsl, NullableExpressionMethods,
+    OptionalExtension, QueryDsl, SelectableHelper,
 };
 
 use super::schema::{
@@ -305,30 +305,14 @@ async fn load_viewport_routes(
 ) -> std::result::Result<(Vec<RoutedEdge>, Option<i32>, bool), TransactionError> {
     use diesel_async::RunQueryDsl;
 
+    // A bounding-box hit alone selects every route leaving a visible high-fanout node. Requiring
+    // both endpoints to enter the overscanned viewport keeps browser work proportional to the
+    // visible subgraph while still preloading edges before either endpoint reaches the screen.
     let mut query = web_graph_route_spatial_index::table
-        .filter(
-            web_graph_route_spatial_index::layout_kind
-                .eq(Some(layout_kind_value(kind).as_bytes().to_vec())),
+        .inner_join(
+            web_graph_route_spatial_items::table.on(web_graph_route_spatial_index::spatial_id
+                .eq(web_graph_route_spatial_items::spatial_id.nullable())),
         )
-        .filter(web_graph_route_spatial_index::min_x.le(Some(bounds.max_x)))
-        .filter(web_graph_route_spatial_index::max_x.ge(Some(bounds.min_x)))
-        .filter(web_graph_route_spatial_index::min_y.le(Some(bounds.max_y)))
-        .filter(web_graph_route_spatial_index::max_y.ge(Some(bounds.min_y)))
-        .into_boxed();
-    if let Some(after) = after {
-        query = query.filter(web_graph_route_spatial_index::spatial_id.gt(Some(after)));
-    }
-    let ids = query
-        .order(web_graph_route_spatial_index::spatial_id.asc())
-        .limit(page_query_limit(limit))
-        .select(web_graph_route_spatial_index::spatial_id)
-        .load::<Option<i32>>(connection)
-        .await?;
-    let (ids, next_after, done) = finish_spatial_ids(ids, after, limit)?;
-    if ids.is_empty() {
-        return Ok((Vec::new(), next_after, done));
-    }
-    let rows = web_graph_route_spatial_items::table
         .inner_join(
             web_graph_edge_routes::table.on(web_graph_route_spatial_items::layout_kind
                 .eq(web_graph_edge_routes::layout_kind)
@@ -338,15 +322,50 @@ async fn load_viewport_routes(
                     web_graph_route_spatial_items::target_id.eq(web_graph_edge_routes::target_id),
                 )),
         )
-        .filter(web_graph_route_spatial_items::spatial_id.eq_any(&ids))
-        .order(web_graph_route_spatial_items::spatial_id.asc())
-        .select(RouteRow::as_select())
-        .load::<RouteRow>(connection)
+        .filter(
+            web_graph_route_spatial_index::layout_kind
+                .eq(Some(layout_kind_value(kind).as_bytes().to_vec())),
+        )
+        .filter(web_graph_route_spatial_index::min_x.le(Some(bounds.max_x)))
+        .filter(web_graph_route_spatial_index::max_x.ge(Some(bounds.min_x)))
+        .filter(web_graph_route_spatial_index::min_y.le(Some(bounds.max_y)))
+        .filter(web_graph_route_spatial_index::max_y.ge(Some(bounds.min_y)))
+        .filter(web_graph_edge_routes::source_x.ge(bounds.min_x))
+        .filter(web_graph_edge_routes::source_x.le(bounds.max_x))
+        .filter(web_graph_edge_routes::source_y.ge(bounds.min_y))
+        .filter(web_graph_edge_routes::source_y.le(bounds.max_y))
+        .filter(web_graph_edge_routes::target_x.ge(bounds.min_x))
+        .filter(web_graph_edge_routes::target_x.le(bounds.max_x))
+        .filter(web_graph_edge_routes::target_y.ge(bounds.min_y))
+        .filter(web_graph_edge_routes::target_y.le(bounds.max_y))
+        .into_boxed();
+    if let Some(after) = after {
+        query = query.filter(web_graph_route_spatial_index::spatial_id.gt(Some(after)));
+    }
+    let mut rows = query
+        .order(web_graph_route_spatial_index::spatial_id.asc())
+        .limit(page_query_limit(limit))
+        .select((
+            web_graph_route_spatial_index::spatial_id,
+            RouteRow::as_select(),
+        ))
+        .load::<(Option<i32>, RouteRow)>(connection)
         .await?
         .into_iter()
-        .map(stored_route)
+        .map(|(spatial_id, row)| {
+            spatial_id
+                .ok_or_else(|| invalid_value("spatial_id", "NULL"))
+                .map(|spatial_id| (spatial_id, row))
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok((rows, next_after, done))
+    let has_more = rows.len() > limit.get();
+    rows.truncate(limit.get());
+    let next_after = rows.last().map(|(spatial_id, _)| *spatial_id).or(after);
+    let routes = rows
+        .into_iter()
+        .map(|(_, row)| stored_route(row))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok((routes, next_after, !has_more))
 }
 
 fn finish_spatial_ids(
