@@ -272,6 +272,16 @@ impl WebGraphRuntime {
         *self.ready.borrow()
     }
 
+    fn publish_revision(&self, revision: u64) {
+        self.ready.send_if_modified(|current| {
+            if *current >= revision {
+                return false;
+            }
+            *current = revision;
+            true
+        });
+    }
+
     pub fn subscribe_source_changes(&self) -> watch::Receiver<u64> {
         self.publisher.subscribe_source_changes()
     }
@@ -376,9 +386,11 @@ impl WebGraphRuntime {
                     .fail();
                 }
                 if cursor == &through {
+                    let current_revision = state.revision.get();
+                    self.publish_revision(current_revision);
                     if let Some(progress) = progress.as_mut() {
                         progress.observe_high_watermark(&through);
-                        progress.log_completed(cursor.row_id, self.current_revision());
+                        progress.log_completed(cursor.row_id, current_revision);
                     }
                     return Ok(());
                 }
@@ -426,7 +438,7 @@ impl WebGraphRuntime {
                 .reflow_and_advance_source(&nodes_to_reflow, page_cursor)
                 .await?;
             let current_revision = finalized.revision.get();
-            self.ready.send_replace(current_revision);
+            self.publish_revision(current_revision);
             let current_row_id = page_cursor.row_id;
             let progress = progress
                 .as_mut()
@@ -1802,6 +1814,36 @@ mod tests {
 
         driver.abort();
         assert!(driver.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn catch_up_publishes_revision_committed_by_another_runtime() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let first = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        first.catch_up().await.unwrap();
+        let second = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        let observed_revision = second.current_revision();
+        let mut revisions = second.subscribe();
+        revisions.borrow_and_update();
+
+        append_text(&writer, &writer.root_id(), "committed by first runtime").await;
+        first.catch_up().await.unwrap();
+        let committed_revision = first.current_revision();
+        assert!(committed_revision > observed_revision);
+        assert_eq!(second.current_revision(), observed_revision);
+
+        second.catch_up().await.unwrap();
+
+        timeout(Duration::from_secs(2), revisions.changed())
+            .await
+            .expect("catch-up should publish the persisted revision")
+            .unwrap();
+        assert_eq!(*revisions.borrow_and_update(), committed_revision);
+        assert_eq!(second.current_revision(), committed_revision);
     }
 
     #[tokio::test]
