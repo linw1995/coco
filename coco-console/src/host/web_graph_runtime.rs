@@ -10,24 +10,23 @@ use coco_mem::{
 use snafu::{IntoError, prelude::*};
 use tokio::sync::{broadcast, watch};
 
-use super::incremental_layout::{EndpointPortSlots, LayoutPoint, StableLayoutConfig, route_edge};
-use super::web_graph_store::{Error as StoreError, StoredGraphState, Viewport, WebGraphStore};
-use crate::api::{
-    GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
-    GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse, Point as ApiPoint,
-};
-use crate::error::{
+use super::error::{
     StoreSnafu, WebGraphModelSnafu, WebGraphNotInitializedSnafu,
     WebGraphParentPlacementMissingSnafu, WebGraphRevisionExhaustedSnafu,
     WebGraphSourceNodeMissingSnafu, WebGraphStoreSnafu,
 };
-use crate::graph::{GraphMode, graph_kind_name, node_target_id, shorten_id, summarize_node};
-use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
-use crate::layout::{
-    GRAPH_PADDING, GRAPH_RANK_STEP, GRAPH_ROW_STEP, GraphLayoutEdgeKind,
-    diff_graph_viewport_responses, edge_key, node_key,
+use super::publisher::{ConsoleNodeCreated, ConsolePublisher};
+use super::web_graph_store::{Error as StoreError, StoredGraphState, Viewport, WebGraphStore};
+use super::web_graph_view::{
+    EndpointPortSlots, GRAPH_PADDING, GRAPH_RANK_STEP, GRAPH_ROW_STEP, ViewMode,
+    diff_graph_viewport_responses, edge_key, graph_kind_name, node_key, node_target_id, route_edge,
+    shorten_id, summarize_node,
 };
-use crate::publisher::{ConsoleNodeCreated, ConsolePublisher};
+use crate::api::{
+    GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
+    GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse, Point as ApiPoint,
+};
+use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::web_graph::{
     BezierRoute, Canvas, EdgeId, EdgeKind, FORMAT_VERSION, Graph, LayoutKind, LayoutPatch,
     LayoutPatches, LayoutSnapshot, LayoutSnapshots, NodeId, NodePlacement, Patch, Point, Revision,
@@ -95,8 +94,49 @@ impl WebGraphRuntime {
         self.ready.subscribe()
     }
 
+    pub fn current_revision(&self) -> u64 {
+        *self.ready.borrow()
+    }
+
     pub fn subscribe_node_creations(&self) -> broadcast::Receiver<ConsoleNodeCreated> {
         self.publisher.subscribe_node_creations()
+    }
+
+    pub async fn node_points(
+        &self,
+        mode: ViewMode,
+        node_ids: &[String],
+    ) -> crate::Result<BTreeMap<String, Point>> {
+        let node_ids = node_ids
+            .iter()
+            .map(|node_id| NodeId::new(node_id.clone()).context(WebGraphModelSnafu))
+            .collect::<crate::Result<Vec<_>>>()?;
+        if node_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        'retry: loop {
+            let mut revision = None;
+            let mut points = BTreeMap::new();
+            for chunk in node_ids.chunks(GRAPH_READ_BATCH_SIZE) {
+                let read = self
+                    .store
+                    .node_placements(layout_kind(mode), chunk)
+                    .await
+                    .context(WebGraphStoreSnafu)?
+                    .context(WebGraphNotInitializedSnafu)?;
+                if revision.is_some_and(|revision| revision != read.state.revision) {
+                    tokio::task::yield_now().await;
+                    continue 'retry;
+                }
+                revision = Some(read.state.revision);
+                points.extend(
+                    read.value
+                        .into_iter()
+                        .map(|placement| (placement.node.to_string(), placement.point)),
+                );
+            }
+            return Ok(points);
+        }
     }
 
     pub async fn drive(
@@ -198,7 +238,7 @@ impl WebGraphRuntime {
 
     pub async fn viewport(
         &self,
-        mode: GraphMode,
+        mode: ViewMode,
         request: GraphViewportRequest,
     ) -> crate::Result<GraphViewportResponse> {
         loop {
@@ -211,7 +251,7 @@ impl WebGraphRuntime {
 
     pub async fn viewport_after(
         &self,
-        mode: GraphMode,
+        mode: ViewMode,
         observed_revision: u64,
         request: GraphViewportRequest,
     ) -> crate::Result<GraphViewportResponse> {
@@ -221,7 +261,7 @@ impl WebGraphRuntime {
 
     pub async fn viewport_diff(
         &self,
-        mode: GraphMode,
+        mode: ViewMode,
         request: GraphViewportDiffRequest,
     ) -> crate::Result<GraphViewportDiffResponse> {
         loop {
@@ -243,7 +283,7 @@ impl WebGraphRuntime {
 
     pub async fn viewport_diff_after(
         &self,
-        mode: GraphMode,
+        mode: ViewMode,
         observed_revision: u64,
         request: GraphViewportDiffRequest,
     ) -> crate::Result<GraphViewportDiffResponse> {
@@ -266,7 +306,7 @@ impl WebGraphRuntime {
 
     async fn viewport_once(
         &self,
-        mode: GraphMode,
+        mode: ViewMode,
         request: GraphViewportRequest,
     ) -> crate::Result<Option<GraphViewportResponse>> {
         let request = request.normalized();
@@ -597,15 +637,14 @@ impl WebGraphRuntime {
                 .expect("parent points are loaded before routing");
             routes.push(RoutedEdge {
                 edge,
-                route: web_route(route_edge(
-                    layout_point(source),
-                    layout_point(point),
+                route: route_edge(
+                    source,
+                    point,
                     EndpointPortSlots {
                         source: source_slot,
                         target: target_slot,
                     },
-                    StableLayoutConfig::default(),
-                )),
+                ),
             });
         }
         Ok(Some(LayoutPatch {
@@ -796,10 +835,10 @@ fn parent_edge_ids(parents: &[ParentEdge], target: &NodeId) -> crate::Result<Vec
         .collect()
 }
 
-fn layout_kind(mode: GraphMode) -> LayoutKind {
+fn layout_kind(mode: ViewMode) -> LayoutKind {
     match mode {
-        GraphMode::Anchors => LayoutKind::Anchors,
-        GraphMode::All => LayoutKind::All,
+        ViewMode::Anchors => LayoutKind::Anchors,
+        ViewMode::All => LayoutKind::All,
     }
 }
 
@@ -807,34 +846,6 @@ fn layout_name(kind: LayoutKind) -> &'static str {
     match kind {
         LayoutKind::Anchors => "anchors",
         LayoutKind::All => "all",
-    }
-}
-
-fn layout_point(point: Point) -> LayoutPoint {
-    LayoutPoint {
-        x: point.x,
-        y: point.y,
-    }
-}
-
-fn web_route(route: super::incremental_layout::CubicRoute) -> BezierRoute {
-    BezierRoute {
-        source: Point {
-            x: route.source.x,
-            y: route.source.y,
-        },
-        control_1: Point {
-            x: route.control_1.x,
-            y: route.control_1.y,
-        },
-        control_2: Point {
-            x: route.control_2.x,
-            y: route.control_2.y,
-        },
-        target: Point {
-            x: route.target.x,
-            y: route.target.y,
-        },
     }
 }
 
@@ -858,17 +869,8 @@ fn viewport_edge(route: RoutedEdge) -> GraphViewportEdge {
         EdgeKind::Merge => GraphViewportEdgeKind::Merge,
         EdgeKind::Shadow => GraphViewportEdgeKind::Shadow,
     };
-    let layout_kind = match route.edge.kind {
-        EdgeKind::Primary => GraphLayoutEdgeKind::Primary,
-        EdgeKind::Merge => GraphLayoutEdgeKind::Merge,
-        EdgeKind::Shadow => GraphLayoutEdgeKind::Shadow,
-    };
     GraphViewportEdge {
-        key: edge_key(
-            layout_kind,
-            route.edge.source.as_str(),
-            route.edge.target.as_str(),
-        ),
+        key: edge_key(kind, route.edge.source.as_str(), route.edge.target.as_str()),
         kind,
         source_id: route.edge.source.to_string(),
         target_id: route.edge.target.to_string(),
@@ -952,13 +954,13 @@ mod tests {
         runtime.synchronize().await.unwrap();
 
         let all = runtime
-            .viewport(GraphMode::All, complete_viewport())
+            .viewport(ViewMode::All, complete_viewport())
             .await
             .unwrap();
         assert_eq!(all.nodes.len(), 6);
         assert_eq!(all.edges.len(), 6);
         let anchors = runtime
-            .viewport(GraphMode::Anchors, complete_viewport())
+            .viewport(ViewMode::Anchors, complete_viewport())
             .await
             .unwrap();
         assert_eq!(
@@ -1048,7 +1050,7 @@ mod tests {
             .point;
         assert_eq!(root_after, root_before);
         let viewport = runtime
-            .viewport(GraphMode::All, complete_viewport())
+            .viewport(ViewMode::All, complete_viewport())
             .await
             .unwrap();
         assert!(viewport.nodes.iter().any(|node| node.id == child));
@@ -1103,7 +1105,7 @@ mod tests {
         timeout(Duration::from_secs(2), async {
             loop {
                 let viewport = runtime
-                    .viewport(GraphMode::All, complete_viewport())
+                    .viewport(ViewMode::All, complete_viewport())
                     .await
                     .unwrap();
                 let visible = viewport
@@ -1121,8 +1123,8 @@ mod tests {
         .await
         .expect("the final batch event should build its missing ancestry");
         let state = runtime.store.state().await.unwrap().unwrap();
-        assert_eq!(state.revision.get(), 4);
-        assert_eq!(state.source_version.get(), 2);
+        assert_eq!(state.revision.get(), 3);
+        assert_eq!(state.source_version.get(), 1);
 
         driver.abort();
         assert!(driver.await.unwrap_err().is_cancelled());

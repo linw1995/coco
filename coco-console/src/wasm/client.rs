@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::rc::Rc;
 use std::str::{FromStr, Split};
 
@@ -40,23 +39,6 @@ struct GraphItemsRefreshInput {
     window: Window,
     viewport: ViewportState,
     query: String,
-}
-
-#[derive(Deserialize)]
-struct ConsoleGraphRebuildStatus {
-    mode: String,
-    state: String,
-    processed: usize,
-    total: usize,
-    message: String,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum GraphProgressAction {
-    Active(String),
-    Failed(String),
-    Ready,
-    Ignore,
 }
 
 type GraphListenerInstaller = fn(Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>;
@@ -114,8 +96,6 @@ async fn run() -> Result<(), JsValue> {
     if has_selected_node {
         refresh_selected_node_detail_from_graph(graph.clone()).await?;
     }
-    spawn_local(refresh_server_rendered_sections_on_version(graph));
-
     Ok(())
 }
 
@@ -148,20 +128,7 @@ fn install_graph_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>
     source.add_event_listener_with_callback("graph", version_callback.as_ref().unchecked_ref())?;
     version_callback.forget();
 
-    let progress_graph = graph.clone();
-    let progress_callback =
-        Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
-            let Some(data) = event.data().as_string() else {
-                return;
-            };
-            handle_graph_progress_event(progress_graph.clone(), &data);
-        }));
-    source.add_event_listener_with_callback(
-        "graph-progress",
-        progress_callback.as_ref().unchecked_ref(),
-    )?;
-    progress_callback.forget();
-    graph.borrow_mut().progress_events = Some(source);
+    graph.borrow_mut().events = Some(source);
     Ok(())
 }
 
@@ -169,49 +136,6 @@ fn handle_graph_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
     match data.parse::<u64>() {
         Ok(version) => request_graph_items_refresh(graph, version),
         Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
-    }
-}
-
-fn handle_graph_progress_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
-    match serde_json::from_str::<Vec<ConsoleGraphRebuildStatus>>(data) {
-        Ok(statuses) => {
-            let should_resume = graph.borrow_mut().apply_progress_statuses(&statuses);
-            if should_resume {
-                request_viewport_update(graph, PendingViewportUpdate::None);
-            }
-        }
-        Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
-    }
-}
-
-fn progress_status_message(status: &ConsoleGraphRebuildStatus) -> String {
-    if status.total == 0 {
-        return status.message.clone();
-    }
-    format!(
-        "{} ({}/{})",
-        status.message,
-        status.processed.min(status.total),
-        status.total
-    )
-}
-
-fn graph_progress_action(
-    mode: &str,
-    statuses: &[ConsoleGraphRebuildStatus],
-) -> GraphProgressAction {
-    statuses
-        .iter()
-        .find(|status| status.mode == mode)
-        .map_or(GraphProgressAction::Ignore, progress_status_action)
-}
-
-fn progress_status_action(status: &ConsoleGraphRebuildStatus) -> GraphProgressAction {
-    match status.state.as_str() {
-        "scheduled" | "building" => GraphProgressAction::Active(progress_status_message(status)),
-        "failed" => GraphProgressAction::Failed(status.message.clone()),
-        "ready" => GraphProgressAction::Ready,
-        _ => GraphProgressAction::Ignore,
     }
 }
 
@@ -289,16 +213,14 @@ struct VirtualGraph {
     canvas: Option<GraphCanvas>,
     auto_fit_short_canvas: bool,
     version: u64,
-    shell_version: u64,
     rendered: RenderedKeys,
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
     pending_viewport_update: PendingViewportUpdate,
-    graph_rebuild_active: bool,
     announced_version: u64,
     version_refresh_scheduled: bool,
     version_refresh_abort: Option<AbortController>,
-    progress_events: Option<EventSource>,
+    events: Option<EventSource>,
 }
 
 impl VirtualGraph {
@@ -333,16 +255,14 @@ impl VirtualGraph {
             canvas: None,
             auto_fit_short_canvas,
             version,
-            shell_version: version,
             rendered: RenderedKeys::new(),
             rendered_viewport: viewport,
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
-            graph_rebuild_active: false,
             announced_version: version,
             version_refresh_scheduled: false,
             version_refresh_abort: None,
-            progress_events: None,
+            events: None,
         };
         graph.apply_follow_toggle_state()?;
         Ok(graph)
@@ -448,7 +368,7 @@ impl VirtualGraph {
         self.rendered = RenderedKeys::new();
         self.apply_response_viewport(version, canvas, viewport)?;
         self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
-        self.sync_branch_visibility();
+        self.sync_svg_viewport();
         self.sync_selected_graph_node();
         self.hide_status();
         Ok(())
@@ -467,7 +387,7 @@ impl VirtualGraph {
         self.apply_response_viewport(version, canvas, viewport)?;
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
-        self.sync_branch_visibility();
+        self.sync_svg_viewport();
         self.sync_selected_graph_node();
         self.hide_status();
         Ok(())
@@ -539,7 +459,7 @@ impl VirtualGraph {
             &self.time_scale_label,
             &self.window,
         )?;
-        self.sync_branch_visibility();
+        self.sync_svg_viewport();
         Ok(())
     }
 
@@ -547,15 +467,6 @@ impl VirtualGraph {
         if let Err(error) = sync_selected_graph_node(&self.window, &self.document) {
             web_sys::console::error_1(&error);
         }
-    }
-
-    fn refresh_time_scale_elements(&mut self) -> Result<(), JsValue> {
-        let elements = query_time_scale_elements(&self.document)?;
-        self.time_scale = elements.time_scale;
-        self.time_scale_track = elements.time_scale_track;
-        self.time_scale_cursor = elements.time_scale_cursor;
-        self.time_scale_label = elements.time_scale_label;
-        self.apply_canvas()
     }
 
     fn upsert_graph_items(
@@ -825,65 +736,25 @@ impl VirtualGraph {
         }
     }
 
-    fn apply_progress_statuses(&mut self, statuses: &[ConsoleGraphRebuildStatus]) -> bool {
-        self.apply_progress_action(graph_progress_action(&self.graph_mode, statuses))
-    }
-
-    fn apply_progress_action(&mut self, action: GraphProgressAction) -> bool {
-        match action {
-            GraphProgressAction::Active(message) => self.apply_active_progress(&message),
-            GraphProgressAction::Failed(message) => self.apply_terminal_progress(Some(&message)),
-            GraphProgressAction::Ready => self.apply_terminal_progress(None),
-            GraphProgressAction::Ignore => false,
-        }
-    }
-
-    fn apply_active_progress(&mut self, message: &str) -> bool {
-        self.graph_rebuild_active = true;
-        self.abort_version_refresh();
-        self.show_status(message);
-        false
-    }
-
-    fn apply_terminal_progress(&mut self, message: Option<&str>) -> bool {
-        let was_active = self.graph_rebuild_active;
-        self.graph_rebuild_active = false;
-        self.apply_terminal_progress_status(message);
-        was_active && self.deferred_viewport_update_needed()
-    }
-
-    fn apply_terminal_progress_status(&self, message: Option<&str>) {
-        match message {
-            Some(message) => self.show_status(message),
-            None => self.hide_status_when_idle(),
-        }
-    }
-
-    fn hide_status_when_idle(&self) {
-        if !self.viewport_update_active() {
-            self.hide_status();
-        }
-    }
-
     fn set_root_version(&self) {
         if let Some(root) = self.document.get_element_by_id(ROOT_ID) {
             let _ = root.set_attribute("data-version", &self.version.to_string());
         }
+        if let Ok(Some(stats)) = self.document.query_selector(".stats") {
+            let mode = if self.graph_mode == "all" {
+                "All"
+            } else {
+                "Anchors"
+            };
+            stats.set_text_content(Some(&format!("{mode} / revision {}", self.version)));
+        }
     }
 
     #[rustfmt::skip]
-    fn apply_shell_version(&mut self, version: u64) { self.shell_version = version; self.sync_branch_visibility(); }
-
-    #[rustfmt::skip]
-    fn sync_branch_visibility(&self) { if let Err(error) = sync_branch_visibility(&self.document, self.viewport) { web_sys::console::error_1(&error); } }
+    fn sync_svg_viewport(&self) { if let Err(error) = sync_svg_viewport(&self.document, self.viewport) { web_sys::console::error_1(&error); } }
 
     fn viewport_update_active(&self) -> bool {
         viewport_update_active(self.patch_in_flight, self.pending_viewport_update)
-    }
-
-    fn deferred_viewport_update_needed(&self) -> bool {
-        self.pending_viewport_update.is_pending()
-            || !same_viewport(self.rendered_viewport, self.viewport)
     }
 
     fn abort_version_refresh(&mut self) {
@@ -1045,7 +916,7 @@ fn request_viewport_update(graph: Rc<RefCell<VirtualGraph>>, update: PendingView
     let should_spawn = {
         let mut graph = graph.borrow_mut();
         graph.pending_viewport_update = graph.pending_viewport_update.merge(update);
-        if graph.graph_rebuild_active || graph.patch_in_flight {
+        if graph.patch_in_flight {
             false
         } else {
             graph.patch_in_flight = true;
@@ -1339,10 +1210,6 @@ async fn render_next_viewport_patch_or_stop(graph: Rc<RefCell<VirtualGraph>>) ->
 }
 
 async fn render_next_viewport_patch(graph: Rc<RefCell<VirtualGraph>>) -> Result<bool, JsValue> {
-    if graph.borrow().graph_rebuild_active {
-        graph.borrow_mut().patch_in_flight = false;
-        return Ok(false);
-    }
     let input = next_viewport_patch_input(graph.clone());
     match input.fetch {
         ViewportFetch::None => finish_idle_viewport_patch(graph),
@@ -1470,18 +1337,16 @@ async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {
 
 fn graph_items_refresh_input(graph: Rc<RefCell<VirtualGraph>>) -> Option<GraphItemsRefreshInput> {
     let graph = graph.borrow();
-    (!graph.graph_rebuild_active && !graph.viewport_update_active()).then(|| {
-        GraphItemsRefreshInput {
-            window: graph.window.clone(),
-            viewport: graph.viewport,
-            query: graph_items_refresh_query(
-                graph.version,
-                graph.viewport,
-                graph.canvas,
-                graph.rendered.known_query(),
-                &graph.graph_mode,
-            ),
-        }
+    (!graph.viewport_update_active()).then(|| GraphItemsRefreshInput {
+        window: graph.window.clone(),
+        viewport: graph.viewport,
+        query: graph_items_refresh_query(
+            graph.version,
+            graph.viewport,
+            graph.canvas,
+            graph.rendered.known_query(),
+            &graph.graph_mode,
+        ),
     })
 }
 
@@ -1610,7 +1475,7 @@ fn begin_version_refresh(
     graph: Rc<RefCell<VirtualGraph>>,
 ) -> Result<Option<AbortController>, JsValue> {
     let mut graph = graph.borrow_mut();
-    if graph.graph_rebuild_active || graph.viewport_update_active() {
+    if graph.viewport_update_active() {
         return Ok(None);
     }
     let controller = AbortController::new()?;
@@ -1637,64 +1502,6 @@ async fn delay_ms(window: &Window, delay_ms: i32) -> Result<(), JsValue> {
     JsFuture::from(promise).await.map(|_| ())
 }
 
-async fn refresh_server_rendered_sections_on_version(graph: Rc<RefCell<VirtualGraph>>) {
-    refresh_on_version(graph, refresh_server_rendered_sections_once).await;
-}
-
-async fn refresh_on_version<F, Fut>(graph: Rc<RefCell<VirtualGraph>>, refresh_once: F)
-where
-    F: Fn(Rc<RefCell<VirtualGraph>>) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    loop {
-        refresh_once(graph.clone()).await;
-    }
-}
-
-async fn refresh_server_rendered_sections_once(graph: Rc<RefCell<VirtualGraph>>) {
-    if graph.borrow().graph_rebuild_active {
-        delay_graph_items_retry(graph).await;
-        return;
-    }
-    let (window, document, url) = server_rendered_sections_request(&graph);
-    let response = refresh_server_rendered_sections_from_url(&window, &document, &url)
-        .await
-        .and_then(|version| {
-            graph.borrow_mut().refresh_time_scale_elements()?;
-            Ok(version)
-        });
-    handle_server_rendered_sections_response(graph, &window, response).await;
-}
-
-fn server_rendered_sections_request(
-    graph: &Rc<RefCell<VirtualGraph>>,
-) -> (Window, Document, String) {
-    let graph = graph.borrow();
-    (
-        graph.window.clone(),
-        graph.document.clone(),
-        format!(
-            "/fragment?version={}&mode={}",
-            graph.shell_version, graph.graph_mode
-        ),
-    )
-}
-
-async fn handle_server_rendered_sections_response(
-    graph: Rc<RefCell<VirtualGraph>>,
-    window: &Window,
-    response: Result<Option<u64>, JsValue>,
-) {
-    match response {
-        Ok(Some(version)) => graph.borrow_mut().apply_shell_version(version),
-        Ok(None) => {}
-        Err(error) => {
-            web_sys::console::error_1(&error);
-            delay_window_retry(window).await;
-        }
-    }
-}
-
 async fn delay_graph_items_retry(graph: Rc<RefCell<VirtualGraph>>) {
     let window = graph.borrow().window.clone();
     delay_window_retry(&window).await;
@@ -1706,110 +1513,7 @@ async fn delay_window_retry(window: &Window) {
     }
 }
 
-async fn refresh_server_rendered_sections_from_url(
-    window: &Window,
-    document: &Document,
-    url: &str,
-) -> Result<Option<u64>, JsValue> {
-    let html = fetch_text(window, url).await?;
-    let container = document.create_element("div")?;
-    container.set_inner_html(&html);
-    let version = fragment_version(&container);
-    refresh_server_fragment_sections(document, &container)?;
-    refresh_selected_node_detail_if_needed(window, document).await?;
-    Ok(version)
-}
-
-fn fragment_version(container: &Element) -> Option<u64> {
-    container
-        .query_selector("#console-root")
-        .ok()
-        .flatten()?
-        .get_attribute("data-version")?
-        .parse()
-        .ok()
-}
-
-fn refresh_server_fragment_sections(
-    document: &Document,
-    container: &Element,
-) -> Result<(), JsValue> {
-    refresh_text_content(document, container, ".stats")?;
-    refresh_text_content(document, container, "#selection-style")?;
-    refresh_inner_html(document, container, ".branch-section")?;
-    refresh_time_scale_fragment(document, container)
-}
-
-fn refresh_time_scale_fragment(document: &Document, container: &Element) -> Result<(), JsValue> {
-    refresh_attributes(
-        document,
-        container,
-        ".time-scale",
-        &["class", "tabindex", "aria-label"],
-    )?;
-    refresh_inner_html(document, container, ".time-scale-track")?;
-    refresh_inner_html(document, container, ".time-scale-extents")
-}
-
-fn refresh_attributes(
-    document: &Document,
-    container: &Element,
-    selector: &str,
-    names: &[&str],
-) -> Result<(), JsValue> {
-    let Some(source) = container.query_selector(selector)? else {
-        return Ok(());
-    };
-    if let Some(target) = document.query_selector(selector)? {
-        for name in names {
-            match source.get_attribute(name) {
-                Some(value) => target.set_attribute(name, &value)?,
-                None => target.remove_attribute(name)?,
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn refresh_selected_node_detail_if_needed(
-    window: &Window,
-    document: &Document,
-) -> Result<(), JsValue> {
-    if selected_node_target(window).is_some() {
-        refresh_selected_node_detail(window, document).await?;
-    }
-    Ok(())
-}
-
-fn refresh_text_content(
-    document: &Document,
-    container: &Element,
-    selector: &str,
-) -> Result<(), JsValue> {
-    let Some(source) = container.query_selector(selector)? else {
-        return Ok(());
-    };
-    if let Some(target) = document.query_selector(selector)? {
-        target.set_text_content(source.text_content().as_deref());
-    }
-    Ok(())
-}
-
-fn refresh_inner_html(
-    document: &Document,
-    container: &Element,
-    selector: &str,
-) -> Result<(), JsValue> {
-    let Some(source) = container.query_selector(selector)? else {
-        return Ok(());
-    };
-    if let Some(target) = document.query_selector(selector)? {
-        target.set_inner_html(&source.inner_html());
-    }
-    Ok(())
-}
-
-fn sync_branch_visibility(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
+fn sync_svg_viewport(document: &Document, viewport: ViewportState) -> Result<(), JsValue> {
     if let Some(graph_svg) = document.query_selector(".graph")? {
         set_attributes(
             &graph_svg,
@@ -2006,19 +1710,10 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
 async fn refresh_selected_node_detail_from_graph(
     graph: Rc<RefCell<VirtualGraph>>,
 ) -> Result<(), JsValue> {
-    let (window, document, graph_rebuild_active) = {
+    let (window, document) = {
         let graph = graph.borrow();
-        (
-            graph.window.clone(),
-            graph.document.clone(),
-            graph.graph_rebuild_active,
-        )
+        (graph.window.clone(), graph.document.clone())
     };
-    if graph_rebuild_active {
-        let _ = selected_node_detail_request(&window, &document)?;
-        focus_selected_node_in_graph(graph);
-        return Ok(());
-    }
     refresh_selected_node_detail(&window, &document).await?;
     focus_selected_node_in_graph(graph);
     Ok(())
@@ -2784,10 +2479,6 @@ mod tests {
                     </div>
                   </nav>
                   <div class="graph-status" hidden></div>
-                  <ul class="branch-list">
-                    <li class="branch"><strong>main</strong></li>
-                    <li class="branch"><strong>feature</strong></li>
-                  </ul>
                 </main>
                 "#,
             );
@@ -2819,37 +2510,6 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_progress_reports_typed_states() {
-        let building = [progress_status(
-            "anchors",
-            "building",
-            9,
-            12,
-            "Building graph entries",
-        )];
-        let failed = [progress_status(
-            "anchors",
-            "failed",
-            0,
-            0,
-            "Graph build failed",
-        )];
-
-        assert_eq!(
-            graph_progress_action("anchors", &building),
-            GraphProgressAction::Active("Building graph entries (9/12)".to_owned())
-        );
-        assert_eq!(
-            graph_progress_action("anchors", &failed),
-            GraphProgressAction::Failed("Graph build failed".to_owned())
-        );
-        assert_eq!(
-            graph_progress_action("all", &building),
-            GraphProgressAction::Ignore
-        );
-    }
-
-    #[wasm_bindgen_test]
     fn graph_items_node_label_limits_heads_and_character_count() {
         let mut node = graph_node("aaaaaaaa", 56, 56);
         node.labels = vec![
@@ -2865,47 +2525,9 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_fragment_helpers_refresh_attributes_and_loading_context() {
+    fn graph_items_render_loading_provider_context() {
         let fixture = GraphFixture::new();
         let document = fixture.graph.borrow().document.clone();
-        let container = document
-            .create_element("div")
-            .expect_throw("fragment container should be created");
-        container.set_inner_html(
-            r#"<nav class="time-scale refreshed" aria-label="Updated time scale"></nav>"#,
-        );
-
-        refresh_attributes(
-            &document,
-            &container,
-            ".time-scale",
-            &["class", "tabindex", "aria-label"],
-        )
-        .expect_throw("time scale attributes should refresh");
-        let time_scale = fixture
-            .root
-            .query_selector(".time-scale")
-            .expect_throw("time scale query should succeed")
-            .expect_throw("time scale should exist");
-        assert_eq!(
-            time_scale.get_attribute("class").as_deref(),
-            Some("time-scale refreshed")
-        );
-        assert_eq!(
-            time_scale.get_attribute("aria-label").as_deref(),
-            Some("Updated time scale")
-        );
-        assert!(time_scale.get_attribute("tabindex").is_none());
-
-        let empty_container = document
-            .create_element("div")
-            .expect_throw("empty fragment container should be created");
-        refresh_attributes(&document, &empty_container, ".missing", &["class"])
-            .expect_throw("missing source should be ignored");
-        empty_container.set_inner_html(r#"<div class="source-only"></div>"#);
-        refresh_attributes(&document, &empty_container, ".source-only", &["class"])
-            .expect_throw("missing target should be ignored");
-
         let loading = loading_provider_context(&document, Some("detail-aaaaaaaa"))
             .expect_throw("loading provider context should render");
         assert_eq!(
@@ -3025,20 +2647,6 @@ mod tests {
             edge_after.get_attribute("d").as_deref(),
             Some(bezier_path(updated_route).as_str())
         );
-
-        let branches = fixture
-            .root
-            .query_selector_all(".branch")
-            .expect_throw("branches should be queryable");
-        assert_eq!(branches.length(), 2);
-        for index in 0..branches.length() {
-            let branch = branches
-                .item(index)
-                .expect_throw("branch should exist")
-                .unchecked_into::<Element>();
-            assert!(!branch.class_list().contains("branch-viewport-hidden"));
-            assert!(branch.get_attribute("aria-hidden").is_none());
-        }
     }
 
     #[wasm_bindgen_test]
@@ -3162,22 +2770,6 @@ mod tests {
             width: 400,
             height: 240,
             overscan: MIN_OVERSCAN,
-        }
-    }
-
-    fn progress_status(
-        mode: &str,
-        state: &str,
-        processed: usize,
-        total: usize,
-        message: &str,
-    ) -> ConsoleGraphRebuildStatus {
-        ConsoleGraphRebuildStatus {
-            mode: mode.to_owned(),
-            state: state.to_owned(),
-            processed,
-            total,
-            message: message.to_owned(),
         }
     }
 }

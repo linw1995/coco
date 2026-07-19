@@ -30,17 +30,6 @@ impl<S> ConsoleStore<S> {
         &self.publisher
     }
 
-    fn notify_branch_if_ok<T>(
-        &self,
-        branch: impl Into<String>,
-        result: StoreResult<T>,
-    ) -> StoreResult<T> {
-        if result.is_ok() {
-            self.publisher.mark_branch_changed(branch);
-        }
-        result
-    }
-
     fn notify_node_if_ok(&self, result: StoreResult<String>) -> StoreResult<String> {
         if let Ok(node_id) = &result {
             self.publisher.mark_node_created(node_id.clone());
@@ -48,19 +37,13 @@ impl<S> ConsoleStore<S> {
         result
     }
 
-    fn notify_branch_and_node_if_ok(
+    fn notify_node_if_created(
         &self,
-        branch: impl Into<String>,
         node_created: bool,
         result: StoreResult<String>,
     ) -> StoreResult<String> {
-        if let Ok(node_id) = &result {
-            if node_created {
-                self.publisher
-                    .mark_branch_and_node_changed(branch, node_id.clone());
-            } else {
-                self.publisher.mark_branch_changed(branch);
-            }
+        if node_created && let Ok(node_id) = &result {
+            self.publisher.mark_node_created(node_id.clone());
         }
         result
     }
@@ -102,7 +85,7 @@ where
     S: BranchStore + Sync,
 {
     async fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
-        self.notify_branch_if_ok(name, self.inner.fork(name, from_ref).await)
+        self.inner.fork(name, from_ref).await
     }
 
     async fn get_branch_head(&self, name: &str) -> StoreResult<String> {
@@ -110,7 +93,7 @@ where
     }
 
     async fn delete_branch(&self, name: &str) -> StoreResult<()> {
-        self.notify_branch_if_ok(name, self.inner.delete_branch(name).await)
+        self.inner.delete_branch(name).await
     }
 
     async fn set_branch_head(
@@ -119,12 +102,9 @@ where
         expected_old_head: &str,
         new_head: &str,
     ) -> StoreResult<()> {
-        self.notify_branch_if_ok(
-            name,
-            self.inner
-                .set_branch_head(name, expected_old_head, new_head)
-                .await,
-        )
+        self.inner
+            .set_branch_head(name, expected_old_head, new_head)
+            .await
     }
 
     async fn append_nodes_and_set_branch_head(
@@ -135,8 +115,7 @@ where
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
         let node_created = !nodes.is_empty();
-        self.notify_branch_and_node_if_ok(
-            name,
+        self.notify_node_if_created(
             node_created,
             self.inner
                 .append_nodes_and_set_branch_head(name, expected_old_head, parent, nodes)
@@ -153,8 +132,7 @@ where
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
         let node_created = !nodes.is_empty();
-        self.notify_branch_and_node_if_ok(
-            name,
+        self.notify_node_if_created(
             node_created,
             self.inner
                 .append_nodes_and_set_branch_head_to(
@@ -172,21 +150,12 @@ where
         &self,
         update: BranchAppendSessionState,
     ) -> StoreResult<String> {
-        let branches = [update.branch.clone(), update.session_branch.clone()];
         let node_created = !update.nodes.is_empty();
         let result = self
             .inner
             .append_nodes_and_set_branch_head_with_session_state(update)
             .await;
-        if let Ok(node_id) = &result {
-            if node_created {
-                self.publisher
-                    .mark_branches_and_node_changed(branches, node_id.clone());
-            } else {
-                self.publisher.mark_branches_changed(branches);
-            }
-        }
-        result
+        self.notify_node_if_created(node_created, result)
     }
 }
 
@@ -209,14 +178,11 @@ where
         expected: Option<&SessionState>,
         next: SessionState,
     ) -> StoreResult<SessionState> {
-        self.notify_branch_if_ok(
-            name,
-            self.inner.set_session_state(name, expected, next).await,
-        )
+        self.inner.set_session_state(name, expected, next).await
     }
 
     async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        self.notify_branch_and_node_if_ok(name, true, self.inner.rebase_session(name, patch).await)
+        self.notify_node_if_ok(self.inner.rebase_session(name, patch).await)
     }
 
     async fn handoff_session(
@@ -225,11 +191,7 @@ where
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> StoreResult<String> {
-        self.notify_branch_and_node_if_ok(
-            name,
-            true,
-            self.inner.handoff_session(name, patch, prompt).await,
-        )
+        self.notify_node_if_ok(self.inner.handoff_session(name, patch, prompt).await)
     }
 }
 
@@ -428,7 +390,7 @@ mod tests {
     use coco_mem::{Kind, Role, SqliteStore};
 
     #[tokio::test]
-    async fn node_creation_and_visible_mutations_publish_precise_invalidations() {
+    async fn only_node_creation_advances_graph_source_version() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(inner, publisher.clone());
@@ -453,9 +415,6 @@ mod tests {
         store.submit_job("main", &root).await.unwrap();
         store.set_branch_head("main", &root, &child).await.unwrap();
 
-        assert_eq!(publisher.current_version(), 3);
-        let invalidations = publisher.take_invalidations();
-        assert_eq!(invalidations.branches, ["main".to_owned()].into());
-        assert!(!invalidations.full);
+        assert_eq!(publisher.current_version(), 1);
     }
 }

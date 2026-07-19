@@ -14,7 +14,6 @@ pub struct DaemonCommand {
 #[derive(Debug, Subcommand)]
 pub enum DaemonSubcommand {
     Serve(DaemonServeCommand),
-    Profile(DaemonProfileCommand),
 }
 
 #[derive(Debug, Args)]
@@ -27,24 +26,4 @@ pub struct DaemonServeCommand {
 
     #[arg(long)]
     pub no_console: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct DaemonProfileCommand {
-    #[command(subcommand)]
-    pub command: DaemonProfileSubcommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DaemonProfileSubcommand {
-    Graph(DaemonProfileGraphCommand),
-}
-
-#[derive(Debug, Args)]
-pub struct DaemonProfileGraphCommand {
-    #[arg(long)]
-    pub all: bool,
-
-    #[arg(long)]
-    pub json: bool,
 }

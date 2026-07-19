@@ -4,7 +4,6 @@ use snafu::prelude::*;
 
 use crate::{
     Result,
-    cli::DaemonSubcommand,
     cli::{Command, PresetSubcommand, PromptSubcommand, SessionSubcommand, SkillSubcommand},
     error::StoreSnafu,
 };
@@ -46,7 +45,7 @@ fn command_is_read_only(command: &Command) -> bool {
             &command.command,
             SkillSubcommand::List(_) | SkillSubcommand::Show(_)
         ),
-        Command::Daemon(command) => matches!(&command.command, DaemonSubcommand::Profile(_)),
+        Command::Daemon(_) => false,
     }
 }
 
@@ -56,13 +55,6 @@ mod tests {
 
     use super::command_is_read_only;
     use crate::cli::Cli;
-
-    #[test]
-    fn daemon_profile_graph_is_read_only() {
-        let cli = Cli::parse_from(["coco", "daemon", "profile", "graph"]);
-
-        assert!(command_is_read_only(&cli.command));
-    }
 
     #[test]
     fn daemon_serve_is_not_read_only() {

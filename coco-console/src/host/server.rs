@@ -1,3 +1,9 @@
+use std::convert::Infallible;
+use std::io;
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
+use std::time::Instant;
+
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, RawQuery, Request, State};
@@ -6,49 +12,38 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use coco_mem::Store;
+use coco_mem::{Store, StoreError};
 use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use snafu::prelude::*;
-use std::convert::Infallible;
-use std::io;
-use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use crate::Result;
-use crate::api::{
-    GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportItems,
-    GraphViewportResponse,
-};
-use crate::config::ConsoleConfig;
-use crate::error::{
+use super::config::ConsoleConfig;
+use super::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
 };
-use crate::graph::{GraphMode, GraphSnapshot};
+use super::publisher::ConsolePublisher;
+use super::render::{
+    ProviderContextItem, render_index_page, render_node_detail_fragment,
+    render_provider_context_default_fragment, render_provider_context_items_fragment,
+    render_provider_context_missing_fragment,
+};
+use crate::Result;
+use crate::api::Point as ApiPoint;
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
-use crate::host::cache::ConsoleGraphCache;
 use crate::host::web_graph_runtime::WebGraphRuntime;
-use crate::publisher::ConsolePublisher;
-use crate::render::{
-    render_fragment, render_graph_node_detail_fragment, render_loading_fragment,
-    render_loading_index_page, render_materialized_fragment, render_materialized_index_page,
-    render_node_detail_fragment, render_provider_context_fragment,
-    render_provider_context_items_fragment, render_provider_context_missing_fragment,
+use crate::host::web_graph_view::{
+    NodeView, ViewMode, node_id_from_target, provider_context_for_node,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
-const REBUILD_RETRY_MIN_DELAY: Duration = Duration::from_millis(250);
-const REBUILD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct AppState<S> {
-    cache: ConsoleGraphCache<S>,
-    web_graph: Option<WebGraphRuntime>,
+    store: S,
+    web_graph: WebGraphRuntime,
 }
 
 #[derive(Debug)]
@@ -81,18 +76,6 @@ impl ConsoleServerHandle {
     }
 }
 
-#[cfg(test)]
-fn start_console_server<S>(
-    config: ConsoleConfig,
-    store: S,
-    publisher: ConsolePublisher,
-) -> Result<ConsoleServerHandle>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    start_console_server_with_cache(config, ConsoleGraphCache::new(store, publisher))
-}
-
 pub async fn start_console_server_with_graph_store_path<S>(
     config: ConsoleConfig,
     store: S,
@@ -102,49 +85,8 @@ pub async fn start_console_server_with_graph_store_path<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let cache = ConsoleGraphCache::new_with_persistent_store_path(
-        store,
-        publisher.clone(),
-        graph_store_path.clone(),
-    )
-    .await?;
     let web_graph = WebGraphRuntime::open(graph_store_path, publisher).await?;
     let node_creations = web_graph.subscribe_node_creations();
-    start_console_server_with_web_graph(config, cache, web_graph, node_creations)
-}
-
-fn start_console_server_with_web_graph<S>(
-    config: ConsoleConfig,
-    cache: ConsoleGraphCache<S>,
-    web_graph: WebGraphRuntime,
-    node_creations: tokio::sync::broadcast::Receiver<crate::publisher::ConsoleNodeCreated>,
-) -> Result<ConsoleServerHandle>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    start_console_server_with_components(config, cache, Some(web_graph), Some(node_creations))
-}
-
-#[cfg(test)]
-fn start_console_server_with_cache<S>(
-    config: ConsoleConfig,
-    cache: ConsoleGraphCache<S>,
-) -> Result<ConsoleServerHandle>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    start_console_server_with_components(config, cache, None, None)
-}
-
-fn start_console_server_with_components<S>(
-    config: ConsoleConfig,
-    cache: ConsoleGraphCache<S>,
-    web_graph: Option<WebGraphRuntime>,
-    node_creations: Option<tokio::sync::broadcast::Receiver<crate::publisher::ConsoleNodeCreated>>,
-) -> Result<ConsoleServerHandle>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
     let listener =
         TcpListener::bind(config.addr).context(BindConsoleSnafu { addr: config.addr })?;
     listener
@@ -155,7 +97,7 @@ where
     let addr = listener
         .local_addr()
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
-    let state = AppState { cache, web_graph };
+    let state = AppState { store, web_graph };
     let task = tokio::spawn(async move {
         serve_console(listener, state, node_creations)
             .await
@@ -168,73 +110,19 @@ where
 async fn serve_console<S>(
     listener: tokio::net::TcpListener,
     state: AppState<S>,
-    node_creations: Option<tokio::sync::broadcast::Receiver<crate::publisher::ConsoleNodeCreated>>,
+    node_creations: tokio::sync::broadcast::Receiver<super::publisher::ConsoleNodeCreated>,
 ) -> io::Result<()>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let cache = state.cache.clone();
     let web_graph = state.web_graph.clone();
-    let server = async move {
-        axum::serve(
-            listener,
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-    };
-    let web_graph_driver = async move {
-        match (web_graph, node_creations) {
-            (Some(web_graph), Some(node_creations)) => web_graph.drive(node_creations).await,
-            _ => std::future::pending::<Infallible>().await,
-        }
-    };
+    let server = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    );
     tokio::select! {
         result = server => result,
-        never = drive_graph_rebuilds(cache) => match never {},
-        never = web_graph_driver => match never {},
-    }
-}
-
-async fn drive_graph_rebuilds<S>(cache: ConsoleGraphCache<S>) -> Infallible
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    let mut invalidations = cache.subscribe_invalidations();
-    let mut retry_delay = REBUILD_RETRY_MIN_DELAY;
-    loop {
-        let source_version = *invalidations.borrow_and_update();
-        if source_version == 0 {
-            invalidations
-                .changed()
-                .await
-                .expect("console graph cache retains the invalidation publisher");
-            continue;
-        }
-        tracing::info!(source_version, "console graph invalidation received");
-        match cache.rebuild_requested_modes().await {
-            Ok(()) => {
-                retry_delay = REBUILD_RETRY_MIN_DELAY;
-                invalidations
-                    .changed()
-                    .await
-                    .expect("console graph cache retains the invalidation publisher");
-            }
-            Err(error) => {
-                tracing::warn!(
-                    source_version,
-                    retry_delay_ms = retry_delay.as_millis(),
-                    %error,
-                    "retrying console graph rebuild",
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(retry_delay) => {}
-                    changed = invalidations.changed() => {
-                        changed.expect("console graph cache retains the invalidation publisher");
-                    }
-                }
-                retry_delay = (retry_delay * 2).min(REBUILD_RETRY_MAX_DELAY);
-            }
-        }
+        never = web_graph.drive(node_creations) => match never {},
     }
 }
 
@@ -246,7 +134,6 @@ where
         .route("/", get(index_page::<S>).post(method_not_allowed))
         .route("/index.html", get(index_page::<S>))
         .route("/style.css", get(style_css))
-        .route("/api/graph", get(graph_json::<S>))
         .route("/api/graph/viewport", get(graph_viewport::<S>))
         .route(
             "/api/graph/viewport/items/diff",
@@ -258,7 +145,6 @@ where
         )
         .route("/api/node-detail", get(node_detail::<S>))
         .route("/api/provider-context", get(provider_context::<S>))
-        .route("/fragment", get(fragment::<S>))
         .route("/events", get(event_stream::<S>))
         .route("/pkg/coco_console.js", get(client_js))
         .route("/pkg/coco_console_bg.wasm", get(client_wasm))
@@ -274,54 +160,20 @@ async fn access_log(
     request: Request,
     next: Next,
 ) -> Response {
-    let access_log = AccessLog::new(peer_addr, method.as_str(), uri.path());
+    let started_at = Instant::now();
     let mut response = next.run(request).await;
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    access_log.log(response.status().as_u16());
+    tracing::info!(
+        %peer_addr,
+        method = %method,
+        path = uri.path(),
+        status = response.status().as_u16(),
+        duration_ms = started_at.elapsed().as_millis(),
+        "console access"
+    );
     response
-}
-
-struct AccessLog {
-    peer_addr: SocketAddr,
-    method: String,
-    path: String,
-    started_at: Instant,
-}
-
-impl AccessLog {
-    fn new(peer_addr: SocketAddr, method: &str, path: &str) -> Self {
-        Self {
-            peer_addr,
-            method: method.to_owned(),
-            path: path.to_owned(),
-            started_at: Instant::now(),
-        }
-    }
-
-    fn log(&self, status: u16) {
-        tracing::info!(
-            peer_addr = %self.peer_addr,
-            method = %self.method,
-            path = %self.path,
-            status,
-            duration_ms = self.started_at.elapsed().as_millis(),
-            "console access"
-        );
-    }
-
-    #[cfg(test)]
-    fn log_error(&self, error: &io::Error) {
-        tracing::warn!(
-            peer_addr = %self.peer_addr,
-            method = %self.method,
-            path = %self.path,
-            duration_ms = self.started_at.elapsed().as_millis(),
-            error = %error,
-            "console access failed"
-        );
-    }
 }
 
 async fn index_page<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
@@ -329,24 +181,9 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let mode = graph_mode_from_query(&query);
-    if state.cache.has_materialized_viewports() {
-        return match state
-            .cache
-            .materialized_shell_current_ready_or_schedule(mode)
-            .await
-        {
-            Ok(Some(shell)) => html_response(render_materialized_index_page(&shell)),
-            Ok(None) => html_response(render_loading_index_page(
-                mode,
-                state.cache.current_viewport_version(mode).await,
-            )),
-            Err(error) => plain_error(error.to_string()),
-        };
-    }
-    html_response(render_loading_index_page(
-        mode,
-        state.cache.current_viewport_version(mode).await,
+    html_response(render_index_page(
+        view_mode_from_query(&query),
+        state.web_graph.current_revision(),
     ))
 }
 
@@ -358,82 +195,21 @@ async fn style_css() -> Response {
     )
 }
 
-async fn graph_json<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    let query = parse_query(query.as_deref().unwrap_or_default());
-    let mode = graph_mode_from_query(&query);
-    if state.cache.has_materialized_viewports() {
-        let _ = state
-            .cache
-            .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default())
-            .await;
-        return json_response(
-            &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
-            "graph",
-        );
-    }
-
-    match state.cache.snapshot_current_ready_or_schedule(mode) {
-        Some(snapshot) => json_response(&snapshot, "graph"),
-        None => json_response(
-            &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
-            "graph",
-        ),
-    }
-}
-
 async fn graph_viewport<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let mode = graph_mode_from_query(&query);
+    let mode = view_mode_from_query(&query);
     let request = viewport_request_from_query(&query);
-    if let Some(web_graph) = state.web_graph.as_ref() {
-        let response = match query.version() {
-            Some(version) => web_graph.viewport_after(mode, version, request).await,
-            None => web_graph.viewport(mode, request).await,
-        };
-        return match response {
-            Ok(response) => json_response(&response, "graph viewport"),
-            Err(error) => plain_error(error.to_string()),
-        };
-    }
     let response = match query.version() {
-        Some(version) => match state.cache.viewport_after(mode, version, request).await {
-            Ok(response) => response,
-            Err(error) => return plain_error(error.to_string()),
-        },
-        None => match state
-            .cache
-            .viewport_current_ready_or_schedule(mode, request)
-            .await
-        {
-            Some(response) => response,
-            None => {
-                return json_response(
-                    &empty_graph_viewport_response(
-                        state.cache.current_viewport_version(mode).await,
-                        request,
-                    ),
-                    "graph viewport",
-                );
-            }
-        },
+        Some(version) => state.web_graph.viewport_after(mode, version, request).await,
+        None => state.web_graph.viewport(mode, request).await,
     };
-    json_response(&response, "graph viewport")
-}
-
-fn empty_graph_viewport_diff_pending_response(
-    version: u64,
-    request: GraphViewportDiffRequest,
-) -> Response {
-    json_response(
-        &empty_graph_viewport_diff_response(version, request),
-        "graph viewport diff",
-    )
+    match response {
+        Ok(response) => json_response(&response, "graph viewport"),
+        Err(error) => plain_error(error.to_string()),
+    }
 }
 
 async fn graph_viewport_diff_get<S>(
@@ -443,8 +219,7 @@ async fn graph_viewport_diff_get<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let query = parse_query(query.as_deref().unwrap_or_default());
-    graph_viewport_diff_response(state, query).await
+    graph_viewport_diff_response(state, parse_query(query.as_deref().unwrap_or_default())).await
 }
 
 async fn graph_viewport_diff_post<S>(
@@ -456,8 +231,9 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let mut query = parse_query(query.as_deref().unwrap_or_default());
-    let body = String::from_utf8_lossy(&body);
-    query.pairs.extend(parse_query(&body).pairs);
+    query
+        .pairs
+        .extend(parse_query(&String::from_utf8_lossy(&body)).pairs);
     graph_viewport_diff_response(state, query).await
 }
 
@@ -468,8 +244,8 @@ async fn graph_viewport_items_diff_get<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let query = parse_query(query.as_deref().unwrap_or_default());
-    graph_viewport_items_diff_response_from_query(state, query).await
+    graph_viewport_items_diff_response(state, parse_query(query.as_deref().unwrap_or_default()))
+        .await
 }
 
 async fn graph_viewport_items_diff_post<S>(
@@ -481,201 +257,47 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let mut query = parse_query(query.as_deref().unwrap_or_default());
-    let body = String::from_utf8_lossy(&body);
-    query.pairs.extend(parse_query(&body).pairs);
-    graph_viewport_items_diff_response_from_query(state, query).await
+    query
+        .pairs
+        .extend(parse_query(&String::from_utf8_lossy(&body)).pairs);
+    graph_viewport_items_diff_response(state, query).await
 }
 
 async fn graph_viewport_diff_response<S>(state: AppState<S>, query: QueryParams) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let request = viewport_diff_request_from_query(&query);
-    let mode = graph_mode_from_query(&query);
-    if let Some(web_graph) = state.web_graph.as_ref() {
-        return match web_graph.viewport_diff(mode, request).await {
-            Ok(response) => json_response(&response, "graph viewport diff"),
-            Err(error) => plain_error(error.to_string()),
-        };
-    }
-    let response = match state
-        .cache
-        .viewport_diff_current_ready_or_schedule(mode, request.clone())
+    match state
+        .web_graph
+        .viewport_diff(
+            view_mode_from_query(&query),
+            viewport_diff_request_from_query(&query),
+        )
         .await
     {
-        Some(response) => response,
-        None => {
-            return empty_graph_viewport_diff_pending_response(
-                state.cache.current_viewport_version(mode).await,
-                request,
-            );
-        }
+        Ok(response) => json_response(&response, "graph viewport diff"),
+        Err(error) => plain_error(error.to_string()),
+    }
+}
+
+async fn graph_viewport_items_diff_response<S>(state: AppState<S>, query: QueryParams) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let Some(version) = query.version() else {
+        return graph_viewport_diff_response(state, query).await;
     };
-    json_response(&response, "graph viewport diff")
-}
-
-async fn graph_viewport_items_diff_response_from_query<S>(
-    state: AppState<S>,
-    query: QueryParams,
-) -> Response
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    match query.version() {
-        Some(observed_version) => {
-            graph_viewport_items_diff_response(
-                state,
-                viewport_diff_request_from_query(&query),
-                observed_version,
-                known_canvas_from_query(&query),
-                graph_mode_from_query(&query),
-            )
-            .await
-        }
-        None => graph_viewport_diff_response(state, query).await,
-    }
-}
-
-async fn graph_viewport_items_diff_response<S>(
-    state: AppState<S>,
-    request: GraphViewportDiffRequest,
-    mut observed_version: u64,
-    known_canvas: Option<GraphCanvas>,
-    mode: GraphMode,
-) -> Response
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    if let Some(web_graph) = state.web_graph.as_ref() {
-        return match web_graph
-            .viewport_diff_after(mode, observed_version, request)
-            .await
-        {
-            Ok(response) => json_response(&response, "graph viewport items diff"),
-            Err(error) => plain_error(error.to_string()),
-        };
-    }
-    loop {
-        let response = match state
-            .cache
-            .viewport_diff_after(mode, observed_version, request.clone())
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return plain_error(error.to_string()),
-        };
-        if viewport_diff_has_changes(&response, request.known.as_ref())
-            || known_canvas != Some(response.canvas)
-        {
-            return json_response(&response, "graph viewport items diff");
-        }
-        observed_version = response.version;
-    }
-}
-
-fn viewport_diff_has_changes(
-    response: &crate::api::GraphViewportDiffResponse,
-    known: Option<&GraphViewportKnownItems>,
-) -> bool {
-    viewport_diff_has_key_changes(response)
-        || known.is_some_and(|known| viewport_diff_has_fingerprint_changes(response, known))
-}
-
-fn viewport_diff_has_key_changes(response: &crate::api::GraphViewportDiffResponse) -> bool {
-    !response.added.nodes.is_empty()
-        || !response.added.edges.is_empty()
-        || !response.removed.is_empty()
-}
-
-fn viewport_diff_has_fingerprint_changes(
-    response: &crate::api::GraphViewportDiffResponse,
-    known: &GraphViewportKnownItems,
-) -> bool {
-    response.updated.nodes.iter().any(|node| {
-        known
-            .node_fingerprints
-            .get(&node.key)
-            .is_none_or(|fingerprint| fingerprint != &node.fingerprint())
-    }) || response.updated.edges.iter().any(|edge| {
-        known
-            .edge_fingerprints
-            .get(&edge.key)
-            .is_none_or(|fingerprint| fingerprint != &edge.fingerprint())
-    })
-}
-
-async fn fragment<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    let query = parse_query(query.as_deref().unwrap_or_default());
-    let mode = graph_mode_from_query(&query);
-    if state.cache.has_materialized_viewports() {
-        match query.version() {
-            Some(version) => {
-                if let Err(error) = state
-                    .cache
-                    .viewport_after(mode, version, GraphViewportRequest::default())
-                    .await
-                {
-                    return plain_error(error.to_string());
-                }
-            }
-            None => {
-                let _ = state
-                    .cache
-                    .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default())
-                    .await;
-            }
-        }
-        return match state
-            .cache
-            .materialized_shell_current_ready_or_schedule(mode)
-            .await
-        {
-            Ok(Some(shell)) => html_response(render_materialized_fragment(&shell)),
-            Ok(None) => html_response(render_loading_fragment(
-                mode,
-                state.cache.current_viewport_version(mode).await,
-            )),
-            Err(error) => plain_error(error.to_string()),
-        };
-    }
-    match query.version() {
-        Some(version) => {
-            if let Some(snapshot) = state.cache.snapshot_current_ready(mode)
-                && snapshot.version > version
-            {
-                return html_response(render_fragment(&snapshot));
-            }
-            let materialized = match state
-                .cache
-                .viewport_after(mode, version, GraphViewportRequest::default())
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => return plain_error(error.to_string()),
-            };
-            if let Some(snapshot) = state.cache.snapshot_current_ready(mode)
-                && snapshot.version >= materialized.version
-            {
-                return html_response(render_fragment(&snapshot));
-            }
-            html_response(render_loading_fragment(mode, materialized.version))
-        }
-        None => {
-            if let Some(snapshot) = state.cache.snapshot_current_ready(mode) {
-                return html_response(render_fragment(&snapshot));
-            }
-            let _ = state
-                .cache
-                .viewport_current_ready_or_schedule(mode, GraphViewportRequest::default())
-                .await;
-            html_response(render_loading_fragment(
-                mode,
-                state.cache.current_viewport_version(mode).await,
-            ))
-        }
+    match state
+        .web_graph
+        .viewport_diff_after(
+            view_mode_from_query(&query),
+            version,
+            viewport_diff_request_from_query(&query),
+        )
+        .await
+    {
+        Ok(response) => json_response(&response, "graph viewport items diff"),
+        Err(error) => plain_error(error.to_string()),
     }
 }
 
@@ -684,38 +306,22 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let mode = graph_mode_from_query(&query);
-    if state.cache.has_materialized_viewports() {
-        let Some(target) = query.get("target") else {
-            return html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
-                None,
-            ));
-        };
-        return match state
-            .cache
-            .node_detail_current_ready_or_schedule(mode, target)
-            .await
-        {
-            Ok(Some(node)) => html_response(render_graph_node_detail_fragment(&node)),
-            Ok(None) => html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
-                Some(target),
-            )),
-            Err(error) => plain_error(error.to_string()),
-        };
-    }
-    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => {
-            return html_response(render_node_detail_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
-                query.get("target"),
-            ));
-        }
-        Err(error) => return plain_error(error.to_string()),
+    let Some(target) = query.get("target") else {
+        return html_response(render_node_detail_fragment(None, None));
     };
-    html_response(render_node_detail_fragment(&snapshot, query.get("target")))
+    let Some(node_id) = node_id_from_target(target) else {
+        return html_response(render_node_detail_fragment(None, Some(target)));
+    };
+    match state.store.get_node(node_id).await {
+        Ok(node) => html_response(render_node_detail_fragment(
+            Some(&NodeView::from(&node)),
+            Some(target),
+        )),
+        Err(error) if is_missing_node(&error) => {
+            html_response(render_node_detail_fragment(None, Some(target)))
+        }
+        Err(error) => plain_error(error.to_string()),
+    }
 }
 
 async fn provider_context<S>(
@@ -726,209 +332,83 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let mode = graph_mode_from_query(&query);
-    if query.get("target").is_none() {
-        return html_response(render_provider_context_fragment(
-            &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
-            None,
-            query.get("context"),
-        ));
-    }
-    if state.cache.has_materialized_viewports() {
-        let target = query
-            .get("target")
-            .expect("target was checked before materialized provider context lookup");
-        return match state
-            .cache
-            .provider_context_current_ready_or_schedule(mode, target, query.get("context"))
-            .await
-        {
-            Ok(Some(items)) => html_response(render_provider_context_items_fragment(items)),
-            Ok(None) => html_response(render_provider_context_missing_fragment(target)),
-            Err(error) => plain_error(error.to_string()),
-        };
-    }
-    let snapshot = match graph_snapshot_for_query(&state.cache, mode, &query).await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => {
-            return html_response(render_provider_context_fragment(
-                &loading_snapshot(mode, state.cache.current_viewport_version(mode).await),
-                query.get("target"),
-                query.get("context"),
-            ));
+    let Some(target) = query.get("target") else {
+        return html_response(render_provider_context_default_fragment());
+    };
+    let Some(node_id) = node_id_from_target(target) else {
+        return html_response(render_provider_context_missing_fragment(target));
+    };
+    let node = match state.store.get_node(node_id).await {
+        Ok(node) => node,
+        Err(error) if is_missing_node(&error) => {
+            return html_response(render_provider_context_missing_fragment(target));
         }
         Err(error) => return plain_error(error.to_string()),
     };
-    html_response(render_provider_context_fragment(
-        &snapshot,
-        query.get("target"),
-        query.get("context"),
-    ))
+    let selection =
+        match provider_context_for_node(&state.store, &node.id, query.get("context")).await {
+            Ok(selection) => selection,
+            Err(error) => return plain_error(error.to_string()),
+        };
+    let Some(selection) = selection else {
+        return html_response(render_provider_context_items_fragment(Vec::new()));
+    };
+    let node_ids = selection
+        .context
+        .nodes
+        .iter()
+        .map(|node| node.node.id.clone())
+        .collect::<Vec<_>>();
+    let points = match state
+        .web_graph
+        .node_points(view_mode_from_query(&query), &node_ids)
+        .await
+    {
+        Ok(points) => points,
+        Err(error) => return plain_error(error.to_string()),
+    };
+    let items = selection
+        .context
+        .nodes
+        .into_iter()
+        .map(|node| ProviderContextItem {
+            context_target: selection.context.id.clone(),
+            selected: node.node.id == selection.selected_id,
+            point: points.get(&node.node.id).map(|point| ApiPoint {
+                x: point.x,
+                y: point.y,
+            }),
+            node: node.node,
+        })
+        .collect();
+    html_response(render_provider_context_items_fragment(items))
+}
+
+fn is_missing_node(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::NotFound { .. } | StoreError::AmbiguousNodePrefix { .. }
+    )
 }
 
 async fn event_stream<S>(State(state): State<AppState<S>>) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    if let Some(web_graph) = state.web_graph.as_ref() {
-        let mut rx = web_graph.subscribe();
-        let current_revision = *rx.borrow_and_update();
-        let initial = stream::iter([
-            Ok::<_, Infallible>(
-                Event::default()
-                    .event("graph")
-                    .data(current_revision.to_string()),
-            ),
-            Ok::<_, Infallible>(Event::default().event("graph-progress").data("[]")),
-        ]);
-        let changes = stream::unfold(rx, |mut rx| async move {
-            if rx.changed().await.is_err() {
-                return None;
-            }
-            let revision = *rx.borrow_and_update();
-            Some((
-                Ok::<_, Infallible>(Event::default().event("graph").data(revision.to_string())),
-                rx,
-            ))
-        });
-        return Sse::new(initial.chain(changes)).into_response();
-    }
-    let mut rx = state.cache.subscribe();
-    let current_version = *rx.borrow_and_update();
-    let mut progress_rx = state.cache.subscribe_progress();
-    progress_rx.borrow_and_update();
-    let cache = state.cache.clone();
-    let initial_progress = graph_progress_event(&cache);
-    let initial = stream::iter([
-        Ok::<_, Infallible>(
-            Event::default()
-                .event("graph")
-                .data(current_version.to_string()),
-        ),
-        Ok::<_, Infallible>(initial_progress),
-    ]);
-    let changes = stream::unfold(
-        (rx, progress_rx, cache),
-        |(mut rx, mut progress_rx, cache)| async move {
-            tokio::select! {
-                changed = rx.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                    let version = *rx.borrow_and_update();
-                    Some((
-                        Ok::<_, Infallible>(
-                            Event::default().event("graph").data(version.to_string()),
-                        ),
-                        (rx, progress_rx, cache),
-                    ))
-                }
-                changed = progress_rx.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                    progress_rx.borrow_and_update();
-                    Some((
-                        Ok::<_, Infallible>(graph_progress_event(&cache)),
-                        (rx, progress_rx, cache),
-                    ))
-                }
-            }
-        },
-    );
-
+    let mut revisions = state.web_graph.subscribe();
+    let current = *revisions.borrow_and_update();
+    let initial = stream::once(async move {
+        Ok::<_, Infallible>(Event::default().event("graph").data(current.to_string()))
+    });
+    let changes = stream::unfold(revisions, |mut revisions| async move {
+        revisions.changed().await.ok()?;
+        let revision = *revisions.borrow_and_update();
+        Some((
+            Ok::<_, Infallible>(Event::default().event("graph").data(revision.to_string())),
+            revisions,
+        ))
+    });
     Sse::new(initial.chain(changes)).into_response()
-}
-
-fn graph_progress_event<S>(cache: &ConsoleGraphCache<S>) -> Event
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    let data = serde_json::to_string(&cache.rebuild_statuses())
-        .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
-    Event::default().event("graph-progress").data(data)
-}
-
-fn loading_snapshot(mode: GraphMode, version: u64) -> GraphSnapshot {
-    GraphSnapshot {
-        version,
-        mode,
-        root_id: String::new(),
-        nodes: Vec::new(),
-        edges: Vec::new(),
-        branches: Vec::new(),
-        provider_contexts: Vec::new(),
-    }
-}
-
-fn empty_graph_viewport_response(
-    version: u64,
-    request: GraphViewportRequest,
-) -> GraphViewportResponse {
-    let request = request.normalized();
-    GraphViewportResponse {
-        version,
-        canvas: empty_graph_canvas(request),
-        viewport: GraphViewport {
-            x: request.x,
-            y: request.y,
-            width: request.width,
-            height: request.height,
-            overscan: request.overscan,
-        },
-        nodes: Vec::new(),
-        edges: Vec::new(),
-    }
-}
-
-fn empty_graph_viewport_diff_response(
-    version: u64,
-    request: GraphViewportDiffRequest,
-) -> GraphViewportDiffResponse {
-    let previous = request.previous.normalized();
-    let current = request.current.normalized();
-    GraphViewportDiffResponse {
-        version,
-        canvas: empty_graph_canvas(current),
-        previous_viewport: GraphViewport {
-            x: previous.x,
-            y: previous.y,
-            width: previous.width,
-            height: previous.height,
-            overscan: previous.overscan,
-        },
-        viewport: GraphViewport {
-            x: current.x,
-            y: current.y,
-            width: current.width,
-            height: current.height,
-            overscan: current.overscan,
-        },
-        added: GraphViewportItems::default(),
-        updated: GraphViewportItems::default(),
-        removed: Vec::new(),
-    }
-}
-
-fn empty_graph_canvas(request: GraphViewportRequest) -> GraphCanvas {
-    GraphCanvas {
-        width: request.width.max(1),
-        height: request.height.max(1),
-    }
-}
-
-async fn graph_snapshot_for_query<S>(
-    cache: &ConsoleGraphCache<S>,
-    mode: GraphMode,
-    query: &QueryParams,
-) -> Result<Option<Arc<GraphSnapshot>>>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    match query.version() {
-        Some(version) => cache.snapshot_after(mode, version).await.map(Some),
-        None => Ok(cache.snapshot_current_ready_or_schedule(mode)),
-    }
 }
 
 async fn client_js() -> Response {
@@ -1028,7 +508,6 @@ fn percent_decode(value: &str) -> String {
         decoded.push(bytes[index]);
         index += 1;
     }
-
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
@@ -1058,7 +537,6 @@ fn viewport_request_from_query(query: &QueryParams) -> GraphViewportRequest {
 
 fn viewport_diff_request_from_query(query: &QueryParams) -> GraphViewportDiffRequest {
     let current = viewport_request_from_query(query);
-    let known = known_items_from_query(query);
     GraphViewportDiffRequest {
         previous: GraphViewportRequest {
             x: query.i32("previous_x").unwrap_or(current.x),
@@ -1068,27 +546,20 @@ fn viewport_diff_request_from_query(query: &QueryParams) -> GraphViewportDiffReq
             overscan: query.i32("previous_overscan").unwrap_or(current.overscan),
         },
         current,
-        known,
+        known: known_items_from_query(query),
     }
 }
 
-fn graph_mode_from_query(query: &QueryParams) -> GraphMode {
+fn view_mode_from_query(query: &QueryParams) -> ViewMode {
     if query.get("mode") == Some("all") || query.get("all").is_some_and(is_truthy_query_value) {
-        GraphMode::All
+        ViewMode::All
     } else {
-        GraphMode::Anchors
+        ViewMode::Anchors
     }
 }
 
 fn is_truthy_query_value(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes" | "on")
-}
-
-fn known_canvas_from_query(query: &QueryParams) -> Option<GraphCanvas> {
-    Some(GraphCanvas {
-        width: query.i32("canvas_width")?,
-        height: query.i32("canvas_height")?,
-    })
 }
 
 fn known_items_from_query(query: &QueryParams) -> Option<GraphViewportKnownItems> {
@@ -1153,1520 +624,71 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AppState, fragment, graph_json, graph_viewport_diff_response,
-        graph_viewport_items_diff_response_from_query, index_page, node_detail, parse_query,
-        provider_context, start_console_server, start_console_server_with_cache,
-        start_console_server_with_graph_store_path, viewport_diff_has_changes,
-        viewport_diff_request_from_query,
-    };
-    use crate::api::{
-        GraphBezierRoute, GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge,
-        GraphViewportEdgeKind, GraphViewportItems, GraphViewportRemovedItem, GraphViewportResponse,
-        Point,
-    };
-    use crate::graph::{GraphMode, build_graph_snapshot, node_target_id};
-    use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
-    use crate::host::cache::{ConsoleGraphCache, ConsoleGraphRebuildState};
-    use crate::layout::layout_graph_viewport;
-    use crate::{ConsoleConfig, ConsolePublisher, ConsoleStore};
+    use super::*;
     use axum::body::to_bytes;
-    use axum::extract::{RawQuery, State};
-    use coco_mem::{
-        Anchor, BranchStore, Kind, NewNode, NodeStore, PersistentStore, PromptAnchor, Role,
-        SessionAnchor, SessionRole, SqliteStore, Store,
-    };
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{Duration, timeout};
+    use coco_mem::{Kind, NewNode, NodeStore, Role, SqliteStore};
 
-    async fn test_store() -> SqliteStore {
-        SqliteStore::open_temporary()
-            .await
-            .expect("temporary SQLite store should open")
-    }
+    use crate::ConsoleStore;
+    use crate::host::web_graph_view::node_target_id;
 
-    fn test_config() -> ConsoleConfig {
-        ConsoleConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-        }
-    }
+    #[test]
+    fn query_parser_decodes_repeated_values() {
+        let query = parse_query("mode=all&known_node=node%3Aa&known_node=node%3Ab");
 
-    fn get_request(path: &str) -> String {
-        format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
-    }
-
-    fn known_viewport_query(
-        version: u64,
-        viewport: GraphViewportRequest,
-        rendered: &crate::api::GraphViewportResponse,
-    ) -> String {
-        let mut query = format!(
-            "version={version}&mode=all&x={}&y={}&width={}&height={}&overscan={}&known=1&canvas_width={}&canvas_height={}",
-            viewport.x,
-            viewport.y,
-            viewport.width,
-            viewport.height,
-            viewport.overscan,
-            rendered.canvas.width,
-            rendered.canvas.height,
-        );
-        for node in &rendered.nodes {
-            append_known_item(&mut query, "node", &node.key, &node.fingerprint());
-        }
-        for edge in &rendered.edges {
-            append_known_item(&mut query, "edge", &edge.key, &edge.fingerprint());
-        }
-        query
-    }
-
-    fn append_known_item(query: &mut String, kind: &str, key: &str, fingerprint: &str) {
-        query.push_str("&known_");
-        query.push_str(kind);
-        query.push('=');
-        query.push_str(key);
-        query.push_str("&known_");
-        query.push_str(kind);
-        query.push_str("_fingerprint=");
-        query.push_str(key);
-        query.push(':');
-        query.push_str(fingerprint);
-    }
-
-    fn app_state<S>(store: S, publisher: ConsolePublisher) -> AppState<S>
-    where
-        S: Store + Clone + Send + Sync + 'static,
-    {
-        AppState {
-            cache: ConsoleGraphCache::new(store, publisher),
-            web_graph: None,
-        }
-    }
-
-    fn temp_store_path() -> PathBuf {
-        static NEXT_TEMP_STORE: AtomicU64 = AtomicU64::new(0);
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let sequence = NEXT_TEMP_STORE.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "coco-console-server-test-{}-{nanos}-{sequence}",
-            std::process::id()
-        ))
-    }
-
-    fn test_session_anchor() -> SessionAnchor {
-        SessionAnchor {
-            role: SessionRole::Orchestrator,
-            provider_profile: None,
-            provider: Some("openai".to_owned()),
-            model: "gpt-4.1-mini".to_owned(),
-            tools: Vec::new(),
-            system_prompt: "You are helpful.".to_owned(),
-            prompt: "Start".to_owned(),
-            temperature: None,
-            max_tokens: None,
-            additional_params: None,
-            enable_coco_shim: false,
-            active_skill: None,
-        }
-    }
-
-    async fn response_bytes_from(bytes: &[u8]) -> Vec<u8> {
-        let handle = start_console_server(
-            test_config(),
-            test_store().await,
-            crate::ConsolePublisher::new(),
-        )
-        .unwrap();
-        let mut client = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        client.write_all(bytes).await.unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        handle.shutdown().await.unwrap();
-
-        response
-    }
-
-    async fn response_from(bytes: &[u8]) -> String {
-        let response = response_bytes_from(bytes).await;
-        String::from_utf8(response).unwrap()
-    }
-
-    #[tokio::test]
-    async fn start_console_server_accepts_requests() {
-        let handle = start_console_server(
-            test_config(),
-            test_store().await,
-            crate::ConsolePublisher::new(),
-        )
-        .unwrap();
-        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        stream
-            .write_all(get_request("/style.css").as_bytes())
-            .await
-            .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.unwrap();
-        handle.shutdown().await.unwrap();
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("content-type: text/css; charset=utf-8"));
-    }
-
-    #[tokio::test]
-    async fn server_rebuilds_without_an_http_client() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let root = writer.root_id();
-        writer.fork("main", &root).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(writer.clone(), publisher.clone());
-        let cache = ConsoleGraphCache::new_with_persistent_store_path(
-            store.clone(),
-            publisher,
-            path.clone(),
-        )
-        .await
-        .unwrap();
-        let mut ready = cache.subscribe();
-        let handle = start_console_server_with_cache(test_config(), cache.clone()).unwrap();
-
-        timeout(Duration::from_secs(1), ready.changed())
-            .await
-            .expect("initial materialization should finish without an HTTP client")
-            .unwrap();
-        assert_eq!(*ready.borrow_and_update(), 1);
-
-        cache.fail_next_branch_refresh("worker").await;
-        let mut progress = cache.subscribe_progress();
-        store.fork("worker", &root).await.unwrap();
-        timeout(Duration::from_secs(1), async {
-            loop {
-                progress.changed().await.unwrap();
-                if cache
-                    .rebuild_statuses()
-                    .iter()
-                    .any(|status| status.state == ConsoleGraphRebuildState::Failed)
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("the injected branch refresh failure should be observable");
-        timeout(Duration::from_secs(3), ready.changed())
-            .await
-            .expect("failed rebuild should retry without a new invalidation")
-            .unwrap();
-        assert_eq!(*ready.borrow_and_update(), 2);
-        assert_eq!(cache.current_viewport_version(GraphMode::All).await, 2);
-
-        let mut client = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        client.write_all(get_request("/").as_bytes()).await.unwrap();
-        let mut response = String::new();
-        client.read_to_string(&mut response).await.unwrap();
-        assert!(response.contains("data-version=\"2\""), "{response}");
-        assert!(response.contains("<strong>main</strong>"), "{response}");
-        assert!(response.contains("<strong>worker</strong>"), "{response}");
-        assert!(!response.contains("Loading graph / Anchors"), "{response}");
-
-        handle.shutdown().await.unwrap();
-        drop(cache);
-        drop(store);
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
+        assert_eq!(view_mode_from_query(&query), ViewMode::All);
+        assert_eq!(query.get_all("known_node"), ["node:a", "node:b"]);
     }
 
     #[test]
-    fn access_log_records_success_and_error_results() {
-        let subscriber = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::dispatcher::with_default(&tracing::Dispatch::new(subscriber), || {
-            let access_log =
-                super::AccessLog::new("127.0.0.1:12345".parse().unwrap(), "GET", "/fragment");
+    fn viewport_query_is_normalized_by_runtime_contract() {
+        let query = parse_query("x=-1&y=2&width=300&height=400&overscan=20&previous_x=10&known=1");
+        let request = viewport_diff_request_from_query(&query);
 
-            access_log.log(200);
-            access_log.log_error(&std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "client closed",
-            ));
-        });
+        assert_eq!(request.current.x, -1);
+        assert_eq!(request.previous.x, 10);
+        assert!(request.known.is_some());
+    }
+
+    #[test]
+    fn malformed_percent_encoding_is_preserved() {
+        assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
     }
 
     #[tokio::test]
-    async fn write_event_stream_writes_initial_and_changed_events() {
+    async fn viewport_and_node_detail_use_the_persistent_graph_and_source_store() {
+        let source = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store().await, publisher.clone());
-        let handle = start_console_server(test_config(), store.clone(), publisher.clone()).unwrap();
-        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        stream
-            .write_all(b"GET /events HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .await
-            .unwrap();
-        let mut response = vec![0; 256];
-
-        let mut initial = Vec::new();
-        while !contains_bytes(&initial, b"event: graph\ndata: 0")
-            || !contains_bytes(&initial, b"event: graph-progress")
-        {
-            let read = stream.read(&mut response).await.unwrap();
-            assert_ne!(read, 0);
-            initial.extend_from_slice(&response[..read]);
-        }
-        let initial = String::from_utf8_lossy(&initial);
-        assert!(initial.starts_with("HTTP/1.1 200 OK"), "{initial}");
-        assert!(initial.contains("content-type: text/event-stream"));
-
-        let mut trigger = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        trigger
-            .write_all(get_request("/api/graph").as_bytes())
-            .await
-            .unwrap();
-        let mut trigger_response = Vec::new();
-        trigger.read_to_end(&mut trigger_response).await.unwrap();
-
-        store.fork("main", &store.root_id()).await.unwrap();
-
-        let mut invalidated = Vec::new();
-        while !contains_bytes(&invalidated, b"event: graph\ndata: 1") {
-            let read = stream.read(&mut response).await.unwrap();
-            assert_ne!(read, 0);
-            invalidated.extend_from_slice(&response[..read]);
-        }
-
-        handle.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn persisted_web_graph_revision_updates_viewport_through_sse() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(writer.clone(), publisher.clone());
-        let handle = start_console_server_with_graph_store_path(
-            test_config(),
-            store.clone(),
-            publisher,
-            path.clone(),
-        )
-        .await
-        .unwrap();
-        let mut events = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        events
-            .write_all(b"GET /events HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .await
-            .unwrap();
-        let mut buffer = vec![0; 512];
-        let mut initial = Vec::new();
-        timeout(Duration::from_secs(2), async {
-            while !contains_bytes(&initial, b"event: graph\ndata: 1") {
-                let read = events.read(&mut buffer).await.unwrap();
-                assert_ne!(read, 0);
-                initial.extend_from_slice(&buffer[..read]);
-            }
-        })
-        .await
-        .expect("initial root should be persisted before its SSE revision");
-
-        let child = store
+        let store = ConsoleStore::new(source.clone(), publisher.clone());
+        let node_id = store
             .append(NewNode {
                 parent: store.root_id(),
                 role: Role::User,
                 metadata: None,
-                kind: Kind::Text("live web graph node".to_owned()),
+                kind: Kind::Text("direct detail".to_owned()),
             })
             .await
             .unwrap();
-        let mut changed = Vec::new();
-        timeout(Duration::from_secs(2), async {
-            while !contains_bytes(&changed, b"event: graph\ndata: 2") {
-                let read = events.read(&mut buffer).await.unwrap();
-                assert_ne!(read, 0);
-                changed.extend_from_slice(&buffer[..read]);
-            }
-        })
-        .await
-        .expect("new node should publish the committed web graph revision");
-
-        let mut viewport = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        viewport
-            .write_all(
-                get_request(
-                    "/api/graph/viewport?mode=all&x=0&y=0&width=2000&height=2000&overscan=0",
-                )
-                .as_bytes(),
-            )
+        let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
             .await
             .unwrap();
-        let mut response = String::new();
-        viewport.read_to_string(&mut response).await.unwrap();
-        let (_, body) = response
-            .split_once("\r\n\r\n")
-            .expect("HTTP response should contain a body");
-        let viewport: GraphViewportResponse = serde_json::from_str(body).unwrap();
-        assert!(viewport.version >= 2);
-        assert!(viewport.nodes.iter().any(|node| node.id == child));
+        web_graph.synchronize().await.unwrap();
+        let state = AppState { store, web_graph };
 
-        handle.shutdown().await.unwrap();
-        drop(store);
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
+        let viewport =
+            graph_viewport(State(state.clone()), RawQuery(Some("mode=all".to_owned()))).await;
+        let viewport_body = to_bytes(viewport.into_body(), usize::MAX).await.unwrap();
+        let viewport: crate::api::GraphViewportResponse =
+            serde_json::from_slice(&viewport_body).unwrap();
+        assert!(viewport.nodes.iter().any(|node| node.id == node_id));
 
-    #[tokio::test]
-    async fn versioned_viewport_items_diff_waits_past_empty_known_diff() {
-        let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store().await, publisher.clone());
-        let root = store.root_id();
-        store.fork("main", &root).await.unwrap();
-        let first = store
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("visible".to_owned()),
-            })
-            .await
-            .unwrap();
-        store.set_branch_head("main", &root, &first).await.unwrap();
-        let viewport = GraphViewportRequest::default();
-        let state = app_state(store.clone(), publisher.clone());
-        let snapshot = state.cache.current_snapshot(GraphMode::All).await;
-        let version = snapshot.version;
-        let rendered = layout_graph_viewport(&snapshot, viewport);
-        let query = known_viewport_query(version, viewport, &rendered);
-        let mut task = tokio::spawn(graph_viewport_items_diff_response_from_query(
-            state,
-            parse_query(&query),
-        ));
-
-        publisher.mark_changed();
-
-        assert!(
-            timeout(Duration::from_millis(50), &mut task).await.is_err(),
-            "an unrelated version bump must not complete the viewport item diff when known items are unchanged"
-        );
-
-        let next = store
-            .append(NewNode {
-                parent: first.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("next visible".to_owned()),
-            })
-            .await
-            .unwrap();
-        store.set_branch_head("main", &first, &next).await.unwrap();
-
-        let response = timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(response.status().is_success());
-    }
-
-    #[tokio::test]
-    async fn versioned_viewport_items_diff_returns_known_payload_changes() {
-        let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store().await, publisher.clone());
-        let root = store.root_id();
-        let first = store
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("first".to_owned()),
-            })
-            .await
-            .unwrap();
-        let second = store
-            .append(NewNode {
-                parent: first.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("second".to_owned()),
-            })
-            .await
-            .unwrap();
-        store.fork("main", &first).await.unwrap();
-        store.fork("draft", &second).await.unwrap();
-        let viewport = GraphViewportRequest::default();
-        let state = app_state(store.clone(), publisher.clone());
-        let snapshot = state.cache.current_snapshot(GraphMode::All).await;
-        let version = snapshot.version;
-        let rendered = layout_graph_viewport(&snapshot, viewport);
-        let query = known_viewport_query(version, viewport, &rendered);
-        let task = tokio::spawn(graph_viewport_items_diff_response_from_query(
-            state,
-            parse_query(&query),
-        ));
-
-        store
-            .set_branch_head("main", &first, &second)
-            .await
-            .unwrap();
-
-        let response = timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(response.status().is_success());
-    }
-
-    #[tokio::test]
-    async fn versioned_viewport_items_diff_waits_for_newer_version() {
-        let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store().await, publisher.clone());
-        let viewport = GraphViewportRequest::default();
-        let state = app_state(store, publisher.clone());
-        let snapshot = state.cache.current_snapshot(GraphMode::All).await;
-        let query = format!(
-            "version={}&mode=all&x={}&y={}&width={}&height={}&overscan={}&known=1",
-            snapshot.version,
-            viewport.x,
-            viewport.y,
-            viewport.width,
-            viewport.height,
-            viewport.overscan,
-        );
-        let mut task = tokio::spawn(graph_viewport_items_diff_response_from_query(
-            state,
-            parse_query(&query),
-        ));
-
-        assert!(
-            timeout(Duration::from_millis(50), &mut task).await.is_err(),
-            "a matching observed version must keep the viewport item diff pending"
-        );
-
-        publisher.mark_changed();
-        let response = timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(response.status().is_success());
-    }
-
-    #[tokio::test]
-    async fn viewport_diff_returns_immediate_patch_even_with_version_query() {
-        let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(test_store().await, publisher.clone());
-        let root = store.root_id();
-        store.fork("main", &root).await.unwrap();
-        let version = publisher.current_version();
-        let viewport = GraphViewportRequest::default();
-        let snapshot = build_graph_snapshot(&store, version).await.unwrap();
-        let rendered = layout_graph_viewport(&snapshot, viewport);
-        let query = known_viewport_query(version, viewport, &rendered);
-        let state = app_state(store, publisher);
-        let task = tokio::spawn(graph_viewport_diff_response(state, parse_query(&query)));
-
-        let response = timeout(Duration::from_millis(50), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(response.status().is_success());
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_viewport_items_diff_get_without_version() {
-        let response = response_from(
-            b"GET /api/graph/viewport/items/diff?x=0&y=0&width=640&height=360&known_node=node:stale HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+        let detail = node_detail(
+            State(state),
+            RawQuery(Some(format!("target={}", node_target_id(&node_id)))),
         )
         .await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"removed\":[]"), "{response}");
-        assert!(
-            !response.contains("\"key\":\"node:stale\""),
-            "pending snapshots must not remove previously rendered items: {response}"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_viewport_items_diff_post_without_version() {
-        let body = "x=0&y=0&width=640&height=360&known_node=node:stale";
-        let request = format!(
-            "POST /api/graph/viewport/items/diff HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let response = response_from(request.as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"removed\":[]"), "{response}");
-        assert!(
-            !response.contains("\"key\":\"node:stale\""),
-            "pending snapshots must not remove previously rendered items: {response}"
-        );
-    }
-
-    #[test]
-    fn viewport_diff_detects_updated_edge_payload_changes() {
-        let edge = GraphViewportEdge {
-            key: "edge:primary_parent:root:child".to_owned(),
-            kind: GraphViewportEdgeKind::Primary,
-            source_id: "root".to_owned(),
-            target_id: "child".to_owned(),
-            route: GraphBezierRoute {
-                source: Point { x: 0, y: 0 },
-                control_1: Point { x: 30, y: 0 },
-                control_2: Point { x: 70, y: 100 },
-                target: Point { x: 100, y: 100 },
-            },
-        };
-        let response = GraphViewportDiffResponse {
-            version: 1,
-            canvas: GraphCanvas {
-                width: 100,
-                height: 100,
-            },
-            previous_viewport: crate::api::GraphViewport {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100,
-                overscan: 0,
-            },
-            viewport: crate::api::GraphViewport {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100,
-                overscan: 0,
-            },
-            added: GraphViewportItems::default(),
-            updated: GraphViewportItems {
-                nodes: Vec::new(),
-                edges: vec![edge.clone()],
-            },
-            removed: Vec::<GraphViewportRemovedItem>::new(),
-        };
-        let mut edge_fingerprints = BTreeMap::new();
-        edge_fingerprints.insert(edge.key.clone(), "stale".to_owned());
-        let known = GraphViewportKnownItems {
-            edge_fingerprints,
-            ..GraphViewportKnownItems::default()
-        };
-
-        assert!(viewport_diff_has_changes(&response, Some(&known)));
-    }
-
-    #[tokio::test]
-    async fn versioned_fragment_waits_for_newer_version() {
-        let publisher = ConsolePublisher::new();
-        let handle =
-            start_console_server(test_config(), test_store().await, publisher.clone()).unwrap();
-        let mut initial = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        initial
-            .write_all(b"GET /fragment HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let mut initial_response = Vec::new();
-        timeout(
-            Duration::from_secs(1),
-            initial.read_to_end(&mut initial_response),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let initial_response = String::from_utf8_lossy(&initial_response);
-        assert!(
-            initial_response.starts_with("HTTP/1.1 200 OK"),
-            "{initial_response}"
-        );
-
-        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
-        stream
-            .write_all(b"GET /fragment?version=0 HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .await
-            .unwrap();
-        let mut response = vec![0; 256];
-
-        assert!(
-            timeout(Duration::from_millis(50), stream.read(&mut response))
-                .await
-                .is_err(),
-            "a matching observed version must keep the fragment request pending"
-        );
-
-        publisher.mark_changed();
-        let read = timeout(Duration::from_secs(1), stream.read(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
-        let response = String::from_utf8_lossy(&response[..read]);
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        handle.shutdown().await.unwrap();
-    }
-
-    fn assert_response(response: &str, status: &str, content_type: &str, body: &str) {
-        assert!(response.starts_with(status), "{response}");
-        assert!(response.contains(content_type), "{response}");
-        assert!(response.ends_with(body), "{response}");
-    }
-
-    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-    }
-
-    #[test]
-    fn parse_query_extracts_path_parameters() {
-        let query = parse_query("ignored=true&version=42");
-
-        assert_eq!(query.get("ignored"), Some("true"));
-        assert_eq!(query.version(), Some(42));
-    }
-
-    #[test]
-    fn parse_query_parses_form_body() {
-        let query = parse_query("version=42&known_node=n1");
-
-        assert_eq!(query.version(), Some(42));
-        assert_eq!(query.get_all("known_node"), vec!["n1"]);
-    }
-
-    #[test]
-    fn parse_query_ignores_invalid_or_missing_version_query() {
-        let invalid = parse_query("version=bad");
-        let missing = parse_query("");
-
-        assert_eq!(invalid.version(), None);
-        assert_eq!(missing.version(), None);
-    }
-
-    #[tokio::test]
-    async fn handle_connection_rejects_non_get_requests() {
-        let response =
-            response_from(b"POST / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n").await;
-
-        assert_response(
-            &response,
-            "HTTP/1.1 405 Method Not Allowed",
-            "content-type: text/plain; charset=utf-8",
-            "method not allowed",
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_viewport_diff_post_body() {
-        let body = "x=0&y=0&width=640&height=360&known_node=node:stale&known_edge=edge:primary_parent:base:stale";
-        let request = format!(
-            "POST /api/graph/viewport/diff HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let response = response_from(request.as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("\"removed\":[]"),
-            "pending snapshots must not remove previously rendered items: {response}"
-        );
-        assert!(!response.contains("\"key\":\"node:stale\""), "{response}");
-        assert!(
-            !response.contains("\"key\":\"edge:primary_parent:base:stale\""),
-            "{response}"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_returns_not_found_for_unknown_path() {
-        let response = response_from(get_request("/missing").as_bytes()).await;
-
-        assert_response(
-            &response,
-            "HTTP/1.1 404 Not Found",
-            "content-type: text/plain; charset=utf-8",
-            "not found",
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_index_page() {
-        let response = response_from(get_request("/index.html").as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: text/html; charset=utf-8"),
-            "{response}"
-        );
-        assert!(response.contains("<!doctype html>"), "{response}");
-        assert!(response.contains("data-version=\"0\""), "{response}");
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_style_css() {
-        let response = response_from(get_request("/style.css").as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: text/css; charset=utf-8"),
-            "{response}"
-        );
-        assert!(response.contains("font-family"), "{response}");
-        assert!(
-            response.contains(".node-detail.node-detail-selected"),
-            "{response}"
-        );
-        assert!(
-            response.contains("body:has(.node-detail.node-detail-selected)"),
-            "{response}"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_json() {
-        let response = response_from(get_request("/api/graph").as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: application/json; charset=utf-8"),
-            "{response}"
-        );
-        assert!(response.contains("\"version\":0"), "{response}");
-        assert!(response.contains("\"nodes\""), "{response}");
-    }
-
-    #[tokio::test]
-    async fn graph_json_schedules_materialization_without_full_snapshot() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).await.unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-
-        let response = graph_json(State(state.clone()), RawQuery(None)).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(json.contains("\"root_id\":\"\""));
-        assert!(json.contains("\"nodes\":[]"));
-        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn graph_json_ignores_cached_full_snapshot_in_materialized_mode() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let root = writer.root_id();
-        writer.fork("main", &root).await.unwrap();
-        let text = writer
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("cached full snapshot node".to_owned()),
-            })
-            .await
-            .unwrap();
-        writer.set_branch_head("main", &root, &text).await.unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-        state.cache.current_snapshot(GraphMode::All).await;
-
-        let response =
-            graph_json(State(state.clone()), RawQuery(Some("mode=all".to_owned()))).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(json.contains("\"nodes\":[]"), "{json}");
-        assert!(!json.contains("cached full snapshot node"), "{json}");
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn index_page_uses_shared_graph_loading_version() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let root = writer.root_id();
-        writer.fork("main", &root).await.unwrap();
-        let text = writer
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("all mode only".to_owned()),
-            })
-            .await
-            .unwrap();
-        writer.set_branch_head("main", &root, &text).await.unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-        state.cache.rebuild_requested_modes().await.unwrap();
-        let all = state
-            .cache
-            .viewport_after(GraphMode::All, 0, GraphViewportRequest::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            state.cache.current_viewport_version(GraphMode::All).await,
-            all.version
-        );
-        assert_eq!(
-            state
-                .cache
-                .current_viewport_version(GraphMode::Anchors)
-                .await,
-            all.version
-        );
-
-        let response = index_page(
-            State(state.clone()),
-            RawQuery(Some("mode=anchors".to_owned())),
-        )
-        .await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(
-            html.contains(&format!("data-version=\"{}\"", all.version)),
-            "{html}"
-        );
-
-        drop(state);
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_viewport_json() {
-        let response = response_from(
-            get_request("/api/graph/viewport?x=10&y=20&width=640&height=360&overscan=40")
-                .as_bytes(),
-        )
-        .await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: application/json; charset=utf-8"),
-            "{response}"
-        );
-        assert!(response.contains("\"canvas\""), "{response}");
-        assert!(response.contains("\"viewport\""), "{response}");
-        assert!(response.contains("\"x\":10"), "{response}");
-        assert!(response.contains("\"width\":640"), "{response}");
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_viewport_diff_json() {
-        let response = response_from(
-            get_request(
-                "/api/graph/viewport/diff?previous_x=0&previous_y=0&previous_width=320&previous_height=180&x=10&y=20&width=640&height=360&overscan=40",
-            )
-            .as_bytes(),
-        )
-        .await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: application/json; charset=utf-8"),
-            "{response}"
-        );
-        assert!(response.contains("\"previous_viewport\""), "{response}");
-        assert!(response.contains("\"added\""), "{response}");
-        assert!(response.contains("\"updated\""), "{response}");
-        assert!(response.contains("\"removed\""), "{response}");
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_viewport_diff_with_known_keys() {
-        let response = response_from(
-            get_request(
-                "/api/graph/viewport/diff?x=0&y=0&width=640&height=360&known_node=node:stale&known_edge=edge:primary_parent:base:stale",
-            )
-            .as_bytes(),
-        )
-        .await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("\"removed\":[]"),
-            "pending snapshots must not remove previously rendered items: {response}"
-        );
-        assert!(!response.contains("\"key\":\"node:stale\""), "{response}");
-        assert!(
-            !response.contains("\"key\":\"edge:primary_parent:base:stale\""),
-            "{response}"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_graph_viewport_diff_with_empty_known_set() {
-        let response = response_from(
-            get_request("/api/graph/viewport/diff?x=0&y=0&width=640&height=360&known=1").as_bytes(),
-        )
-        .await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"added\""), "{response}");
-        assert!(response.contains("\"nodes\":[]"), "{response}");
-    }
-
-    #[test]
-    fn viewport_diff_query_parses_repeated_known_keys() {
-        let query = parse_query(
-            "known_node=node%3Abase&known_node=node:merged&known_edge=edge%3Aprimary_parent%3Abase%3Amerged",
-        );
-
-        let request = viewport_diff_request_from_query(&query);
-        let known = request.known.expect("known keys should parse");
-
-        assert_eq!(known.nodes, vec!["node:base", "node:merged"]);
-        assert_eq!(known.edges, vec!["edge:primary_parent:base:merged"]);
-    }
-
-    #[test]
-    fn viewport_diff_query_parses_empty_known_set_marker() {
-        let query = parse_query("known=1");
-
-        let request = viewport_diff_request_from_query(&query);
-        let known = request.known.expect("empty known set should parse");
-
-        assert!(known.nodes.is_empty());
-        assert!(known.edges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_fragment() {
-        let response = response_from(get_request("/fragment").as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: text/html; charset=utf-8"),
-            "{response}"
-        );
-        assert!(response.contains("data-version=\"0\""), "{response}");
-    }
-
-    #[tokio::test]
-    async fn fragment_schedules_materialization_without_full_snapshot() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).await.unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-
-        let response = fragment(State(state.clone()), RawQuery(None)).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(html.contains("Loading graph"));
-        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn fragment_rebuilds_materialized_shell_on_startup() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let root = writer.root_id();
-        let session = writer
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
-            })
-            .await
-            .unwrap();
-        writer.fork("main", &session).await.unwrap();
-        let prompt = writer
-            .append(NewNode {
-                parent: session.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::prompt(
-                    Vec::new(),
-                    PromptAnchor {
-                        prompt: "visible shell prompt".to_owned(),
-                        attachments: Vec::new(),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-        writer
-            .set_branch_head("main", &session, &prompt)
-            .await
-            .unwrap();
-        publisher.mark_changed();
-        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store().await,
-            publisher.clone(),
-            path.clone(),
-        )
-        .await
-        .unwrap();
-        seed_cache.current_snapshot(GraphMode::Anchors).await;
-        drop(seed_cache);
-
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-
-        let response = fragment(
-            State(state.clone()),
-            RawQuery(Some("mode=anchors".to_owned())),
-        )
-        .await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(html.contains("2 nodes / 1 edges / Anchors"), "{html}");
-        assert!(html.contains("<strong>main</strong>"), "{html}");
-        assert!(html.contains("time-scale-tick"), "{html}");
-        assert!(!html.contains("Loading graph / Anchors"), "{html}");
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_node_detail_fragment() {
-        let response = response_from(get_request("/api/node-detail").as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: text/html; charset=utf-8"),
-            "{response}"
-        );
-        assert!(
-            response.contains("Select a node to inspect its content."),
-            "{response}"
-        );
-    }
-
-    #[tokio::test]
-    async fn node_detail_uses_rebuilt_materialized_facts() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let root = writer.root_id();
-        writer.fork("main", &root).await.unwrap();
-        let text = writer
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("single node detail".to_owned()),
-            })
-            .await
-            .unwrap();
-        writer.set_branch_head("main", &root, &text).await.unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-        state.cache.rebuild_requested_modes().await.unwrap();
-        let query = format!("target={}&mode=all", node_target_id(&text));
-
-        let response = node_detail(State(state.clone()), RawQuery(Some(query))).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(html.contains("single node detail"), "{html}");
-        let materialization_version = timeout(Duration::from_secs(1), async {
-            loop {
-                let version = state.cache.current_viewport_version(GraphMode::All).await;
-                if version > 0 {
-                    break version;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("graph materialization should finish");
-        assert_eq!(materialization_version, 1);
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn node_detail_reads_hidden_context_node_incrementally() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let root = writer.root_id();
-        let session = writer
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
-            })
-            .await
-            .unwrap();
-        writer.fork("main", &session).await.unwrap();
-        let hidden_text = writer
-            .append(NewNode {
-                parent: session.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("hidden targeted materialized detail".to_owned()),
-            })
-            .await
-            .unwrap();
-        let prompt = writer
-            .append(NewNode {
-                parent: hidden_text.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::prompt(
-                    Vec::new(),
-                    PromptAnchor {
-                        prompt: "visible prompt after hidden detail".to_owned(),
-                        attachments: Vec::new(),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-        writer
-            .set_branch_head("main", &session, &prompt)
-            .await
-            .unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-        state.cache.current_snapshot(GraphMode::Anchors).await;
-        let query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
-
-        let response = node_detail(State(state.clone()), RawQuery(Some(query))).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(
-            html.contains("hidden targeted materialized detail"),
-            "{html}"
-        );
-        assert!(html.contains("<dd>None</dd>"), "{html}");
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn node_detail_ignores_hidden_node_outside_current_materialized_context() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let root = writer.root_id();
-        let session = writer
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
-            })
-            .await
-            .unwrap();
-        writer.fork("main", &session).await.unwrap();
-        let hidden_text = writer
-            .append(NewNode {
-                parent: session.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("stale hidden materialized detail".to_owned()),
-            })
-            .await
-            .unwrap();
-        let prompt = writer
-            .append(NewNode {
-                parent: hidden_text.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::prompt(
-                    Vec::new(),
-                    PromptAnchor {
-                        prompt: "visible prompt before rewind".to_owned(),
-                        attachments: Vec::new(),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-        writer
-            .set_branch_head("main", &session, &prompt)
-            .await
-            .unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher.clone(),
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-        let initial = state.cache.current_snapshot(GraphMode::Anchors).await;
-        writer
-            .set_branch_head("main", &prompt, &session)
-            .await
-            .unwrap();
-        publisher.mark_changed();
-        state.cache.rebuild_requested_modes().await.unwrap();
-        assert!(
-            state
-                .cache
-                .current_viewport_version(GraphMode::Anchors)
-                .await
-                > initial.version
-        );
-
-        let detail = state
-            .cache
-            .node_detail_current_ready_or_schedule(
-                GraphMode::Anchors,
-                &node_target_id(&hidden_text),
-            )
-            .await
-            .unwrap();
-
-        assert!(detail.is_none());
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_provider_context_fragment() {
-        let response = response_from(get_request("/api/provider-context").as_bytes()).await;
-
-        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(
-            response.contains("content-type: text/html; charset=utf-8"),
-            "{response}"
-        );
-        assert!(
-            response.contains("Select a node to inspect its provider context."),
-            "{response}"
-        );
-    }
-
-    #[tokio::test]
-    async fn provider_context_default_avoids_full_snapshot() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        writer.fork("main", &writer.root_id()).await.unwrap();
-        publisher.mark_changed();
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-
-        let response = provider_context(State(state.clone()), RawQuery(None)).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(
-            html.contains("Select a node to inspect its provider context."),
-            "{html}"
-        );
-        assert!(state.cache.snapshot_current_ready(GraphMode::All).is_none());
-
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn provider_context_uses_materialized_graph_facts() {
-        let path = temp_store_path();
-        let writer = PersistentStore::open(&path).await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let root = writer.root_id();
-        let session = writer
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::session(Vec::new(), test_session_anchor())),
-            })
-            .await
-            .unwrap();
-        writer.fork("main", &session).await.unwrap();
-        let hidden_text = writer
-            .append(NewNode {
-                parent: session.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("hidden context item".to_owned()),
-            })
-            .await
-            .unwrap();
-        let prompt = writer
-            .append(NewNode {
-                parent: hidden_text.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::prompt(
-                    Vec::new(),
-                    PromptAnchor {
-                        prompt: "visible context prompt".to_owned(),
-                        attachments: Vec::new(),
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-        writer
-            .set_branch_head("main", &session, &prompt)
-            .await
-            .unwrap();
-        publisher.mark_changed();
-        let seed_cache = ConsoleGraphCache::new_with_persistent_store_path(
-            test_store().await,
-            publisher.clone(),
-            path.clone(),
-        )
-        .await
-        .unwrap();
-        seed_cache.current_snapshot(GraphMode::Anchors).await;
-        drop(seed_cache);
-
-        let state = AppState {
-            cache: ConsoleGraphCache::new_with_persistent_store_path(
-                test_store().await,
-                publisher,
-                path.clone(),
-            )
-            .await
-            .unwrap(),
-            web_graph: None,
-        };
-        let visible_query = format!("mode=anchors&target={}", node_target_id(&prompt));
-
-        let response = provider_context(State(state.clone()), RawQuery(Some(visible_query))).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let visible_html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(
-            visible_html.contains("visible context prompt"),
-            "{visible_html}"
-        );
-        assert!(
-            visible_html.contains("hidden context item"),
-            "{visible_html}"
-        );
-        assert!(visible_html.contains("data-node-x="), "{visible_html}");
-        let hidden_query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
-        let response = provider_context(State(state.clone()), RawQuery(Some(hidden_query))).await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let hidden_html = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(hidden_html.contains("hidden context item"), "{hidden_html}");
-        assert!(
-            hidden_html.contains("class=\"provider-context-node selected\""),
-            "{hidden_html}"
-        );
-        drop(writer);
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn handle_connection_serves_assets() {
-        let js = response_bytes_from(get_request("/pkg/coco_console.js").as_bytes()).await;
-        let wasm = response_bytes_from(get_request("/pkg/coco_console_bg.wasm").as_bytes()).await;
-
-        assert!(js.starts_with(b"HTTP/1.1 200 OK"), "{js:?}");
-        assert!(contains_bytes(
-            &js,
-            b"content-type: text/javascript; charset=utf-8"
-        ));
-        assert!(contains_bytes(&js, b"import"));
-
-        assert!(wasm.starts_with(b"HTTP/1.1 200 OK"), "{wasm:?}");
-        assert!(contains_bytes(&wasm, b"content-type: application/wasm"));
-        assert!(contains_bytes(&wasm, b"\0asm"));
+        let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
+        let detail = String::from_utf8(detail_body.to_vec()).unwrap();
+        assert!(detail.contains("direct detail"));
+        assert!(detail.contains(&node_id));
     }
 }

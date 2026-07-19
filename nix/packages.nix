@@ -20,7 +20,6 @@
       (lib.fileset.maybeMissing (root + /coco-console/src/host/style.css))
       (lib.fileset.maybeMissing (root + /coco-console/src/host/templates))
       (lib.fileset.maybeMissing (root + /coco-console/templates))
-      (lib.fileset.maybeMissing (root + /coco-console/migrations))
       (lib.fileset.maybeMissing (root + /coco-console/web-graph-migrations))
       (lib.fileset.maybeMissing (root + /coco-mem/migrations))
       (lib.fileset.maybeMissing (root + /coco-mem/src/default_skills))

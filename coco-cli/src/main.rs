@@ -547,28 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_profile_command_is_not_forwarded() {
-        let target = with_env_vars(
-            &[
-                (COCO_CLI_RUNTIME_SOCKET_ENV, Some("/tmp/runtime.sock")),
-                (COCO_DAEMON_SOCKET_ENV, Some("/tmp/daemon.sock")),
-            ],
-            || {
-                resolve_forwarding_target(&[
-                    "--daemon-socket".to_owned(),
-                    "/tmp/override.sock".to_owned(),
-                    "daemon".to_owned(),
-                    "profile".to_owned(),
-                    "graph".to_owned(),
-                ])
-            },
-        )
-        .unwrap();
-
-        assert_eq!(target, None);
-    }
-
-    #[test]
     fn runtime_socket_takes_priority_over_daemon_client_socket() {
         let target = with_env_vars(
             &[

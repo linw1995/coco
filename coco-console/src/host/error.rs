@@ -1,6 +1,5 @@
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use snafu::prelude::*;
 
@@ -18,76 +17,6 @@ pub enum Error {
 
     #[snafu(display("Console server task failed: {source}"))]
     JoinConsoleServer { source: tokio::task::JoinError },
-
-    #[snafu(display(
-        "Console graph rebuild failed for {mode} at store version {source_version}: {message}"
-    ))]
-    ConsoleGraphRebuild {
-        mode: &'static str,
-        source_version: u64,
-        message: String,
-    },
-
-    #[snafu(display("Console graph layout failed: {source}"))]
-    GraphLayout {
-        source: crate::layout::GraphLayoutError,
-    },
-
-    #[snafu(display("Console graph frontier failed: {source}"))]
-    IncrementalFrontier {
-        source: Box<crate::host::frontier::AdaptiveFrontierError<Error>>,
-    },
-
-    #[snafu(display("Console graph snapshot store {} query failed: {source}", path.display()))]
-    QueryGraphSnapshotStore {
-        path: PathBuf,
-        source: diesel::result::Error,
-    },
-
-    #[snafu(display("Console graph snapshot store {} migration failed: {source}", path.display()))]
-    MigrateGraphSnapshotStore {
-        path: PathBuf,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to create console graph snapshot store pool {}: {source}",
-        path.display()
-    ))]
-    CreateGraphSnapshotPool {
-        path: PathBuf,
-        source: diesel_async::pooled_connection::PoolError,
-    },
-
-    #[snafu(display(
-        "Failed to acquire console graph snapshot store connection {}: {source}",
-        path.display()
-    ))]
-    AcquireGraphSnapshotConnection {
-        path: PathBuf,
-        source: diesel_async::pooled_connection::bb8::RunError,
-    },
-
-    #[snafu(display(
-        "Failed to configure console graph snapshot store {}: {message}",
-        path.display()
-    ))]
-    ConfigureGraphSnapshotStore { path: PathBuf, message: String },
-
-    #[snafu(display("Failed to parse console graph snapshot store value {column}: {source}"))]
-    ParseGraphSnapshotStoreValue {
-        column: &'static str,
-        source: serde_json::Error,
-    },
-
-    #[snafu(display("Failed to serialize console graph snapshot store value {column}: {source}"))]
-    SerializeGraphSnapshotStoreValue {
-        column: &'static str,
-        source: serde_json::Error,
-    },
-
-    #[snafu(display("Invalid console graph snapshot store value {column}: {value}"))]
-    InvalidGraphSnapshotStoreValue { column: &'static str, value: String },
 
     #[snafu(display("Web graph store operation failed: {source}"))]
     WebGraphStore {

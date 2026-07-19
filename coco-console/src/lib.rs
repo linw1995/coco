@@ -4,46 +4,24 @@ mod api;
 mod web_graph;
 
 #[cfg(not(target_arch = "wasm32"))]
-mod schema;
-
-#[cfg(not(target_arch = "wasm32"))]
 mod host {
-    pub mod api;
-    pub mod cache;
-    pub mod config;
-    pub mod error;
+    mod api;
+    mod config;
+    mod error;
+    mod publisher;
+    mod render;
+    mod server;
+    mod store;
+    mod web_graph_runtime;
     #[allow(dead_code)]
-    pub mod frontier;
-    pub mod graph;
-    pub mod incremental_build;
-    #[allow(dead_code)]
-    pub mod incremental_layout;
-    #[allow(dead_code)]
-    pub mod incremental_store;
-    #[allow(dead_code)]
-    pub mod layout;
-    pub mod publisher;
-    pub mod render;
-    pub mod server;
-    #[allow(dead_code)]
-    pub mod snapshot_store;
-    #[allow(dead_code)]
-    pub mod source_cache;
-    pub mod store;
-    pub mod web_graph_runtime;
-    #[allow(dead_code)]
-    pub mod web_graph_store;
+    mod web_graph_store;
+    mod web_graph_view;
 
     pub use config::ConsoleConfig;
     pub use error::{Error, Result};
-    pub use graph::{GraphMode, GraphSnapshot, build_graph_snapshot_with_mode};
     pub use publisher::ConsolePublisher;
     pub use server::{ConsoleServerHandle, start_console_server_with_graph_store_path};
     pub use store::ConsoleStore;
-
-    #[cfg(test)]
-    #[path = "v2_tests.rs"]
-    mod tests;
 }
 
 // Host tests compile viewport so its pure geometry logic stays covered without a wasm test runner.
@@ -57,11 +35,8 @@ mod wasm {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use host::{
-    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, GraphMode,
-    GraphSnapshot, Result, build_graph_snapshot_with_mode,
+    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, ConsoleStore, Error, Result,
     start_console_server_with_graph_store_path,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use host::{config, error, graph, layout, publisher, render};
 #[cfg(target_arch = "wasm32")]
 use wasm::viewport;
