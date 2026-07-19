@@ -703,12 +703,22 @@ fn validate_source_cursor_advance(
             },
         ));
     }
-    let expected = state.source_version.get().checked_add(1).ok_or_else(|| {
-        TransactionError::Operation(Error::SourceVersionCursorMismatch {
-            expected: state.source_version.get(),
-            actual: next_source_version.get(),
-        })
-    })?;
+    let current_row_id = state
+        .source_cursor
+        .as_ref()
+        .map_or(0, |cursor| cursor.row_id);
+    let advanced_rows = u64::try_from(next.row_id - current_row_id)
+        .expect("validated source cursor advancement is positive");
+    let expected = state
+        .source_version
+        .get()
+        .checked_add(advanced_rows)
+        .ok_or_else(|| {
+            TransactionError::Operation(Error::SourceVersionCursorMismatch {
+                expected: state.source_version.get(),
+                actual: next_source_version.get(),
+            })
+        })?;
     if next_source_version.get() != expected {
         return Err(TransactionError::Operation(
             Error::SourceVersionCursorMismatch {
@@ -3187,6 +3197,35 @@ mod tests {
         assert!(matches!(error, Error::SourceVersionCursorMismatch { .. }));
         assert_eq!(store.state().await.unwrap().unwrap(), original_state);
         assert_eq!(load_graph_for_test(&store).await, Some(original_graph));
+    }
+
+    #[tokio::test]
+    async fn source_cursor_advance_accounts_for_every_row_in_a_page() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&empty_graph(0, 0)).await.unwrap();
+        let cursor = GraphNodeCursor {
+            row_id: 3,
+            node_id: "source-c".to_owned(),
+        };
+
+        let state = store
+            .apply_patch_and_advance_source(
+                Patch {
+                    format_version: FORMAT_VERSION,
+                    base_revision: Revision::new(0),
+                    revision: Revision::new(1),
+                    source_version: SourceVersion::new(3),
+                    topology: TopologyPatch::default(),
+                    layouts: LayoutPatches::default(),
+                },
+                cursor.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(state.source_version, SourceVersion::new(3));
+        assert_eq!(state.source_cursor, Some(cursor));
     }
 
     #[tokio::test]

@@ -409,31 +409,25 @@ impl WebGraphRuntime {
             let page_complete = page.complete;
             let processed_nodes = page.entries.len();
             let mut changed_source_nodes = 0_u64;
-            let mut added_nodes = Vec::new();
+            let mut nodes_to_reflow = Vec::new();
             for entry in &page.entries {
                 let result = self.ensure_source_node(entry).await?;
                 if result.changed {
                     changed_source_nodes = changed_source_nodes.saturating_add(1);
                 }
-                added_nodes.extend(result.added_nodes);
+                nodes_to_reflow.extend(result.added_nodes);
+                nodes_to_reflow.push(entry.node_id.clone());
             }
-            if !added_nodes.is_empty() {
-                self.reflow_added_nodes(&added_nodes).await?;
-            }
-            let current_revision = self
-                .store
-                .state()
-                .await
-                .context(WebGraphStoreSnafu)?
-                .context(WebGraphNotInitializedSnafu)?
-                .revision
-                .get();
-            self.ready.send_replace(current_revision);
-            let current_row_id = page
+            let page_cursor = page
                 .entries
                 .last()
-                .expect("non-empty graph page should end with a cursor")
-                .row_id;
+                .expect("non-empty graph page should end with a cursor");
+            let finalized = self
+                .reflow_and_advance_source(&nodes_to_reflow, page_cursor)
+                .await?;
+            let current_revision = finalized.revision.get();
+            self.ready.send_replace(current_revision);
+            let current_row_id = page_cursor.row_id;
             let progress = progress
                 .as_mut()
                 .expect("catch-up progress starts before reading a graph page");
@@ -623,7 +617,6 @@ impl WebGraphRuntime {
             return Ok(EnsureResult::default());
         }
         if self.node_exists(&source_cursor.node_id).await? {
-            self.advance_source_cursor(source_cursor).await?;
             return Ok(EnsureResult::default());
         }
 
@@ -654,12 +647,7 @@ impl WebGraphRuntime {
                 }
                 EnsureStep::Build(node) => {
                     visiting.remove(&node.id);
-                    let is_source_node = node.id == source_cursor.node_id;
-                    if (is_source_node || !self.node_exists(&node.id).await?)
-                        && self
-                            .apply_node(&node, is_source_node.then_some(source_cursor))
-                            .await?
-                    {
+                    if self.apply_node(&node).await? {
                         result.changed = true;
                         result.added_nodes.push(node.id.clone());
                     }
@@ -669,7 +657,11 @@ impl WebGraphRuntime {
         Ok(result)
     }
 
-    async fn reflow_added_nodes(&self, added_nodes: &[String]) -> crate::Result<()> {
+    async fn reflow_and_advance_source(
+        &self,
+        added_nodes: &[String],
+        source_cursor: &GraphNodeCursor,
+    ) -> crate::Result<StoredGraphState> {
         let mut new_node_order = BTreeMap::new();
         for (order, node_id) in added_nodes.iter().enumerate() {
             let node = NodeId::new(node_id.clone()).context(WebGraphModelSnafu)?;
@@ -682,6 +674,20 @@ impl WebGraphRuntime {
                 .await
                 .context(WebGraphStoreSnafu)?
                 .context(WebGraphNotInitializedSnafu)?;
+            if let Some(current) = state.source_cursor.as_ref()
+                && current.row_id >= source_cursor.row_id
+            {
+                if current.row_id == source_cursor.row_id
+                    && current.node_id != source_cursor.node_id
+                {
+                    return WebGraphSourceCursorMismatchSnafu {
+                        row_id: current.row_id,
+                        node_id: current.node_id.clone(),
+                    }
+                    .fail();
+                }
+                return Ok(state);
+            }
             let Some(anchors) = self
                 .build_reflow_layout_patch(LayoutKind::Anchors, &new_node_order, state.revision)
                 .await?
@@ -696,9 +702,6 @@ impl WebGraphRuntime {
                 tokio::task::yield_now().await;
                 continue;
             };
-            if anchors == LayoutPatch::default() && all == LayoutPatch::default() {
-                return Ok(());
-            }
             let revision =
                 state
                     .revision
@@ -707,16 +710,33 @@ impl WebGraphRuntime {
                     .context(WebGraphRevisionExhaustedSnafu {
                         revision: state.revision.get(),
                     })?;
+            let current_row_id = state
+                .source_cursor
+                .as_ref()
+                .map_or(0, |cursor| cursor.row_id);
+            let advanced_rows = u64::try_from(source_cursor.row_id - current_row_id)
+                .expect("source cursor advancement is positive");
+            let source_version = state
+                .source_version
+                .get()
+                .checked_add(advanced_rows)
+                .context(WebGraphSourceVersionExhaustedSnafu {
+                    source_version: state.source_version.get(),
+                })?;
             let patch = Patch {
                 format_version: FORMAT_VERSION,
                 base_revision: state.revision,
                 revision: Revision::new(revision),
-                source_version: state.source_version,
+                source_version: SourceVersion::new(source_version),
                 topology: TopologyPatch::default(),
                 layouts: LayoutPatches { anchors, all },
             };
-            match self.store.apply_patch(patch).await {
-                Ok(_) => return Ok(()),
+            match self
+                .store
+                .apply_patch_and_advance_source(patch, source_cursor.clone())
+                .await
+            {
+                Ok(state) => return Ok(state),
                 Err(StoreError::InvalidGraph {
                     source: crate::web_graph::Error::RevisionMismatch { .. },
                 }) => tokio::task::yield_now().await,
@@ -1014,16 +1034,9 @@ impl WebGraphRuntime {
             })
     }
 
-    async fn apply_node(
-        &self,
-        node: &GraphNodeRecord,
-        source_cursor: Option<&GraphNodeCursor>,
-    ) -> crate::Result<bool> {
+    async fn apply_node(&self, node: &GraphNodeRecord) -> crate::Result<bool> {
         loop {
             if self.node_exists(&node.id).await? {
-                if let Some(source_cursor) = source_cursor {
-                    self.advance_source_cursor(source_cursor).await?;
-                }
                 return Ok(false);
             }
             let state = self
@@ -1032,21 +1045,11 @@ impl WebGraphRuntime {
                 .await
                 .context(WebGraphStoreSnafu)?
                 .context(WebGraphNotInitializedSnafu)?;
-            let Some(patch) = self
-                .build_node_patch(node, source_cursor.is_some(), &state)
-                .await?
-            else {
+            let Some(patch) = self.build_node_patch(node, &state).await? else {
                 tokio::task::yield_now().await;
                 continue;
             };
-            let result = if let Some(source_cursor) = source_cursor {
-                self.store
-                    .apply_patch_and_advance_source(patch, source_cursor.clone())
-                    .await
-            } else {
-                self.store.apply_patch(patch).await
-            };
-            match result {
+            match self.store.apply_patch(patch).await {
                 Ok(_) => return Ok(true),
                 Err(StoreError::InvalidGraph {
                     source: crate::web_graph::Error::RevisionMismatch { .. },
@@ -1059,7 +1062,6 @@ impl WebGraphRuntime {
     async fn build_node_patch(
         &self,
         node: &GraphNodeRecord,
-        consume_source: bool,
         state: &StoredGraphState,
     ) -> crate::Result<Option<Patch>> {
         let node_id = NodeId::new(node.id.clone()).context(WebGraphModelSnafu)?;
@@ -1108,20 +1110,11 @@ impl WebGraphRuntime {
                 .context(WebGraphRevisionExhaustedSnafu {
                     revision: state.revision.get(),
                 })?;
-        let source_version = if consume_source {
-            state.source_version.get().checked_add(1).context(
-                WebGraphSourceVersionExhaustedSnafu {
-                    source_version: state.source_version.get(),
-                },
-            )?
-        } else {
-            state.source_version.get()
-        };
         Ok(Some(Patch {
             format_version: FORMAT_VERSION,
             base_revision: state.revision,
             revision: Revision::new(revision),
-            source_version: SourceVersion::new(source_version),
+            source_version: state.source_version,
             topology: TopologyPatch {
                 add_nodes: vec![node_id],
                 add_edges,
@@ -1270,63 +1263,6 @@ impl WebGraphRuntime {
             current = node.parent;
         }
         Ok(None)
-    }
-
-    async fn advance_source_cursor(&self, source_cursor: &GraphNodeCursor) -> crate::Result<()> {
-        loop {
-            let state = self
-                .store
-                .state()
-                .await
-                .context(WebGraphStoreSnafu)?
-                .context(WebGraphNotInitializedSnafu)?;
-            if let Some(current) = state.source_cursor.as_ref()
-                && current.row_id >= source_cursor.row_id
-            {
-                if current.row_id == source_cursor.row_id
-                    && current.node_id != source_cursor.node_id
-                {
-                    return WebGraphSourceCursorMismatchSnafu {
-                        row_id: current.row_id,
-                        node_id: current.node_id.clone(),
-                    }
-                    .fail();
-                }
-                return Ok(());
-            }
-            let revision =
-                state
-                    .revision
-                    .get()
-                    .checked_add(1)
-                    .context(WebGraphRevisionExhaustedSnafu {
-                        revision: state.revision.get(),
-                    })?;
-            let source_version = state.source_version.get().checked_add(1).context(
-                WebGraphSourceVersionExhaustedSnafu {
-                    source_version: state.source_version.get(),
-                },
-            )?;
-            let patch = Patch {
-                format_version: FORMAT_VERSION,
-                base_revision: state.revision,
-                revision: Revision::new(revision),
-                source_version: SourceVersion::new(source_version),
-                topology: TopologyPatch::default(),
-                layouts: LayoutPatches::default(),
-            };
-            match self
-                .store
-                .apply_patch_and_advance_source(patch, source_cursor.clone())
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(StoreError::InvalidGraph {
-                    source: crate::web_graph::Error::RevisionMismatch { .. },
-                }) => tokio::task::yield_now().await,
-                Err(source) => return Err(source).context(WebGraphStoreSnafu),
-            }
-        }
     }
 }
 
@@ -1647,6 +1583,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_reflows_nodes_persisted_before_source_cursor_advances() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let upper_parent = append_text(&writer, &root, "upper parent").await;
+        let middle_parent = append_text(&writer, &root, "middle parent").await;
+        let lower_parent = append_text(&writer, &root, "lower parent").await;
+        let upper_child = append_text(&writer, &upper_parent, "upper child").await;
+        let lower_child = append_text(&writer, &lower_parent, "lower child").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        let finalized = runtime.store.state().await.unwrap().unwrap();
+
+        let middle_child = append_text(&writer, &middle_parent, "middle child").await;
+        let middle_record = runtime.source_node(&middle_child).await.unwrap();
+        assert!(runtime.apply_node(&middle_record).await.unwrap());
+        let partial = runtime.store.state().await.unwrap().unwrap();
+        assert_eq!(partial.source_cursor, finalized.source_cursor);
+        assert_eq!(partial.source_version, finalized.source_version);
+        assert_eq!(partial.revision.get(), finalized.revision.get() + 1);
+
+        let upper_child_id = NodeId::new(upper_child).unwrap();
+        let middle_child_id = NodeId::new(middle_child).unwrap();
+        let lower_child_id = NodeId::new(lower_child).unwrap();
+        let partial_points = runtime
+            .store
+            .node_placements(
+                LayoutKind::All,
+                &[
+                    upper_child_id.clone(),
+                    middle_child_id.clone(),
+                    lower_child_id.clone(),
+                ],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .into_iter()
+            .map(|placement| (placement.node, placement.point))
+            .collect::<BTreeMap<_, _>>();
+        assert!(partial_points[&lower_child_id].y < partial_points[&middle_child_id].y);
+        drop(runtime);
+
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let recovered = runtime.store.state().await.unwrap().unwrap();
+        assert_eq!(recovered.revision.get(), partial.revision.get() + 1);
+        assert_eq!(
+            recovered.source_version.get(),
+            finalized.source_version.get() + 1
+        );
+        assert_eq!(
+            recovered.source_cursor,
+            runtime.source.graph_node_high_watermark().await.unwrap()
+        );
+        let recovered_points = runtime
+            .store
+            .node_placements(
+                LayoutKind::All,
+                &[
+                    upper_child_id.clone(),
+                    middle_child_id.clone(),
+                    lower_child_id.clone(),
+                ],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .into_iter()
+            .map(|placement| (placement.node, placement.point))
+            .collect::<BTreeMap<_, _>>();
+        assert!(recovered_points[&upper_child_id].y < recovered_points[&middle_child_id].y);
+        assert!(recovered_points[&middle_child_id].y < recovered_points[&lower_child_id].y);
+    }
+
+    #[tokio::test]
     async fn synchronization_builds_global_topology_and_both_layouts_incrementally() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
@@ -1860,7 +1878,7 @@ mod tests {
         .await
         .expect("the final batch event should build its missing ancestry");
         let state = runtime.store.state().await.unwrap().unwrap();
-        assert_eq!(state.revision.get(), 3);
+        assert_eq!(state.revision.get(), 5);
         assert_eq!(state.source_version.get(), 3);
         assert_eq!(
             state.source_cursor,
@@ -1904,7 +1922,7 @@ mod tests {
 
         let after = runtime.store.state().await.unwrap().unwrap();
         assert_eq!(after.source_version.get(), before.source_version.get() + 2);
-        assert_eq!(after.revision.get(), before.revision.get() + 2);
+        assert_eq!(after.revision.get(), before.revision.get() + 3);
         assert_eq!(
             after.source_cursor,
             runtime.source.graph_node_high_watermark().await.unwrap()
