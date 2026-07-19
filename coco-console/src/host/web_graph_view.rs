@@ -303,39 +303,62 @@ pub struct EndpointPortSlots {
     pub target: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointPortOffsets {
+    pub source: i32,
+    pub target: i32,
+}
+
+pub fn edge_port_offset(slot: usize) -> i32 {
+    const PORT_STEP: i32 = 4;
+    const PORT_RANGE: i32 = 12;
+
+    i32::try_from(slot)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(PORT_STEP)
+        .rem_euclid(PORT_RANGE.saturating_mul(2).saturating_add(PORT_STEP))
+        .saturating_sub(PORT_RANGE)
+}
+
 pub fn route_edge(
     source_center: Point,
     target_center: Point,
     slots: EndpointPortSlots,
 ) -> BezierRoute {
+    route_edge_with_offsets(
+        source_center,
+        target_center,
+        EndpointPortOffsets {
+            source: edge_port_offset(slots.source),
+            target: edge_port_offset(slots.target),
+        },
+    )
+}
+
+pub fn route_edge_with_offsets(
+    source_center: Point,
+    target_center: Point,
+    offsets: EndpointPortOffsets,
+) -> BezierRoute {
     const NODE_RADIUS: i32 = 18;
     const SOURCE_PADDING: i32 = 2;
     const TARGET_PADDING: i32 = 6;
-    const PORT_STEP: i32 = 4;
-    const PORT_RANGE: i32 = 12;
     const CONTROL_RATIO_PERCENT: i32 = 45;
     const MIN_CONTROL_DISTANCE: i32 = 24;
 
-    let port_offset = |slot: usize| {
-        i32::try_from(slot)
-            .unwrap_or(i32::MAX)
-            .saturating_mul(PORT_STEP)
-            .rem_euclid(PORT_RANGE.saturating_mul(2).saturating_add(PORT_STEP))
-            .saturating_sub(PORT_RANGE)
-    };
     let source = Point {
         x: source_center
             .x
             .saturating_add(NODE_RADIUS)
             .saturating_add(SOURCE_PADDING),
-        y: source_center.y.saturating_add(port_offset(slots.source)),
+        y: source_center.y.saturating_add(offsets.source),
     };
     let target = Point {
         x: target_center
             .x
             .saturating_sub(NODE_RADIUS)
             .saturating_sub(TARGET_PADDING),
-        y: target_center.y.saturating_add(port_offset(slots.target)),
+        y: target_center.y.saturating_add(offsets.target),
     };
     let horizontal_distance = target.x.saturating_sub(source.x).max(MIN_CONTROL_DISTANCE);
     let control_distance = i32::try_from(

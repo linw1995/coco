@@ -12,6 +12,7 @@ mod host {
     mod render;
     mod server;
     mod store;
+    mod web_graph_order;
     mod web_graph_runtime;
     #[allow(dead_code)]
     mod web_graph_store;

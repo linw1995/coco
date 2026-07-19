@@ -26,6 +26,11 @@ pub enum Error {
     #[snafu(display("Web graph model operation failed: {source}"))]
     WebGraphModel { source: crate::web_graph::Error },
 
+    #[snafu(display("Web graph order operation failed: {source}"))]
+    WebGraphOrder {
+        source: crate::host::web_graph_order::Error,
+    },
+
     #[snafu(display("Web graph store is not initialized"))]
     WebGraphNotInitialized,
 

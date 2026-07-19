@@ -59,6 +59,12 @@ pub struct LayoutNodeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnPosition {
+    y: i32,
+    node: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor<T> {
     revision: Revision,
     layout: LayoutKind,
@@ -75,6 +81,7 @@ impl<T> PageCursor<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CursorScope {
     All,
+    Column(i32),
     Incident(Vec<NodeId>),
 }
 
@@ -159,6 +166,33 @@ impl WebGraphStore {
                     state,
                     value: bottom,
                 }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn layout_column_placements_page(
+        &self,
+        kind: LayoutKind,
+        x: i32,
+        cursor: Option<&PageCursor<ColumnPosition>>,
+        limit: NonZeroUsize,
+    ) -> Result<Option<GraphRead<GraphPage<NodePlacement, ColumnPosition>>>> {
+        validate_read_batch_size(limit.get())?;
+        let path = self.path.clone();
+        let scope = CursorScope::Column(x);
+        let cursor = cursor.cloned();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                validate_cursor(cursor.as_ref(), state.revision, kind, &scope)?;
+                let page =
+                    load_column_placements_page(connection, kind, x, cursor, limit, state.revision)
+                        .await?;
+                Ok(Some(GraphRead { state, value: page }))
             })
             .await
             .map_err(|error| error.into_store_error(path))
@@ -399,8 +433,9 @@ impl WebGraphStore {
                     validate_source_cursor_advance(&state, source_cursor, patch.source_version)?;
                 }
                 validate_patch_candidate(connection, &patch).await?;
+                let new_layout_edges = collect_new_layout_edges(connection, &patch).await?;
                 apply_patch_rows(connection, &patch, source_cursor.as_ref()).await?;
-                validate_new_cycles(connection, &patch).await?;
+                validate_new_cycles(connection, &new_layout_edges).await?;
                 Ok(StoredGraphState {
                     format_version: state.format_version,
                     revision: patch.revision,
@@ -731,6 +766,61 @@ async fn load_placements_by_node_ids(
         .collect()
 }
 
+async fn load_column_placements_page(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    x: i32,
+    cursor: Option<PageCursor<ColumnPosition>>,
+    limit: NonZeroUsize,
+    revision: Revision,
+) -> std::result::Result<GraphPage<NodePlacement, ColumnPosition>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let after = cursor.map(|cursor| (cursor.after.y, cursor.after.node.as_str().to_owned()));
+    let mut query = web_graph_node_placements::table
+        .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+        .filter(web_graph_node_placements::x.eq(x))
+        .into_boxed();
+    if let Some((y, node)) = &after {
+        query = query.filter(
+            web_graph_node_placements::y
+                .gt(y)
+                .or(web_graph_node_placements::y
+                    .eq(y)
+                    .and(web_graph_node_placements::node_id.gt(node))),
+        );
+    }
+    let mut items = query
+        .order((
+            web_graph_node_placements::y.asc(),
+            web_graph_node_placements::node_id.asc(),
+        ))
+        .limit(i64::try_from(limit.get() + 1).expect("bounded read limit fits in SQLite INTEGER"))
+        .select(PlacementRow::as_select())
+        .load::<PlacementRow>(connection)
+        .await?
+        .into_iter()
+        .map(stored_placement)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = items.len() > limit.get();
+    items.truncate(limit.get());
+    let next_cursor = has_more.then(|| {
+        let placement = items
+            .last()
+            .expect("a non-empty column page has a final placement");
+        PageCursor {
+            revision,
+            layout: kind,
+            scope: CursorScope::Column(x),
+            after: ColumnPosition {
+                y: placement.point.y,
+                node: placement.node.clone(),
+            },
+        }
+    });
+    Ok(GraphPage { items, next_cursor })
+}
+
 async fn load_layout_node_states_by_node_ids(
     connection: &mut AsyncSqliteConnection,
     kind: LayoutKind,
@@ -805,6 +895,9 @@ async fn load_routes_page(
 
     let node_ids = match &scope {
         CursorScope::All => None,
+        CursorScope::Column(_) => {
+            return Err(TransactionError::Operation(Error::CursorQueryMismatch));
+        }
         CursorScope::Incident(nodes) => Some(
             nodes
                 .iter()
@@ -1266,20 +1359,31 @@ async fn validate_final_references(
     Ok(())
 }
 
-async fn validate_new_cycles(
+async fn collect_new_layout_edges(
     connection: &mut AsyncSqliteConnection,
     patch: &Patch,
-) -> std::result::Result<(), TransactionError> {
+) -> std::result::Result<Vec<(LayoutKind, EdgeId)>, TransactionError> {
+    let mut edges = Vec::new();
     for kind in [LayoutKind::Anchors, LayoutKind::All] {
         for routed in &patch_layout(patch, kind).upsert_edges {
-            if layout_path_exists(connection, kind, &routed.edge.target, &routed.edge.source)
-                .await?
-            {
-                return Err(invalid_graph(crate::web_graph::Error::Cycle {
-                    layout: kind,
-                    node: routed.edge.source.clone(),
-                }));
+            if !layout_edge_exists(connection, kind, &routed.edge).await? {
+                edges.push((kind, routed.edge.clone()));
             }
+        }
+    }
+    Ok(edges)
+}
+
+async fn validate_new_cycles(
+    connection: &mut AsyncSqliteConnection,
+    new_edges: &[(LayoutKind, EdgeId)],
+) -> std::result::Result<(), TransactionError> {
+    for (kind, edge) in new_edges {
+        if layout_path_exists(connection, *kind, &edge.target, &edge.source).await? {
+            return Err(invalid_graph(crate::web_graph::Error::Cycle {
+                layout: *kind,
+                node: edge.source.clone(),
+            }));
         }
     }
     Ok(())
@@ -1713,6 +1817,9 @@ async fn add_topology_rows(
         })
         .collect::<Vec<_>>();
     let edges = patch.add_edges.iter().map(edge_row).collect::<Vec<_>>();
+    if nodes.is_empty() && edges.is_empty() {
+        return Ok(());
+    }
     connection
         .spawn_blocking(move |connection| {
             for chunk in nodes.chunks(WRITE_BATCH_SIZE) {
@@ -2622,6 +2729,57 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn column_pagination_is_stable_and_query_scoped() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        let mut snapshot = graph().snapshot();
+        let b = snapshot
+            .layouts
+            .all
+            .nodes
+            .iter_mut()
+            .find(|placement| placement.node == node("b"))
+            .unwrap();
+        b.point = point(80, 240);
+        store
+            .replace(&Graph::from_snapshot(snapshot).unwrap())
+            .await
+            .unwrap();
+        let limit = NonZeroUsize::new(1).unwrap();
+
+        let first = store
+            .layout_column_placements_page(LayoutKind::All, 80, None, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.value.items, vec![placement("a", 80, 120)]);
+        let cursor = first.value.next_cursor.unwrap();
+        assert_eq!(cursor.revision(), Revision::new(1));
+
+        let error = store
+            .layout_column_placements_page(LayoutKind::All, 360, Some(&cursor), limit)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CursorQueryMismatch));
+
+        let second = store
+            .layout_column_placements_page(LayoutKind::All, 80, Some(&cursor), limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.value.items, vec![placement("b", 80, 240)]);
+        assert!(second.value.next_cursor.is_none());
+
+        let missing = store
+            .layout_column_placements_page(LayoutKind::All, 999, None, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(missing.value.items.is_empty());
+        assert!(missing.value.next_cursor.is_none());
     }
 
     #[tokio::test]
