@@ -29,6 +29,7 @@ use crate::error::{
 use crate::graph::{GraphMode, GraphSnapshot};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::cache::ConsoleGraphCache;
+use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::publisher::ConsolePublisher;
 use crate::render::{
     render_fragment, render_graph_node_detail_fragment, render_loading_fragment,
@@ -47,6 +48,7 @@ const REBUILD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 struct AppState<S> {
     cache: ConsoleGraphCache<S>,
+    web_graph: Option<WebGraphRuntime>,
 }
 
 #[derive(Debug)]
@@ -100,15 +102,45 @@ pub async fn start_console_server_with_graph_store_path<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let cache =
-        ConsoleGraphCache::new_with_persistent_store_path(store, publisher, graph_store_path)
-            .await?;
-    start_console_server_with_cache(config, cache)
+    let cache = ConsoleGraphCache::new_with_persistent_store_path(
+        store,
+        publisher.clone(),
+        graph_store_path.clone(),
+    )
+    .await?;
+    let web_graph = WebGraphRuntime::open(graph_store_path, publisher).await?;
+    let node_creations = web_graph.subscribe_node_creations();
+    start_console_server_with_web_graph(config, cache, web_graph, node_creations)
 }
 
+fn start_console_server_with_web_graph<S>(
+    config: ConsoleConfig,
+    cache: ConsoleGraphCache<S>,
+    web_graph: WebGraphRuntime,
+    node_creations: tokio::sync::broadcast::Receiver<crate::publisher::ConsoleNodeCreated>,
+) -> Result<ConsoleServerHandle>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    start_console_server_with_components(config, cache, Some(web_graph), Some(node_creations))
+}
+
+#[cfg(test)]
 fn start_console_server_with_cache<S>(
     config: ConsoleConfig,
     cache: ConsoleGraphCache<S>,
+) -> Result<ConsoleServerHandle>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    start_console_server_with_components(config, cache, None, None)
+}
+
+fn start_console_server_with_components<S>(
+    config: ConsoleConfig,
+    cache: ConsoleGraphCache<S>,
+    web_graph: Option<WebGraphRuntime>,
+    node_creations: Option<tokio::sync::broadcast::Receiver<crate::publisher::ConsoleNodeCreated>>,
 ) -> Result<ConsoleServerHandle>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -123,9 +155,9 @@ where
     let addr = listener
         .local_addr()
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
-    let state = AppState { cache };
+    let state = AppState { cache, web_graph };
     let task = tokio::spawn(async move {
-        serve_console(listener, state)
+        serve_console(listener, state, node_creations)
             .await
             .context(ServeConsoleSnafu { addr })
     });
@@ -133,11 +165,16 @@ where
     Ok(ConsoleServerHandle { addr, task })
 }
 
-async fn serve_console<S>(listener: tokio::net::TcpListener, state: AppState<S>) -> io::Result<()>
+async fn serve_console<S>(
+    listener: tokio::net::TcpListener,
+    state: AppState<S>,
+    node_creations: Option<tokio::sync::broadcast::Receiver<crate::publisher::ConsoleNodeCreated>>,
+) -> io::Result<()>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
     let cache = state.cache.clone();
+    let web_graph = state.web_graph.clone();
     let server = async move {
         axum::serve(
             listener,
@@ -145,9 +182,16 @@ where
         )
         .await
     };
+    let web_graph_driver = async move {
+        match (web_graph, node_creations) {
+            (Some(web_graph), Some(node_creations)) => web_graph.drive(node_creations).await,
+            _ => std::future::pending::<Infallible>().await,
+        }
+    };
     tokio::select! {
         result = server => result,
         never = drive_graph_rebuilds(cache) => match never {},
+        never = web_graph_driver => match never {},
     }
 }
 
@@ -347,6 +391,16 @@ where
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = graph_mode_from_query(&query);
     let request = viewport_request_from_query(&query);
+    if let Some(web_graph) = state.web_graph.as_ref() {
+        let response = match query.version() {
+            Some(version) => web_graph.viewport_after(mode, version, request).await,
+            None => web_graph.viewport(mode, request).await,
+        };
+        return match response {
+            Ok(response) => json_response(&response, "graph viewport"),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
     let response = match query.version() {
         Some(version) => match state.cache.viewport_after(mode, version, request).await {
             Ok(response) => response,
@@ -438,6 +492,12 @@ where
 {
     let request = viewport_diff_request_from_query(&query);
     let mode = graph_mode_from_query(&query);
+    if let Some(web_graph) = state.web_graph.as_ref() {
+        return match web_graph.viewport_diff(mode, request).await {
+            Ok(response) => json_response(&response, "graph viewport diff"),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
     let response = match state
         .cache
         .viewport_diff_current_ready_or_schedule(mode, request.clone())
@@ -486,6 +546,15 @@ async fn graph_viewport_items_diff_response<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
+    if let Some(web_graph) = state.web_graph.as_ref() {
+        return match web_graph
+            .viewport_diff_after(mode, observed_version, request)
+            .await
+        {
+            Ok(response) => json_response(&response, "graph viewport items diff"),
+            Err(error) => plain_error(error.to_string()),
+        };
+    }
     loop {
         let response = match state
             .cache
@@ -701,6 +770,29 @@ async fn event_stream<S>(State(state): State<AppState<S>>) -> Response
 where
     S: Store + Clone + Send + Sync + 'static,
 {
+    if let Some(web_graph) = state.web_graph.as_ref() {
+        let mut rx = web_graph.subscribe();
+        let current_revision = *rx.borrow_and_update();
+        let initial = stream::iter([
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event("graph")
+                    .data(current_revision.to_string()),
+            ),
+            Ok::<_, Infallible>(Event::default().event("graph-progress").data("[]")),
+        ]);
+        let changes = stream::unfold(rx, |mut rx| async move {
+            if rx.changed().await.is_err() {
+                return None;
+            }
+            let revision = *rx.borrow_and_update();
+            Some((
+                Ok::<_, Infallible>(Event::default().event("graph").data(revision.to_string())),
+                rx,
+            ))
+        });
+        return Sse::new(initial.chain(changes)).into_response();
+    }
     let mut rx = state.cache.subscribe();
     let current_version = *rx.borrow_and_update();
     let mut progress_rx = state.cache.subscribe_progress();
@@ -1065,11 +1157,13 @@ mod tests {
         AppState, fragment, graph_json, graph_viewport_diff_response,
         graph_viewport_items_diff_response_from_query, index_page, node_detail, parse_query,
         provider_context, start_console_server, start_console_server_with_cache,
-        viewport_diff_has_changes, viewport_diff_request_from_query,
+        start_console_server_with_graph_store_path, viewport_diff_has_changes,
+        viewport_diff_request_from_query,
     };
     use crate::api::{
         GraphBezierRoute, GraphCanvas, GraphViewportDiffResponse, GraphViewportEdge,
-        GraphViewportEdgeKind, GraphViewportItems, GraphViewportRemovedItem, Point,
+        GraphViewportEdgeKind, GraphViewportItems, GraphViewportRemovedItem, GraphViewportResponse,
+        Point,
     };
     use crate::graph::{GraphMode, build_graph_snapshot, node_target_id};
     use crate::host::api::{GraphViewportKnownItems, GraphViewportRequest};
@@ -1148,6 +1242,7 @@ mod tests {
     {
         AppState {
             cache: ConsoleGraphCache::new(store, publisher),
+            web_graph: None,
         }
     }
 
@@ -1348,6 +1443,82 @@ mod tests {
         }
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persisted_web_graph_revision_updates_viewport_through_sse() {
+        let path = temp_store_path();
+        let writer = PersistentStore::open(&path).await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(writer.clone(), publisher.clone());
+        let handle = start_console_server_with_graph_store_path(
+            test_config(),
+            store.clone(),
+            publisher,
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        let mut events = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        events
+            .write_all(b"GET /events HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buffer = vec![0; 512];
+        let mut initial = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while !contains_bytes(&initial, b"event: graph\ndata: 1") {
+                let read = events.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                initial.extend_from_slice(&buffer[..read]);
+            }
+        })
+        .await
+        .expect("initial root should be persisted before its SSE revision");
+
+        let child = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("live web graph node".to_owned()),
+            })
+            .await
+            .unwrap();
+        let mut changed = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while !contains_bytes(&changed, b"event: graph\ndata: 2") {
+                let read = events.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0);
+                changed.extend_from_slice(&buffer[..read]);
+            }
+        })
+        .await
+        .expect("new node should publish the committed web graph revision");
+
+        let mut viewport = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        viewport
+            .write_all(
+                get_request(
+                    "/api/graph/viewport?mode=all&x=0&y=0&width=2000&height=2000&overscan=0",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        viewport.read_to_string(&mut response).await.unwrap();
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response should contain a body");
+        let viewport: GraphViewportResponse = serde_json::from_str(body).unwrap();
+        assert!(viewport.version >= 2);
+        assert!(viewport.nodes.iter().any(|node| node.id == child));
+
+        handle.shutdown().await.unwrap();
+        drop(store);
+        drop(writer);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
@@ -1782,6 +1953,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
 
         let response = graph_json(State(state.clone()), RawQuery(None)).await;
@@ -1822,6 +1994,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
         state.cache.current_snapshot(GraphMode::All).await;
 
@@ -1863,6 +2036,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
         state.cache.rebuild_requested_modes().await.unwrap();
         let all = state
@@ -2025,6 +2199,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
 
         let response = fragment(State(state.clone()), RawQuery(None)).await;
@@ -2092,6 +2267,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
 
         let response = fragment(
@@ -2152,6 +2328,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
         state.cache.rebuild_requested_modes().await.unwrap();
         let query = format!("target={}&mode=all", node_target_id(&text));
@@ -2231,6 +2408,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
         state.cache.current_snapshot(GraphMode::Anchors).await;
         let query = format!("mode=anchors&target={}", node_target_id(&hidden_text));
@@ -2302,6 +2480,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
         let initial = state.cache.current_snapshot(GraphMode::Anchors).await;
         writer
@@ -2363,6 +2542,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
 
         let response = provider_context(State(state.clone()), RawQuery(None)).await;
@@ -2442,6 +2622,7 @@ mod tests {
             )
             .await
             .unwrap(),
+            web_graph: None,
         };
         let visible_query = format!("mode=anchors&target={}", node_target_id(&prompt));
 

@@ -89,6 +89,32 @@ pub enum Error {
     #[snafu(display("Invalid console graph snapshot store value {column}: {value}"))]
     InvalidGraphSnapshotStoreValue { column: &'static str, value: String },
 
+    #[snafu(display("Web graph store operation failed: {source}"))]
+    WebGraphStore {
+        source: crate::host::web_graph_store::Error,
+    },
+
+    #[snafu(display("Web graph model operation failed: {source}"))]
+    WebGraphModel { source: crate::web_graph::Error },
+
+    #[snafu(display("Web graph store is not initialized"))]
+    WebGraphNotInitialized,
+
+    #[snafu(display(
+        "Web graph {layout} layout is missing parent {parent_id} while placing {node_id}"
+    ))]
+    WebGraphParentPlacementMissing {
+        layout: &'static str,
+        node_id: String,
+        parent_id: String,
+    },
+
+    #[snafu(display("Web graph references missing source node {node_id}"))]
+    WebGraphSourceNodeMissing { node_id: String },
+
+    #[snafu(display("Web graph revision {revision} cannot be advanced"))]
+    WebGraphRevisionExhausted { revision: u64 },
+
     #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },
 }

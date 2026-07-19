@@ -104,6 +104,9 @@ pub fn start() {
 async fn run() -> Result<(), JsValue> {
     let graph = setup_graph()?;
     render_full_viewport(graph.clone()).await?;
+    if let Err(error) = install_graph_events(graph.clone()) {
+        web_sys::console::error_1(&error);
+    }
     let has_selected_node = {
         let graph = graph.borrow();
         selected_node_target(&graph.window).is_some()
@@ -111,7 +114,6 @@ async fn run() -> Result<(), JsValue> {
     if has_selected_node {
         refresh_selected_node_detail_from_graph(graph.clone()).await?;
     }
-    spawn_local(refresh_graph_items_on_version(graph.clone()));
     spawn_local(refresh_server_rendered_sections_on_version(graph));
 
     Ok(())
@@ -123,9 +125,6 @@ fn setup_graph() -> Result<Rc<RefCell<VirtualGraph>>, JsValue> {
     let graph = Rc::new(RefCell::new(graph));
 
     install_graph_listeners(graph.clone())?;
-    if let Err(error) = install_graph_progress_events(graph.clone()) {
-        web_sys::console::error_1(&error);
-    }
 
     Ok(graph)
 }
@@ -136,20 +135,41 @@ fn browser_context() -> Result<(Window, Document), JsValue> {
     Ok((window, document))
 }
 
-fn install_graph_progress_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+fn install_graph_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let source = EventSource::new("/events")?;
-    let callback_graph = graph.clone();
-    let callback =
+    let version_graph = graph.clone();
+    let version_callback =
         Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
             let Some(data) = event.data().as_string() else {
                 return;
             };
-            handle_graph_progress_event(callback_graph.clone(), &data);
+            handle_graph_version_event(version_graph.clone(), &data);
         }));
-    source.add_event_listener_with_callback("graph-progress", callback.as_ref().unchecked_ref())?;
-    callback.forget();
+    source.add_event_listener_with_callback("graph", version_callback.as_ref().unchecked_ref())?;
+    version_callback.forget();
+
+    let progress_graph = graph.clone();
+    let progress_callback =
+        Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+            let Some(data) = event.data().as_string() else {
+                return;
+            };
+            handle_graph_progress_event(progress_graph.clone(), &data);
+        }));
+    source.add_event_listener_with_callback(
+        "graph-progress",
+        progress_callback.as_ref().unchecked_ref(),
+    )?;
+    progress_callback.forget();
     graph.borrow_mut().progress_events = Some(source);
     Ok(())
+}
+
+fn handle_graph_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
+    match data.parse::<u64>() {
+        Ok(version) => request_graph_items_refresh(graph, version),
+        Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
+    }
 }
 
 fn handle_graph_progress_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
@@ -275,6 +295,8 @@ struct VirtualGraph {
     patch_in_flight: bool,
     pending_viewport_update: PendingViewportUpdate,
     graph_rebuild_active: bool,
+    announced_version: u64,
+    version_refresh_scheduled: bool,
     version_refresh_abort: Option<AbortController>,
     progress_events: Option<EventSource>,
 }
@@ -317,6 +339,8 @@ impl VirtualGraph {
             patch_in_flight: false,
             pending_viewport_update: PendingViewportUpdate::None,
             graph_rebuild_active: false,
+            announced_version: version,
+            version_refresh_scheduled: false,
             version_refresh_abort: None,
             progress_events: None,
         };
@@ -1395,8 +1419,40 @@ fn finish_applied_viewport_patch(graph: &mut VirtualGraph) -> bool {
     should_continue
 }
 
-async fn refresh_graph_items_on_version(graph: Rc<RefCell<VirtualGraph>>) {
-    refresh_on_version(graph, refresh_graph_items_once).await;
+fn request_graph_items_refresh(graph: Rc<RefCell<VirtualGraph>>, announced_version: u64) {
+    {
+        let mut graph = graph.borrow_mut();
+        graph.announced_version = graph.announced_version.max(announced_version);
+    }
+    schedule_graph_items_refresh(graph);
+}
+
+fn schedule_graph_items_refresh(graph: Rc<RefCell<VirtualGraph>>) {
+    let should_schedule = {
+        let mut graph = graph.borrow_mut();
+        if graph.version_refresh_scheduled || graph.announced_version <= graph.version {
+            false
+        } else {
+            graph.version_refresh_scheduled = true;
+            true
+        }
+    };
+    if should_schedule {
+        spawn_local(run_scheduled_graph_items_refresh(graph));
+    }
+}
+
+async fn run_scheduled_graph_items_refresh(graph: Rc<RefCell<VirtualGraph>>) {
+    refresh_graph_items_once(graph.clone()).await;
+    let retry = {
+        let graph = graph.borrow();
+        graph.announced_version > graph.version
+    };
+    if retry {
+        delay_graph_items_retry(graph.clone()).await;
+    }
+    graph.borrow_mut().version_refresh_scheduled = false;
+    schedule_graph_items_refresh(graph);
 }
 
 async fn refresh_graph_items_once(graph: Rc<RefCell<VirtualGraph>>) {

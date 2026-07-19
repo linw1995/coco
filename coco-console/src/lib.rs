@@ -30,6 +30,7 @@ mod host {
     #[allow(dead_code)]
     pub mod source_cache;
     pub mod store;
+    pub mod web_graph_runtime;
     #[allow(dead_code)]
     pub mod web_graph_store;
 

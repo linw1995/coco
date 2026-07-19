@@ -126,6 +126,36 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
+    pub async fn layout_column_bottom(
+        &self,
+        kind: LayoutKind,
+        x: i32,
+    ) -> Result<Option<GraphRead<Option<i32>>>> {
+        use diesel::dsl::max;
+        use diesel_async::RunQueryDsl;
+
+        let path = self.path.clone();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let bottom = web_graph_node_placements::table
+                    .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+                    .filter(web_graph_node_placements::x.eq(x))
+                    .select(max(web_graph_node_placements::y))
+                    .get_result::<Option<i32>>(connection)
+                    .await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: bottom,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
     pub async fn node_placements(
         &self,
         kind: LayoutKind,
@@ -281,6 +311,22 @@ impl WebGraphStore {
         connection
             .immediate_transaction::<_, TransactionError, _>(async |connection| {
                 replace_snapshot(connection, &snapshot).await
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn initialize(&self, graph: &Graph) -> Result<bool> {
+        let snapshot = graph.snapshot();
+        let path = self.path.clone();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .immediate_transaction::<_, TransactionError, _>(async |connection| {
+                if load_state(connection).await?.is_some() {
+                    return Ok(false);
+                }
+                replace_snapshot(connection, &snapshot).await?;
+                Ok(true)
             })
             .await
             .map_err(|error| error.into_store_error(path))

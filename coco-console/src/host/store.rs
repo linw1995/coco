@@ -41,13 +41,26 @@ impl<S> ConsoleStore<S> {
         result
     }
 
-    fn notify_branches_if_ok<T>(
+    fn notify_node_if_ok(&self, result: StoreResult<String>) -> StoreResult<String> {
+        if let Ok(node_id) = &result {
+            self.publisher.mark_node_created(node_id.clone());
+        }
+        result
+    }
+
+    fn notify_branch_and_node_if_ok(
         &self,
-        branches: impl IntoIterator<Item = String>,
-        result: StoreResult<T>,
-    ) -> StoreResult<T> {
-        if result.is_ok() {
-            self.publisher.mark_branches_changed(branches);
+        branch: impl Into<String>,
+        node_created: bool,
+        result: StoreResult<String>,
+    ) -> StoreResult<String> {
+        if let Ok(node_id) = &result {
+            if node_created {
+                self.publisher
+                    .mark_branch_and_node_changed(branch, node_id.clone());
+            } else {
+                self.publisher.mark_branch_changed(branch);
+            }
         }
         result
     }
@@ -63,7 +76,7 @@ where
     }
 
     async fn append(&self, node: NewNode) -> StoreResult<String> {
-        self.inner.append(node).await
+        self.notify_node_if_ok(self.inner.append(node).await)
     }
 
     async fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
@@ -121,8 +134,10 @@ where
         parent: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_branch_if_ok(
+        let node_created = !nodes.is_empty();
+        self.notify_branch_and_node_if_ok(
             name,
+            node_created,
             self.inner
                 .append_nodes_and_set_branch_head(name, expected_old_head, parent, nodes)
                 .await,
@@ -137,8 +152,10 @@ where
         new_head: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_branch_if_ok(
+        let node_created = !nodes.is_empty();
+        self.notify_branch_and_node_if_ok(
             name,
+            node_created,
             self.inner
                 .append_nodes_and_set_branch_head_to(
                     name,
@@ -156,12 +173,20 @@ where
         update: BranchAppendSessionState,
     ) -> StoreResult<String> {
         let branches = [update.branch.clone(), update.session_branch.clone()];
-        self.notify_branches_if_ok(
-            branches,
-            self.inner
-                .append_nodes_and_set_branch_head_with_session_state(update)
-                .await,
-        )
+        let node_created = !update.nodes.is_empty();
+        let result = self
+            .inner
+            .append_nodes_and_set_branch_head_with_session_state(update)
+            .await;
+        if let Ok(node_id) = &result {
+            if node_created {
+                self.publisher
+                    .mark_branches_and_node_changed(branches, node_id.clone());
+            } else {
+                self.publisher.mark_branches_changed(branches);
+            }
+        }
+        result
     }
 }
 
@@ -191,7 +216,7 @@ where
     }
 
     async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        self.notify_branch_if_ok(name, self.inner.rebase_session(name, patch).await)
+        self.notify_branch_and_node_if_ok(name, true, self.inner.rebase_session(name, patch).await)
     }
 
     async fn handoff_session(
@@ -200,7 +225,11 @@ where
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> StoreResult<String> {
-        self.notify_branch_if_ok(name, self.inner.handoff_session(name, patch, prompt).await)
+        self.notify_branch_and_node_if_ok(
+            name,
+            true,
+            self.inner.handoff_session(name, patch, prompt).await,
+        )
     }
 }
 
@@ -287,9 +316,14 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job> {
-        self.inner
+        let result = self
+            .inner
             .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
-            .await
+            .await;
+        if let Ok(job) = &result {
+            self.publisher.mark_node_created(job.base.clone());
+        }
+        result
     }
 
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
@@ -304,7 +338,8 @@ where
         merge_parents: Vec<MergeParent>,
         session_patch: Option<SessionAnchorPatch>,
     ) -> StoreResult<Job> {
-        self.inner
+        let result = self
+            .inner
             .submit_job_with_id_and_prompt_base(
                 job_id,
                 branch,
@@ -312,7 +347,11 @@ where
                 merge_parents,
                 session_patch,
             )
-            .await
+            .await;
+        if let Ok(job) = &result {
+            self.publisher.mark_node_created(job.base.clone());
+        }
+        result
     }
 
     async fn get_job(&self, job_id: &str) -> StoreResult<Job> {
@@ -389,7 +428,7 @@ mod tests {
     use coco_mem::{Kind, Role, SqliteStore};
 
     #[tokio::test]
-    async fn only_visible_graph_mutations_publish_branch_invalidations() {
+    async fn node_creation_and_visible_mutations_publish_precise_invalidations() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(inner, publisher.clone());
@@ -408,13 +447,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(publisher.current_version(), 0);
+        assert_eq!(publisher.current_version(), 1);
 
         store.fork("main", &root).await.unwrap();
         store.submit_job("main", &root).await.unwrap();
         store.set_branch_head("main", &root, &child).await.unwrap();
 
-        assert_eq!(publisher.current_version(), 2);
+        assert_eq!(publisher.current_version(), 3);
         let invalidations = publisher.take_invalidations();
         assert_eq!(invalidations.branches, ["main".to_owned()].into());
         assert!(!invalidations.full);

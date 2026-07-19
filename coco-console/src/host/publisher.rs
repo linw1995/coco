@@ -3,12 +3,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
+
+const NODE_CREATION_CHANNEL_CAPACITY: usize = 1_024;
 
 #[derive(Clone)]
 pub struct ConsolePublisher {
     version: Arc<AtomicU64>,
     tx: watch::Sender<u64>,
+    node_tx: broadcast::Sender<ConsoleNodeCreated>,
     pending: Arc<Mutex<PendingInvalidations>>,
 }
 
@@ -25,6 +28,12 @@ pub(crate) struct ConsoleInvalidationBatch {
     pub branches: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConsoleNodeCreated {
+    pub source_version: u64,
+    pub node_id: String,
+}
+
 impl Default for ConsolePublisher {
     fn default() -> Self {
         Self::new()
@@ -34,9 +43,11 @@ impl Default for ConsolePublisher {
 impl ConsolePublisher {
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0);
+        let (node_tx, _) = broadcast::channel(NODE_CREATION_CHANNEL_CAPACITY);
         Self {
             version: Arc::new(AtomicU64::new(0)),
             tx,
+            node_tx,
             pending: Arc::new(Mutex::new(PendingInvalidations::default())),
         }
     }
@@ -73,6 +84,44 @@ impl ConsolePublisher {
             |pending| pending.branches.extend(branches),
             |publisher| publisher.publish_change(),
         )
+    }
+
+    pub(crate) fn mark_node_created(&self, node_id: impl Into<String>) -> u64 {
+        self.mark_changed_with_node(|_| {}, node_id)
+    }
+
+    pub(crate) fn mark_branch_and_node_changed(
+        &self,
+        branch: impl Into<String>,
+        node_id: impl Into<String>,
+    ) -> u64 {
+        self.mark_changed_with_node(
+            |pending| {
+                pending.branches.insert(branch.into());
+            },
+            node_id,
+        )
+    }
+
+    pub(crate) fn mark_branches_and_node_changed(
+        &self,
+        branches: impl IntoIterator<Item = String>,
+        node_id: impl Into<String>,
+    ) -> u64 {
+        self.mark_changed_with_node(|pending| pending.branches.extend(branches), node_id)
+    }
+
+    fn mark_changed_with_node(
+        &self,
+        update: impl FnOnce(&mut PendingInvalidations),
+        node_id: impl Into<String>,
+    ) -> u64 {
+        let version = self.update_and_publish(update, |publisher| publisher.publish_change());
+        let _ = self.node_tx.send(ConsoleNodeCreated {
+            source_version: version,
+            node_id: node_id.into(),
+        });
+        version
     }
 
     fn update_and_publish(
@@ -148,6 +197,10 @@ impl ConsolePublisher {
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_node_creations(&self) -> broadcast::Receiver<ConsoleNodeCreated> {
+        self.node_tx.subscribe()
     }
 }
 
@@ -240,5 +293,27 @@ mod tests {
         assert_eq!(batch.version, 1);
         assert!(!batch.full);
         assert_eq!(batch.branches, BTreeSet::from(["main".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn node_creation_uses_the_same_version_as_its_invalidation() {
+        let publisher = ConsolePublisher::new();
+        let mut nodes = publisher.subscribe_node_creations();
+
+        let version = publisher.mark_branch_and_node_changed("main", "node-1");
+
+        assert_eq!(version, 1);
+        assert_eq!(publisher.current_version(), 1);
+        assert_eq!(
+            nodes.recv().await.unwrap(),
+            ConsoleNodeCreated {
+                source_version: 1,
+                node_id: "node-1".to_owned(),
+            }
+        );
+        assert_eq!(
+            publisher.take_invalidations().branches,
+            BTreeSet::from(["main".to_owned()])
+        );
     }
 }
