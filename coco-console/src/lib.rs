@@ -1,5 +1,8 @@
 mod api;
 
+#[allow(dead_code)]
+mod web_graph;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod schema;
 
