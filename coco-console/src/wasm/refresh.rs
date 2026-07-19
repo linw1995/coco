@@ -48,6 +48,14 @@ pub fn viewport_update_active(
     patch_in_flight || pending_update.is_pending()
 }
 
+pub fn node_selection_needs_hash_change(
+    selected_target: Option<&str>,
+    selected_context: Option<&str>,
+    target: &str,
+) -> bool {
+    selected_target != Some(target) || selected_context.is_some()
+}
+
 pub fn next_viewport_fetch(
     rendered: ViewportState,
     current: ViewportState,
@@ -92,7 +100,8 @@ pub fn version_refresh_action(
 mod tests {
     use super::{
         PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
-        pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
+        node_selection_needs_hash_change, pending_update_for_viewport_change,
+        version_refresh_action, viewport_update_active,
     };
     use crate::wasm::viewport::ViewportState;
 
@@ -203,6 +212,25 @@ mod tests {
     #[test]
     fn viewport_update_stays_active_after_pending_update_is_consumed() {
         assert!(viewport_update_active(true, PendingViewportUpdate::None));
+    }
+
+    #[test]
+    fn node_selection_changes_hash_only_when_hashchange_should_refresh() {
+        assert!(node_selection_needs_hash_change(
+            Some("detail-before"),
+            None,
+            "detail-after"
+        ));
+        assert!(node_selection_needs_hash_change(
+            Some("detail-after"),
+            Some("detail-context"),
+            "detail-after"
+        ));
+        assert!(!node_selection_needs_hash_change(
+            Some("detail-after"),
+            None,
+            "detail-after"
+        ));
     }
 
     #[test]

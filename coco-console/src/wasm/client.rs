@@ -13,7 +13,8 @@ use web_sys::{
 
 use super::refresh::{
     PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
-    pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
+    node_selection_needs_hash_change, pending_update_for_viewport_change, version_refresh_action,
+    viewport_update_active,
 };
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -1788,12 +1789,13 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
         graph.window.clone()
     };
 
-    if (selected_node_target(&window).as_deref() != Some(target.as_str())
-        || selected_provider_context_target(&window).is_some())
-        && let Err(error) = window.location().set_hash(&target)
-    {
-        web_sys::console::error_1(&error);
-        return;
+    match set_selected_node_hash(&window, &target) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            return;
+        }
     }
 
     spawn_local(async move {
@@ -1801,6 +1803,18 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
             web_sys::console::error_1(&error);
         }
     });
+}
+
+fn set_selected_node_hash(window: &Window, target: &str) -> Result<bool, JsValue> {
+    if !node_selection_needs_hash_change(
+        selected_node_target(window).as_deref(),
+        selected_provider_context_target(window).as_deref(),
+        target,
+    ) {
+        return Ok(false);
+    }
+    window.location().set_hash(target)?;
+    Ok(true)
 }
 
 async fn refresh_selected_node_detail_from_graph(
@@ -2645,6 +2659,29 @@ mod tests {
                 .text_content()
                 .as_deref(),
             Some("Select a node to inspect its provider context.")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_node_selection_uses_one_refresh_trigger() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+
+        assert!(
+            set_selected_node_hash(&window, "detail-aaaaaaaa")
+                .expect_throw("new selection hash should be set")
+        );
+        assert!(
+            !set_selected_node_hash(&window, "detail-aaaaaaaa")
+                .expect_throw("unchanged selection should be detected")
+        );
+        window
+            .location()
+            .set_hash("detail-aaaaaaaa?context=detail-context")
+            .expect_throw("provider context hash should be set");
+        assert!(
+            set_selected_node_hash(&window, "detail-aaaaaaaa")
+                .expect_throw("provider context selection should be cleared")
         );
     }
 
