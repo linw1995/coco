@@ -2,6 +2,7 @@ pub const MIN_OVERSCAN: i32 = 180;
 const VERTICAL_PREFETCH_MULTIPLIER: f64 = 3.0;
 const SHORT_CANVAS_VISIBLE_WIDTH_FRACTION: f64 = 0.74;
 const SHORT_CANVAS_VISIBLE_HEIGHT_FRACTION: f64 = 0.82;
+const DRAG_THRESHOLD_PX: f64 = 3.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ViewportState {
@@ -10,6 +11,44 @@ pub struct ViewportState {
     pub width: f64,
     pub height: f64,
     pub overscan: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ViewportDrag {
+    start_client_x: f64,
+    start_client_y: f64,
+    start_viewport_x: f64,
+    start_viewport_y: f64,
+    zoom: f64,
+}
+
+impl ViewportDrag {
+    pub fn new(
+        viewport: ViewportState,
+        zoom: f64,
+        start_client_x: f64,
+        start_client_y: f64,
+    ) -> Self {
+        Self {
+            start_client_x,
+            start_client_y,
+            start_viewport_x: viewport.x,
+            start_viewport_y: viewport.y,
+            zoom,
+        }
+    }
+
+    pub fn viewport_origin_at(self, client_x: f64, client_y: f64) -> Option<(f64, f64)> {
+        let delta_x = client_x - self.start_client_x;
+        let delta_y = client_y - self.start_client_y;
+        if delta_x.mul_add(delta_x, delta_y * delta_y) < DRAG_THRESHOLD_PX.powi(2) {
+            return None;
+        }
+        Some((
+            self.start_viewport_x - delta_x / self.zoom,
+            self.start_viewport_y - delta_y / self.zoom,
+        ))
+    }
 }
 
 impl ViewportState {
@@ -157,8 +196,8 @@ fn short_axis_zoom(
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch, same_viewport,
-        short_canvas_auto_zoom,
+        ViewportDrag, ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch,
+        same_viewport, short_canvas_auto_zoom,
     };
 
     fn viewport(x: f64, y: f64) -> ViewportState {
@@ -332,5 +371,13 @@ mod tests {
             short_canvas_auto_zoom(1000.0, 600.0, 1600.0, 900.0, 1.25),
             1.25
         );
+    }
+
+    #[test]
+    fn viewport_drag_moves_against_scaled_pointer_delta_after_threshold() {
+        let drag = ViewportDrag::new(viewport(100.0, 80.0), 2.0, 40.0, 30.0);
+
+        assert_eq!(drag.viewport_origin_at(42.0, 32.0), None);
+        assert_eq!(drag.viewport_origin_at(60.0, 40.0), Some((90.0, 75.0)));
     }
 }

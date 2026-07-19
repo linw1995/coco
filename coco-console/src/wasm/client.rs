@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::str::{FromStr, Split};
@@ -21,7 +21,7 @@ use crate::api::{
     GraphViewportResponse, Point,
 };
 use crate::viewport::{
-    MIN_OVERSCAN, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
+    MIN_OVERSCAN, ViewportDrag, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
 };
 
 const ROOT_ID: &str = "console-root";
@@ -1552,9 +1552,10 @@ fn graph_item_i32(element: &Element, attr: &str) -> Option<i32> {
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let installers: [GraphListenerInstaller; 7] = [
+    let installers: [GraphListenerInstaller; 8] = [
         install_node_detail_listener,
         install_follow_toggle_listener,
+        install_mouse_pan_listener,
         install_wheel_listener,
         install_resize_listener,
         install_time_scale_listener,
@@ -1564,6 +1565,93 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
     for install in installers {
         install(graph.clone())?;
     }
+    Ok(())
+}
+
+fn install_mouse_pan_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let graph_wrap = graph.borrow().graph_wrap.clone();
+    let window = graph.borrow().window.clone();
+    let drag = Rc::new(RefCell::new(None::<ViewportDrag>));
+    let did_pan = Rc::new(Cell::new(false));
+    let suppress_click = Rc::new(Cell::new(false));
+
+    let down_graph = graph.clone();
+    let down_drag = drag.clone();
+    let down_did_pan = did_pan.clone();
+    let down_suppress_click = suppress_click.clone();
+    let down_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        if event.button() != 0 {
+            return;
+        }
+        event.prevent_default();
+        down_suppress_click.set(false);
+        let graph = down_graph.borrow();
+        down_drag.replace(Some(ViewportDrag::new(
+            graph.viewport,
+            graph.zoom,
+            f64::from(event.client_x()),
+            f64::from(event.client_y()),
+        )));
+        down_did_pan.set(false);
+    });
+    graph_wrap
+        .add_event_listener_with_callback("mousedown", down_closure.as_ref().unchecked_ref())?;
+    down_closure.forget();
+
+    let move_graph = graph.clone();
+    let move_drag = drag.clone();
+    let move_did_pan = did_pan.clone();
+    let move_suppress_click = suppress_click.clone();
+    let move_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        if event.buttons() & 1 == 0 {
+            if move_drag.borrow_mut().take().is_some() {
+                move_suppress_click.set(move_did_pan.replace(false));
+            }
+            return;
+        }
+        let Some((x, y)) = move_drag.borrow().as_ref().and_then(|drag| {
+            drag.viewport_origin_at(f64::from(event.client_x()), f64::from(event.client_y()))
+        }) else {
+            return;
+        };
+        event.prevent_default();
+        move_did_pan.set(true);
+        update_viewport(move_graph.clone(), |graph| {
+            if graph.auto_follow
+                && let Err(error) = graph.set_auto_follow(false)
+            {
+                web_sys::console::error_1(&error);
+            }
+            graph.viewport.x = x;
+            graph.viewport.y = y;
+        });
+    });
+    window.add_event_listener_with_callback("mousemove", move_closure.as_ref().unchecked_ref())?;
+    move_closure.forget();
+
+    let up_drag = drag;
+    let up_did_pan = did_pan;
+    let up_suppress_click = suppress_click.clone();
+    let up_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        if event.button() == 0 && up_drag.borrow_mut().take().is_some() {
+            up_suppress_click.set(up_did_pan.replace(false));
+        }
+    });
+    window.add_event_listener_with_callback("mouseup", up_closure.as_ref().unchecked_ref())?;
+    up_closure.forget();
+
+    let click_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        if suppress_click.replace(false) {
+            event.prevent_default();
+            event.stop_immediate_propagation();
+        }
+    });
+    graph_wrap.add_event_listener_with_callback_and_bool(
+        "click",
+        click_closure.as_ref().unchecked_ref(),
+        true,
+    )?;
+    click_closure.forget();
     Ok(())
 }
 
