@@ -1,21 +1,23 @@
+use std::collections::{BTreeSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use diesel::{
-    ExpressionMethods, Insertable, OptionalExtension, QueryDsl, Queryable, Selectable,
-    SelectableHelper,
+    BoolExpressionMethods, ExpressionMethods, Insertable, OptionalExtension, QueryDsl, Queryable,
+    Selectable, SelectableHelper,
 };
 use diesel_async::AsyncConnection;
 use diesel_migrations::{EmbeddedMigrations, embed_migrations};
 use snafu::prelude::*;
 
 use crate::web_graph::{
-    BezierRoute, Canvas, EdgeId, EdgeKind, Graph, LayoutKind, LayoutPatch, LayoutSnapshot,
-    LayoutSnapshots, NodeId, NodePlacement, Patch, Point, Revision, RoutedEdge, Snapshot,
-    SourceVersion, TopologyPatch, TopologySnapshot,
+    BezierRoute, Canvas, EdgeId, EdgeKind, Graph, LayoutKind, LayoutPatch, LayoutSnapshot, NodeId,
+    NodePlacement, Patch, Point, Revision, RoutedEdge, Snapshot, SourceVersion, TopologyPatch,
 };
 
 const DATABASE_FILE_NAME: &str = "web-graph.sqlite3";
 const WRITE_BATCH_SIZE: usize = 64;
+const MAX_READ_BATCH_SIZE: usize = 128;
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("web-graph-migrations");
 
 mod database;
@@ -31,6 +33,45 @@ use schema::{
 pub struct WebGraphStore {
     path: PathBuf,
     database: Database,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredGraphState {
+    pub format_version: u32,
+    pub revision: Revision,
+    pub source_version: SourceVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRead<T> {
+    pub state: StoredGraphState,
+    pub value: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageCursor<T> {
+    revision: Revision,
+    layout: LayoutKind,
+    scope: CursorScope,
+    after: T,
+}
+
+impl<T> PageCursor<T> {
+    pub fn revision(&self) -> Revision {
+        self.revision
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CursorScope {
+    All,
+    Incident(Vec<NodeId>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphPage<T, C> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<PageCursor<C>>,
 }
 
 impl std::fmt::Debug for WebGraphStore {
@@ -57,11 +98,144 @@ impl WebGraphStore {
         &self.path
     }
 
-    pub async fn load(&self) -> Result<Option<Graph>> {
+    pub async fn state(&self) -> Result<Option<StoredGraphState>> {
+        let path = self.path.clone();
+        let mut connection = self.database.acquire().await?;
+        load_state(&mut connection)
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn canvas(&self, kind: LayoutKind) -> Result<Option<GraphRead<Canvas>>> {
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
         connection
-            .transaction::<_, TransactionError, _>(async |connection| load_graph(connection).await)
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let canvas = load_canvas(connection, kind).await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: canvas,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn node_placements(
+        &self,
+        kind: LayoutKind,
+        node_ids: &[NodeId],
+    ) -> Result<Option<GraphRead<Vec<NodePlacement>>>> {
+        validate_read_batch_size(node_ids.len())?;
+        let path = self.path.clone();
+        let node_ids = node_ids
+            .iter()
+            .map(|node| node.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let placements = load_placements_by_node_ids(connection, kind, &node_ids).await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: placements,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn incident_edge_routes_page(
+        &self,
+        kind: LayoutKind,
+        node_ids: &[NodeId],
+        cursor: Option<&PageCursor<EdgeId>>,
+        limit: NonZeroUsize,
+    ) -> Result<Option<GraphRead<GraphPage<RoutedEdge, EdgeId>>>> {
+        validate_read_batch_size(node_ids.len())?;
+        validate_read_batch_size(limit.get())?;
+        let path = self.path.clone();
+        let scope = CursorScope::Incident(
+            node_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        );
+        let cursor = cursor.cloned();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                validate_cursor(cursor.as_ref(), state.revision, kind, &scope)?;
+                let page = load_routes_page(connection, kind, cursor, limit, state.revision, scope)
+                    .await?;
+                Ok(Some(GraphRead { state, value: page }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn node_placements_page(
+        &self,
+        kind: LayoutKind,
+        cursor: Option<&PageCursor<NodeId>>,
+        limit: NonZeroUsize,
+    ) -> Result<Option<GraphRead<GraphPage<NodePlacement, NodeId>>>> {
+        validate_read_batch_size(limit.get())?;
+        let path = self.path.clone();
+        let cursor = cursor.cloned();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                validate_cursor(cursor.as_ref(), state.revision, kind, &CursorScope::All)?;
+                let page =
+                    load_placements_page(connection, kind, cursor, limit, state.revision).await?;
+                Ok(Some(GraphRead { state, value: page }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn edge_routes_page(
+        &self,
+        kind: LayoutKind,
+        cursor: Option<&PageCursor<EdgeId>>,
+        limit: NonZeroUsize,
+    ) -> Result<Option<GraphRead<GraphPage<RoutedEdge, EdgeId>>>> {
+        validate_read_batch_size(limit.get())?;
+        let path = self.path.clone();
+        let cursor = cursor.cloned();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                validate_cursor(cursor.as_ref(), state.revision, kind, &CursorScope::All)?;
+                let page = load_routes_page(
+                    connection,
+                    kind,
+                    cursor,
+                    limit,
+                    state.revision,
+                    CursorScope::All,
+                )
+                .await?;
+                Ok(Some(GraphRead { state, value: page }))
+            })
             .await
             .map_err(|error| error.into_store_error(path))
     }
@@ -78,19 +252,25 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
-    pub async fn apply_patch(&self, patch: Patch) -> Result<Graph> {
+    pub async fn apply_patch(&self, patch: Patch) -> Result<StoredGraphState> {
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
         connection
             .immediate_transaction::<_, TransactionError, _>(async |connection| {
-                let mut graph = load_graph(connection).await?.ok_or_else(|| {
+                let state = load_state(connection).await?.ok_or_else(|| {
                     TransactionError::Operation(Error::NotInitialized { path: path.clone() })
                 })?;
-                graph.apply_patch(patch.clone()).map_err(|source| {
-                    TransactionError::Operation(Error::InvalidGraph { source })
-                })?;
+                patch
+                    .validate_against(state.revision, state.source_version)
+                    .map_err(invalid_graph)?;
+                validate_patch_candidate(connection, &patch).await?;
                 apply_patch_rows(connection, &patch).await?;
-                Ok(graph)
+                validate_new_cycles(connection, &patch).await?;
+                Ok(StoredGraphState {
+                    format_version: state.format_version,
+                    revision: patch.revision,
+                    source_version: patch.source_version,
+                })
             })
             .await
             .map_err(|error| error.into_store_error(path))
@@ -154,13 +334,6 @@ struct RouteRow {
     target_y: i32,
 }
 
-#[derive(Default)]
-struct LoadedLayout {
-    canvas: Option<Canvas>,
-    nodes: Vec<NodePlacement>,
-    edges: Vec<RoutedEdge>,
-}
-
 struct SnapshotRows {
     state: StateRow,
     nodes: Vec<NodeRow>,
@@ -214,6 +387,17 @@ pub enum Error {
     #[snafu(display("Web graph store {} is not initialized", path.display()))]
     NotInitialized { path: PathBuf },
 
+    #[snafu(display("Web graph read batch contains {actual} items; maximum is {maximum}"))]
+    ReadBatchTooLarge { actual: usize, maximum: usize },
+
+    #[snafu(display(
+        "Web graph page cursor revision {cursor} does not match current revision {current}"
+    ))]
+    StaleCursor { cursor: Revision, current: Revision },
+
+    #[snafu(display("Web graph page cursor belongs to a different query"))]
+    CursorQueryMismatch,
+
     #[snafu(display("Stored web graph is invalid: {source}"))]
     InvalidGraph { source: crate::web_graph::Error },
 
@@ -262,147 +446,243 @@ impl From<Error> for TransactionError {
     }
 }
 
-async fn load_graph(
+async fn load_state(
     connection: &mut AsyncSqliteConnection,
-) -> std::result::Result<Option<Graph>, TransactionError> {
+) -> std::result::Result<Option<StoredGraphState>, TransactionError> {
     use diesel_async::RunQueryDsl;
 
-    let Some(state) = web_graph_state::table
+    web_graph_state::table
         .filter(web_graph_state::id.eq(1))
         .select(StateRow::as_select())
         .first::<StateRow>(connection)
         .await
         .optional()?
-    else {
-        return Ok(None);
-    };
+        .map(stored_state)
+        .transpose()
+}
 
-    let nodes = web_graph_nodes::table
-        .order(web_graph_nodes::node_id.asc())
-        .select(NodeRow::as_select())
-        .load::<NodeRow>(connection)
-        .await?
-        .into_iter()
-        .map(|row| stored_node_id(row.node_id))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let edges = web_graph_edges::table
-        .order((
-            web_graph_edges::edge_kind.asc(),
-            web_graph_edges::source_id.asc(),
-            web_graph_edges::target_id.asc(),
-        ))
-        .select(EdgeRow::as_select())
-        .load::<EdgeRow>(connection)
-        .await?
-        .into_iter()
-        .map(stored_edge)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut anchors = LoadedLayout::default();
-    let mut all = LoadedLayout::default();
-    for row in web_graph_layouts::table
-        .order(web_graph_layouts::layout_kind.asc())
-        .select(LayoutRow::as_select())
-        .load::<LayoutRow>(connection)
-        .await?
-    {
-        let layout = loaded_layout_mut(
-            stored_layout_kind(&row.layout_kind)?,
-            &mut anchors,
-            &mut all,
-        );
-        if layout
-            .canvas
-            .replace(Canvas {
-                width: row.canvas_width,
-                height: row.canvas_height,
-            })
-            .is_some()
-        {
-            return Err(invalid_value(
-                "web_graph_layouts.layout_kind",
-                row.layout_kind,
-            ));
-        }
+fn stored_state(row: StateRow) -> std::result::Result<StoredGraphState, TransactionError> {
+    let format_version = stored_u32(row.format_version, "web_graph_state.format_version")?;
+    if format_version != crate::web_graph::FORMAT_VERSION {
+        return Err(invalid_graph(crate::web_graph::Error::UnsupportedFormat {
+            actual: format_version,
+        }));
     }
-    for row in web_graph_node_placements::table
-        .order((
-            web_graph_node_placements::layout_kind.asc(),
-            web_graph_node_placements::node_id.asc(),
-        ))
+    Ok(StoredGraphState {
+        format_version,
+        revision: Revision::new(stored_u64(row.revision, "web_graph_state.revision")?),
+        source_version: SourceVersion::new(stored_u64(
+            row.source_version,
+            "web_graph_state.source_version",
+        )?),
+    })
+}
+
+async fn load_canvas(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+) -> std::result::Result<Canvas, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let row = web_graph_layouts::table
+        .filter(web_graph_layouts::layout_kind.eq(layout_kind_value(kind)))
+        .select(LayoutRow::as_select())
+        .first::<LayoutRow>(connection)
+        .await
+        .optional()?
+        .ok_or_else(|| {
+            invalid_value(
+                "web_graph_layouts.layout_kind",
+                format!("missing {} layout", layout_kind_value(kind)),
+            )
+        })?;
+    Ok(Canvas {
+        width: row.canvas_width,
+        height: row.canvas_height,
+    })
+}
+
+async fn load_placements_by_node_ids(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    node_ids: &[String],
+) -> std::result::Result<Vec<NodePlacement>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    web_graph_node_placements::table
+        .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+        .filter(web_graph_node_placements::node_id.eq_any(node_ids))
+        .order(web_graph_node_placements::node_id.asc())
         .select(PlacementRow::as_select())
         .load::<PlacementRow>(connection)
         .await?
-    {
-        let kind = stored_layout_kind(&row.layout_kind)?;
-        loaded_layout_mut(kind, &mut anchors, &mut all)
-            .nodes
-            .push(NodePlacement {
-                node: stored_node_id(row.node_id)?,
-                point: Point { x: row.x, y: row.y },
-            });
+        .into_iter()
+        .map(stored_placement)
+        .collect()
+}
+
+async fn load_placements_page(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    cursor: Option<PageCursor<NodeId>>,
+    limit: NonZeroUsize,
+    revision: Revision,
+) -> std::result::Result<GraphPage<NodePlacement, NodeId>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let after = cursor.map(|cursor| cursor.after.as_str().to_owned());
+    let mut query = web_graph_node_placements::table
+        .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+        .into_boxed();
+    if let Some(after) = &after {
+        query = query.filter(web_graph_node_placements::node_id.gt(after));
     }
-    for row in web_graph_edge_routes::table
+    let mut items = query
+        .order(web_graph_node_placements::node_id.asc())
+        .limit(i64::try_from(limit.get() + 1).expect("bounded read limit fits in SQLite INTEGER"))
+        .select(PlacementRow::as_select())
+        .load::<PlacementRow>(connection)
+        .await?
+        .into_iter()
+        .map(stored_placement)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = items.len() > limit.get();
+    items.truncate(limit.get());
+    let next_cursor = has_more.then(|| PageCursor {
+        revision,
+        layout: kind,
+        scope: CursorScope::All,
+        after: items
+            .last()
+            .expect("a non-empty page has a final node")
+            .node
+            .clone(),
+    });
+    Ok(GraphPage { items, next_cursor })
+}
+
+async fn load_routes_page(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    cursor: Option<PageCursor<EdgeId>>,
+    limit: NonZeroUsize,
+    revision: Revision,
+    scope: CursorScope,
+) -> std::result::Result<GraphPage<RoutedEdge, EdgeId>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let node_ids = match &scope {
+        CursorScope::All => None,
+        CursorScope::Incident(nodes) => Some(
+            nodes
+                .iter()
+                .map(|node| node.as_str().to_owned())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    if node_ids.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(GraphPage {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+    }
+    let after = cursor.map(|cursor| {
+        (
+            edge_kind_value(cursor.after.kind).to_owned(),
+            cursor.after.source.as_str().to_owned(),
+            cursor.after.target.as_str().to_owned(),
+        )
+    });
+    let mut query = web_graph_edge_routes::table
+        .filter(web_graph_edge_routes::layout_kind.eq(layout_kind_value(kind)))
+        .into_boxed();
+    if let Some(node_ids) = &node_ids {
+        query = query.filter(
+            web_graph_edge_routes::source_id
+                .eq_any(node_ids)
+                .or(web_graph_edge_routes::target_id.eq_any(node_ids)),
+        );
+    }
+    if let Some((edge_kind, source, target)) = &after {
+        query = query.filter(
+            web_graph_edge_routes::edge_kind
+                .gt(edge_kind)
+                .or(web_graph_edge_routes::edge_kind
+                    .eq(edge_kind)
+                    .and(web_graph_edge_routes::source_id.gt(source)))
+                .or(web_graph_edge_routes::edge_kind
+                    .eq(edge_kind)
+                    .and(web_graph_edge_routes::source_id.eq(source))
+                    .and(web_graph_edge_routes::target_id.gt(target))),
+        );
+    }
+    let mut items = query
         .order((
-            web_graph_edge_routes::layout_kind.asc(),
             web_graph_edge_routes::edge_kind.asc(),
             web_graph_edge_routes::source_id.asc(),
             web_graph_edge_routes::target_id.asc(),
         ))
+        .limit(i64::try_from(limit.get() + 1).expect("bounded read limit fits in SQLite INTEGER"))
         .select(RouteRow::as_select())
         .load::<RouteRow>(connection)
         .await?
-    {
-        let kind = stored_layout_kind(&row.layout_kind)?;
-        loaded_layout_mut(kind, &mut anchors, &mut all)
-            .edges
-            .push(stored_route(row)?);
-    }
-
-    let snapshot = Snapshot {
-        format_version: stored_u32(state.format_version, "web_graph_state.format_version")?,
-        revision: Revision::new(stored_u64(state.revision, "web_graph_state.revision")?),
-        source_version: SourceVersion::new(stored_u64(
-            state.source_version,
-            "web_graph_state.source_version",
-        )?),
-        topology: TopologySnapshot { nodes, edges },
-        layouts: LayoutSnapshots {
-            anchors: finish_loaded_layout(LayoutKind::Anchors, anchors)?,
-            all: finish_loaded_layout(LayoutKind::All, all)?,
-        },
-    };
-    Graph::from_snapshot(snapshot)
-        .map(Some)
-        .map_err(|source| TransactionError::Operation(Error::InvalidGraph { source }))
+        .into_iter()
+        .map(stored_route)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = items.len() > limit.get();
+    items.truncate(limit.get());
+    let next_cursor = has_more.then(|| PageCursor {
+        revision,
+        layout: kind,
+        scope,
+        after: items
+            .last()
+            .expect("a non-empty page has a final edge")
+            .edge
+            .clone(),
+    });
+    Ok(GraphPage { items, next_cursor })
 }
 
-fn loaded_layout_mut<'a>(
-    kind: LayoutKind,
-    anchors: &'a mut LoadedLayout,
-    all: &'a mut LoadedLayout,
-) -> &'a mut LoadedLayout {
-    match kind {
-        LayoutKind::Anchors => anchors,
-        LayoutKind::All => all,
-    }
-}
-
-fn finish_loaded_layout(
-    kind: LayoutKind,
-    layout: LoadedLayout,
-) -> std::result::Result<LayoutSnapshot, TransactionError> {
-    let canvas = layout.canvas.ok_or_else(|| {
-        invalid_value(
-            "web_graph_layouts.layout_kind",
-            format!("missing {} layout", layout_kind_value(kind)),
-        )
-    })?;
-    Ok(LayoutSnapshot {
-        canvas,
-        nodes: layout.nodes,
-        edges: layout.edges,
+fn stored_placement(row: PlacementRow) -> std::result::Result<NodePlacement, TransactionError> {
+    Ok(NodePlacement {
+        node: stored_node_id(row.node_id)?,
+        point: Point { x: row.x, y: row.y },
     })
+}
+
+fn validate_read_batch_size(actual: usize) -> Result<()> {
+    if actual <= MAX_READ_BATCH_SIZE {
+        Ok(())
+    } else {
+        Err(Error::ReadBatchTooLarge {
+            actual,
+            maximum: MAX_READ_BATCH_SIZE,
+        })
+    }
+}
+
+fn validate_cursor<T>(
+    cursor: Option<&PageCursor<T>>,
+    current: Revision,
+    kind: LayoutKind,
+    scope: &CursorScope,
+) -> std::result::Result<(), TransactionError> {
+    if let Some(cursor) = cursor {
+        if cursor.revision != current {
+            return Err(TransactionError::Operation(Error::StaleCursor {
+                cursor: cursor.revision,
+                current,
+            }));
+        }
+        if cursor.layout != kind || &cursor.scope != scope {
+            return Err(TransactionError::Operation(Error::CursorQueryMismatch));
+        }
+    }
+    Ok(())
 }
 
 fn stored_node_id(value: String) -> std::result::Result<NodeId, TransactionError> {
@@ -451,14 +731,6 @@ fn stored_edge_kind(value: &str) -> std::result::Result<EdgeKind, TransactionErr
         "merge_parent" => Ok(EdgeKind::Merge),
         "shadow_parent" => Ok(EdgeKind::Shadow),
         _ => Err(invalid_value("edge_kind", value)),
-    }
-}
-
-fn stored_layout_kind(value: &str) -> std::result::Result<LayoutKind, TransactionError> {
-    match value {
-        "anchors" => Ok(LayoutKind::Anchors),
-        "all" => Ok(LayoutKind::All),
-        _ => Err(invalid_value("layout_kind", value)),
     }
 }
 
@@ -543,6 +815,534 @@ async fn replace_snapshot(
         })
         .await?;
     Ok(())
+}
+
+async fn validate_patch_candidate(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+) -> std::result::Result<(), TransactionError> {
+    validate_patch_item_existence(connection, patch).await?;
+    validate_explicit_cleanup(connection, patch).await?;
+    validate_final_references(connection, patch).await
+}
+
+async fn validate_patch_item_existence(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+) -> std::result::Result<(), TransactionError> {
+    for node in &patch.topology.remove_nodes {
+        require_patch_item(
+            topology_node_exists(connection, node).await?,
+            false,
+            "topology.remove_nodes",
+            node,
+        )?;
+    }
+    for node in &patch.topology.add_nodes {
+        require_patch_item(
+            topology_node_exists(connection, node).await?,
+            true,
+            "topology.add_nodes",
+            node,
+        )?;
+    }
+    for edge in &patch.topology.remove_edges {
+        require_patch_item(
+            topology_edge_exists(connection, edge).await?,
+            false,
+            "topology.remove_edges",
+            edge,
+        )?;
+    }
+    for edge in &patch.topology.add_edges {
+        require_patch_item(
+            topology_edge_exists(connection, edge).await?,
+            true,
+            "topology.add_edges",
+            edge,
+        )?;
+    }
+    for kind in [LayoutKind::Anchors, LayoutKind::All] {
+        let layout_patch = patch_layout(patch, kind);
+        for node in &layout_patch.remove_nodes {
+            require_patch_item(
+                layout_node_exists(connection, kind, node).await?,
+                false,
+                layout_patch_collection(kind, "remove_nodes"),
+                node,
+            )?;
+        }
+        for edge in &layout_patch.remove_edges {
+            require_patch_item(
+                layout_edge_exists(connection, kind, edge).await?,
+                false,
+                layout_patch_collection(kind, "remove_edges"),
+                edge,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn validate_explicit_cleanup(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+) -> std::result::Result<(), TransactionError> {
+    for node in &patch.topology.remove_nodes {
+        for edge in load_incident_topology_edges(connection, node).await? {
+            require_explicit_removal(
+                patch.topology.remove_edges.contains(&edge),
+                "topology.remove_edges",
+                &edge,
+            )?;
+        }
+        for kind in [LayoutKind::Anchors, LayoutKind::All] {
+            if layout_node_exists(connection, kind, node).await? {
+                require_explicit_removal(
+                    patch_layout(patch, kind).remove_nodes.contains(node),
+                    layout_patch_collection(kind, "remove_nodes"),
+                    node,
+                )?;
+            }
+        }
+    }
+    for edge in &patch.topology.remove_edges {
+        for kind in [LayoutKind::Anchors, LayoutKind::All] {
+            if layout_edge_exists(connection, kind, edge).await? {
+                require_explicit_removal(
+                    patch_layout(patch, kind).remove_edges.contains(edge),
+                    layout_patch_collection(kind, "remove_edges"),
+                    edge,
+                )?;
+            }
+        }
+    }
+    for kind in [LayoutKind::Anchors, LayoutKind::All] {
+        let layout_patch = patch_layout(patch, kind);
+        for node in &layout_patch.remove_nodes {
+            for edge in load_incident_layout_edges(connection, kind, node).await? {
+                require_explicit_removal(
+                    layout_patch.remove_edges.contains(&edge),
+                    layout_patch_collection(kind, "remove_edges"),
+                    &edge,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_final_references(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+) -> std::result::Result<(), TransactionError> {
+    let affected_nodes = affected_nodes(patch);
+    let affected_edges = affected_edges(patch);
+
+    for edge in &affected_edges {
+        if final_topology_edge_exists(connection, patch, edge).await? {
+            for node in [&edge.source, &edge.target] {
+                if !final_topology_node_exists(connection, patch, node).await? {
+                    return Err(invalid_graph(
+                        crate::web_graph::Error::MissingEdgeEndpoint {
+                            edge: edge.clone(),
+                            node: node.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    for kind in [LayoutKind::Anchors, LayoutKind::All] {
+        for node in &affected_nodes {
+            if final_layout_node_exists(connection, patch, kind, node).await?
+                && !final_topology_node_exists(connection, patch, node).await?
+            {
+                return Err(invalid_graph(
+                    crate::web_graph::Error::LayoutNodeMissingFromTopology {
+                        layout: kind,
+                        node: node.clone(),
+                    },
+                ));
+            }
+        }
+        for edge in &affected_edges {
+            if !final_layout_edge_exists(connection, patch, kind, edge).await? {
+                continue;
+            }
+            if !final_topology_edge_exists(connection, patch, edge).await? {
+                return Err(invalid_graph(
+                    crate::web_graph::Error::LayoutEdgeMissingFromTopology {
+                        layout: kind,
+                        edge: edge.clone(),
+                    },
+                ));
+            }
+            for node in [&edge.source, &edge.target] {
+                if !final_layout_node_exists(connection, patch, kind, node).await? {
+                    return Err(invalid_graph(
+                        crate::web_graph::Error::LayoutEdgeEndpointMissing {
+                            layout: kind,
+                            edge: edge.clone(),
+                            node: node.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    for node in &affected_nodes {
+        let all = final_layout_node_exists(connection, patch, LayoutKind::All, node).await?;
+        if final_layout_node_exists(connection, patch, LayoutKind::Anchors, node).await? && !all {
+            return Err(invalid_graph(
+                crate::web_graph::Error::AnchorNodeMissingFromAll { node: node.clone() },
+            ));
+        }
+        if final_topology_node_exists(connection, patch, node).await? && !all {
+            return Err(invalid_graph(
+                crate::web_graph::Error::TopologyNodeMissingFromAll { node: node.clone() },
+            ));
+        }
+    }
+    for edge in &affected_edges {
+        if final_topology_edge_exists(connection, patch, edge).await?
+            && !final_layout_edge_exists(connection, patch, LayoutKind::Anchors, edge).await?
+            && !final_layout_edge_exists(connection, patch, LayoutKind::All, edge).await?
+        {
+            return Err(invalid_graph(crate::web_graph::Error::UnusedTopologyEdge {
+                edge: edge.clone(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_new_cycles(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+) -> std::result::Result<(), TransactionError> {
+    for kind in [LayoutKind::Anchors, LayoutKind::All] {
+        for routed in &patch_layout(patch, kind).upsert_edges {
+            if layout_path_exists(connection, kind, &routed.edge.target, &routed.edge.source)
+                .await?
+            {
+                return Err(invalid_graph(crate::web_graph::Error::Cycle {
+                    layout: kind,
+                    node: routed.edge.source.clone(),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn layout_path_exists(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    start: &NodeId,
+    target: &NodeId,
+) -> std::result::Result<bool, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let mut visited = BTreeSet::from([start.clone()]);
+    let mut pending = VecDeque::from([start.clone()]);
+    while !pending.is_empty() {
+        let mut sources = Vec::with_capacity(MAX_READ_BATCH_SIZE);
+        while sources.len() < MAX_READ_BATCH_SIZE {
+            let Some(source) = pending.pop_front() else {
+                break;
+            };
+            sources.push(source.as_str().to_owned());
+        }
+        let targets = web_graph_edge_routes::table
+            .filter(web_graph_edge_routes::layout_kind.eq(layout_kind_value(kind)))
+            .filter(web_graph_edge_routes::source_id.eq_any(&sources))
+            .select(web_graph_edge_routes::target_id)
+            .load::<String>(connection)
+            .await?;
+        for target_id in targets {
+            let node = stored_node_id(target_id)?;
+            if &node == target {
+                return Ok(true);
+            }
+            if visited.insert(node.clone()) {
+                pending.push_back(node);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn affected_nodes(patch: &Patch) -> BTreeSet<NodeId> {
+    let mut nodes = BTreeSet::new();
+    nodes.extend(patch.topology.add_nodes.iter().cloned());
+    nodes.extend(patch.topology.remove_nodes.iter().cloned());
+    for kind in [LayoutKind::Anchors, LayoutKind::All] {
+        let layout = patch_layout(patch, kind);
+        nodes.extend(
+            layout
+                .upsert_nodes
+                .iter()
+                .map(|placement| placement.node.clone()),
+        );
+        nodes.extend(layout.remove_nodes.iter().cloned());
+    }
+    nodes
+}
+
+fn affected_edges(patch: &Patch) -> BTreeSet<EdgeId> {
+    let mut edges = BTreeSet::new();
+    edges.extend(patch.topology.add_edges.iter().cloned());
+    edges.extend(patch.topology.remove_edges.iter().cloned());
+    for kind in [LayoutKind::Anchors, LayoutKind::All] {
+        let layout = patch_layout(patch, kind);
+        edges.extend(layout.upsert_edges.iter().map(|routed| routed.edge.clone()));
+        edges.extend(layout.remove_edges.iter().cloned());
+    }
+    edges
+}
+
+async fn topology_node_exists(
+    connection: &mut AsyncSqliteConnection,
+    node: &NodeId,
+) -> std::result::Result<bool, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    Ok(web_graph_nodes::table
+        .filter(web_graph_nodes::node_id.eq(node.as_str()))
+        .select(web_graph_nodes::node_id)
+        .first::<String>(connection)
+        .await
+        .optional()?
+        .is_some())
+}
+
+async fn topology_edge_exists(
+    connection: &mut AsyncSqliteConnection,
+    edge: &EdgeId,
+) -> std::result::Result<bool, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    Ok(web_graph_edges::table
+        .filter(web_graph_edges::edge_kind.eq(edge_kind_value(edge.kind)))
+        .filter(web_graph_edges::source_id.eq(edge.source.as_str()))
+        .filter(web_graph_edges::target_id.eq(edge.target.as_str()))
+        .select(web_graph_edges::target_id)
+        .first::<String>(connection)
+        .await
+        .optional()?
+        .is_some())
+}
+
+async fn layout_node_exists(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    node: &NodeId,
+) -> std::result::Result<bool, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    Ok(web_graph_node_placements::table
+        .filter(web_graph_node_placements::layout_kind.eq(layout_kind_value(kind)))
+        .filter(web_graph_node_placements::node_id.eq(node.as_str()))
+        .select(web_graph_node_placements::node_id)
+        .first::<String>(connection)
+        .await
+        .optional()?
+        .is_some())
+}
+
+async fn layout_edge_exists(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    edge: &EdgeId,
+) -> std::result::Result<bool, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    Ok(web_graph_edge_routes::table
+        .filter(web_graph_edge_routes::layout_kind.eq(layout_kind_value(kind)))
+        .filter(web_graph_edge_routes::edge_kind.eq(edge_kind_value(edge.kind)))
+        .filter(web_graph_edge_routes::source_id.eq(edge.source.as_str()))
+        .filter(web_graph_edge_routes::target_id.eq(edge.target.as_str()))
+        .select(web_graph_edge_routes::target_id)
+        .first::<String>(connection)
+        .await
+        .optional()?
+        .is_some())
+}
+
+async fn load_incident_topology_edges(
+    connection: &mut AsyncSqliteConnection,
+    node: &NodeId,
+) -> std::result::Result<Vec<EdgeId>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    web_graph_edges::table
+        .filter(
+            web_graph_edges::source_id
+                .eq(node.as_str())
+                .or(web_graph_edges::target_id.eq(node.as_str())),
+        )
+        .select(EdgeRow::as_select())
+        .load::<EdgeRow>(connection)
+        .await?
+        .into_iter()
+        .map(stored_edge)
+        .collect()
+}
+
+async fn load_incident_layout_edges(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    node: &NodeId,
+) -> std::result::Result<Vec<EdgeId>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    web_graph_edge_routes::table
+        .filter(web_graph_edge_routes::layout_kind.eq(layout_kind_value(kind)))
+        .filter(
+            web_graph_edge_routes::source_id
+                .eq(node.as_str())
+                .or(web_graph_edge_routes::target_id.eq(node.as_str())),
+        )
+        .select((
+            web_graph_edge_routes::edge_kind,
+            web_graph_edge_routes::source_id,
+            web_graph_edge_routes::target_id,
+        ))
+        .load::<(String, String, String)>(connection)
+        .await?
+        .into_iter()
+        .map(|(edge_kind, source_id, target_id)| {
+            stored_edge(EdgeRow {
+                edge_kind,
+                source_id,
+                target_id,
+            })
+        })
+        .collect()
+}
+
+async fn final_topology_node_exists(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    node: &NodeId,
+) -> std::result::Result<bool, TransactionError> {
+    if patch.topology.remove_nodes.contains(node) {
+        Ok(false)
+    } else if patch.topology.add_nodes.contains(node) {
+        Ok(true)
+    } else {
+        topology_node_exists(connection, node).await
+    }
+}
+
+async fn final_topology_edge_exists(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    edge: &EdgeId,
+) -> std::result::Result<bool, TransactionError> {
+    if patch.topology.remove_edges.contains(edge) {
+        Ok(false)
+    } else if patch.topology.add_edges.contains(edge) {
+        Ok(true)
+    } else {
+        topology_edge_exists(connection, edge).await
+    }
+}
+
+async fn final_layout_node_exists(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    kind: LayoutKind,
+    node: &NodeId,
+) -> std::result::Result<bool, TransactionError> {
+    let layout = patch_layout(patch, kind);
+    if layout.remove_nodes.contains(node) {
+        Ok(false)
+    } else if layout
+        .upsert_nodes
+        .iter()
+        .any(|placement| &placement.node == node)
+    {
+        Ok(true)
+    } else {
+        layout_node_exists(connection, kind, node).await
+    }
+}
+
+async fn final_layout_edge_exists(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    kind: LayoutKind,
+    edge: &EdgeId,
+) -> std::result::Result<bool, TransactionError> {
+    let layout = patch_layout(patch, kind);
+    if layout.remove_edges.contains(edge) {
+        Ok(false)
+    } else if layout
+        .upsert_edges
+        .iter()
+        .any(|routed| &routed.edge == edge)
+    {
+        Ok(true)
+    } else {
+        layout_edge_exists(connection, kind, edge).await
+    }
+}
+
+fn require_patch_item(
+    exists: bool,
+    adding: bool,
+    collection: &'static str,
+    key: &impl std::fmt::Display,
+) -> std::result::Result<(), TransactionError> {
+    match (adding, exists) {
+        (true, true) => Err(invalid_graph(crate::web_graph::Error::ExistingPatchItem {
+            collection,
+            key: key.to_string(),
+        })),
+        (false, false) => Err(invalid_graph(crate::web_graph::Error::MissingPatchItem {
+            collection,
+            key: key.to_string(),
+        })),
+        _ => Ok(()),
+    }
+}
+
+fn require_explicit_removal(
+    removed: bool,
+    collection: &'static str,
+    key: &impl std::fmt::Display,
+) -> std::result::Result<(), TransactionError> {
+    if removed {
+        Ok(())
+    } else {
+        Err(invalid_graph(crate::web_graph::Error::MissingPatchItem {
+            collection,
+            key: key.to_string(),
+        }))
+    }
+}
+
+fn invalid_graph(source: crate::web_graph::Error) -> TransactionError {
+    TransactionError::Operation(Error::InvalidGraph { source })
+}
+
+fn patch_layout(patch: &Patch, kind: LayoutKind) -> &LayoutPatch {
+    match kind {
+        LayoutKind::Anchors => &patch.layouts.anchors,
+        LayoutKind::All => &patch.layouts.all,
+    }
+}
+
+fn layout_patch_collection(kind: LayoutKind, operation: &'static str) -> &'static str {
+    match (kind, operation) {
+        (LayoutKind::Anchors, "remove_nodes") => "layouts.anchors.remove_nodes",
+        (LayoutKind::Anchors, "remove_edges") => "layouts.anchors.remove_edges",
+        (LayoutKind::All, "remove_nodes") => "layouts.all.remove_nodes",
+        (LayoutKind::All, "remove_edges") => "layouts.all.remove_edges",
+        _ => "layouts",
+    }
 }
 
 async fn apply_patch_rows(
@@ -882,7 +1682,9 @@ mod tests {
     use tokio::sync::Barrier;
 
     use super::*;
-    use crate::web_graph::{Error as GraphError, FORMAT_VERSION, LayoutPatches};
+    use crate::web_graph::{
+        Error as GraphError, FORMAT_VERSION, LayoutPatches, LayoutSnapshots, TopologySnapshot,
+    };
 
     static TEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1063,13 +1865,82 @@ mod tests {
         }
     }
 
+    async fn load_layout_for_test(store: &WebGraphStore, kind: LayoutKind) -> LayoutSnapshot {
+        let canvas = store.canvas(kind).await.unwrap().unwrap().value;
+        let limit = NonZeroUsize::new(2).unwrap();
+        let mut nodes = Vec::new();
+        let mut node_cursor = None;
+        loop {
+            let page = store
+                .node_placements_page(kind, node_cursor.as_ref(), limit)
+                .await
+                .unwrap()
+                .unwrap()
+                .value;
+            nodes.extend(page.items);
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            node_cursor = Some(cursor);
+        }
+        let mut edges = Vec::new();
+        let mut edge_cursor = None;
+        loop {
+            let page = store
+                .edge_routes_page(kind, edge_cursor.as_ref(), limit)
+                .await
+                .unwrap()
+                .unwrap()
+                .value;
+            edges.extend(page.items);
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            edge_cursor = Some(cursor);
+        }
+        LayoutSnapshot {
+            canvas,
+            nodes,
+            edges,
+        }
+    }
+
+    async fn load_graph_for_test(store: &WebGraphStore) -> Option<Graph> {
+        let state = store.state().await.unwrap()?;
+        let anchors = load_layout_for_test(store, LayoutKind::Anchors).await;
+        let all = load_layout_for_test(store, LayoutKind::All).await;
+        let nodes = all
+            .nodes
+            .iter()
+            .map(|placement| placement.node.clone())
+            .collect();
+        let edges = anchors
+            .edges
+            .iter()
+            .chain(&all.edges)
+            .map(|routed| routed.edge.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Some(
+            Graph::from_snapshot(Snapshot {
+                format_version: state.format_version,
+                revision: state.revision,
+                source_version: state.source_version,
+                topology: TopologySnapshot { nodes, edges },
+                layouts: LayoutSnapshots { anchors, all },
+            })
+            .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn new_store_is_empty() {
         let directory = TestDirectory::new();
         let store = WebGraphStore::open(&directory.path).await.unwrap();
 
         assert_eq!(store.path(), directory.path.join(DATABASE_FILE_NAME));
-        assert_eq!(store.load().await.unwrap(), None);
+        assert_eq!(store.state().await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1107,7 +1978,7 @@ mod tests {
             stores[0].database.shared_pool(),
             store.database.shared_pool()
         )));
-        assert_eq!(stores[0].load().await.unwrap(), None);
+        assert_eq!(stores[0].state().await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1121,12 +1992,19 @@ mod tests {
             held_connections.push(store.database.acquire().await.unwrap());
         }
 
-        let actual = tokio::time::timeout(Duration::from_secs(1), store.load())
+        let actual = tokio::time::timeout(Duration::from_secs(1), store.state())
             .await
-            .expect("graph load should acquire the fourth pool connection")
+            .expect("state query should acquire the fourth pool connection")
             .unwrap();
 
-        assert_eq!(actual, Some(expected));
+        assert_eq!(
+            actual,
+            Some(StoredGraphState {
+                format_version: FORMAT_VERSION,
+                revision: expected.revision(),
+                source_version: expected.source_version(),
+            })
+        );
     }
 
     #[tokio::test]
@@ -1136,16 +2014,169 @@ mod tests {
         {
             let store = WebGraphStore::open(&directory.path).await.unwrap();
             store.replace(&expected).await.unwrap();
-            assert_eq!(store.load().await.unwrap(), Some(expected.clone()));
+            assert_eq!(load_graph_for_test(&store).await, Some(expected.clone()));
         }
         {
             let store = WebGraphStore::open(&directory.path).await.unwrap();
-            assert_eq!(store.load().await.unwrap(), Some(expected));
+            assert_eq!(load_graph_for_test(&store).await, Some(expected));
 
             let empty = empty_graph(2, 11);
             store.replace(&empty).await.unwrap();
-            assert_eq!(store.load().await.unwrap(), Some(empty));
+            assert_eq!(load_graph_for_test(&store).await, Some(empty));
         }
+    }
+
+    #[tokio::test]
+    async fn filtered_queries_return_only_requested_layout_data() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+
+        let placements = store
+            .node_placements(LayoutKind::All, &[node("c"), node("missing"), node("a")])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(placements.state.revision, Revision::new(1));
+        assert_eq!(
+            placements
+                .value
+                .iter()
+                .map(|placement| placement.node.clone())
+                .collect::<Vec<_>>(),
+            vec![node("a"), node("c")]
+        );
+
+        let routes = store
+            .incident_edge_routes_page(
+                LayoutKind::All,
+                &[node("b")],
+                None,
+                NonZeroUsize::new(10).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            routes
+                .value
+                .items
+                .iter()
+                .map(|routed| routed.edge.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                edge(EdgeKind::Primary, "a", "b"),
+                edge(EdgeKind::Primary, "b", "c")
+            ]
+        );
+        let first_incident_page = store
+            .incident_edge_routes_page(
+                LayoutKind::All,
+                &[node("b")],
+                None,
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let incident_cursor = first_incident_page.value.next_cursor.unwrap();
+        let error = store
+            .incident_edge_routes_page(
+                LayoutKind::All,
+                &[node("a")],
+                Some(&incident_cursor),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CursorQueryMismatch));
+        assert!(
+            store
+                .incident_edge_routes_page(
+                    LayoutKind::Anchors,
+                    &[node("b")],
+                    None,
+                    NonZeroUsize::new(10).unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .value
+                .items
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_is_stable_and_rejects_a_cursor_after_revision_changes() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let limit = NonZeroUsize::new(1).unwrap();
+
+        let first = store
+            .node_placements_page(LayoutKind::All, None, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.value.items[0].node, node("a"));
+        let cursor = first.value.next_cursor.unwrap();
+        assert_eq!(cursor.revision(), Revision::new(1));
+        let error = store
+            .node_placements_page(LayoutKind::Anchors, Some(&cursor), limit)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CursorQueryMismatch));
+        let second = store
+            .node_placements_page(LayoutKind::All, Some(&cursor), limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.value.items[0].node, node("b"));
+
+        store.apply_patch(relayout_patch()).await.unwrap();
+        let error = store
+            .node_placements_page(LayoutKind::All, Some(&cursor), limit)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::StaleCursor {
+                cursor,
+                current
+            } if cursor == Revision::new(1) && current == Revision::new(2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_queries_enforce_the_sqlite_parameter_budget() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let nodes = (0..=MAX_READ_BATCH_SIZE)
+            .map(|index| node(&format!("node-{index}")))
+            .collect::<Vec<_>>();
+
+        let error = store
+            .node_placements(LayoutKind::All, &nodes)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBatchTooLarge {
+                actual,
+                maximum: MAX_READ_BATCH_SIZE
+            } if actual == MAX_READ_BATCH_SIZE + 1
+        ));
+        let error = store
+            .edge_routes_page(
+                LayoutKind::All,
+                None,
+                NonZeroUsize::new(MAX_READ_BATCH_SIZE + 1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ReadBatchTooLarge { .. }));
     }
 
     #[tokio::test]
@@ -1159,8 +2190,9 @@ mod tests {
 
         let actual = store.apply_patch(patch).await.unwrap();
 
-        assert_eq!(actual, expected);
-        assert_eq!(store.load().await.unwrap(), Some(expected));
+        assert_eq!(actual.revision, expected.revision());
+        assert_eq!(actual.source_version, expected.source_version());
+        assert_eq!(load_graph_for_test(&store).await, Some(expected));
     }
 
     #[tokio::test]
@@ -1175,7 +2207,48 @@ mod tests {
         let error = store.apply_patch(invalid).await.unwrap_err();
 
         assert!(matches!(error, Error::InvalidGraph { .. }));
-        assert_eq!(store.load().await.unwrap(), Some(original));
+        assert_eq!(load_graph_for_test(&store).await, Some(original));
+    }
+
+    #[tokio::test]
+    async fn cyclic_patch_rolls_back_incremental_rows_and_revision() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        let original = graph();
+        store.replace(&original).await.unwrap();
+        let cycle = edge(EdgeKind::Primary, "c", "a");
+        let patch = Patch {
+            format_version: FORMAT_VERSION,
+            base_revision: Revision::new(1),
+            revision: Revision::new(2),
+            source_version: SourceVersion::new(10),
+            topology: TopologyPatch {
+                add_nodes: Vec::new(),
+                remove_nodes: Vec::new(),
+                add_edges: vec![cycle.clone()],
+                remove_edges: Vec::new(),
+            },
+            layouts: LayoutPatches {
+                anchors: LayoutPatch::default(),
+                all: LayoutPatch {
+                    upsert_edges: vec![routed(cycle, 600)],
+                    ..LayoutPatch::default()
+                },
+            },
+        };
+
+        let error = store.apply_patch(patch).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::InvalidGraph {
+                source: GraphError::Cycle {
+                    layout: LayoutKind::All,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(load_graph_for_test(&store).await, Some(original));
     }
 
     #[tokio::test]
@@ -1201,7 +2274,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            store.load().await.unwrap().unwrap().revision(),
+            store.state().await.unwrap().unwrap().revision,
             Revision::new(2)
         );
     }
@@ -1214,7 +2287,7 @@ mod tests {
         let error = store.apply_patch(relayout_patch()).await.unwrap_err();
 
         assert!(matches!(error, Error::NotInitialized { .. }));
-        assert_eq!(store.load().await.unwrap(), None);
+        assert_eq!(store.state().await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1234,6 +2307,6 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(store.load().await.unwrap(), Some(original));
+        assert_eq!(load_graph_for_test(&store).await, Some(original));
     }
 }

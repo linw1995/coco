@@ -214,27 +214,7 @@ impl Graph {
     }
 
     pub fn apply_patch(&mut self, patch: Patch) -> Result<()> {
-        validate_format_version(patch.format_version)?;
-        if patch.base_revision != self.revision {
-            return Err(Error::RevisionMismatch {
-                current: self.revision,
-                base: patch.base_revision,
-            });
-        }
-        if patch.revision <= self.revision {
-            return Err(Error::RevisionNotAdvanced {
-                current: self.revision,
-                next: patch.revision,
-            });
-        }
-        if patch.source_version < self.source_version {
-            return Err(Error::SourceVersionRegressed {
-                current: self.source_version,
-                next: patch.source_version,
-            });
-        }
-
-        patch.validate()?;
+        patch.validate_against(self.revision, self.source_version)?;
         let mut candidate = self.clone();
         candidate.topology.apply_patch(patch.topology)?;
         candidate.layouts.apply_patch(patch.layouts)?;
@@ -563,6 +543,33 @@ pub struct Patch {
 }
 
 impl Patch {
+    pub fn validate_against(
+        &self,
+        current_revision: Revision,
+        current_source_version: SourceVersion,
+    ) -> Result<()> {
+        validate_format_version(self.format_version)?;
+        if self.base_revision != current_revision {
+            return Err(Error::RevisionMismatch {
+                current: current_revision,
+                base: self.base_revision,
+            });
+        }
+        if self.revision <= current_revision {
+            return Err(Error::RevisionNotAdvanced {
+                current: current_revision,
+                next: self.revision,
+            });
+        }
+        if self.source_version < current_source_version {
+            return Err(Error::SourceVersionRegressed {
+                current: current_source_version,
+                next: self.source_version,
+            });
+        }
+        self.validate()
+    }
+
     fn validate(&self) -> Result<()> {
         self.topology.validate()?;
         self.layouts.validate()
@@ -627,6 +634,15 @@ pub struct LayoutPatch {
 impl LayoutPatch {
     fn validate(&self, kind: LayoutKind) -> Result<()> {
         let prefix = kind.as_str();
+        if let Some(canvas) = self.canvas
+            && (canvas.width <= 0 || canvas.height <= 0)
+        {
+            return Err(Error::InvalidCanvas {
+                layout: kind,
+                width: canvas.width,
+                height: canvas.height,
+            });
+        }
         validate_placements(&self.upsert_nodes, layout_collection(kind, "upsert_nodes"))?;
         validate_node_list(&self.remove_nodes, layout_collection(kind, "remove_nodes"))?;
         validate_routes(&self.upsert_edges, layout_collection(kind, "upsert_edges"))?;
@@ -1485,6 +1501,21 @@ mod tests {
         existing.topology.add_nodes = vec![node("a")];
         assert_failed_without_mutation(&graph, existing, |error| {
             matches!(error, Error::ExistingPatchItem { .. })
+        });
+
+        let mut invalid_canvas = patch(1, 2, 10);
+        invalid_canvas.layouts.anchors.canvas = Some(Canvas {
+            width: 0,
+            height: 100,
+        });
+        assert_failed_without_mutation(&graph, invalid_canvas, |error| {
+            matches!(
+                error,
+                Error::InvalidCanvas {
+                    layout: LayoutKind::Anchors,
+                    ..
+                }
+            )
         });
     }
 
