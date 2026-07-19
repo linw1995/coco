@@ -20,6 +20,7 @@ pub struct ViewportDrag {
     start_viewport_x: f64,
     start_viewport_y: f64,
     zoom: f64,
+    started: bool,
 }
 
 impl ViewportDrag {
@@ -35,19 +36,26 @@ impl ViewportDrag {
             start_viewport_x: viewport.x,
             start_viewport_y: viewport.y,
             zoom,
+            started: false,
         }
     }
 
-    pub fn viewport_origin_at(self, client_x: f64, client_y: f64) -> Option<(f64, f64)> {
+    pub fn viewport_origin_at(&mut self, client_x: f64, client_y: f64) -> Option<(f64, f64)> {
         let delta_x = client_x - self.start_client_x;
         let delta_y = client_y - self.start_client_y;
-        if delta_x.mul_add(delta_x, delta_y * delta_y) < DRAG_THRESHOLD_PX.powi(2) {
+        if !self.started && delta_x.mul_add(delta_x, delta_y * delta_y) < DRAG_THRESHOLD_PX.powi(2)
+        {
             return None;
         }
+        self.started = true;
         Some((
             self.start_viewport_x - delta_x / self.zoom,
             self.start_viewport_y - delta_y / self.zoom,
         ))
+    }
+
+    pub fn did_pan(self) -> bool {
+        self.started
     }
 }
 
@@ -375,9 +383,11 @@ mod tests {
 
     #[test]
     fn viewport_drag_moves_against_scaled_pointer_delta_after_threshold() {
-        let drag = ViewportDrag::new(viewport(100.0, 80.0), 2.0, 40.0, 30.0);
+        let mut drag = ViewportDrag::new(viewport(100.0, 80.0), 2.0, 40.0, 30.0);
 
         assert_eq!(drag.viewport_origin_at(42.0, 32.0), None);
         assert_eq!(drag.viewport_origin_at(60.0, 40.0), Some((90.0, 75.0)));
+        assert_eq!(drag.viewport_origin_at(40.0, 30.0), Some((100.0, 80.0)));
+        assert!(drag.did_pan());
     }
 }
