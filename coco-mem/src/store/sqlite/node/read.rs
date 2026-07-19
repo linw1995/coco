@@ -1,5 +1,13 @@
 use super::*;
 
+diesel::table! {
+    #[sql_name = "nodes"]
+    nodes_with_rowid (id) {
+        rowid -> BigInt,
+        id -> Text,
+    }
+}
+
 macro_rules! node_row_columns {
     () => {
         (
@@ -721,6 +729,139 @@ pub async fn load_child_ids_page(
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
         })
+}
+
+pub async fn load_node_high_watermark(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<Option<(i64, String)>> {
+    nodes_with_rowid::table
+        .select((nodes_with_rowid::rowid, nodes_with_rowid::id))
+        .order(nodes_with_rowid::rowid.desc())
+        .first::<(i64, String)>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+pub async fn node_cursor_matches(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    row_id: i64,
+    node_id: &str,
+) -> Result<bool> {
+    diesel::select(diesel::dsl::exists(
+        nodes_with_rowid::table
+            .filter(nodes_with_rowid::rowid.eq(row_id))
+            .filter(nodes_with_rowid::id.eq(node_id)),
+    ))
+    .get_result(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })
+}
+
+pub async fn load_node_page(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    cursor: Option<i64>,
+    through: i64,
+    limit: usize,
+) -> Result<Vec<(i64, String)>> {
+    let mut query = nodes_with_rowid::table
+        .select((nodes_with_rowid::rowid, nodes_with_rowid::id))
+        .filter(nodes_with_rowid::rowid.le(through))
+        .into_boxed();
+    if let Some(cursor) = cursor {
+        query = query.filter(nodes_with_rowid::rowid.gt(cursor));
+    }
+    query
+        .order(nodes_with_rowid::rowid.asc())
+        .limit(i64::try_from(limit).expect("graph node page limit should fit in i64"))
+        .load::<(i64, String)>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+}
+
+pub async fn load_graph_node_records_by_exact_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    ids: &[String],
+) -> Result<Vec<GraphNodeRecord>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = nodes::table
+        .filter(nodes::id.eq_any(ids))
+        .select((nodes::id, nodes::parent_id, nodes::kind))
+        .order(nodes::id)
+        .load::<(String, String, String)>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    ensure!(
+        rows.len() == ids.len(),
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "SQLite graph batch requested {} node records but returned {}",
+                ids.len(),
+                rows.len()
+            ),
+        }
+    );
+    let rows = rows
+        .into_iter()
+        .map(|(id, parent, kind)| {
+            let is_anchor = graph_node_kind_is_anchor(path, &id, &kind)?;
+            Ok((id, parent, is_anchor))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let anchor_ids = rows
+        .iter()
+        .filter(|(_, _, is_anchor)| *is_anchor)
+        .map(|(id, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    let mut relations =
+        load_node_relation_rows_for_ids(connection, path, Some(&anchor_ids)).await?;
+    rows.into_iter()
+        .map(|(id, parent, is_anchor)| {
+            let merge_parents = if is_anchor {
+                let relation_rows = relations.remove(&id).unwrap_or_default();
+                super::write::merge_parents_from_relation_rows(path, &id, &parent, &relation_rows)?
+            } else {
+                Vec::new()
+            };
+            Ok(GraphNodeRecord {
+                id,
+                parent,
+                is_anchor,
+                merge_parents,
+            })
+        })
+        .collect()
+}
+
+fn graph_node_kind_is_anchor(path: &Path, node_id: &str, kind: &str) -> Result<bool> {
+    match kind {
+        NODE_KIND_ANCHOR_SESSION
+        | NODE_KIND_ANCHOR_SESSION_PATCH
+        | NODE_KIND_ANCHOR_PROMPT
+        | NODE_KIND_ANCHOR_SKILL_INVOCATION
+        | NODE_KIND_ANCHOR_SKILL_RESULT => Ok(true),
+        "tool_use" | "tool_result" | "text" | "failure" => Ok(false),
+        _ => CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!("invalid SQLite node kind {kind:?} for node {node_id:?}"),
+        }
+        .fail(),
+    }
 }
 
 pub async fn load_node_by_exact_id(

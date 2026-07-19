@@ -44,6 +44,28 @@ pub enum Error {
     #[snafu(display("Web graph revision {revision} cannot be advanced"))]
     WebGraphRevisionExhausted { revision: u64 },
 
+    #[snafu(display("Web graph source version {source_version} cannot be advanced"))]
+    WebGraphSourceVersionExhausted { source_version: u64 },
+
+    #[snafu(display("Web graph source cursor row {row_id} no longer identifies node {node_id}"))]
+    WebGraphSourceCursorMismatch { row_id: i64, node_id: String },
+
+    #[snafu(display(
+        "Web graph source high watermark {source_row_id} precedes stored cursor {stored_row_id}"
+    ))]
+    WebGraphSourceCursorRegressed {
+        stored_row_id: i64,
+        source_row_id: i64,
+    },
+
+    #[snafu(display(
+        "Web graph source cursor {stored_row_id:?} cannot advance to high watermark {source_row_id}"
+    ))]
+    WebGraphSourceCursorStalled {
+        stored_row_id: Option<i64>,
+        source_row_id: i64,
+    },
+
     #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },
 }

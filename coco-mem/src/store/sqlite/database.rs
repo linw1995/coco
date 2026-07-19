@@ -10,7 +10,8 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use snafu::prelude::*;
 
 use super::{
-    AsyncSqliteConnection, AsyncSqliteConnectionGuard, SqliteDatabase, SqliteDatabaseInner,
+    AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_CONNECTION_LIMIT, SqliteDatabase,
+    SqliteDatabaseInner, SqliteGraphConnectionGuard,
 };
 use crate::StoreResult as Result;
 use crate::error::{
@@ -62,6 +63,7 @@ impl SqliteDatabase {
         let inner = Arc::new(SqliteDatabaseInner {
             database_path: database_path.clone(),
             pool,
+            graph_connection_gate: Arc::new(tokio::sync::Semaphore::new(GRAPH_CONNECTION_LIMIT)),
             wal_journal_mode_enabled: tokio::sync::OnceCell::new(),
             initialized_root_id: tokio::sync::OnceCell::new(),
         });
@@ -93,6 +95,18 @@ impl SqliteDatabase {
             .context(AcquireSqliteConnectionSnafu {
                 path: self.inner.database_path.clone(),
             })
+    }
+
+    pub(super) async fn acquire_graph(&self) -> Result<SqliteGraphConnectionGuard<'_>> {
+        let permit = Arc::clone(&self.inner.graph_connection_gate)
+            .acquire_owned()
+            .await
+            .expect("graph connection gate should remain open");
+        let connection = self.acquire().await?;
+        Ok(SqliteGraphConnectionGuard {
+            connection,
+            _permit: permit,
+        })
     }
 
     #[cfg(test)]

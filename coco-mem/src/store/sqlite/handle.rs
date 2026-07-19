@@ -14,15 +14,17 @@ use snafu::prelude::*;
 use super::OwnedStoreDirectory;
 use super::database::sqlite_database_path;
 use super::node::{
-    load_child_ids_by_parent_ids, load_child_ids_page, load_node_by_exact_id,
-    load_node_by_prefix_or_branch, load_nodes_by_exact_ids, load_root_id, node_count,
+    load_child_ids_by_parent_ids, load_child_ids_page, load_graph_node_records_by_exact_ids,
+    load_node_by_exact_id, load_node_by_prefix_or_branch, load_node_high_watermark, load_node_page,
+    load_nodes_by_exact_ids, load_root_id, node_count, node_cursor_matches,
     persist_node_without_transaction,
 };
 use super::{
     AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchPage,
-    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor, SqliteDatabase,
-    SqliteGraphConnectionFuture, SqliteGraphStore, SqliteStore, SqliteTransactionError,
-    StoreAccess, migration,
+    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor,
+    GraphNodeCursor, GraphNodePage, GraphNodeRecord, SqliteDatabase, SqliteGraphConnectionFuture,
+    SqliteGraphConnectionGuard, SqliteGraphStore, SqliteStore, SqliteTransactionError, StoreAccess,
+    migration,
 };
 use crate::StoreResult as Result;
 use crate::error::{
@@ -308,6 +310,59 @@ impl SqliteGraphStore {
         load_nodes_by_exact_ids(&mut connection, &self.database_path, ids).await
     }
 
+    pub async fn graph_node_records_by_ids(&self, ids: &[String]) -> Result<Vec<GraphNodeRecord>> {
+        ensure_graph_read_batch_size(ids.len())?;
+        let mut connection = self.connect().await?;
+        load_graph_node_records_by_exact_ids(&mut connection, &self.database_path, ids).await
+    }
+
+    pub async fn graph_node_high_watermark(&self) -> Result<Option<GraphNodeCursor>> {
+        let mut connection = self.connect().await?;
+        load_node_high_watermark(&mut connection, &self.database_path)
+            .await
+            .map(|row| row.map(|(row_id, node_id)| GraphNodeCursor { row_id, node_id }))
+    }
+
+    pub async fn graph_node_cursor_matches(&self, cursor: &GraphNodeCursor) -> Result<bool> {
+        let mut connection = self.connect().await?;
+        node_cursor_matches(
+            &mut connection,
+            &self.database_path,
+            cursor.row_id,
+            &cursor.node_id,
+        )
+        .await
+    }
+
+    pub async fn graph_nodes_page(
+        &self,
+        cursor: Option<&GraphNodeCursor>,
+        through: &GraphNodeCursor,
+        page_size: NonZeroUsize,
+    ) -> Result<GraphNodePage> {
+        ensure_graph_read_batch_size(page_size.get())?;
+        let mut connection = self.connect().await?;
+        let mut rows = load_node_page(
+            &mut connection,
+            &self.database_path,
+            cursor.map(|cursor| cursor.row_id),
+            through.row_id,
+            page_size.get() + 1,
+        )
+        .await?;
+        let complete = rows.len() <= page_size.get();
+        if !complete {
+            rows.truncate(page_size.get());
+        }
+        Ok(GraphNodePage {
+            entries: rows
+                .into_iter()
+                .map(|(row_id, node_id)| GraphNodeCursor { row_id, node_id })
+                .collect(),
+            complete,
+        })
+    }
+
     pub async fn graph_child_ids(
         &self,
         parent_ids: &[String],
@@ -383,8 +438,8 @@ impl SqliteGraphStore {
             .map_err(|error| error.into_store_error(&self.database_path))
     }
 
-    pub(super) async fn connect(&self) -> Result<AsyncSqliteConnectionGuard<'_>> {
-        self.database.acquire().await
+    pub(super) async fn connect(&self) -> Result<SqliteGraphConnectionGuard<'_>> {
+        self.database.acquire_graph().await
     }
 
     pub(super) async fn with_connection<T, F>(&self, operation: F) -> Result<T>

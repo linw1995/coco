@@ -31,8 +31,8 @@ impl<S> ConsoleStore<S> {
     }
 
     fn notify_node_if_ok(&self, result: StoreResult<String>) -> StoreResult<String> {
-        if let Ok(node_id) = &result {
-            self.publisher.mark_node_created(node_id.clone());
+        if result.is_ok() {
+            self.publisher.mark_source_dirty();
         }
         result
     }
@@ -42,8 +42,8 @@ impl<S> ConsoleStore<S> {
         node_created: bool,
         result: StoreResult<String>,
     ) -> StoreResult<String> {
-        if node_created && let Ok(node_id) = &result {
-            self.publisher.mark_node_created(node_id.clone());
+        if node_created && result.is_ok() {
+            self.publisher.mark_source_dirty();
         }
         result
     }
@@ -282,8 +282,8 @@ where
             .inner
             .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
             .await;
-        if let Ok(job) = &result {
-            self.publisher.mark_node_created(job.base.clone());
+        if result.is_ok() {
+            self.publisher.mark_source_dirty();
         }
         result
     }
@@ -310,8 +310,8 @@ where
                 session_patch,
             )
             .await;
-        if let Ok(job) = &result {
-            self.publisher.mark_node_created(job.base.clone());
+        if result.is_ok() {
+            self.publisher.mark_source_dirty();
         }
         result
     }
@@ -390,9 +390,11 @@ mod tests {
     use coco_mem::{Kind, Role, SqliteStore};
 
     #[tokio::test]
-    async fn only_node_creation_advances_graph_source_version() {
+    async fn only_node_creation_marks_the_graph_source_dirty() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
+        let mut source_changes = publisher.subscribe_source_changes();
+        source_changes.borrow_and_update();
         let store = ConsoleStore::new(inner, publisher.clone());
         let root = store.root_id();
         let child = store
@@ -409,12 +411,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(publisher.current_version(), 1);
+        assert_eq!(*source_changes.borrow_and_update(), 1);
 
         store.fork("main", &root).await.unwrap();
         store.submit_job("main", &root).await.unwrap();
         store.set_branch_head("main", &root, &child).await.unwrap();
 
-        assert_eq!(publisher.current_version(), 1);
+        assert_eq!(*source_changes.borrow(), 1);
     }
 }

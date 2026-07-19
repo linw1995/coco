@@ -86,7 +86,7 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let web_graph = WebGraphRuntime::open(graph_store_path, publisher).await?;
-    let node_creations = web_graph.subscribe_node_creations();
+    let source_changes = web_graph.subscribe_source_changes();
     let listener =
         TcpListener::bind(config.addr).context(BindConsoleSnafu { addr: config.addr })?;
     listener
@@ -99,7 +99,7 @@ where
         .context(ConfigureConsoleSocketSnafu { addr: config.addr })?;
     let state = AppState { store, web_graph };
     let task = tokio::spawn(async move {
-        serve_console(listener, state, node_creations)
+        serve_console(listener, state, source_changes)
             .await
             .context(ServeConsoleSnafu { addr })
     });
@@ -110,7 +110,7 @@ where
 async fn serve_console<S>(
     listener: tokio::net::TcpListener,
     state: AppState<S>,
-    node_creations: tokio::sync::broadcast::Receiver<super::publisher::ConsoleNodeCreated>,
+    source_changes: tokio::sync::watch::Receiver<u64>,
 ) -> io::Result<()>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -122,7 +122,7 @@ where
     );
     tokio::select! {
         result = server => result,
-        never = web_graph.drive(node_creations) => match never {},
+        never = web_graph.drive(source_changes) => match never {},
     }
 }
 
@@ -671,7 +671,7 @@ mod tests {
         let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
             .await
             .unwrap();
-        web_graph.synchronize().await.unwrap();
+        web_graph.catch_up().await.unwrap();
         let state = AppState { store, web_graph };
 
         let viewport =

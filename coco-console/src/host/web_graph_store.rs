@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use coco_mem::GraphNodeCursor;
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, Insertable, OptionalExtension, QueryDsl, Queryable,
     Selectable, SelectableHelper,
@@ -37,11 +38,12 @@ pub struct WebGraphStore {
     database: Database,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredGraphState {
     pub format_version: u32,
     pub revision: Revision,
     pub source_version: SourceVersion,
+    pub source_cursor: Option<GraphNodeCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +335,22 @@ impl WebGraphStore {
     }
 
     pub async fn apply_patch(&self, patch: Patch) -> Result<StoredGraphState> {
+        self.apply_patch_inner(patch, None).await
+    }
+
+    pub async fn apply_patch_and_advance_source(
+        &self,
+        patch: Patch,
+        source_cursor: GraphNodeCursor,
+    ) -> Result<StoredGraphState> {
+        self.apply_patch_inner(patch, Some(source_cursor)).await
+    }
+
+    async fn apply_patch_inner(
+        &self,
+        patch: Patch,
+        source_cursor: Option<GraphNodeCursor>,
+    ) -> Result<StoredGraphState> {
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
         connection
@@ -343,13 +361,17 @@ impl WebGraphStore {
                 patch
                     .validate_against(state.revision, state.source_version)
                     .map_err(invalid_graph)?;
+                if let Some(source_cursor) = source_cursor.as_ref() {
+                    validate_source_cursor_advance(&state, source_cursor, patch.source_version)?;
+                }
                 validate_patch_candidate(connection, &patch).await?;
-                apply_patch_rows(connection, &patch).await?;
+                apply_patch_rows(connection, &patch, source_cursor.as_ref()).await?;
                 validate_new_cycles(connection, &patch).await?;
                 Ok(StoredGraphState {
                     format_version: state.format_version,
                     revision: patch.revision,
                     source_version: patch.source_version,
+                    source_cursor: source_cursor.or(state.source_cursor),
                 })
             })
             .await
@@ -364,6 +386,8 @@ struct StateRow {
     format_version: i32,
     revision: i64,
     source_version: i64,
+    source_cursor_row_id: Option<i64>,
+    source_cursor_node_id: Option<String>,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable)]
@@ -495,6 +519,17 @@ pub enum Error {
     #[snafu(display("Web graph store value {column} exceeds SQLite INTEGER: {value}"))]
     IntegerOutOfRange { column: &'static str, value: u64 },
 
+    #[snafu(display("Web graph source cursor {next:?} does not advance {current:?}"))]
+    SourceCursorNotAdvanced {
+        current: Option<GraphNodeCursor>,
+        next: GraphNodeCursor,
+    },
+
+    #[snafu(display(
+        "Web graph source cursor advance requires source version {expected}, got {actual}"
+    ))]
+    SourceVersionCursorMismatch { expected: u64, actual: u64 },
+
     #[snafu(display(
         "Web graph store operation {operation} changed {actual} rows instead of {expected}"
     ))]
@@ -556,6 +591,18 @@ fn stored_state(row: StateRow) -> std::result::Result<StoredGraphState, Transact
             actual: format_version,
         }));
     }
+    let source_cursor = match (row.source_cursor_row_id, row.source_cursor_node_id) {
+        (None, None) => None,
+        (Some(row_id), Some(node_id)) if row_id > 0 && !node_id.is_empty() => {
+            Some(GraphNodeCursor { row_id, node_id })
+        }
+        (row_id, node_id) => {
+            return Err(invalid_value(
+                "web_graph_state.source_cursor",
+                format!("row_id={row_id:?}, node_id={node_id:?}"),
+            ));
+        }
+    };
     Ok(StoredGraphState {
         format_version,
         revision: Revision::new(stored_u64(row.revision, "web_graph_state.revision")?),
@@ -563,7 +610,44 @@ fn stored_state(row: StateRow) -> std::result::Result<StoredGraphState, Transact
             row.source_version,
             "web_graph_state.source_version",
         )?),
+        source_cursor,
     })
+}
+
+fn validate_source_cursor_advance(
+    state: &StoredGraphState,
+    next: &GraphNodeCursor,
+    next_source_version: SourceVersion,
+) -> std::result::Result<(), TransactionError> {
+    if next.row_id <= 0
+        || next.node_id.is_empty()
+        || state
+            .source_cursor
+            .as_ref()
+            .is_some_and(|current| next.row_id <= current.row_id)
+    {
+        return Err(TransactionError::Operation(
+            Error::SourceCursorNotAdvanced {
+                current: state.source_cursor.clone(),
+                next: next.clone(),
+            },
+        ));
+    }
+    let expected = state.source_version.get().checked_add(1).ok_or_else(|| {
+        TransactionError::Operation(Error::SourceVersionCursorMismatch {
+            expected: state.source_version.get(),
+            actual: next_source_version.get(),
+        })
+    })?;
+    if next_source_version.get() != expected {
+        return Err(TransactionError::Operation(
+            Error::SourceVersionCursorMismatch {
+                expected,
+                actual: next_source_version.get(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 async fn load_canvas(
@@ -1438,6 +1522,7 @@ fn layout_patch_collection(kind: LayoutKind, operation: &'static str) -> &'stati
 async fn apply_patch_rows(
     connection: &mut AsyncSqliteConnection,
     patch: &Patch,
+    source_cursor: Option<&GraphNodeCursor>,
 ) -> std::result::Result<(), TransactionError> {
     use diesel_async::RunQueryDsl;
 
@@ -1452,17 +1537,28 @@ async fn apply_patch_rows(
     upsert_layout_rows(connection, LayoutKind::Anchors, &patch.layouts.anchors).await?;
     upsert_layout_rows(connection, LayoutKind::All, &patch.layouts.all).await?;
 
-    let changed = diesel::update(
-        web_graph_state::table
-            .filter(web_graph_state::id.eq(1))
-            .filter(web_graph_state::revision.eq(base_revision)),
-    )
-    .set((
-        web_graph_state::revision.eq(revision),
-        web_graph_state::source_version.eq(source_version),
-    ))
-    .execute(connection)
-    .await?;
+    let target = web_graph_state::table
+        .filter(web_graph_state::id.eq(1))
+        .filter(web_graph_state::revision.eq(base_revision));
+    let changed = if let Some(source_cursor) = source_cursor {
+        diesel::update(target)
+            .set((
+                web_graph_state::revision.eq(revision),
+                web_graph_state::source_version.eq(source_version),
+                web_graph_state::source_cursor_row_id.eq(source_cursor.row_id),
+                web_graph_state::source_cursor_node_id.eq(&source_cursor.node_id),
+            ))
+            .execute(connection)
+            .await?
+    } else {
+        diesel::update(target)
+            .set((
+                web_graph_state::revision.eq(revision),
+                web_graph_state::source_version.eq(source_version),
+            ))
+            .execute(connection)
+            .await?
+    };
     expect_row_count("advance_revision", 1, changed)
 }
 
@@ -1677,6 +1773,8 @@ fn snapshot_rows(snapshot: &Snapshot) -> std::result::Result<SnapshotRows, Trans
             })?,
             revision: sqlite_integer(snapshot.revision.get(), "revision")?,
             source_version: sqlite_integer(snapshot.source_version.get(), "source_version")?,
+            source_cursor_row_id: None,
+            source_cursor_node_id: None,
         },
         nodes: snapshot
             .topology
@@ -2038,6 +2136,7 @@ mod tests {
         let mut connection = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
         connection.run_pending_migrations(MIGRATIONS).unwrap();
         connection.revert_last_migration(MIGRATIONS).unwrap();
+        connection.revert_last_migration(MIGRATIONS).unwrap();
         let rows = snapshot_rows(&graph.snapshot()).unwrap();
         connection
             .transaction::<_, diesel::result::Error, _>(|connection| {
@@ -2057,7 +2156,12 @@ mod tests {
                     .values(&rows.routes)
                     .execute(connection)?;
                 diesel::insert_into(web_graph_state::table)
-                    .values(&rows.state)
+                    .values((
+                        web_graph_state::id.eq(rows.state.id),
+                        web_graph_state::format_version.eq(rows.state.format_version),
+                        web_graph_state::revision.eq(rows.state.revision),
+                        web_graph_state::source_version.eq(rows.state.source_version),
+                    ))
                     .execute(connection)?;
                 Ok(())
             })
@@ -2108,6 +2212,32 @@ mod tests {
 
         assert_eq!(store.path(), directory.path.join(DATABASE_FILE_NAME));
         assert_eq!(store.state().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stored_source_cursor_requires_a_complete_valid_pair() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let mut connection = store.database.acquire().await.unwrap();
+        diesel_async::RunQueryDsl::execute(
+            diesel::update(web_graph_state::table.filter(web_graph_state::id.eq(1)))
+                .set(web_graph_state::source_cursor_row_id.eq(Some(1_i64))),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        drop(connection);
+
+        let error = store.state().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::InvalidValue {
+                column: "web_graph_state.source_cursor",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2170,6 +2300,7 @@ mod tests {
                 format_version: FORMAT_VERSION,
                 revision: expected.revision(),
                 source_version: expected.source_version(),
+                source_cursor: None,
             })
         );
     }
@@ -2207,6 +2338,7 @@ mod tests {
         create_v1_store(&directory.path.join(DATABASE_FILE_NAME), &expected);
 
         let store = WebGraphStore::open(&directory.path).await.unwrap();
+        assert_eq!(store.state().await.unwrap().unwrap().source_cursor, None);
         let (nodes, edges) =
             load_viewport_for_test(&store, LayoutKind::All, viewport(0, 0, 1_000, 1_000), 2).await;
 
@@ -2580,6 +2712,113 @@ mod tests {
         let (_, added_routes) =
             load_viewport_for_test(&store, LayoutKind::All, viewport(300, 301, 6, 6), 10).await;
         assert_eq!(added_routes[0].edge, edge(EdgeKind::Primary, "c", "d"));
+    }
+
+    #[tokio::test]
+    async fn patch_and_source_cursor_advance_are_atomic_and_persistent() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let cursor = GraphNodeCursor {
+            row_id: 1,
+            node_id: "source-a".to_owned(),
+        };
+
+        let state = store
+            .apply_patch_and_advance_source(graph_patch(), cursor.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(state.source_cursor, Some(cursor.clone()));
+        drop(store);
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        assert_eq!(
+            store.state().await.unwrap().unwrap().source_cursor,
+            Some(cursor.clone())
+        );
+
+        let regular = Patch {
+            format_version: FORMAT_VERSION,
+            base_revision: Revision::new(2),
+            revision: Revision::new(3),
+            source_version: SourceVersion::new(11),
+            topology: TopologyPatch::default(),
+            layouts: LayoutPatches::default(),
+        };
+        let state = store.apply_patch(regular).await.unwrap();
+        assert_eq!(state.source_cursor, Some(cursor.clone()));
+
+        let original_graph = load_graph_for_test(&store).await.unwrap();
+        let original_state = store.state().await.unwrap().unwrap();
+        let cycle = edge(EdgeKind::Primary, "d", "c");
+        let error = store
+            .apply_patch_and_advance_source(
+                Patch {
+                    format_version: FORMAT_VERSION,
+                    base_revision: Revision::new(3),
+                    revision: Revision::new(4),
+                    source_version: SourceVersion::new(12),
+                    topology: TopologyPatch {
+                        add_edges: vec![cycle.clone()],
+                        ..TopologyPatch::default()
+                    },
+                    layouts: LayoutPatches {
+                        anchors: LayoutPatch::default(),
+                        all: LayoutPatch {
+                            upsert_edges: vec![routed(cycle, 700)],
+                            ..LayoutPatch::default()
+                        },
+                    },
+                },
+                GraphNodeCursor {
+                    row_id: 2,
+                    node_id: "source-b".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidGraph { .. }));
+        assert_eq!(store.state().await.unwrap().unwrap(), original_state);
+        assert_eq!(
+            load_graph_for_test(&store).await,
+            Some(original_graph.clone())
+        );
+
+        let invalid = Patch {
+            format_version: FORMAT_VERSION,
+            base_revision: Revision::new(3),
+            revision: Revision::new(4),
+            source_version: SourceVersion::new(12),
+            topology: TopologyPatch::default(),
+            layouts: LayoutPatches::default(),
+        };
+        let error = store
+            .apply_patch_and_advance_source(invalid.clone(), cursor)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::SourceCursorNotAdvanced { .. }));
+        assert_eq!(store.state().await.unwrap().unwrap(), original_state);
+        assert_eq!(
+            load_graph_for_test(&store).await,
+            Some(original_graph.clone())
+        );
+
+        let error = store
+            .apply_patch_and_advance_source(
+                Patch {
+                    source_version: SourceVersion::new(11),
+                    ..invalid
+                },
+                GraphNodeCursor {
+                    row_id: 2,
+                    node_id: "source-b".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::SourceVersionCursorMismatch { .. }));
+        assert_eq!(store.state().await.unwrap().unwrap(), original_state);
+        assert_eq!(load_graph_for_test(&store).await, Some(original_graph));
     }
 
     #[tokio::test]

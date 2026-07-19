@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -7,11 +8,13 @@ use diesel_async::pooled_connection::bb8::{
 };
 use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
 
-use crate::SessionState;
 use crate::StoreResult as Result;
 use crate::error::StoreError;
+use crate::{MergeParent, SessionState};
 
 pub const GRAPH_READ_BATCH_SIZE: usize = 128;
+// Graph reads are auxiliary and must not exhaust the pool shared with primary store operations.
+const GRAPH_CONNECTION_LIMIT: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphBranchRecord {
@@ -45,6 +48,27 @@ pub struct GraphChildPage {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNodeCursor {
+    pub row_id: i64,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNodePage {
+    pub entries: Vec<GraphNodeCursor>,
+    pub complete: bool,
+}
+
+/// Topology-only node data for incremental graph construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNodeRecord {
+    pub id: String,
+    pub parent: String,
+    pub is_anchor: bool,
+    pub merge_parents: Vec<MergeParent>,
+}
+
 mod branch;
 mod codec;
 mod database;
@@ -72,7 +96,7 @@ use node::{
     NodeAnchorPromptAttachmentRow, NodeAnchorSessionPatchRow, NodeAnchorSessionPatchToolRow,
     NodeAnchorSessionRow, NodeAnchorSessionToolRow, NodeAnchorSkillInvocationRow,
     NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow, NodeToolUseRow,
-    load_node_by_exact_id, node_storage_kind,
+    load_graph_node_records_by_exact_ids, load_node_by_exact_id, node_storage_kind,
 };
 
 type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;
@@ -94,6 +118,7 @@ struct SqliteDatabase {
 struct SqliteDatabaseInner {
     database_path: PathBuf,
     pool: AsyncSqlitePool<AsyncSqliteConnection>,
+    graph_connection_gate: Arc<tokio::sync::Semaphore>,
     wal_journal_mode_enabled: tokio::sync::OnceCell<()>,
     initialized_root_id: tokio::sync::OnceCell<String>,
 }
@@ -116,6 +141,25 @@ pub struct SqliteGraphStore {
     database_path: PathBuf,
     database: SqliteDatabase,
     root_id: String,
+}
+
+struct SqliteGraphConnectionGuard<'a> {
+    connection: AsyncSqliteConnectionGuard<'a>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Deref for SqliteGraphConnectionGuard<'_> {
+    type Target = AsyncSqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for SqliteGraphConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

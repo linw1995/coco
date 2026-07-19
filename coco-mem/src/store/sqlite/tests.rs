@@ -12,12 +12,13 @@ use crate::schema::{
     skill_version_scripts, skill_versions,
 };
 use crate::{
-    Anchor, BackendMetadata, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord, Job, JobStatus,
-    JobStore, Kind, MergeParent, MessageQueueStore, NewNode, Node, NodeStore, PauseReason, Preset,
-    PresetStore, PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
-    SessionAnchorPatch, SessionRole, SessionState, SessionStore, SkillInvocationAnchor,
-    SkillInvocationMode, SkillResultAnchor, SkillRuntimeContext, SkillScript, SkillStore,
-    SkillUpdatePatch, SkillVersionSpec, StoreError, Tool, ToolResult, ToolUse,
+    Anchor, BackendMetadata, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
+    GraphNodeCursor, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode, Node,
+    NodeStore, PauseReason, Preset, PresetStore, PromptAnchor, PromptAttachment,
+    PromptImageAttachment, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
+    SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
+    SkillRuntimeContext, SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError,
+    Tool, ToolResult, ToolUse,
 };
 use diesel::connection::InstrumentationEvent;
 use diesel::prelude::*;
@@ -700,6 +701,58 @@ async fn graph_store_connection_contention_does_not_block_writer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn graph_store_reserves_pool_capacity_for_regular_operations() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+    let second_graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+    let first_graph_connection = graph.connect().await.unwrap();
+    let mut held_connections = Vec::new();
+    for _ in 0..2 {
+        held_connections.push(store.database.acquire().await.unwrap());
+    }
+
+    let (second_acquired_tx, mut second_acquired_rx) = oneshot::channel();
+    let (release_second_tx, release_second_rx) = oneshot::channel();
+    let second = tokio::spawn(async move {
+        let _connection = second_graph.connect().await.unwrap();
+        second_acquired_tx.send(()).unwrap();
+        release_second_rx.await.unwrap();
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut second_acquired_rx)
+            .await
+            .is_err(),
+        "a second graph reader should wait without reserving a pool connection"
+    );
+
+    let root = store.root_id();
+    let written = tokio::time::timeout(
+        Duration::from_secs(1),
+        store.append(NewNode {
+            parent: root,
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("write while graph readers are queued".to_owned()),
+        }),
+    )
+    .await
+    .expect("writer should use the pool capacity reserved from graph readers")
+    .unwrap();
+
+    drop(first_graph_connection);
+    tokio::time::timeout(Duration::from_secs(1), &mut second_acquired_rx)
+        .await
+        .expect("queued graph reader should continue after the first reader finishes")
+        .unwrap();
+    release_second_tx.send(()).unwrap();
+    second.await.unwrap();
+    drop(held_connections);
+    assert_eq!(store.get_node(&written).await.unwrap().id, written);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn graph_read_batch_releases_its_connection_before_writer_runs() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
@@ -723,6 +776,27 @@ async fn graph_read_batch_releases_its_connection_before_writer_runs() {
     .await
     .expect("graph read should acquire the remaining pool connection")
     .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        graph.graph_node_records_by_ids(std::slice::from_ref(&root)),
+    )
+    .await
+    .expect("graph topology read should reuse the remaining pool connection")
+    .unwrap();
+
+    let through = tokio::time::timeout(Duration::from_secs(1), graph.graph_node_high_watermark())
+        .await
+        .expect("graph high-watermark read should reuse the remaining pool connection")
+        .unwrap()
+        .unwrap();
+    let page = tokio::time::timeout(
+        Duration::from_secs(1),
+        graph.graph_nodes_page(None, &through, NonZeroUsize::new(1).unwrap()),
+    )
+    .await
+    .expect("graph node page should reuse the remaining pool connection")
+    .unwrap();
+    assert!(page.complete);
 
     let written = tokio::time::timeout(
         Duration::from_secs(1),
@@ -983,6 +1057,92 @@ async fn graph_child_ids_page_is_stable_across_high_fan_out_and_relation_kinds()
 }
 
 #[tokio::test]
+async fn graph_nodes_page_is_stable_and_bounded_by_high_watermark() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let mut node_ids = vec![root.clone()];
+    for index in 0..4 {
+        node_ids.push(
+            store
+                .append(NewNode {
+                    parent: root.clone(),
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text(format!("global node {index}")),
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let last_existing_id = node_ids[4].clone();
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let through = graph.graph_node_high_watermark().await.unwrap().unwrap();
+    assert_eq!(through.node_id, last_existing_id);
+    assert!(graph.graph_node_cursor_matches(&through).await.unwrap());
+    assert!(
+        !graph
+            .graph_node_cursor_matches(&GraphNodeCursor {
+                row_id: through.row_id,
+                node_id: "different-node".to_owned(),
+            })
+            .await
+            .unwrap()
+    );
+
+    let later_id = store
+        .append(NewNode {
+            parent: root,
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("after high watermark".to_owned()),
+        })
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&later_id)))
+        .set(nodes::created_at.eq("1970-01-01T00:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    let page_size = NonZeroUsize::new(2).unwrap();
+    let mut cursor = None;
+    let mut actual = Vec::new();
+    loop {
+        let page = graph
+            .graph_nodes_page(cursor.as_ref(), &through, page_size)
+            .await
+            .unwrap();
+        assert!(page.entries.len() <= page_size.get());
+        actual.extend(page.entries);
+        if page.complete {
+            break;
+        }
+        cursor = actual.last().cloned();
+    }
+
+    assert_eq!(
+        actual
+            .iter()
+            .map(|entry| entry.node_id.as_str())
+            .collect::<Vec<_>>(),
+        node_ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert!(
+        actual
+            .windows(2)
+            .all(|entries| entries[0].row_id < entries[1].row_id)
+    );
+    assert!(!actual.iter().any(|entry| entry.node_id == later_id));
+    let latest = graph.graph_node_high_watermark().await.unwrap().unwrap();
+    assert!(latest.row_id > through.row_id);
+    assert_eq!(latest.node_id, later_id);
+}
+
+#[tokio::test]
 async fn graph_read_api_rejects_oversized_batches() {
     let store = SqliteStore::open_temporary().await.unwrap();
     let graph = SqliteGraphStore::open_read_only(store.store_path())
@@ -993,6 +1153,24 @@ async fn graph_read_api_rejects_oversized_batches() {
         .collect::<Vec<_>>();
 
     let error = graph.graph_nodes_by_ids(&ids).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::GraphReadBatchTooLarge {
+            actual,
+            maximum: GRAPH_READ_BATCH_SIZE,
+        } if actual == GRAPH_READ_BATCH_SIZE + 1
+    ));
+
+    let through = graph.graph_node_high_watermark().await.unwrap().unwrap();
+    let error = graph
+        .graph_nodes_page(
+            None,
+            &through,
+            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE + 1).unwrap(),
+        )
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         error,
@@ -1694,6 +1872,95 @@ async fn reading_anchor_node_queries_only_selected_payload_tables() {
     );
     assert!(queries.iter().any(|query| query.contains("node_relations")));
     for table in [
+        "node_anchor_session_patches",
+        "node_anchor_session_patch_tools",
+        "node_anchor_prompt_attachments",
+        "node_anchor_skill_invocations",
+        "node_anchor_skill_results",
+        "node_metadata",
+        "node_tool_uses",
+        "node_tool_results",
+    ] {
+        assert!(
+            queries.iter().all(|query| !query.contains(table)),
+            "unexpected query for {table}: {queries:#?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reading_graph_node_records_queries_only_topology_tables() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let root = store.root_id();
+    let primary = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("primary".to_owned()),
+        })
+        .await
+        .unwrap();
+    let merge = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("merge".to_owned()),
+        })
+        .await
+        .unwrap();
+    let shadow = store
+        .append(NewNode {
+            parent: root,
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("shadow".to_owned()),
+        })
+        .await
+        .unwrap();
+    let merge_parents = vec![
+        MergeParent::merge(merge.clone()),
+        MergeParent::shadow(shadow.clone()),
+    ];
+    let anchor = store
+        .append(rich_session_anchor_node(&primary, merge_parents.clone()))
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let captured_queries = Arc::clone(&queries);
+    connection.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            captured_queries.lock().unwrap().push(query.to_string());
+        }
+    });
+
+    let records = super::load_graph_node_records_by_exact_ids(
+        &mut connection,
+        &store.database_path,
+        &[primary.clone(), anchor.clone()],
+    )
+    .await
+    .unwrap();
+
+    let primary_record = records.iter().find(|record| record.id == primary).unwrap();
+    assert!(!primary_record.is_anchor);
+    assert!(primary_record.merge_parents.is_empty());
+    let anchor_record = records.iter().find(|record| record.id == anchor).unwrap();
+    assert_eq!(anchor_record.parent, primary);
+    assert!(anchor_record.is_anchor);
+    assert_eq!(anchor_record.merge_parents, merge_parents);
+
+    let queries = queries.lock().unwrap();
+    assert_eq!(queries.len(), 2, "unexpected queries: {queries:#?}");
+    assert!(queries.iter().any(|query| query.contains("nodes")));
+    assert!(queries.iter().any(|query| query.contains("node_relations")));
+    for table in [
+        "node_anchor_sessions",
+        "node_anchor_session_tools",
         "node_anchor_session_patches",
         "node_anchor_session_patch_tools",
         "node_anchor_prompt_attachments",
