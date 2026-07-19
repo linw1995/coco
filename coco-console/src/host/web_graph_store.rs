@@ -2295,6 +2295,58 @@ mod tests {
         .unwrap()
     }
 
+    fn fanout_graph(child_count: usize) -> Graph {
+        let source = node("source");
+        let mut nodes = vec![source.clone()];
+        let mut topology_edges = Vec::with_capacity(child_count);
+        let mut placements = vec![NodePlacement {
+            node: source.clone(),
+            point: point(80, 80),
+        }];
+        let mut routes = Vec::with_capacity(child_count);
+        for index in 0..child_count {
+            let target = node(&format!("target-{index:04}"));
+            let target_y = 80 + i32::try_from(index).unwrap() * 72;
+            let edge = EdgeId::new(EdgeKind::Primary, source.clone(), target.clone());
+            nodes.push(target.clone());
+            topology_edges.push(edge.clone());
+            placements.push(NodePlacement {
+                node: target,
+                point: point(220, target_y),
+            });
+            routes.push(RoutedEdge {
+                edge,
+                route: BezierRoute {
+                    source: point(100, 80),
+                    control_1: point(140, 80),
+                    control_2: point(160, target_y),
+                    target: point(196, target_y),
+                },
+            });
+        }
+        Graph::from_snapshot(Snapshot {
+            format_version: FORMAT_VERSION,
+            revision: Revision::new(1),
+            source_version: SourceVersion::new(1),
+            topology: TopologySnapshot {
+                nodes,
+                edges: topology_edges,
+            },
+            layouts: LayoutSnapshots {
+                anchors: empty_layout(),
+                all: LayoutSnapshot {
+                    canvas: Canvas {
+                        width: 320,
+                        height: 160 + i32::try_from(child_count).unwrap() * 72,
+                    },
+                    nodes: placements,
+                    edges: routes,
+                },
+            },
+        })
+        .unwrap()
+    }
+
     fn empty_graph(revision: u64, source_version: u64) -> Graph {
         Graph::from_snapshot(Snapshot {
             format_version: FORMAT_VERSION,
@@ -2893,6 +2945,23 @@ mod tests {
                 .map(|placement| placement.node.clone())
                 .collect::<Vec<_>>(),
             vec![node("a"), node("b")]
+        );
+    }
+
+    #[tokio::test]
+    async fn viewport_query_culls_edges_with_offscreen_endpoints() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&fanout_graph(256)).await.unwrap();
+
+        let (nodes, edges) =
+            load_viewport_for_test(&store, LayoutKind::All, viewport(0, 0, 320, 500), 10).await;
+
+        assert_eq!(nodes.len(), 8);
+        assert_eq!(edges.len(), 6);
+        assert!(
+            edges.iter().all(|edge| edge.route.target.y <= 500),
+            "offscreen fanout edges must not enter the rendered viewport"
         );
     }
 
