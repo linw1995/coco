@@ -9,7 +9,8 @@ pub use error::{StoreError, StoreResult};
 pub use store::{
     BranchAppendSessionState, BranchSessionStateUpdate, BranchStore, GRAPH_READ_BATCH_SIZE,
     GraphBranchPage, GraphBranchPageCursor, GraphBranchRecord, GraphChildPage,
-    GraphChildPageCursor, JobStore, MessageQueueStore, NodeStore, PersistentStore, PresetStore,
-    ProcessShareableStore, SessionStore, SkillStore, SqliteGraphStore, SqliteStore, Store,
+    GraphChildPageCursor, GraphNodeCursor, GraphNodePage, GraphNodeRecord, JobStore,
+    MessageQueueStore, NodeStore, PersistentStore, PresetStore, ProcessShareableStore,
+    SessionStore, SkillStore, SqliteGraphStore, SqliteStore, Store,
 };
 pub use types::*;

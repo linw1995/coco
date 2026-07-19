@@ -24,10 +24,10 @@ use crate::schema::{
 };
 use crate::store::NodeStore;
 use crate::{
-    Anchor, AnchorPayload, AnchorPayloadKind, BackendMetadata, Kind, MergeParent, NewNode, Node,
-    NodeMetadata, PromptAnchor, PromptAttachment, PromptImageAttachment, Role, SessionAnchor,
-    SessionAnchorPatch, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
-    SkillRuntimeContext, StoreResult as Result, Tool, ToolResult, ToolUse,
+    Anchor, AnchorPayload, AnchorPayloadKind, BackendMetadata, GraphNodeRecord, Kind, MergeParent,
+    NewNode, Node, NodeMetadata, PromptAnchor, PromptAttachment, PromptImageAttachment, Role,
+    SessionAnchor, SessionAnchorPatch, SkillInvocationAnchor, SkillInvocationMode,
+    SkillResultAnchor, SkillRuntimeContext, StoreResult as Result, Tool, ToolResult, ToolUse,
 };
 
 mod read;
@@ -36,8 +36,10 @@ mod write;
 
 pub use read::{
     load_ancestry_nodes, load_child_ids_by_parent_ids, load_child_ids_page, load_child_nodes,
-    load_log_nodes, load_node_by_exact_id, load_node_by_prefix_or_branch, load_nodes_by_exact_ids,
-    load_root_id, node_count, resolve_ref_id, validate_new_node,
+    load_graph_node_records_by_exact_ids, load_log_nodes, load_node_by_exact_id,
+    load_node_by_prefix_or_branch, load_node_high_watermark, load_node_page,
+    load_nodes_by_exact_ids, load_root_id, node_count, node_cursor_matches, resolve_ref_id,
+    validate_new_node,
 };
 pub use row::*;
 #[cfg(test)]

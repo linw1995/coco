@@ -1415,7 +1415,7 @@ fn parse_u32_column(path: &Path, column: &str, value: i64) -> Result<u32> {
         })
 }
 
-fn merge_parents_from_relation_rows(
+pub fn merge_parents_from_relation_rows(
     path: &Path,
     node_id: &str,
     parent_id: &str,

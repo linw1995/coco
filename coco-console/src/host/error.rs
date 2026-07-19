@@ -1,6 +1,5 @@
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use snafu::prelude::*;
 
@@ -19,75 +18,58 @@ pub enum Error {
     #[snafu(display("Console server task failed: {source}"))]
     JoinConsoleServer { source: tokio::task::JoinError },
 
-    #[snafu(display(
-        "Console graph rebuild failed for {mode} at store version {source_version}: {message}"
-    ))]
-    ConsoleGraphRebuild {
-        mode: &'static str,
-        source_version: u64,
-        message: String,
+    #[snafu(display("Web graph store operation failed: {source}"))]
+    WebGraphStore {
+        source: crate::host::web_graph_store::Error,
     },
 
-    #[snafu(display("Console graph layout failed: {source}"))]
-    GraphLayout {
-        source: crate::layout::GraphLayoutError,
+    #[snafu(display("Web graph model operation failed: {source}"))]
+    WebGraphModel { source: crate::web_graph::Error },
+
+    #[snafu(display("Web graph order operation failed: {source}"))]
+    WebGraphOrder {
+        source: crate::host::web_graph_order::Error,
     },
 
-    #[snafu(display("Console graph frontier failed: {source}"))]
-    IncrementalFrontier {
-        source: Box<crate::host::frontier::AdaptiveFrontierError<Error>>,
-    },
-
-    #[snafu(display("Console graph snapshot store {} query failed: {source}", path.display()))]
-    QueryGraphSnapshotStore {
-        path: PathBuf,
-        source: diesel::result::Error,
-    },
-
-    #[snafu(display("Console graph snapshot store {} migration failed: {source}", path.display()))]
-    MigrateGraphSnapshotStore {
-        path: PathBuf,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display("Web graph store is not initialized"))]
+    WebGraphNotInitialized,
 
     #[snafu(display(
-        "Failed to create console graph snapshot store pool {}: {source}",
-        path.display()
+        "Web graph {layout} layout is missing parent {parent_id} while placing {node_id}"
     ))]
-    CreateGraphSnapshotPool {
-        path: PathBuf,
-        source: diesel_async::pooled_connection::PoolError,
+    WebGraphParentPlacementMissing {
+        layout: &'static str,
+        node_id: String,
+        parent_id: String,
     },
 
+    #[snafu(display("Web graph references missing source node {node_id}"))]
+    WebGraphSourceNodeMissing { node_id: String },
+
+    #[snafu(display("Web graph revision {revision} cannot be advanced"))]
+    WebGraphRevisionExhausted { revision: u64 },
+
+    #[snafu(display("Web graph source version {source_version} cannot be advanced"))]
+    WebGraphSourceVersionExhausted { source_version: u64 },
+
+    #[snafu(display("Web graph source cursor row {row_id} no longer identifies node {node_id}"))]
+    WebGraphSourceCursorMismatch { row_id: i64, node_id: String },
+
     #[snafu(display(
-        "Failed to acquire console graph snapshot store connection {}: {source}",
-        path.display()
+        "Web graph source high watermark {source_row_id} precedes stored cursor {stored_row_id}"
     ))]
-    AcquireGraphSnapshotConnection {
-        path: PathBuf,
-        source: diesel_async::pooled_connection::bb8::RunError,
+    WebGraphSourceCursorRegressed {
+        stored_row_id: i64,
+        source_row_id: i64,
     },
 
     #[snafu(display(
-        "Failed to configure console graph snapshot store {}: {message}",
-        path.display()
+        "Web graph source cursor {stored_row_id:?} cannot advance to high watermark {source_row_id}"
     ))]
-    ConfigureGraphSnapshotStore { path: PathBuf, message: String },
-
-    #[snafu(display("Failed to parse console graph snapshot store value {column}: {source}"))]
-    ParseGraphSnapshotStoreValue {
-        column: &'static str,
-        source: serde_json::Error,
+    WebGraphSourceCursorStalled {
+        stored_row_id: Option<i64>,
+        source_row_id: i64,
     },
-
-    #[snafu(display("Failed to serialize console graph snapshot store value {column}: {source}"))]
-    SerializeGraphSnapshotStoreValue {
-        column: &'static str,
-        source: serde_json::Error,
-    },
-
-    #[snafu(display("Invalid console graph snapshot store value {column}: {value}"))]
-    InvalidGraphSnapshotStoreValue { column: &'static str, value: String },
 
     #[snafu(display("{source}"))]
     Store { source: coco_mem::StoreError },

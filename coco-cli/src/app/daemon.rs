@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use coco_channel::{
@@ -10,8 +10,8 @@ use coco_channel::{
 };
 use coco_channel::{Error as ChannelError, telegram::TelegramChannel};
 use coco_console::{
-    ConsoleConfig, ConsolePublisher, ConsoleServerHandle, GraphMode, GraphSnapshot,
-    build_graph_snapshot_with_mode, start_console_server_with_graph_store_path,
+    ConsoleConfig, ConsolePublisher, ConsoleServerHandle,
+    start_console_server_with_graph_store_path,
 };
 use coco_core::{
     ConversationEngine, CoreService, EngineError, FixedBranchResolver, SYSTEM_EVENT_QUEUE,
@@ -43,10 +43,7 @@ use super::{
 };
 use crate::{
     Result,
-    cli::{
-        CliSessionRole, CliTool, DaemonCommand, DaemonProfileCommand, DaemonProfileGraphCommand,
-        DaemonProfileSubcommand, DaemonSubcommand, SessionCreateCommand,
-    },
+    cli::{CliSessionRole, CliTool, DaemonCommand, DaemonSubcommand, SessionCreateCommand},
     error::{
         BindDaemonSocketSnafu, ChannelSnafu, ConsoleSnafu, CoreEngineSnafu, JoinChannelTaskSnafu,
         JoinDaemonServerSnafu, JoinMessageQueueTaskSnafu, LlmSnafu, ResolveDaemonSocketRootSnafu,
@@ -85,17 +82,6 @@ pub struct DaemonServerOptions<'a> {
     pub console: Option<ConsoleServerHandle>,
 }
 
-#[derive(Debug, Serialize)]
-struct DaemonGraphProfileResult {
-    mode: &'static str,
-    version: u64,
-    nodes: usize,
-    edges: usize,
-    branches: usize,
-    provider_contexts: usize,
-    duration_ms: u128,
-}
-
 pub async fn run_daemon_command<B, S>(
     command: DaemonCommand,
     shared_store: &S,
@@ -109,12 +95,6 @@ where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    if let DaemonSubcommand::Profile(command) = &command.command {
-        return run_daemon_profile_command(command, shared_store)
-            .await
-            .map(Some);
-    }
-
     let socket_path = resolve_daemon_command_socket_path(&command)?;
     let shared_engine = Arc::new(ConversationEngine::new(llm.clone()));
     let console_config = daemon_console_config(&command, console_publisher.as_ref());
@@ -162,7 +142,6 @@ where
 fn resolve_daemon_command_socket_path(command: &DaemonCommand) -> Result<PathBuf> {
     resolve_daemon_socket_path(match &command.command {
         DaemonSubcommand::Serve(command) => command.socket.as_deref(),
-        DaemonSubcommand::Profile(_) => None,
     })
 }
 
@@ -176,82 +155,6 @@ fn daemon_console_config(
         }),
         _ => None,
     }
-}
-
-async fn run_daemon_profile_command<S>(
-    command: &DaemonProfileCommand,
-    shared_store: &S,
-) -> Result<String>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    match &command.command {
-        DaemonProfileSubcommand::Graph(command) => {
-            run_daemon_profile_graph_command(command, shared_store).await
-        }
-    }
-}
-
-async fn run_daemon_profile_graph_command<S>(
-    command: &DaemonProfileGraphCommand,
-    shared_store: &S,
-) -> Result<String>
-where
-    S: Store + Clone + Send + Sync + 'static,
-{
-    let mode = daemon_profile_graph_mode(command);
-    let started_at = Instant::now();
-    let snapshot = build_graph_snapshot_with_mode(shared_store, 0, mode)
-        .await
-        .context(ConsoleSnafu)?;
-    let result = daemon_graph_profile_result(mode, &snapshot, started_at.elapsed());
-
-    if command.json {
-        Ok(render_daemon_graph_profile_json(&result))
-    } else {
-        Ok(render_daemon_graph_profile_text(&result))
-    }
-}
-
-fn daemon_profile_graph_mode(command: &DaemonProfileGraphCommand) -> GraphMode {
-    if command.all {
-        GraphMode::All
-    } else {
-        GraphMode::Anchors
-    }
-}
-
-fn daemon_graph_profile_result(
-    mode: GraphMode,
-    snapshot: &GraphSnapshot,
-    duration: Duration,
-) -> DaemonGraphProfileResult {
-    DaemonGraphProfileResult {
-        mode: mode.as_query_value(),
-        version: snapshot.version,
-        nodes: snapshot.nodes.len(),
-        edges: snapshot.edges.len(),
-        branches: snapshot.branches.len(),
-        provider_contexts: snapshot.provider_contexts.len(),
-        duration_ms: duration.as_millis(),
-    }
-}
-
-fn render_daemon_graph_profile_text(result: &DaemonGraphProfileResult) -> String {
-    format!(
-        "built graph mode={} version={} nodes={} edges={} branches={} provider_contexts={} duration_ms={}",
-        result.mode,
-        result.version,
-        result.nodes,
-        result.edges,
-        result.branches,
-        result.provider_contexts,
-        result.duration_ms
-    )
-}
-
-fn render_daemon_graph_profile_json(result: &DaemonGraphProfileResult) -> String {
-    serde_json::to_string_pretty(result).expect("daemon graph profile output should serialize")
 }
 
 pub async fn ensure_initial_session<B, S>(
@@ -2347,47 +2250,6 @@ mod tests {
         let path = resolve_daemon_command_socket_path(&command).unwrap();
 
         assert_eq!(path, PathBuf::from("/tmp/coco.sock"));
-    }
-
-    #[tokio::test]
-    async fn daemon_profile_graph_builds_snapshot_without_serving() {
-        let store = test_store().await;
-        let root = store.root_id();
-        store.fork("main", &root).await.unwrap();
-        let node = store
-            .append(NewNode {
-                parent: root.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::Text("profile graph".to_owned()),
-            })
-            .await
-            .unwrap();
-        store.set_branch_head("main", &root, &node).await.unwrap();
-        let llm = Arc::new(LlmService::new(
-            store.clone(),
-            BlockingOnceBackend::default(),
-        ));
-        let command = daemon_command(["coco", "daemon", "profile", "graph", "--all", "--json"]);
-
-        let output = run_daemon_command(
-            command,
-            &store,
-            &llm,
-            &provider_profiles(),
-            &ChannelConfigs::default(),
-            None,
-            PathBuf::from(".coco-store"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
-
-        assert_eq!(value["mode"], "all");
-        assert_eq!(value["version"], 0);
-        assert_eq!(value["branches"], 1);
-        assert_eq!(value["nodes"], 1);
     }
 
     #[test]
