@@ -1193,6 +1193,88 @@ mod tests {
     }
 
     #[test]
+    fn errors_have_non_empty_messages() {
+        let node_a = node("a");
+        let node_b = node("b");
+        let edge_ab = edge(EdgeKind::Primary, "a", "b");
+        let errors = [
+            Error::UnsupportedFormat { actual: 2 },
+            Error::EmptyNodeId { context: "nodes" },
+            Error::SelfEdge {
+                context: "edges",
+                edge: edge_ab.clone(),
+            },
+            Error::DuplicateItem {
+                collection: "nodes",
+                key: "a".to_owned(),
+            },
+            Error::ConflictingPatchItem {
+                collection: "nodes",
+                key: "a".to_owned(),
+            },
+            Error::MissingPatchItem {
+                collection: "nodes",
+                key: "a".to_owned(),
+            },
+            Error::ExistingPatchItem {
+                collection: "nodes",
+                key: "a".to_owned(),
+            },
+            Error::RevisionMismatch {
+                current: Revision::new(2),
+                base: Revision::new(1),
+            },
+            Error::RevisionNotAdvanced {
+                current: Revision::new(2),
+                next: Revision::new(2),
+            },
+            Error::SourceVersionRegressed {
+                current: SourceVersion::new(2),
+                next: SourceVersion::new(1),
+            },
+            Error::InvalidCanvas {
+                layout: LayoutKind::All,
+                width: 0,
+                height: 1,
+            },
+            Error::MissingEdgeEndpoint {
+                edge: edge_ab.clone(),
+                node: node_b.clone(),
+            },
+            Error::LayoutNodeMissingFromTopology {
+                layout: LayoutKind::All,
+                node: node_a.clone(),
+            },
+            Error::LayoutEdgeMissingFromTopology {
+                layout: LayoutKind::All,
+                edge: edge_ab.clone(),
+            },
+            Error::LayoutEdgeEndpointMissing {
+                layout: LayoutKind::All,
+                edge: edge_ab.clone(),
+                node: node_b.clone(),
+            },
+            Error::AnchorNodeMissingFromAll {
+                node: node_a.clone(),
+            },
+            Error::TopologyNodeMissingFromAll {
+                node: node_a.clone(),
+            },
+            Error::UnusedTopologyEdge {
+                edge: edge_ab.clone(),
+            },
+            Error::Cycle {
+                layout: LayoutKind::All,
+                node: node_a,
+            },
+        ];
+
+        for error in errors {
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
     fn snapshot_round_trip_is_canonical_and_stable() {
         let graph = Graph::from_snapshot(fixture_snapshot()).unwrap();
         let snapshot = graph.snapshot();

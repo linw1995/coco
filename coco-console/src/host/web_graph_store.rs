@@ -1291,7 +1291,21 @@ async fn validate_final_references(
     let affected_nodes = affected_nodes(patch);
     let affected_edges = affected_edges(patch);
 
-    for edge in &affected_edges {
+    validate_final_topology_edge_endpoints(connection, patch, &affected_edges).await?;
+    for kind in [LayoutKind::Anchors, LayoutKind::All] {
+        validate_final_layout_nodes(connection, patch, kind, &affected_nodes).await?;
+        validate_final_layout_edges(connection, patch, kind, &affected_edges).await?;
+    }
+    validate_final_node_membership(connection, patch, &affected_nodes).await?;
+    validate_final_topology_edge_usage(connection, patch, &affected_edges).await
+}
+
+async fn validate_final_topology_edge_endpoints(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    affected_edges: &BTreeSet<EdgeId>,
+) -> std::result::Result<(), TransactionError> {
+    for edge in affected_edges {
         if final_topology_edge_exists(connection, patch, edge).await? {
             for node in [&edge.source, &edge.target] {
                 if !final_topology_node_exists(connection, patch, node).await? {
@@ -1305,45 +1319,69 @@ async fn validate_final_references(
             }
         }
     }
-    for kind in [LayoutKind::Anchors, LayoutKind::All] {
-        for node in &affected_nodes {
-            if final_layout_node_exists(connection, patch, kind, node).await?
-                && !final_topology_node_exists(connection, patch, node).await?
-            {
+    Ok(())
+}
+
+async fn validate_final_layout_nodes(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    kind: LayoutKind,
+    affected_nodes: &BTreeSet<NodeId>,
+) -> std::result::Result<(), TransactionError> {
+    for node in affected_nodes {
+        if final_layout_node_exists(connection, patch, kind, node).await?
+            && !final_topology_node_exists(connection, patch, node).await?
+        {
+            return Err(invalid_graph(
+                crate::web_graph::Error::LayoutNodeMissingFromTopology {
+                    layout: kind,
+                    node: node.clone(),
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_final_layout_edges(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    kind: LayoutKind,
+    affected_edges: &BTreeSet<EdgeId>,
+) -> std::result::Result<(), TransactionError> {
+    for edge in affected_edges {
+        if !final_layout_edge_exists(connection, patch, kind, edge).await? {
+            continue;
+        }
+        if !final_topology_edge_exists(connection, patch, edge).await? {
+            return Err(invalid_graph(
+                crate::web_graph::Error::LayoutEdgeMissingFromTopology {
+                    layout: kind,
+                    edge: edge.clone(),
+                },
+            ));
+        }
+        for node in [&edge.source, &edge.target] {
+            if !final_layout_node_exists(connection, patch, kind, node).await? {
                 return Err(invalid_graph(
-                    crate::web_graph::Error::LayoutNodeMissingFromTopology {
+                    crate::web_graph::Error::LayoutEdgeEndpointMissing {
                         layout: kind,
+                        edge: edge.clone(),
                         node: node.clone(),
                     },
                 ));
             }
         }
-        for edge in &affected_edges {
-            if !final_layout_edge_exists(connection, patch, kind, edge).await? {
-                continue;
-            }
-            if !final_topology_edge_exists(connection, patch, edge).await? {
-                return Err(invalid_graph(
-                    crate::web_graph::Error::LayoutEdgeMissingFromTopology {
-                        layout: kind,
-                        edge: edge.clone(),
-                    },
-                ));
-            }
-            for node in [&edge.source, &edge.target] {
-                if !final_layout_node_exists(connection, patch, kind, node).await? {
-                    return Err(invalid_graph(
-                        crate::web_graph::Error::LayoutEdgeEndpointMissing {
-                            layout: kind,
-                            edge: edge.clone(),
-                            node: node.clone(),
-                        },
-                    ));
-                }
-            }
-        }
     }
-    for node in &affected_nodes {
+    Ok(())
+}
+
+async fn validate_final_node_membership(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    affected_nodes: &BTreeSet<NodeId>,
+) -> std::result::Result<(), TransactionError> {
+    for node in affected_nodes {
         let all = final_layout_node_exists(connection, patch, LayoutKind::All, node).await?;
         if final_layout_node_exists(connection, patch, LayoutKind::Anchors, node).await? && !all {
             return Err(invalid_graph(
@@ -1356,7 +1394,15 @@ async fn validate_final_references(
             ));
         }
     }
-    for edge in &affected_edges {
+    Ok(())
+}
+
+async fn validate_final_topology_edge_usage(
+    connection: &mut AsyncSqliteConnection,
+    patch: &Patch,
+    affected_edges: &BTreeSet<EdgeId>,
+) -> std::result::Result<(), TransactionError> {
+    for edge in affected_edges {
         if final_topology_edge_exists(connection, patch, edge).await?
             && !final_layout_edge_exists(connection, patch, LayoutKind::Anchors, edge).await?
             && !final_layout_edge_exists(connection, patch, LayoutKind::All, edge).await?

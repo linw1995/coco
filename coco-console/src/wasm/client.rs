@@ -86,9 +86,17 @@ pub fn start() {
 async fn run() -> Result<(), JsValue> {
     let graph = setup_graph()?;
     render_full_viewport(graph.clone()).await?;
-    if let Err(error) = install_graph_events(graph.clone()) {
+    install_graph_events_or_log(graph.clone());
+    refresh_initial_selection(graph).await
+}
+
+fn install_graph_events_or_log(graph: Rc<RefCell<VirtualGraph>>) {
+    if let Err(error) = install_graph_events(graph) {
         web_sys::console::error_1(&error);
     }
+}
+
+async fn refresh_initial_selection(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let has_selected_node = {
         let graph = graph.borrow();
         selected_node_target(&graph.window).is_some()

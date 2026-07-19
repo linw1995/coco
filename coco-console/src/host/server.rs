@@ -626,7 +626,10 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use coco_mem::{Kind, NewNode, NodeStore, Role, SqliteStore};
+    use coco_mem::{
+        Anchor, BranchStore, Kind, NewNode, NodeStore, Role, SessionAnchor, SessionRole,
+        SqliteStore,
+    };
 
     use crate::ConsoleStore;
     use crate::host::web_graph_view::node_target_id;
@@ -690,5 +693,91 @@ mod tests {
         let detail = String::from_utf8(detail_body.to_vec()).unwrap();
         assert!(detail.contains("direct detail"));
         assert!(detail.contains(&node_id));
+    }
+
+    #[tokio::test]
+    async fn provider_context_uses_persistent_layout_points() {
+        let source = SqliteStore::open_temporary().await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(source.clone(), publisher.clone());
+        let session_id = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    Vec::new(),
+                    SessionAnchor {
+                        role: SessionRole::Orchestrator,
+                        provider_profile: None,
+                        provider: Some("openai".to_owned()),
+                        model: "test-model".to_owned(),
+                        tools: Vec::new(),
+                        system_prompt: "test system prompt".to_owned(),
+                        prompt: "test prompt".to_owned(),
+                        temperature: None,
+                        max_tokens: None,
+                        additional_params: None,
+                        enable_coco_shim: false,
+                        active_skill: None,
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        store.fork("main", &session_id).await.unwrap();
+        let selected_id = store
+            .append(NewNode {
+                parent: session_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("provider context selection".to_owned()),
+            })
+            .await
+            .unwrap();
+        store
+            .set_branch_head("main", &session_id, &selected_id)
+            .await
+            .unwrap();
+        let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
+            .await
+            .unwrap();
+        web_graph.catch_up().await.unwrap();
+        let state = AppState { store, web_graph };
+
+        let response = provider_context(
+            State(state),
+            RawQuery(Some(format!(
+                "target={}&mode=all",
+                node_target_id(&selected_id)
+            ))),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("provider context selection"));
+        assert!(body.contains("provider-context-node visible selected"));
+        assert!(body.contains("data-node-x"));
+    }
+
+    #[tokio::test]
+    async fn server_with_graph_store_path_starts_and_shuts_down() {
+        let source = SqliteStore::open_temporary().await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(source.clone(), publisher.clone());
+        let handle = start_console_server_with_graph_store_path(
+            ConsoleConfig {
+                addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            },
+            store,
+            publisher,
+            source.store_path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(handle.addr().port(), 0);
+        handle.shutdown().await.unwrap();
     }
 }

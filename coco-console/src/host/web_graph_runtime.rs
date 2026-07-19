@@ -1740,6 +1740,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn viewport_diff_supports_server_and_client_known_state() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        let viewport = complete_viewport();
+
+        let server_diff = runtime
+            .viewport_diff(
+                ViewMode::All,
+                GraphViewportDiffRequest {
+                    previous: viewport,
+                    current: viewport,
+                    known: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(server_diff.added.nodes.is_empty());
+        assert!(server_diff.updated.nodes.is_empty());
+        assert!(server_diff.removed.is_empty());
+
+        let client_diff = runtime
+            .viewport_diff(
+                ViewMode::All,
+                GraphViewportDiffRequest {
+                    previous: viewport,
+                    current: viewport,
+                    known: Some(crate::host::api::GraphViewportKnownItems::default()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(client_diff.added.nodes.len(), 1);
+        assert!(client_diff.updated.nodes.is_empty());
+        assert!(client_diff.removed.is_empty());
+    }
+
+    #[tokio::test]
     async fn source_dirty_wakeup_persists_cursor_before_publishing_revision() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
