@@ -62,6 +62,7 @@ jobs:
               - "coco-*/tests/**"
               - "coco-console/build.rs"
               - "coco-console/migrations/**"
+              - "coco-console/web-graph-migrations/**"
               - "coco-console/templates/**"
               - "coco-mem/src/default_skills/**"
             wasm_coverage:
@@ -100,6 +101,7 @@ jobs:
               - "coco-*/tests/**"
               - "coco-console/build.rs"
               - "coco-console/migrations/**"
+              - "coco-console/web-graph-migrations/**"
               - "coco-console/templates/**"
               - "coco-mem/src/default_skills/**"
 

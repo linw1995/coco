@@ -30,6 +30,8 @@ mod host {
     #[allow(dead_code)]
     pub mod source_cache;
     pub mod store;
+    #[allow(dead_code)]
+    pub mod web_graph_store;
 
     pub use config::ConsoleConfig;
     pub use error::{Error, Result};
