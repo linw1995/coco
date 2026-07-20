@@ -772,7 +772,7 @@ mod tests {
         assert!(body.contains("data-node-x"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn server_serves_third_party_notices_and_shuts_down() {
         let source = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
