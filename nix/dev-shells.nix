@@ -43,6 +43,7 @@ in {
       grcov
 
       cargo-about
+      cargo-deny
       cargo-nextest
       wasm-bindgen-cli
       chromedriver
@@ -62,6 +63,8 @@ in {
       prek
       diesel-cli
       wasm-bindgen-cli
+      cargo-about
+      cargo-deny
       ruff
       taplo
       uv
