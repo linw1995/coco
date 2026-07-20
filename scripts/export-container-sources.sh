@@ -149,6 +149,10 @@ cut -f1 "${source_derivations_file}" | sort -u > "${source_paths_file}"
 
 while IFS= read -r source_path; do
   if [[ ! -e "${source_path}" && ! -L "${source_path}" ]]; then
+    nix-store --realise "${source_path}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ ! -e "${source_path}" && ! -L "${source_path}" ]]; then
     parent_derivation="$(
       awk -F '\t' -v source_path="${source_path}" \
         '$1 == source_path { print $2; exit }' \
