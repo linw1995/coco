@@ -3,7 +3,7 @@ use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use leptos::{
     ev,
-    leptos_dom::helpers::{location_hash, window_event_listener},
+    leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
 };
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue};
@@ -14,6 +14,8 @@ use web_sys::Response;
 
 #[cfg(any(target_arch = "wasm32", test))]
 const NODE_TARGET_PREFIX: &str = "detail-";
+#[cfg(target_arch = "wasm32")]
+pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PanelSelection {
@@ -75,7 +77,7 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
         <Suspense fallback=render_default_provider_context>
             {move || Suspend::new(async move {
                 match provider_context.await {
-                    Ok(html) => render_panel_html(html),
+                    Ok(html) => render_provider_context_html(html),
                     Err(error) => render_provider_context_error(error),
                 }
             })}
@@ -142,11 +144,11 @@ async fn fetch_panel_html(url: String) -> Result<String, String> {
         if !response.ok() {
             return Err(format!("request failed with status {}", response.status()));
         }
-        return JsFuture::from(response.text().map_err(js_error_message)?)
+        JsFuture::from(response.text().map_err(js_error_message)?)
             .await
             .map_err(js_error_message)?
             .as_string()
-            .ok_or_else(|| "response text is not a string".to_owned());
+            .ok_or_else(|| "response text is not a string".to_owned())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -164,7 +166,25 @@ fn render_panel_html(html: String) -> AnyView {
     view! { <div class="panel-fragment" inner_html=html></div> }.into_any()
 }
 
-fn render_default_node_detail() -> AnyView {
+#[cfg(target_arch = "wasm32")]
+fn render_provider_context_html(html: String) -> AnyView {
+    request_animation_frame(|| {
+        let Ok(event) = web_sys::Event::new(PROVIDER_CONTEXT_RENDERED_EVENT) else {
+            return;
+        };
+        if let Some(window) = web_sys::window() {
+            let _ = window.dispatch_event(&event);
+        }
+    });
+    render_panel_html(html)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn render_provider_context_html(html: String) -> AnyView {
+    render_panel_html(html)
+}
+
+pub fn render_default_node_detail() -> AnyView {
     view! {
         <section class="node-details node-details-default">
             <h2>"Node"</h2>
@@ -192,7 +212,7 @@ fn render_node_detail_error(error: String) -> AnyView {
     .into_any()
 }
 
-fn render_default_provider_context() -> AnyView {
+pub fn render_default_provider_context() -> AnyView {
     view! {
         <section class="provider-context-section provider-context-default">
             <h2>"Provider Context"</h2>
@@ -280,5 +300,49 @@ mod tests {
         assert!(provider.contains("leptos-island"));
         assert!(provider.contains("Select a node to inspect its provider context."));
         assert!(!provider.contains("<h2>Node</h2>"));
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+
+    use wasm_bindgen::UnwrapThrowExt;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn panel_selection_signals_track_hash_changes_independently() {
+        let owner = Owner::new();
+        owner.set();
+        let window = web_sys::window().expect_throw("window should be available");
+        window
+            .location()
+            .set_hash("detail-node")
+            .expect_throw("initial hash should be set");
+        let node_selection = use_panel_selection();
+        let context_selection = use_panel_selection();
+
+        window
+            .location()
+            .set_hash("detail-node?context=detail-context")
+            .expect_throw("provider context hash should be set");
+        window
+            .dispatch_event(&web_sys::Event::new("hashchange").expect_throw("event should build"))
+            .expect_throw("hashchange should dispatch");
+
+        let expected = PanelSelection {
+            target: Some("detail-node".to_owned()),
+            context: Some("detail-context".to_owned()),
+        };
+        assert_eq!(node_selection.get_untracked(), expected);
+        assert_eq!(context_selection.get_untracked(), expected);
+
+        owner.cleanup();
+        window
+            .location()
+            .set_hash("")
+            .expect_throw("hash should be cleared");
     }
 }

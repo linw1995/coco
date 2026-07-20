@@ -3,6 +3,10 @@ use leptos::{html::HtmlElement, prelude::*};
 
 use crate::api::Point;
 use crate::host::web_graph_view::{NodeView, ViewMode, node_target_id};
+use crate::panels::{
+    NodeDetailPanel, ProviderContextPanel, render_default_node_detail,
+    render_default_provider_context,
+};
 
 #[derive(Template)]
 #[template(path = "graph_shell.html")]
@@ -24,12 +28,12 @@ pub fn render_node_detail_fragment(node: Option<&NodeView>, target: Option<&str>
     match (node, target) {
         (Some(node), _) => render_node_details(node).to_html(),
         (None, Some(target)) => render_missing_node_details(target).to_html(),
-        (None, None) => render_default_node_details().to_html(),
+        (None, None) => render_default_node_detail().to_html(),
     }
 }
 
 pub fn render_provider_context_default_fragment() -> String {
-    view! { <ProviderContextDefault/> }.to_html()
+    render_default_provider_context().to_html()
 }
 
 pub fn render_provider_context_items_fragment(items: Vec<ProviderContextItem>) -> String {
@@ -58,6 +62,7 @@ fn render_document(root: AnyView) -> String {
 
 fn render_root(mode: ViewMode, revision: u64) -> AnyView {
     let stats = format!("{} / revision {}", mode.label(), revision);
+    let graph_mode = mode.as_query_value().to_owned();
     let graph_shell = GraphShellTemplate
         .render()
         .expect("graph shell template should render");
@@ -85,10 +90,12 @@ fn render_root(mode: ViewMode, revision: u64) -> AnyView {
                     {render_empty_time_scale()}
                 </div>
                 <section class="provider-context-panel">
-                    <div class="provider-context-slot"><ProviderContextDefault/></div>
+                    <div class="provider-context-slot">
+                        <ProviderContextPanel graph_mode=graph_mode.clone()/>
+                    </div>
                 </section>
                 <aside class="side">
-                    <div class="node-detail-slot">{render_default_node_details()}</div>
+                    <div class="node-detail-slot"><NodeDetailPanel graph_mode=graph_mode/></div>
                 </aside>
             </section>
         </main>
@@ -133,21 +140,6 @@ fn render_empty_time_scale() -> AnyView {
     .into_any()
 }
 
-fn render_default_node_details() -> AnyView {
-    view! {
-        <section class="node-details node-details-default">
-            <h2>"Node"</h2>
-            <dl class="detail-list">
-                <div>
-                    <dt>"Selection"</dt>
-                    <dd>"Select a node to inspect its content."</dd>
-                </div>
-            </dl>
-        </section>
-    }
-    .into_any()
-}
-
 fn render_node_details(node: &NodeView) -> AnyView {
     let target = node_target_id(&node.id);
     let id = node.id.clone();
@@ -187,16 +179,6 @@ fn render_missing_node_details(target: &str) -> AnyView {
         </section>
     }
     .into_any()
-}
-
-#[component]
-fn ProviderContextDefault() -> impl IntoView {
-    view! {
-        <section class="provider-context-section provider-context-default">
-            <h2>"Provider Context"</h2>
-            <p class="provider-context-empty">"Select a node to inspect its provider context."</p>
-        </section>
-    }
 }
 
 #[component]
@@ -292,6 +274,9 @@ mod tests {
         assert!(page.contains("data-graph-mode=\"all\""));
         assert!(page.contains("virtual-graph"));
         assert!(page.contains("/pkg/coco_console.js"));
+        assert_eq!(page.matches("<leptos-island").count(), 2);
+        assert!(page.contains("Select a node to inspect its content."));
+        assert!(page.contains("Select a node to inspect its provider context."));
     }
 
     #[test]
