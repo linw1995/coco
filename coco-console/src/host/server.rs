@@ -36,6 +36,7 @@ use crate::host::web_graph_view::{
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
+const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.html");
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
@@ -134,6 +135,7 @@ where
         .route("/", get(index_page::<S>).post(method_not_allowed))
         .route("/index.html", get(index_page::<S>))
         .route("/style.css", get(style_css))
+        .route("/third-party-notices.html", get(third_party_notices))
         .route("/api/graph/viewport", get(graph_viewport::<S>))
         .route(
             "/api/graph/viewport/items/diff",
@@ -192,6 +194,14 @@ async fn style_css() -> Response {
         StatusCode::OK,
         "text/css; charset=utf-8",
         Body::from(STYLE_CSS),
+    )
+}
+
+async fn third_party_notices() -> Response {
+    response_with_body(
+        StatusCode::OK,
+        "text/html; charset=utf-8",
+        Body::from(THIRD_PARTY_NOTICES),
     )
 }
 
@@ -655,6 +665,16 @@ mod tests {
     #[test]
     fn malformed_percent_encoding_is_preserved() {
         assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
+    }
+
+    #[tokio::test]
+    async fn third_party_notices_are_embedded() {
+        let response = third_party_notices().await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("CoCo Third-Party Notices"));
+        assert!(body.contains("Apache License 2.0"));
     }
 
     #[tokio::test]

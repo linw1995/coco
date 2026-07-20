@@ -42,6 +42,7 @@ in {
       diesel-cli
       grcov
 
+      cargo-about
       cargo-nextest
       wasm-bindgen-cli
       chromedriver

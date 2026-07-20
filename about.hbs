@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CoCo Third-Party Notices</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      line-height: 1.5;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 72rem;
+      padding: 2rem;
+    }
+    a {
+      color: inherit;
+    }
+    .license-list {
+      list-style: none;
+      padding: 0;
+    }
+    .license-text {
+      border: 1px solid currentColor;
+      max-height: 24rem;
+      overflow: auto;
+      padding: 1rem;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>CoCo Third-Party Notices</h1>
+    <p>This document lists licenses for Rust dependencies distributed with CoCo.</p>
+    <h2>License overview</h2>
+    <ul>
+      {{#each overview}}
+      <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+      {{/each}}
+    </ul>
+    <h2>License texts</h2>
+    <ul class="license-list">
+      {{#each licenses}}
+      <li>
+        {{#if first_of_kind}}<h3 id="{{id}}">{{name}}</h3>{{/if}}
+        <h4 id="{{id}}-{{@index}}">Used by</h4>
+        <ul>
+          {{#each used_by}}
+          {{#if crate.source}}
+          <li>
+            <a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">
+              {{crate.name}} {{crate.version}}
+            </a>
+          </li>
+          {{/if}}
+          {{/each}}
+        </ul>
+        <pre class="license-text">{{text}}</pre>
+      </li>
+      {{/each}}
+    </ul>
+  </main>
+</body>
+</html>

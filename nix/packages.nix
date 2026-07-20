@@ -23,6 +23,9 @@
       (lib.fileset.maybeMissing (root + /coco-console/web-graph-migrations))
       (lib.fileset.maybeMissing (root + /coco-mem/migrations))
       (lib.fileset.maybeMissing (root + /coco-mem/src/default_skills))
+      (lib.fileset.maybeMissing (root + /LICENSE))
+      (lib.fileset.maybeMissing (root + /NOTICE))
+      (lib.fileset.maybeMissing (root + /THIRD_PARTY_NOTICES.html))
     ];
   };
   cargoArgs = {
@@ -38,6 +41,11 @@
       wasm-bindgen-cli
     ];
   };
+  installLicenses = ''
+    install -Dm644 LICENSE "$out/share/licenses/coco/LICENSE"
+    install -Dm644 NOTICE "$out/share/licenses/coco/NOTICE"
+    install -Dm644 THIRD_PARTY_NOTICES.html "$out/share/licenses/coco/THIRD_PARTY_NOTICES.html"
+  '';
   cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
   debugCargoArgs =
     cargoArgs
@@ -61,18 +69,22 @@
   coco-cli = craneLib.buildPackage (cargoArgs
     // {
       inherit cargoArtifacts;
+      postInstall = installLicenses;
 
       meta = {
         inherit description;
+        license = lib.licenses.asl20;
         mainProgram = "coco-cli";
       };
     });
   coco-debug-cli = craneLib.buildPackage (debugCargoArgs
     // {
       cargoArtifacts = debugCargoArtifacts;
+      postInstall = installLicenses;
 
       meta = {
         inherit description;
+        license = lib.licenses.asl20;
         mainProgram = "coco-cli";
       };
     });

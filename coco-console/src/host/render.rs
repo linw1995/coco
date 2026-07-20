@@ -48,6 +48,7 @@ fn render_document(root: AnyView) -> String {
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>"CoCo Console"</title>
                 <link rel="stylesheet" href="/style.css" />
+                <link rel="license" href="/third-party-notices.html" />
                 <script type="module" src="/pkg/coco_console.js"></script>
             </head>
             <body>{root}</body>
