@@ -21,6 +21,7 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem,
     GraphViewportResponse, Point,
 };
+use crate::panels::PanelSelection;
 use crate::viewport::{
     MIN_OVERSCAN, ViewportDrag, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
 };
@@ -2186,28 +2187,15 @@ fn graph_focus_point_from_rendered_node(
 }
 
 fn selected_node_target(window: &Window) -> Option<String> {
-    let hash = selected_hash(window)?;
-    let target = hash
-        .split_once('?')
-        .map(|(target, _)| target)
-        .unwrap_or(&hash);
-    (!target.is_empty() && target.starts_with("detail-")).then(|| target.to_owned())
+    selected_panel_selection(window).target
 }
 
 fn selected_provider_context_target(window: &Window) -> Option<String> {
-    let hash = selected_hash(window)?;
-    let (_, query) = hash.split_once('?')?;
-    query.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
-        (name == "context" && value.starts_with("detail-")).then(|| value.to_owned())
-    })
+    selected_panel_selection(window).context
 }
 
-fn selected_hash(window: &Window) -> Option<String> {
-    let hash = window.location().hash().ok()?;
-    hash.strip_prefix('#')
-        .filter(|target| !target.is_empty())
-        .map(str::to_owned)
+fn selected_panel_selection(window: &Window) -> PanelSelection {
+    PanelSelection::from_hash(&window.location().hash().unwrap_or_default())
 }
 
 fn pan_from_wheel(graph: &mut VirtualGraph, event: &WheelEvent) {
