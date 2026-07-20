@@ -23,7 +23,7 @@ axum = { version = "0.8", default-features = false, features = [
   "tokio",
 ] }
 futures-util = "0.3.32"
-leptos.workspace = true
+leptos = { workspace = true, features = ["islands", "ssr"] }
 tokio.workspace = true
 tracing.workspace = true
 diesel.workspace = true
@@ -36,6 +36,7 @@ snafu.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Wasm bindings.
 js-sys = "=0.3.94"
+leptos = { workspace = true, features = ["hydrate", "islands"] }
 wasm-bindgen = "=0.2.117"
 wasm-bindgen-futures = "=0.4.67"
 

@@ -77,6 +77,7 @@ struct ViewportPatchInput {
 
 #[cfg_attr(not(test), wasm_bindgen::prelude::wasm_bindgen(start))]
 pub fn start() {
+    leptos::mount::hydrate_islands();
     spawn_local(async {
         if let Err(error) = run().await {
             web_sys::console::error_1(&error);
