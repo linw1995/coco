@@ -8,6 +8,12 @@ use crate::panels::{
     render_default_provider_context,
 };
 
+const HYDRATION_BOOTSTRAP: &str = "__RESOLVED_RESOURCES=[];\
+__SERIALIZED_ERRORS=[];\
+__PENDING_RESOURCES=[];\
+__RESOURCE_RESOLVERS=[];\
+__INCOMPLETE_CHUNKS=[];";
+
 #[derive(Template)]
 #[template(path = "graph_shell.html")]
 struct GraphShellTemplate;
@@ -53,6 +59,7 @@ fn render_document(root: AnyView) -> String {
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>"CoCo Console"</title>
                 <link rel="stylesheet" href="/style.css" />
+                <script>{HYDRATION_BOOTSTRAP}</script>
                 <HydrationScripts options=options islands=true/>
             </head>
             <body>{root}</body>
@@ -275,7 +282,13 @@ mod tests {
         assert!(page.contains("data-graph-mode=\"all\""));
         assert!(page.contains("virtual-graph"));
         assert!(page.contains("/pkg/coco_console.js"));
-        assert!(page.contains("hydrateIslands(document.body, mod)"));
+        let bootstrap = page
+            .find("__INCOMPLETE_CHUNKS=[]")
+            .expect("hydration globals should be initialized");
+        let loader = page
+            .find("hydrateIslands(document.body, mod)")
+            .expect("island loader should be rendered");
+        assert!(bootstrap < loader);
         assert_eq!(page.matches("<leptos-island").count(), 2);
         assert!(page.contains("Select a node to inspect its content."));
         assert!(page.contains("Select a node to inspect its provider context."));
