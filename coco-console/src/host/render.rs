@@ -45,6 +45,7 @@ pub fn render_provider_context_missing_fragment(target: &str) -> String {
 }
 
 fn render_document(root: AnyView) -> String {
+    let options = LeptosOptions::builder().output_name("coco_console").build();
     let rendered: View<HtmlElement<_, _, _>> = view! {
         <html lang="en">
             <head>
@@ -52,7 +53,7 @@ fn render_document(root: AnyView) -> String {
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>"CoCo Console"</title>
                 <link rel="stylesheet" href="/style.css" />
-                <script type="module" src="/pkg/coco_console.js"></script>
+                <HydrationScripts options=options islands=true/>
             </head>
             <body>{root}</body>
         </html>
@@ -274,6 +275,7 @@ mod tests {
         assert!(page.contains("data-graph-mode=\"all\""));
         assert!(page.contains("virtual-graph"));
         assert!(page.contains("/pkg/coco_console.js"));
+        assert!(page.contains("hydrateIslands(document.body, mod)"));
         assert_eq!(page.matches("<leptos-island").count(), 2);
         assert!(page.contains("Select a node to inspect its content."));
         assert!(page.contains("Select a node to inspect its provider context."));
