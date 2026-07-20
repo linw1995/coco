@@ -640,6 +640,7 @@ mod tests {
         Anchor, BranchStore, Kind, NewNode, NodeStore, Role, SessionAnchor, SessionRole,
         SqliteStore,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::ConsoleStore;
     use crate::host::web_graph_view::node_target_id;
@@ -665,16 +666,6 @@ mod tests {
     #[test]
     fn malformed_percent_encoding_is_preserved() {
         assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
-    }
-
-    #[tokio::test]
-    async fn third_party_notices_are_embedded() {
-        let response = third_party_notices().await;
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(body.contains("CoCo Third-Party Notices"));
-        assert!(body.contains("Apache License 2.0"));
     }
 
     #[tokio::test]
@@ -782,7 +773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_with_graph_store_path_starts_and_shuts_down() {
+    async fn server_serves_third_party_notices_and_shuts_down() {
         let source = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(source.clone(), publisher.clone());
@@ -798,6 +789,20 @@ mod tests {
         .unwrap();
 
         assert_ne!(handle.addr().port(), 0);
+        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        stream
+            .write_all(
+                b"GET /third-party-notices.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("content-type: text/html; charset=utf-8\r\n"));
+        assert!(response.contains("CoCo Third-Party Notices"));
+        assert!(response.contains("Apache License 2.0"));
         handle.shutdown().await.unwrap();
     }
 }
