@@ -1,5 +1,4 @@
 mod api;
-#[cfg(any(target_arch = "wasm32", test))]
 mod panels;
 
 #[allow(dead_code)]
