@@ -13,6 +13,37 @@
   };
   lib = packagePkgs.lib;
   craneLib = (inputs.crane.mkLib packagePkgs).overrideToolchain rustToolchainFor;
+  spdxLicenseListVersion = "v3.28.0";
+  fetchSpdxLicense = {
+    name,
+    hash,
+  }:
+    packagePkgs.fetchurl {
+      inherit name hash;
+      url = "https://raw.githubusercontent.com/spdx/license-list-data/${spdxLicenseListVersion}/text/${name}";
+    };
+  containerLicenseTexts = {
+    gpl20 = fetchSpdxLicense {
+      name = "GPL-2.0-only.txt";
+      hash = "sha256-qvE1Ry+BxbSg3Kk2flu16XUAMrW+vlRCs25MCkdDDfM=";
+    };
+    gpl30 = fetchSpdxLicense {
+      name = "GPL-3.0-only.txt";
+      hash = "sha256-+5gWaMGKJ54oX8TYP7oeg2zITdTapzyWl9PP0tispuA=";
+    };
+    lgpl21 = fetchSpdxLicense {
+      name = "LGPL-2.1-only.txt";
+      hash = "sha256-V0l4XIve+vy115gnDtCpZwNv4spj3O2t4WJ1Zd/vgdI=";
+    };
+    lgpl30 = fetchSpdxLicense {
+      name = "LGPL-3.0-only.txt";
+      hash = "sha256-mWrwUT3yH3SWKIlRxBQooDwXTp5KnWNmXFfWcPhFzLE=";
+    };
+    mpl20 = fetchSpdxLicense {
+      name = "MPL-2.0.txt";
+      hash = "sha256-ZqMQfVrWoFiqt1PqrCBHzLLtDjlGXdD+WETaPjANUXI=";
+    };
+  };
   src = lib.fileset.toSource {
     inherit root;
     fileset = lib.fileset.unions [
@@ -88,11 +119,21 @@
         mainProgram = "coco-cli";
       };
     });
+  containerLegal = packagePkgs.runCommand "coco-container-legal-${version}" {} ''
+    legal_dir="$out/share/licenses/coco-container"
+
+    install -Dm644 ${containerLicenseTexts.gpl20} "$legal_dir/GPL-2.0-only.txt"
+    install -Dm644 ${containerLicenseTexts.gpl30} "$legal_dir/GPL-3.0-only.txt"
+    install -Dm644 ${containerLicenseTexts.lgpl21} "$legal_dir/LGPL-2.1-only.txt"
+    install -Dm644 ${containerLicenseTexts.lgpl30} "$legal_dir/LGPL-3.0-only.txt"
+    install -Dm644 ${containerLicenseTexts.mpl20} "$legal_dir/MPL-2.0.txt"
+    install -Dm644 ${root + /docker/CONTAINER_SOURCE.md} "$legal_dir/CONTAINER_SOURCE.md"
+  '';
   coco-image = import ./docker-image.nix {
-    inherit packagePkgs lib targetSystem coco-cli cocoDockerEntrypoint;
+    inherit packagePkgs lib targetSystem coco-cli cocoDockerEntrypoint containerLegal;
   };
   coco-debug-image = import ./docker-image.nix {
-    inherit packagePkgs lib targetSystem cocoDockerEntrypoint;
+    inherit packagePkgs lib targetSystem cocoDockerEntrypoint containerLegal;
     coco-cli = coco-debug-cli;
     debugTools = true;
   };

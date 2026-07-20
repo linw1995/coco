@@ -76,11 +76,20 @@ jobs:
           mkdir -p dist
           cp --dereference image "dist/${ARTIFACT_PREFIX}-${ARCH}.tar.gz"
 
+      - name: Export corresponding sources
+        shell: bash
+        env:
+          ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
+          ARCH: ${{ matrix.arch }}
+        run: scripts/export-container-sources.sh image "dist/${ARTIFACT_PREFIX}-${ARCH}-sources.tar.gz" "linux-${ARCH}"
+
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v7
         with:
           name: "${{ inputs.artifact-prefix }}-image-${{ matrix.arch }}"
-          path: "dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}.tar.gz"
+          path: |
+            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}.tar.gz
+            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-sources.tar.gz
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
@@ -118,7 +127,27 @@ jobs:
 
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha_tag="${SHA_TAG_PREFIX}-${GITHUB_SHA::12}"
-          image_files=(artifacts/"${ARTIFACT_PREFIX}"-*.tar.gz)
+          artifact_files=(artifacts/"${ARTIFACT_PREFIX}"-*.tar.gz)
+          image_files=()
+          declare -A source_layers=()
+
+          for artifact_file in "${artifact_files[@]}"; do
+            case "$(basename "${artifact_file}")" in
+              "${ARTIFACT_PREFIX}-amd64.tar.gz" | "${ARTIFACT_PREFIX}-arm64.tar.gz")
+                image_files+=("${artifact_file}")
+                ;;
+              "${ARTIFACT_PREFIX}-amd64-sources.tar.gz")
+                source_layers[amd64]="${artifact_file}"
+                ;;
+              "${ARTIFACT_PREFIX}-arm64-sources.tar.gz")
+                source_layers[arm64]="${artifact_file}"
+                ;;
+              *)
+                echo "::error::Unexpected Docker publication artifact: ${artifact_file}"
+                exit 1
+                ;;
+            esac
+          done
 
           if ((${#image_files[@]} == 0)); then
             echo "::error::No Docker image artifacts were built."
@@ -126,6 +155,7 @@ jobs:
           fi
 
           manifest_refs=()
+          source_layer_args=()
 
           for image_file in "${image_files[@]}"; do
             case "$(basename "${image_file}")" in
@@ -141,12 +171,19 @@ jobs:
                 ;;
             esac
 
+            source_layer="${source_layers[${arch}]:-}"
+            if [[ -z "${source_layer}" ]]; then
+              echo "::error::No corresponding source artifact was built for ${arch}."
+              exit 1
+            fi
+
             docker_tar="${image_file%.gz}"
             gzip -dc "${image_file}" > "${docker_tar}"
 
             digest="$(nix run nixpkgs#crane -- digest --tarball "${docker_tar}")"
             nix run nixpkgs#crane -- push "${docker_tar}" "${image}@${digest}"
             manifest_refs+=("${image}@${digest}")
+            source_layer_args+=("--new_layer" "${source_layer}")
           done
 
           publish_image() {
@@ -165,16 +202,30 @@ jobs:
             nix run nixpkgs#crane -- index append "${manifest_args[@]}" --tag "${image}:${tag}"
           }
 
+          publish_alias() {
+            local tag="$1"
+
+            nix run nixpkgs#crane -- copy \
+              "${image}:${sha_tag}-sources" \
+              "${image}:${tag}-sources"
+            publish_image "${tag}"
+          }
+
+          nix run nixpkgs#crane -- append \
+            --oci-empty-base \
+            "${source_layer_args[@]}" \
+            --new_tag "${image}:${sha_tag}-sources"
+
           publish_image "${sha_tag}"
 
           if [[ "${PUBLISH_LATEST_ON_MAIN}" == "true" && "${GITHUB_REF_TYPE}" == "branch" && "${GITHUB_REF_NAME}" == "main" ]]; then
-            publish_image "latest"
+            publish_alias "latest"
           fi
 
           if [[ "${PUBLISH_GIT_TAG}" == "true" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            publish_image "${GITHUB_REF_NAME}"
+            publish_alias "${GITHUB_REF_NAME}"
           fi
 
           if [[ -n "${MANUAL_TAG}" ]]; then
-            publish_image "${MANUAL_TAG}"
+            publish_alias "${MANUAL_TAG}"
           fi
