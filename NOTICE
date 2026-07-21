@@ -1,0 +1,12 @@
+CoCo
+Copyright 2026 Jade Lin
+
+This product includes implementation adaptations from the following projects,
+each licensed under the Apache License, Version 2.0:
+
+OpenAI Codex
+Copyright 2025 OpenAI
+https://github.com/openai/codex
+
+Bub
+https://github.com/bubbuild/bub

@@ -4,6 +4,7 @@
   targetSystem,
   coco-cli,
   cocoDockerEntrypoint,
+  containerLegal,
   debugTools ? false,
 }: let
   fhsDynamicLinker = lib.attrByPath [targetSystem] null {
@@ -26,6 +27,7 @@ in
         [
           coco-cli
           cocoDockerEntrypoint
+          containerLegal
           bash
           coreutils
           curl
@@ -70,6 +72,13 @@ in
           fi
         '';
       config = {
+        Labels = {
+          "io.coco.corresponding-source-pattern" = "ghcr.io/linw1995/coco:<tag>-sources";
+          "org.opencontainers.image.documentation" = "https://github.com/linw1995/coco/blob/main/docs/container-licenses.md";
+          "org.opencontainers.image.licenses" = "Apache-2.0";
+          "org.opencontainers.image.source" = "https://github.com/linw1995/coco";
+          "org.opencontainers.image.title" = "CoCo";
+        };
         Env = [
           "PATH=/bin"
           "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"

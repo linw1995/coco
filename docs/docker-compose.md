@@ -242,6 +242,13 @@ Run manual image builds on Linux, or on a host whose Nix setup can build the
 selected Linux target. For example, a macOS host needs a Linux builder before it
 can build `.#coco-image-linux-arm64` locally.
 
+## Licenses and Corresponding Source
+
+Published image tags have matching `-sources` tags in GHCR. The runtime image
+also contains project, dependency, and container license files. See
+[Container Licenses and Corresponding Source](container-licenses.md) for the
+layout and extraction commands.
+
 ## Cronjob Skill
 
 The entrypoint supervises one `supercronic -inotify` process per active
