@@ -19,6 +19,7 @@ use super::error::StoreSnafu;
 pub const GRAPH_PADDING: i32 = 56;
 pub const GRAPH_RANK_STEP: i32 = 112;
 pub const GRAPH_ROW_STEP: i32 = 72;
+pub const GRAPH_NODE_RADIUS: i32 = 18;
 
 const SUMMARY_LIMIT: usize = 140;
 
@@ -343,7 +344,6 @@ pub fn route_edge_with_offsets(
     target_center: Point,
     offsets: EndpointPortOffsets,
 ) -> BezierRoute {
-    const NODE_RADIUS: i32 = 18;
     const SOURCE_PADDING: i32 = 2;
     const TARGET_PADDING: i32 = 6;
     const CONTROL_RATIO_PERCENT: i32 = 45;
@@ -352,14 +352,14 @@ pub fn route_edge_with_offsets(
     let source = Point {
         x: source_center
             .x
-            .saturating_add(NODE_RADIUS)
+            .saturating_add(GRAPH_NODE_RADIUS)
             .saturating_add(SOURCE_PADDING),
         y: source_center.y.saturating_add(offsets.source),
     };
     let target = Point {
         x: target_center
             .x
-            .saturating_sub(NODE_RADIUS)
+            .saturating_sub(GRAPH_NODE_RADIUS)
             .saturating_sub(TARGET_PADDING),
         y: target_center.y.saturating_add(offsets.target),
     };

@@ -22,9 +22,10 @@ use super::web_graph_order::{
 };
 use super::web_graph_store::{Error as StoreError, StoredGraphState, Viewport, WebGraphStore};
 use super::web_graph_view::{
-    EndpointPortOffsets, EndpointPortSlots, GRAPH_PADDING, GRAPH_RANK_STEP, GRAPH_ROW_STEP,
-    ViewMode, diff_graph_viewport_responses, edge_key, edge_port_offset, graph_kind_name, node_key,
-    node_target_id, route_edge, route_edge_with_offsets, shorten_id, summarize_node,
+    EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
+    GRAPH_ROW_STEP, ViewMode, diff_graph_viewport_responses, edge_key, edge_port_offset,
+    graph_kind_name, node_key, node_target_id, route_edge, route_edge_with_offsets, shorten_id,
+    summarize_node,
 };
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -387,9 +388,11 @@ fn reserved_edge_rows(
         let target = points[&routed.edge.target];
         let mut x = source.x.saturating_add(GRAPH_RANK_STEP);
         while x < target.x {
-            rows.entry(x)
-                .or_default()
-                .insert(nearest_row_for_y(route_y_at_x(routed.route, x)));
+            let left_y = route_y_at_x(routed.route, x.saturating_sub(GRAPH_NODE_RADIUS));
+            let right_y = route_y_at_x(routed.route, x.saturating_add(GRAPH_NODE_RADIUS));
+            let first_row = nearest_row_for_y(left_y.min(right_y));
+            let last_row = nearest_row_for_y(left_y.max(right_y));
+            rows.entry(x).or_default().extend(first_row..=last_row);
             let next = x.saturating_add(GRAPH_RANK_STEP);
             if next <= x {
                 break;
@@ -2037,6 +2040,50 @@ mod tests {
             projected[&source_to_lower].route.source.y,
             points[&source].y + edge_port_offset(1, 2)
         );
+    }
+
+    #[test]
+    fn edge_lanes_reserve_every_row_crossed_within_node_radius() {
+        let source = NodeId::new("source").unwrap();
+        let target = NodeId::new("target").unwrap();
+        let edge = EdgeId::new(EdgeKind::Merge, source.clone(), target.clone());
+        let points = BTreeMap::from([
+            (
+                source.clone(),
+                Point {
+                    x: GRAPH_PADDING,
+                    y: GRAPH_PADDING,
+                },
+            ),
+            (
+                target.clone(),
+                Point {
+                    x: GRAPH_PADDING + 2 * GRAPH_RANK_STEP,
+                    y: GRAPH_PADDING + 3 * GRAPH_ROW_STEP,
+                },
+            ),
+        ]);
+        let route = route_edge_with_offsets(
+            points[&source],
+            points[&target],
+            EndpointPortOffsets {
+                source: 0,
+                target: 0,
+            },
+        );
+        let routes = BTreeMap::from([(edge.clone(), RoutedEdge { edge, route })]);
+        let middle_x = GRAPH_PADDING + GRAPH_RANK_STEP;
+        let center_row = nearest_row_for_y(route_y_at_x(route, middle_x));
+        let left_row = nearest_row_for_y(route_y_at_x(
+            route,
+            middle_x.saturating_sub(GRAPH_NODE_RADIUS),
+        ));
+
+        let reserved = reserved_edge_rows(&routes, &points);
+
+        assert_ne!(left_row, center_row);
+        assert!(reserved[&middle_x].contains(&left_row));
+        assert!(reserved[&middle_x].contains(&center_row));
     }
 
     #[test]
