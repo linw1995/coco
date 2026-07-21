@@ -99,6 +99,7 @@ diesel::table! {
         source_version -> BigInt,
         source_cursor_row_id -> Nullable<BigInt>,
         source_cursor_node_id -> Nullable<Text>,
+        layout_version -> Integer,
     }
 }
 

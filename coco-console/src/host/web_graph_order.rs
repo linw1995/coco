@@ -10,6 +10,9 @@ use crate::web_graph::{EdgeKind, NodeId, NodePlacement, Point};
 pub enum Error {
     #[snafu(display("Web graph order {order} exceeds the layout coordinate range"))]
     CoordinateOverflow { order: usize },
+
+    #[snafu(display("Web graph reflow did not converge after {iterations} iterations"))]
+    ReflowDidNotConverge { iterations: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -24,6 +27,7 @@ pub fn stable_column_order(
     placements: &[NodePlacement],
     new_node_order: &BTreeMap<NodeId, usize>,
     incoming: &BTreeMap<NodeId, Vec<IncomingEdge>>,
+    reserved_edge_rows: &BTreeSet<usize>,
 ) -> Result<Vec<NodePlacement>> {
     let mut placements = placements.to_vec();
     placements.sort_by(|left, right| {
@@ -32,32 +36,30 @@ pub fn stable_column_order(
             .cmp(&right.point.y)
             .then_with(|| left.node.cmp(&right.node))
     });
-    let new_node_ids = placements
+    let point_by_node = placements
         .iter()
-        .filter(|placement| new_node_order.contains_key(&placement.node))
-        .map(|placement| placement.node.clone())
-        .collect::<BTreeSet<_>>();
-    let mut fixed = placements
+        .map(|placement| (placement.node.clone(), placement.point))
+        .collect::<BTreeMap<_, _>>();
+    let mut fixed = Vec::new();
+    let mut pending = placements
         .iter()
-        .filter(|placement| !new_node_ids.contains(&placement.node))
         .map(|placement| placement.node.clone())
         .collect::<Vec<_>>();
-    let mut pending = new_node_ids.into_iter().collect::<Vec<_>>();
     pending.sort_by(|left, right| {
         preferred_position(left, incoming)
             .cmp(&preferred_position(right, incoming))
             .then_with(|| {
-                new_nodes_order(left, new_node_order, placements.as_slice()).cmp(&new_nodes_order(
+                stable_node_order(left, new_node_order, &point_by_node).cmp(&stable_node_order(
                     right,
                     new_node_order,
-                    placements.as_slice(),
+                    &point_by_node,
                 ))
             })
             .then_with(|| left.cmp(right))
     });
 
     for node in pending {
-        let index = best_insertion_index(&fixed, &node, incoming);
+        let index = best_insertion_index(&fixed, &node, incoming, reserved_edge_rows);
         fixed.insert(index, node);
     }
 
@@ -72,7 +74,7 @@ pub fn stable_column_order(
             Ok(NodePlacement {
                 point: Point {
                     x: x_by_node[&node],
-                    y: order_y(order)?,
+                    y: order_y(available_row(order, reserved_edge_rows))?,
                 },
                 node,
             })
@@ -80,17 +82,14 @@ pub fn stable_column_order(
         .collect()
 }
 
-fn new_nodes_order(
+fn stable_node_order(
     node: &NodeId,
     new_nodes: &BTreeMap<NodeId, usize>,
-    placements: &[NodePlacement],
-) -> (usize, i32) {
+    point_by_node: &BTreeMap<NodeId, Point>,
+) -> (i32, usize) {
     (
+        point_by_node[node].y,
         new_nodes.get(node).copied().unwrap_or(usize::MAX),
-        placements
-            .iter()
-            .find(|placement| &placement.node == node)
-            .map_or(i32::MAX, |placement| placement.point.y),
     )
 }
 
@@ -135,6 +134,7 @@ fn best_insertion_index(
     fixed: &[NodeId],
     node: &NodeId,
     incoming: &BTreeMap<NodeId, Vec<IncomingEdge>>,
+    reserved_edge_rows: &BTreeSet<usize>,
 ) -> usize {
     let new_edges = incoming.get(node).map(Vec::as_slice).unwrap_or_default();
     let mut deltas = vec![CrossingDelta::default(); fixed.len() + 2];
@@ -166,7 +166,7 @@ fn best_insertion_index(
     for (index, delta) in deltas.into_iter().take(fixed.len() + 1).enumerate() {
         crossings += delta;
         let target_y = i64::from(GRAPH_PADDING).saturating_add(
-            i64::try_from(index)
+            i64::try_from(available_row(index, reserved_edge_rows))
                 .unwrap_or(i64::MAX)
                 .saturating_mul(i64::from(GRAPH_ROW_STEP)),
         );
@@ -198,6 +198,44 @@ fn best_insertion_index(
         }
     }
     best.expect("a column always has an insertion gap").1
+}
+
+fn available_row(mut index: usize, reserved_edge_rows: &BTreeSet<usize>) -> usize {
+    for reserved in reserved_edge_rows {
+        if *reserved > index {
+            break;
+        }
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+pub fn reserved_rows_from_placements(placements: &[NodePlacement]) -> BTreeSet<usize> {
+    let occupied = placements
+        .iter()
+        .filter_map(|placement| row_for_y(placement.point.y))
+        .collect::<BTreeSet<_>>();
+    let Some(last) = occupied.last().copied() else {
+        return BTreeSet::new();
+    };
+    (0..last).filter(|row| !occupied.contains(row)).collect()
+}
+
+pub fn nearest_row_for_y(y: i32) -> usize {
+    if y <= GRAPH_PADDING {
+        return 0;
+    }
+    let offset = i64::from(y) - i64::from(GRAPH_PADDING);
+    let rounded = offset.saturating_add(i64::from(GRAPH_ROW_STEP) / 2) / i64::from(GRAPH_ROW_STEP);
+    usize::try_from(rounded).unwrap_or(usize::MAX)
+}
+
+fn row_for_y(y: i32) -> Option<usize> {
+    let offset = y.checked_sub(GRAPH_PADDING)?;
+    if offset < 0 || offset % GRAPH_ROW_STEP != 0 {
+        return None;
+    }
+    usize::try_from(offset / GRAPH_ROW_STEP).ok()
 }
 
 fn add_crossing_range(
@@ -331,9 +369,13 @@ mod tests {
             (node("new"), vec![incoming(EdgeKind::Primary, 1)]),
         ]);
 
-        let ordered =
-            stable_column_order(&placements, &BTreeMap::from([(node("new"), 0)]), &incoming)
-                .unwrap();
+        let ordered = stable_column_order(
+            &placements,
+            &BTreeMap::from([(node("new"), 0)]),
+            &incoming,
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             ordered
@@ -357,15 +399,19 @@ mod tests {
             (node("new"), vec![incoming(EdgeKind::Primary, 0)]),
         ]);
 
-        let ordered =
-            stable_column_order(&placements, &BTreeMap::from([(node("new"), 0)]), &incoming)
-                .unwrap();
+        let ordered = stable_column_order(
+            &placements,
+            &BTreeMap::from([(node("new"), 0)]),
+            &incoming,
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(ordered, placements);
     }
 
     #[test]
-    fn existing_nodes_keep_their_relative_order() {
+    fn existing_nodes_are_reordered_when_their_primary_edges_cross() {
         let placements = vec![placement("a", 0), placement("b", 1), placement("new", 2)];
         let incoming = BTreeMap::from([
             (node("a"), vec![incoming(EdgeKind::Primary, 2)]),
@@ -373,19 +419,59 @@ mod tests {
             (node("new"), vec![incoming(EdgeKind::Primary, 1)]),
         ]);
 
-        let ordered =
-            stable_column_order(&placements, &BTreeMap::from([(node("new"), 0)]), &incoming)
-                .unwrap();
+        let ordered = stable_column_order(
+            &placements,
+            &BTreeMap::from([(node("new"), 0)]),
+            &incoming,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let nodes = ordered
             .into_iter()
             .map(|placement| placement.node)
             .collect::<Vec<_>>();
 
-        let a = node("a");
-        let b = node("b");
-        assert!(
-            nodes.iter().position(|candidate| candidate == &a).unwrap()
-                < nodes.iter().position(|candidate| candidate == &b).unwrap()
+        assert_eq!(nodes, vec![node("b"), node("new"), node("a")]);
+    }
+
+    #[test]
+    fn equal_parent_positions_keep_existing_node_order() {
+        let placements = vec![placement("a", 0), placement("b", 1)];
+        let incoming = BTreeMap::from([
+            (node("a"), vec![incoming(EdgeKind::Primary, 0)]),
+            (node("b"), vec![incoming(EdgeKind::Primary, 0)]),
+        ]);
+
+        let ordered =
+            stable_column_order(&placements, &BTreeMap::new(), &incoming, &BTreeSet::new())
+                .unwrap();
+
+        assert_eq!(ordered, placements);
+    }
+
+    #[test]
+    fn reserved_edge_rows_take_space_without_changing_node_order() {
+        let placements = vec![placement("a", 0), placement("b", 1)];
+
+        let ordered = stable_column_order(
+            &placements,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::from([0]),
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![placement("a", 1), placement("b", 2)]);
+    }
+
+    #[test]
+    fn existing_empty_rows_remain_reserved_for_edge_lanes() {
+        let placements = vec![placement("a", 0), placement("b", 2)];
+
+        assert_eq!(
+            reserved_rows_from_placements(&placements),
+            BTreeSet::from([1])
         );
+        assert_eq!(nearest_row_for_y(GRAPH_PADDING + GRAPH_ROW_STEP / 2), 1);
     }
 }
