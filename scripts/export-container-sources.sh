@@ -66,7 +66,7 @@ gzip -dc "${image_path}" | "${tar_command}" -xf - -C "${archive_dir}"
 layer_count=0
 while IFS= read -r layer_path; do
   ((layer_count += 1))
-  "${tar_command}" -tf "${archive_dir}/${layer_path}" \
+  "${tar_command}" --absolute-names -tf "${archive_dir}/${layer_path}" \
     | sed -nE \
       -e 's#^/nix/store/([^/]+).*#/nix/store/\1#p' \
       -e 's#^\./nix/store/([^/]+).*#/nix/store/\1#p' \
