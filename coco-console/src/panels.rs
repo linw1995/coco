@@ -1,4 +1,7 @@
 use leptos::prelude::*;
+use serde::de::DeserializeOwned;
+
+use crate::api::{NodeDetailResponse, PanelNode, ProviderContextItem, ProviderContextResponse};
 
 #[cfg(target_arch = "wasm32")]
 use leptos::{
@@ -12,7 +15,6 @@ use wasm_bindgen_futures::JsFuture;
 #[cfg(target_arch = "wasm32")]
 use web_sys::Response;
 
-#[cfg(any(target_arch = "wasm32", test))]
 const NODE_TARGET_PREFIX: &str = "detail-";
 #[cfg(target_arch = "wasm32")]
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
@@ -45,18 +47,22 @@ pub fn NodeDetailPanel(graph_mode: String) -> impl IntoView {
     let detail = LocalResource::new(move || {
         let target = selection.get().target;
         let url = node_detail_url(target.as_deref(), &graph_mode);
-        fetch_panel_html(url)
+        fetch_panel_data::<NodeDetailResponse>(url)
     });
 
     view! {
-        <Transition fallback=render_default_node_detail>
+        <Suspense fallback=|| view! { <NodeDetailDefault/> }>
             {move || Suspend::new(async move {
                 match detail.await {
-                    Ok(html) => render_panel_html(html),
-                    Err(error) => render_node_detail_error(error),
+                    Ok(response) => view! {
+                        <div class="panel-content"><NodeDetailContent response=response/></div>
+                    }.into_any(),
+                    Err(error) => view! {
+                        <div class="panel-content"><NodeDetailError error=error/></div>
+                    }.into_any(),
                 }
             })}
-        </Transition>
+        </Suspense>
     }
 }
 
@@ -70,18 +76,27 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
             selection.context.as_deref(),
             &graph_mode,
         );
-        fetch_panel_html(url)
+        fetch_panel_data::<ProviderContextResponse>(url)
     });
 
     view! {
-        <Transition fallback=render_default_provider_context>
+        <Suspense fallback=|| view! { <ProviderContextDefault/> }>
             {move || Suspend::new(async move {
                 match provider_context.await {
-                    Ok(html) => render_provider_context_html(html),
-                    Err(error) => render_provider_context_error(error),
+                    Ok(response) => {
+                        notify_provider_context_rendered();
+                        view! {
+                            <div class="panel-content">
+                                <ProviderContextContent response=response/>
+                            </div>
+                        }.into_any()
+                    }
+                    Err(error) => view! {
+                        <div class="panel-content"><ProviderContextError error=error/></div>
+                    }.into_any(),
                 }
             })}
-        </Transition>
+        </Suspense>
     }
 }
 
@@ -132,7 +147,10 @@ fn provider_context_url(target: Option<&str>, context: Option<&str>, graph_mode:
     format!("/api/provider-context?{query}")
 }
 
-async fn fetch_panel_html(url: String) -> Result<String, String> {
+async fn fetch_panel_data<T>(url: String) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
     #[cfg(target_arch = "wasm32")]
     {
         let window = web_sys::window().ok_or_else(|| "window is unavailable".to_owned())?;
@@ -144,11 +162,12 @@ async fn fetch_panel_html(url: String) -> Result<String, String> {
         if !response.ok() {
             return Err(format!("request failed with status {}", response.status()));
         }
-        JsFuture::from(response.text().map_err(js_error_message)?)
+        let text = JsFuture::from(response.text().map_err(js_error_message)?)
             .await
             .map_err(js_error_message)?
             .as_string()
-            .ok_or_else(|| "response text is not a string".to_owned())
+            .ok_or_else(|| "response text is not a string".to_owned())?;
+        serde_json::from_str(&text).map_err(|error| format!("invalid panel response: {error}"))
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -162,12 +181,8 @@ fn js_error_message(error: JsValue) -> String {
     error.as_string().unwrap_or_else(|| format!("{error:?}"))
 }
 
-fn render_panel_html(html: String) -> AnyView {
-    view! { <div class="panel-fragment" inner_html=html></div> }.into_any()
-}
-
 #[cfg(target_arch = "wasm32")]
-fn render_provider_context_html(html: String) -> AnyView {
+fn notify_provider_context_rendered() {
     request_animation_frame(|| {
         let Ok(event) = web_sys::Event::new(PROVIDER_CONTEXT_RENDERED_EVENT) else {
             return;
@@ -176,15 +191,42 @@ fn render_provider_context_html(html: String) -> AnyView {
             let _ = window.dispatch_event(&event);
         }
     });
-    render_panel_html(html)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn render_provider_context_html(html: String) -> AnyView {
-    render_panel_html(html)
+fn notify_provider_context_rendered() {}
+
+#[component]
+fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
+    match response {
+        NodeDetailResponse::Default => view! { <NodeDetailDefault/> }.into_any(),
+        NodeDetailResponse::Missing { target } => {
+            view! { <NodeDetailMissing target=target/> }.into_any()
+        }
+        NodeDetailResponse::Found { node } => view! { <NodeDetail node=node/> }.into_any(),
+    }
 }
 
-pub fn render_default_node_detail() -> AnyView {
+#[component]
+fn NodeDetail(node: PanelNode) -> impl IntoView {
+    let target = format!("{NODE_TARGET_PREFIX}{}", node.id);
+    view! {
+        <section id=target class="node-details node-detail">
+            <h2>"Node"</h2>
+            <dl class="detail-list">
+                <div><dt>"Id"</dt><dd>{node.id}</dd></div>
+                <div><dt>"Kind"</dt><dd>{node.kind}</dd></div>
+                <div><dt>"Role"</dt><dd>{node.role}</dd></div>
+                <div><dt>"Created"</dt><dd>{node.created_at}</dd></div>
+                <div><dt>"Labels"</dt><dd>"None"</dd></div>
+                <div><dt>"Content"</dt><dd>{node.content}</dd></div>
+            </dl>
+        </section>
+    }
+}
+
+#[component]
+fn NodeDetailDefault() -> impl IntoView {
     view! {
         <section class="node-details node-details-default">
             <h2>"Node"</h2>
@@ -196,10 +238,26 @@ pub fn render_default_node_detail() -> AnyView {
             </dl>
         </section>
     }
-    .into_any()
 }
 
-fn render_node_detail_error(error: String) -> AnyView {
+#[component]
+fn NodeDetailMissing(target: String) -> impl IntoView {
+    view! {
+        <section class="node-details node-details-default">
+            <h2>"Node"</h2>
+            <dl class="detail-list">
+                <div>
+                    <dt>"Selection"</dt>
+                    <dd>"The selected node is no longer available."</dd>
+                </div>
+                <div><dt>"Target"</dt><dd>{target}</dd></div>
+            </dl>
+        </section>
+    }
+}
+
+#[component]
+fn NodeDetailError(error: String) -> impl IntoView {
     view! {
         <section class="node-details node-details-default">
             <h2>"Node"</h2>
@@ -209,20 +267,114 @@ fn render_node_detail_error(error: String) -> AnyView {
             </dl>
         </section>
     }
-    .into_any()
 }
 
-pub fn render_default_provider_context() -> AnyView {
+#[component]
+fn ProviderContextContent(response: ProviderContextResponse) -> AnyView {
+    match response {
+        ProviderContextResponse::Default => view! { <ProviderContextDefault/> }.into_any(),
+        ProviderContextResponse::Missing { target } => {
+            view! { <ProviderContextMissing target=target/> }.into_any()
+        }
+        ProviderContextResponse::Found { items } => {
+            view! { <ProviderContextList items=items/> }.into_any()
+        }
+    }
+}
+
+#[component]
+fn ProviderContextDefault() -> impl IntoView {
     view! {
         <section class="provider-context-section provider-context-default">
             <h2>"Provider Context"</h2>
             <p class="provider-context-empty">"Select a node to inspect its provider context."</p>
         </section>
     }
-    .into_any()
 }
 
-fn render_provider_context_error(error: String) -> AnyView {
+#[component]
+fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
+    if items.is_empty() {
+        view! {
+            <section class="provider-context-section">
+                <h2>"Provider Context"</h2>
+                <p class="provider-context-empty">"No provider context nodes."</p>
+            </section>
+        }
+        .into_any()
+    } else {
+        view! {
+            <section class="provider-context-section">
+                <h2>"Provider Context"</h2>
+                <ol class="provider-context-list">
+                    {items.into_iter().map(|item| view! { <ProviderContextRow item=item/> }).collect::<Vec<_>>()}
+                </ol>
+            </section>
+        }
+        .into_any()
+    }
+}
+
+#[component]
+fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
+    let visible = item.point.is_some();
+    let class = provider_context_node_class(visible, item.selected);
+    let node_target = format!("{NODE_TARGET_PREFIX}{}", item.node.id);
+    let target = format!("#{node_target}?context={}", item.context_target);
+    let graph_point = item
+        .point
+        .map(|point| {
+            view! {
+                <span
+                    class="provider-context-node-graph-point"
+                    data-node-target=node_target.clone()
+                    data-node-x=point.x.to_string()
+                    data-node-y=point.y.to_string()
+                ></span>
+            }
+            .into_any()
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    view! {
+        <li class=class>
+            <a class="provider-context-node-link" href=target>
+                {graph_point}
+                <div class="provider-context-node-head">
+                    <span>{item.node.short_id}</span>
+                    <span>{item.node.kind}</span>
+                    <span>{item.node.role}</span>
+                </div>
+                <time>{item.node.created_at}</time>
+                <p>{item.node.summary}</p>
+            </a>
+        </li>
+    }
+}
+
+fn provider_context_node_class(visible: bool, selected: bool) -> &'static str {
+    match (visible, selected) {
+        (true, true) => "provider-context-node visible selected",
+        (true, false) => "provider-context-node visible",
+        (false, true) => "provider-context-node selected",
+        (false, false) => "provider-context-node",
+    }
+}
+
+#[component]
+fn ProviderContextMissing(target: String) -> impl IntoView {
+    view! {
+        <section class="provider-context-section provider-context-default">
+            <h2>"Provider Context"</h2>
+            <p class="provider-context-empty">"The selected node is no longer available."</p>
+            <p class="provider-context-target">{target}</p>
+        </section>
+    }
+}
+
+#[component]
+fn ProviderContextError(error: String) -> impl IntoView {
     view! {
         <section class="provider-context-section provider-context-default">
             <h2>"Provider Context"</h2>
@@ -230,7 +382,6 @@ fn render_provider_context_error(error: String) -> AnyView {
             <p class="provider-context-target">{error}</p>
         </section>
     }
-    .into_any()
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -308,15 +459,34 @@ mod tests {
     }
 
     #[test]
-    fn panel_fragments_render_success_and_error_states() {
-        let node = render_panel_html("<section>node</section>".to_owned()).to_html();
-        let provider =
-            render_provider_context_html("<section>provider</section>".to_owned()).to_html();
-        let node_error = render_node_detail_error("node failed".to_owned()).to_html();
-        let provider_error = render_provider_context_error("provider failed".to_owned()).to_html();
+    fn panel_components_render_typed_success_and_error_states() {
+        let node = view! {
+            <NodeDetailContent response=NodeDetailResponse::Found {
+                node: PanelNode {
+                    id: "node-1".to_owned(),
+                    short_id: "node-1".to_owned(),
+                    kind: "text".to_owned(),
+                    role: "User".to_owned(),
+                    created_at: "now".to_owned(),
+                    content: "<script>alert(1)</script>".to_owned(),
+                    summary: "summary".to_owned(),
+                },
+            }/>
+        }
+        .to_html();
+        let provider = view! {
+            <ProviderContextContent response=ProviderContextResponse::Found {
+                items: Vec::new(),
+            }/>
+        }
+        .to_html();
+        let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
+        let provider_error =
+            view! { <ProviderContextError error="provider failed".to_owned()/> }.to_html();
 
-        assert!(node.contains("<section>node</section>"));
-        assert!(provider.contains("<section>provider</section>"));
+        assert!(node.contains("&lt;script&gt;"));
+        assert!(!node.contains("<script>"));
+        assert!(provider.contains("No provider context nodes."));
         assert!(node_error.contains("Failed to load node detail."));
         assert!(node_error.contains("node failed"));
         assert!(provider_error.contains("Failed to load provider context."));
@@ -368,17 +538,13 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn graph_items_panel_html_fetches_from_the_current_origin() {
-        let window = web_sys::window().expect_throw("window should be available");
-        let url = window
-            .location()
-            .href()
-            .expect_throw("test URL should be available");
+    async fn graph_items_panel_fetch_deserializes_typed_data() {
+        let response = fetch_panel_data::<NodeDetailResponse>(
+            "data:application/json,%7B%22status%22%3A%22default%22%7D".to_owned(),
+        )
+        .await
+        .expect("typed panel data should be fetched");
 
-        let html = fetch_panel_html(url)
-            .await
-            .expect("test page should be fetched");
-
-        assert!(!html.is_empty());
+        assert_eq!(response, NodeDetailResponse::Default);
     }
 }

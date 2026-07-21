@@ -417,8 +417,13 @@ body {
 
 .provider-context-slot > leptos-island,
 .node-detail-slot > leptos-island,
-.panel-fragment {
+.panel-content {
   display: contents;
+}
+
+leptos-island:has(> .panel-content) > .node-details-default,
+leptos-island:has(> .panel-content) > .provider-context-default {
+  display: none;
 }
 
 .side {
@@ -442,15 +447,6 @@ body {
   max-height: min(48vh, 32rem);
   overflow: auto;
   padding-bottom: 1rem;
-}
-
-.panel-fragment .node-detail {
-  display: block;
-}
-
-leptos-island:has(> .panel-fragment) > .node-details-default,
-leptos-island:has(> .panel-fragment) > .provider-context-default {
-  display: none;
 }
 
 .detail-list {
