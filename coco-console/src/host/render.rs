@@ -286,10 +286,14 @@ mod tests {
         let bootstrap = page
             .find("__INCOMPLETE_CHUNKS=[]")
             .expect("hydration globals should be initialized");
-        let loader = page
+        let graph_loader = page
+            .find("mod.hydrate();")
+            .expect("graph loader should be rendered");
+        let island_loader = page
             .find("hydrateIslands(document.body, mod)")
             .expect("island loader should be rendered");
-        assert!(bootstrap < loader);
+        assert!(bootstrap < graph_loader);
+        assert!(graph_loader < island_loader);
         assert!(page.contains("<!--bo-"));
         assert!(page.contains("<!--bc-"));
         assert_eq!(page.matches("<leptos-island").count(), 2);
