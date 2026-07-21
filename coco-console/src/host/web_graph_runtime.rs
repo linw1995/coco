@@ -17,8 +17,8 @@ use super::error::{
 };
 use super::publisher::ConsolePublisher;
 use super::web_graph_order::{
-    Error as OrderError, IncomingEdge, nearest_row_for_y, reserved_rows_from_placements,
-    stable_column_order,
+    Error as OrderError, IncomingEdge, Result as OrderResult, nearest_row_for_y,
+    reserved_rows_from_placements, stable_column_order,
 };
 use super::web_graph_store::{Error as StoreError, StoredGraphState, Viewport, WebGraphStore};
 use super::web_graph_view::{
@@ -397,6 +397,96 @@ fn reserved_edge_rows(
         }
     }
     rows
+}
+
+fn reflow_points(
+    columns: &BTreeMap<i32, Vec<NodePlacement>>,
+    new_nodes_by_column: &BTreeMap<i32, BTreeMap<NodeId, usize>>,
+    routes: &BTreeMap<EdgeId, RoutedEdge>,
+    old_points: &BTreeMap<NodeId, Point>,
+) -> OrderResult<BTreeMap<NodeId, Point>> {
+    let baseline_reserved_rows = columns
+        .iter()
+        .map(|(x, placements)| (*x, reserved_rows_from_placements(placements)))
+        .collect::<BTreeMap<_, _>>();
+    let empty_new_nodes = BTreeMap::new();
+    let maximum_iterations = columns
+        .values()
+        .map(Vec::len)
+        .sum::<usize>()
+        .saturating_add(routes.len())
+        .max(8);
+    let mut final_points = old_points.clone();
+    let mut seen = BTreeSet::new();
+    let mut accumulated_edge_rows = BTreeMap::<i32, BTreeSet<usize>>::new();
+    for _ in 0..maximum_iterations {
+        let projected_routes = reroute_at_points(routes, &final_points);
+        let edge_rows_by_column = reserved_edge_rows(&projected_routes, &final_points);
+        for (x, rows) in edge_rows_by_column {
+            accumulated_edge_rows.entry(x).or_default().extend(rows);
+        }
+        let mut next_points = final_points.clone();
+        for (x, placements) in columns {
+            let incoming = placements
+                .iter()
+                .map(|placement| {
+                    let edges = projected_routes
+                        .values()
+                        .filter(|route| route.edge.target == placement.node)
+                        .map(|route| IncomingEdge {
+                            kind: route.edge.kind,
+                            source_y: next_points[&route.edge.source].y,
+                        })
+                        .collect::<Vec<_>>();
+                    (placement.node.clone(), edges)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut reserved_rows = baseline_reserved_rows[x].clone();
+            if let Some(edge_rows) = accumulated_edge_rows.get(x) {
+                reserved_rows.extend(edge_rows);
+            }
+            let ordered = stable_column_order(
+                placements,
+                new_nodes_by_column.get(x).unwrap_or(&empty_new_nodes),
+                &incoming,
+                &reserved_rows,
+            )?;
+            next_points.extend(
+                ordered
+                    .into_iter()
+                    .map(|placement| (placement.node, placement.point)),
+            );
+        }
+        let next_routes = reroute_at_points(routes, &next_points);
+        let next_edge_rows = reserved_edge_rows(&next_routes, &next_points);
+        let has_overlap = columns.iter().any(|(x, placements)| {
+            next_edge_rows.get(x).is_some_and(|edge_rows| {
+                placements.iter().any(|placement| {
+                    edge_rows.contains(&nearest_row_for_y(next_points[&placement.node].y))
+                })
+            })
+        });
+        if !has_overlap {
+            return Ok(next_points);
+        }
+        let signature = (
+            next_points
+                .iter()
+                .map(|(node, point)| (node.clone(), point.x, point.y))
+                .collect::<Vec<_>>(),
+            accumulated_edge_rows
+                .iter()
+                .map(|(x, rows)| (*x, rows.iter().copied().collect::<Vec<_>>()))
+                .collect::<Vec<_>>(),
+        );
+        if !seen.insert(signature) {
+            break;
+        }
+        final_points = next_points;
+    }
+    Err(OrderError::ReflowDidNotConverge {
+        iterations: maximum_iterations,
+    })
 }
 
 impl WebGraphRuntime {
@@ -988,96 +1078,8 @@ impl WebGraphRuntime {
             columns.insert(x, placements);
         }
 
-        let mut final_points = old_points.clone();
-        let baseline_reserved_rows = columns
-            .iter()
-            .map(|(x, placements)| (*x, reserved_rows_from_placements(placements)))
-            .collect::<BTreeMap<_, _>>();
-        let empty_new_nodes = BTreeMap::new();
-        let maximum_iterations = columns
-            .values()
-            .map(Vec::len)
-            .sum::<usize>()
-            .saturating_add(routes.len())
-            .max(8);
-        let mut seen = BTreeSet::new();
-        let mut converged = false;
-        let mut accumulated_edge_rows = BTreeMap::<i32, BTreeSet<usize>>::new();
-        for _ in 0..maximum_iterations {
-            let projected_routes = reroute_at_points(&routes, &final_points);
-            let edge_rows_by_column = reserved_edge_rows(&projected_routes, &final_points);
-            for (x, rows) in edge_rows_by_column {
-                accumulated_edge_rows.entry(x).or_default().extend(rows);
-            }
-            let mut next_points = final_points.clone();
-            for (x, placements) in &columns {
-                let incoming = placements
-                    .iter()
-                    .map(|placement| {
-                        let edges = projected_routes
-                            .values()
-                            .filter(|route| route.edge.target == placement.node)
-                            .map(|route| IncomingEdge {
-                                kind: route.edge.kind,
-                                source_y: next_points[&route.edge.source].y,
-                            })
-                            .collect::<Vec<_>>();
-                        (placement.node.clone(), edges)
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                let mut reserved_rows = baseline_reserved_rows[x].clone();
-                if let Some(edge_rows) = accumulated_edge_rows.get(x) {
-                    reserved_rows.extend(edge_rows);
-                }
-                let ordered = stable_column_order(
-                    placements,
-                    new_nodes_by_column.get(x).unwrap_or(&empty_new_nodes),
-                    &incoming,
-                    &reserved_rows,
-                )
-                .context(WebGraphOrderSnafu)?;
-                next_points.extend(
-                    ordered
-                        .into_iter()
-                        .map(|placement| (placement.node, placement.point)),
-                );
-            }
-            let next_routes = reroute_at_points(&routes, &next_points);
-            let next_edge_rows = reserved_edge_rows(&next_routes, &next_points);
-            let has_overlap = columns.iter().any(|(x, placements)| {
-                next_edge_rows.get(x).is_some_and(|edge_rows| {
-                    placements.iter().any(|placement| {
-                        edge_rows.contains(&nearest_row_for_y(next_points[&placement.node].y))
-                    })
-                })
-            });
-            if !has_overlap {
-                final_points = next_points;
-                converged = true;
-                break;
-            }
-            let signature = (
-                next_points
-                    .iter()
-                    .map(|(node, point)| (node.clone(), point.x, point.y))
-                    .collect::<Vec<_>>(),
-                accumulated_edge_rows
-                    .iter()
-                    .map(|(x, rows)| (*x, rows.iter().copied().collect::<Vec<_>>()))
-                    .collect::<Vec<_>>(),
-            );
-            if !seen.insert(signature) {
-                break;
-            }
-            final_points = next_points;
-        }
-        if !converged {
-            return Err(
-                WebGraphOrderSnafu.into_error(OrderError::ReflowDidNotConverge {
-                    iterations: maximum_iterations,
-                }),
-            );
-        }
+        let mut final_points = reflow_points(&columns, &new_nodes_by_column, &routes, &old_points)
+            .context(WebGraphOrderSnafu)?;
         let placement_updates = columns
             .values()
             .flatten()
