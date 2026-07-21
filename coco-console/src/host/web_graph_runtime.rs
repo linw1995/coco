@@ -400,6 +400,36 @@ fn reserved_edge_rows(
     rows
 }
 
+fn reflow_iteration_limit(
+    columns: &BTreeMap<i32, Vec<NodePlacement>>,
+    routes: &BTreeMap<EdgeId, RoutedEdge>,
+    points: &BTreeMap<NodeId, Point>,
+) -> usize {
+    let placements = columns
+        .values()
+        .fold(0_usize, |total, column| total.saturating_add(column.len()));
+    let lane_slots = routes
+        .values()
+        .map(|route| {
+            let source_x = points[&route.edge.source].x;
+            let target_x = points[&route.edge.target].x;
+            let ranks = target_x
+                .saturating_sub(source_x)
+                .div_euclid(GRAPH_RANK_STEP);
+            usize::try_from(ranks.saturating_sub(1).max(0)).unwrap_or(usize::MAX)
+        })
+        .fold(0_usize, usize::saturating_add);
+    let layout_slots = placements.saturating_add(lane_slots);
+    let coordinate_rows = usize::try_from(
+        (i64::from(i32::MAX) - i64::from(GRAPH_PADDING)) / i64::from(GRAPH_ROW_STEP),
+    )
+    .unwrap_or(usize::MAX);
+    layout_slots
+        .saturating_mul(layout_slots)
+        .min(coordinate_rows)
+        .max(8)
+}
+
 fn reflow_points(
     columns: &BTreeMap<i32, Vec<NodePlacement>>,
     new_nodes_by_column: &BTreeMap<i32, BTreeMap<NodeId, usize>>,
@@ -412,12 +442,7 @@ fn reflow_points(
         .map(|(x, placements)| (*x, reserved_rows_from_placements(placements)))
         .collect::<BTreeMap<_, _>>();
     let empty_new_nodes = BTreeMap::new();
-    let maximum_iterations = columns
-        .values()
-        .map(Vec::len)
-        .sum::<usize>()
-        .saturating_add(routes.len())
-        .max(8);
+    let maximum_iterations = reflow_iteration_limit(columns, routes, old_points);
     let mut final_points = old_points.clone();
     let mut seen = BTreeSet::new();
     let mut accumulated_edge_rows = BTreeMap::<i32, BTreeSet<usize>>::new();
@@ -1937,6 +1962,85 @@ mod tests {
             projected[&source_to_lower].route.source.y,
             points[&source].y + edge_port_offset(1, 2)
         );
+    }
+
+    #[test]
+    fn lane_reflow_reaches_a_fixed_point_for_cross_linked_routes() {
+        let nodes = (0..8)
+            .map(|index| NodeId::new(format!("node-{index}")).unwrap())
+            .collect::<Vec<_>>();
+        let points = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                (
+                    node.clone(),
+                    Point {
+                        x: GRAPH_PADDING + i32::try_from(index).unwrap() * GRAPH_RANK_STEP,
+                        y: GRAPH_PADDING,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let columns = points
+            .iter()
+            .map(|(node, point)| {
+                (
+                    point.x,
+                    vec![NodePlacement {
+                        node: node.clone(),
+                        point: *point,
+                    }],
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let edges = (0..7)
+            .map(|index| {
+                EdgeId::new(
+                    EdgeKind::Primary,
+                    nodes[index].clone(),
+                    nodes[index + 1].clone(),
+                )
+            })
+            .chain(
+                [(0, 3), (1, 4), (1, 6), (2, 4), (2, 5), (3, 7)]
+                    .into_iter()
+                    .map(|(source, target)| {
+                        EdgeId::new(
+                            EdgeKind::Merge,
+                            nodes[source].clone(),
+                            nodes[target].clone(),
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let routes = edges
+            .into_iter()
+            .map(|edge| {
+                let route = route_edge_with_offsets(
+                    points[&edge.source],
+                    points[&edge.target],
+                    EndpointPortOffsets {
+                        source: 0,
+                        target: 0,
+                    },
+                );
+                (edge.clone(), RoutedEdge { edge, route })
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let reflowed =
+            reflow_points(&columns, &BTreeMap::new(), &routes, &routes, &points).unwrap();
+        let projected = reroute_at_points(&routes, &routes, &reflowed);
+        let edge_rows = reserved_edge_rows(&projected, &reflowed);
+
+        assert!(columns.iter().all(|(x, placements)| {
+            edge_rows.get(x).is_none_or(|rows| {
+                placements.iter().all(|placement| {
+                    !rows.contains(&nearest_row_for_y(reflowed[&placement.node].y))
+                })
+            })
+        }));
     }
 
     #[tokio::test]
