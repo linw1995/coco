@@ -300,7 +300,9 @@ pub fn node_id_from_target(target: &str) -> Option<&str> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointPortSlots {
     pub source: usize,
+    pub source_count: usize,
     pub target: usize,
+    pub target_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,15 +311,16 @@ pub struct EndpointPortOffsets {
     pub target: i32,
 }
 
-pub fn edge_port_offset(slot: usize) -> i32 {
-    const PORT_STEP: i32 = 4;
+pub fn edge_port_offset(slot: usize, count: usize) -> i32 {
     const PORT_RANGE: i32 = 12;
 
-    i32::try_from(slot)
-        .unwrap_or(i32::MAX)
-        .saturating_mul(PORT_STEP)
-        .rem_euclid(PORT_RANGE.saturating_mul(2).saturating_add(PORT_STEP))
-        .saturating_sub(PORT_RANGE)
+    if count <= 1 {
+        return 0;
+    }
+    let slot = i64::try_from(slot.min(count - 1)).unwrap_or(i64::MAX);
+    let intervals = i64::try_from(count - 1).unwrap_or(i64::MAX);
+    let numerator = slot.saturating_mul(i64::from(PORT_RANGE)).saturating_mul(2);
+    i32::try_from(-i64::from(PORT_RANGE) + numerator / intervals).unwrap_or(i32::MAX)
 }
 
 pub fn route_edge(
@@ -329,8 +332,8 @@ pub fn route_edge(
         source_center,
         target_center,
         EndpointPortOffsets {
-            source: edge_port_offset(slots.source),
-            target: edge_port_offset(slots.target),
+            source: edge_port_offset(slots.source, slots.source_count),
+            target: edge_port_offset(slots.target, slots.target_count),
         },
     )
 }
@@ -578,7 +581,9 @@ mod tests {
             target,
             EndpointPortSlots {
                 source: 0,
+                source_count: 2,
                 target: 0,
+                target_count: 2,
             },
         );
         let second = route_edge(
@@ -586,11 +591,20 @@ mod tests {
             target,
             EndpointPortSlots {
                 source: 1,
+                source_count: 2,
                 target: 1,
+                target_count: 2,
             },
         );
 
         assert_ne!(first.source.y, second.source.y);
         assert_ne!(first.target.y, second.target.y);
+    }
+
+    #[test]
+    fn a_single_edge_uses_the_vertical_center() {
+        assert_eq!(edge_port_offset(0, 1), 0);
+        assert_eq!(edge_port_offset(0, 2), -12);
+        assert_eq!(edge_port_offset(1, 2), 12);
     }
 }

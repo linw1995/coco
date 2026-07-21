@@ -19,6 +19,7 @@ use crate::web_graph::{
 const DATABASE_FILE_NAME: &str = "web-graph.sqlite3";
 const WRITE_BATCH_SIZE: usize = 64;
 const MAX_READ_BATCH_SIZE: usize = 128;
+const LAYOUT_VERSION: u32 = 1;
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("web-graph-migrations");
 
 mod database;
@@ -44,6 +45,7 @@ pub struct StoredGraphState {
     pub revision: Revision,
     pub source_version: SourceVersion,
     pub source_cursor: Option<GraphNodeCursor>,
+    pub layout_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,8 +394,18 @@ impl WebGraphStore {
         let mut connection = self.database.acquire().await?;
         connection
             .immediate_transaction::<_, TransactionError, _>(async |connection| {
-                if load_state(connection).await?.is_some() {
-                    return Ok(false);
+                if let Some(state) = load_state(connection).await? {
+                    if state.layout_version == LAYOUT_VERSION {
+                        return Ok(false);
+                    }
+                    if state.layout_version > LAYOUT_VERSION {
+                        return Err(TransactionError::Operation(
+                            Error::UnsupportedLayoutVersion {
+                                actual: state.layout_version,
+                                expected: LAYOUT_VERSION,
+                            },
+                        ));
+                    }
                 }
                 replace_snapshot(connection, &snapshot).await?;
                 Ok(true)
@@ -441,6 +453,7 @@ impl WebGraphStore {
                     revision: patch.revision,
                     source_version: patch.source_version,
                     source_cursor: source_cursor.or(state.source_cursor),
+                    layout_version: state.layout_version,
                 })
             })
             .await
@@ -457,6 +470,7 @@ struct StateRow {
     source_version: i64,
     source_cursor_row_id: Option<i64>,
     source_cursor_node_id: Option<String>,
+    layout_version: i32,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable)]
@@ -561,6 +575,11 @@ pub enum Error {
 
     #[snafu(display("Web graph store {} is not initialized", path.display()))]
     NotInitialized { path: PathBuf },
+
+    #[snafu(display(
+        "Web graph layout version {actual} is newer than supported version {expected}"
+    ))]
+    UnsupportedLayoutVersion { actual: u32, expected: u32 },
 
     #[snafu(display("Web graph read batch contains {actual} items; maximum is {maximum}"))]
     ReadBatchTooLarge { actual: usize, maximum: usize },
@@ -681,6 +700,7 @@ fn stored_state(row: StateRow) -> std::result::Result<StoredGraphState, Transact
             "web_graph_state.source_version",
         )?),
         source_cursor,
+        layout_version: stored_u32(row.layout_version, "web_graph_state.layout_version")?,
     })
 }
 
@@ -2061,6 +2081,8 @@ fn snapshot_rows(snapshot: &Snapshot) -> std::result::Result<SnapshotRows, Trans
             source_version: sqlite_integer(snapshot.source_version.get(), "source_version")?,
             source_cursor_row_id: None,
             source_cursor_node_id: None,
+            layout_version: i32::try_from(LAYOUT_VERSION)
+                .expect("layout version should fit in i32"),
         },
         nodes: snapshot
             .topology
@@ -2499,10 +2521,7 @@ mod tests {
     fn create_v1_store(path: &Path, graph: &Graph) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut connection = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
-        connection.run_pending_migrations(MIGRATIONS).unwrap();
-        connection.revert_last_migration(MIGRATIONS).unwrap();
-        connection.revert_last_migration(MIGRATIONS).unwrap();
-        connection.revert_last_migration(MIGRATIONS).unwrap();
+        connection.run_next_migration(MIGRATIONS).unwrap();
         let rows = snapshot_rows(&graph.snapshot()).unwrap();
         connection
             .transaction::<_, diesel::result::Error, _>(|connection| {
@@ -2585,6 +2604,58 @@ mod tests {
 
         assert_eq!(store.path(), directory.path.join(DATABASE_FILE_NAME));
         assert_eq!(store.state().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn initialize_replaces_an_outdated_derived_layout() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let mut connection = store.database.acquire().await.unwrap();
+        diesel_async::RunQueryDsl::execute(
+            diesel::update(web_graph_state::table.filter(web_graph_state::id.eq(1)))
+                .set(web_graph_state::layout_version.eq(0)),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        drop(connection);
+        let empty = empty_graph(0, 0);
+
+        assert!(store.initialize(&empty).await.unwrap());
+        assert_eq!(load_graph_for_test(&store).await, Some(empty));
+        let state = store.state().await.unwrap().unwrap();
+        assert_eq!(state.layout_version, LAYOUT_VERSION);
+        assert_eq!(state.source_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn initialize_does_not_replace_a_newer_derived_layout() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        let expected = graph();
+        store.replace(&expected).await.unwrap();
+        let future_version = LAYOUT_VERSION + 1;
+        let mut connection = store.database.acquire().await.unwrap();
+        diesel_async::RunQueryDsl::execute(
+            diesel::update(web_graph_state::table.filter(web_graph_state::id.eq(1)))
+                .set(web_graph_state::layout_version.eq(i32::try_from(future_version).unwrap())),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        drop(connection);
+
+        let error = store.initialize(&empty_graph(0, 0)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UnsupportedLayoutVersion {
+                actual,
+                expected
+            } if actual == future_version && expected == LAYOUT_VERSION
+        ));
+        assert_eq!(load_graph_for_test(&store).await, Some(expected));
     }
 
     #[tokio::test]
@@ -2674,6 +2745,7 @@ mod tests {
                 revision: expected.revision(),
                 source_version: expected.source_version(),
                 source_cursor: None,
+                layout_version: LAYOUT_VERSION,
             })
         );
     }
