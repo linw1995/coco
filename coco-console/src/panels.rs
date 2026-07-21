@@ -283,9 +283,14 @@ mod tests {
             node_detail_url(Some("detail-node/value"), "all"),
             "/api/node-detail?target=detail-node%2Fvalue&mode=all"
         );
+        assert_eq!(node_detail_url(None, "all"), "/api/node-detail?mode=all");
         assert_eq!(
             provider_context_url(Some("detail-node"), Some("detail-context/value"), "anchors"),
             "/api/provider-context?mode=anchors&target=detail-node&context=detail-context%2Fvalue"
+        );
+        assert_eq!(
+            provider_context_url(None, None, "all"),
+            "/api/provider-context?mode=all"
         );
     }
 
@@ -301,6 +306,22 @@ mod tests {
         assert!(provider.contains("Select a node to inspect its provider context."));
         assert!(!provider.contains("<h2>Node</h2>"));
     }
+
+    #[test]
+    fn panel_fragments_render_success_and_error_states() {
+        let node = render_panel_html("<section>node</section>".to_owned()).to_html();
+        let provider =
+            render_provider_context_html("<section>provider</section>".to_owned()).to_html();
+        let node_error = render_node_detail_error("node failed".to_owned()).to_html();
+        let provider_error = render_provider_context_error("provider failed".to_owned()).to_html();
+
+        assert!(node.contains("<section>node</section>"));
+        assert!(provider.contains("<section>provider</section>"));
+        assert!(node_error.contains("Failed to load node detail."));
+        assert!(node_error.contains("node failed"));
+        assert!(provider_error.contains("Failed to load provider context."));
+        assert!(provider_error.contains("provider failed"));
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -313,7 +334,7 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    fn panel_selection_signals_track_hash_changes_independently() {
+    fn graph_items_panel_selection_signals_track_hash_changes_independently() {
         let owner = Owner::new();
         owner.set();
         let window = web_sys::window().expect_throw("window should be available");
@@ -344,5 +365,20 @@ mod wasm_tests {
             .location()
             .set_hash("")
             .expect_throw("hash should be cleared");
+    }
+
+    #[wasm_bindgen_test]
+    async fn graph_items_panel_html_fetches_from_the_current_origin() {
+        let window = web_sys::window().expect_throw("window should be available");
+        let url = window
+            .location()
+            .href()
+            .expect_throw("test URL should be available");
+
+        let html = fetch_panel_html(url)
+            .await
+            .expect("test page should be fetched");
+
+        assert!(!html.is_empty());
     }
 }

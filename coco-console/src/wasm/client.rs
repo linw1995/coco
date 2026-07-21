@@ -2417,6 +2417,38 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_detail_link_detection_handles_plain_clicks() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        let link = document
+            .create_element("a")
+            .expect_throw("detail link should be created");
+        link.set_attribute("href", "#detail-aaaaaaaa")
+            .expect_throw("detail link target should be set");
+        fixture
+            .root
+            .append_child(&link)
+            .expect_throw("detail link should be mounted");
+
+        let captured_hash = Rc::new(RefCell::new(None));
+        let closure_hash = captured_hash.clone();
+        let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+            closure_hash.replace(
+                detail_link_from_event(&event).and_then(|link| link.get_attribute("href")),
+            );
+        });
+        link.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+            .expect_throw("detail link listener should be installed");
+
+        link.dispatch_event(&mouse_event("click", 0, 0, 0, 0))
+            .expect_throw("detail click should dispatch");
+
+        link.remove_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+            .expect_throw("detail link listener should be removed");
+        assert_eq!(captured_hash.borrow().as_deref(), Some("#detail-aaaaaaaa"));
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_mouse_pan_updates_viewport_and_suppresses_drag_click() {
         let fixture = GraphFixture::new();
         let (graph_wrap, follow_toggle, time_scale, window) = {
