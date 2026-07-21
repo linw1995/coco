@@ -28,9 +28,19 @@ pub enum NodeDetailResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderContextItem {
     pub context_target: String,
-    pub node: PanelNode,
+    pub node: ProviderContextNode,
     pub selected: bool,
     pub point: Option<Point>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderContextNode {
+    pub id: String,
+    pub short_id: String,
+    pub kind: String,
+    pub role: String,
+    pub created_at: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

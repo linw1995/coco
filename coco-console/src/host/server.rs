@@ -25,7 +25,8 @@ use super::publisher::ConsolePublisher;
 use super::render::render_index_page;
 use crate::Result;
 use crate::api::{
-    NodeDetailResponse, PanelNode, Point as ApiPoint, ProviderContextItem, ProviderContextResponse,
+    NodeDetailResponse, PanelNode, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
+    ProviderContextResponse,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
@@ -409,7 +410,7 @@ where
                 x: point.x,
                 y: point.y,
             }),
-            node: panel_node(node.node),
+            node: provider_context_node(node.node),
         })
         .collect();
     json_response(
@@ -426,6 +427,17 @@ fn panel_node(node: NodeView) -> PanelNode {
         role: node.role,
         created_at: node.created_at,
         content: node.content,
+        summary: node.summary,
+    }
+}
+
+fn provider_context_node(node: NodeView) -> ProviderContextNode {
+    ProviderContextNode {
+        id: node.id,
+        short_id: node.short_id,
+        kind: node.kind,
+        role: node.role,
+        created_at: node.created_at,
         summary: node.summary,
     }
 }
@@ -804,6 +816,7 @@ mod tests {
         )
         .await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("\"content\":"));
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         let ProviderContextResponse::Found { items } = response else {
             panic!("provider context should be found");
@@ -812,7 +825,7 @@ mod tests {
             .iter()
             .find(|item| item.selected)
             .expect("selected provider context item should exist");
-        assert_eq!(selected.node.content, "provider context selection");
+        assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
     }
 
