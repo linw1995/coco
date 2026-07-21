@@ -66,7 +66,7 @@ gzip -dc "${image_path}" | "${tar_command}" -xf - -C "${archive_dir}"
 layer_count=0
 while IFS= read -r layer_path; do
   ((layer_count += 1))
-  "${tar_command}" -tf "${archive_dir}/${layer_path}" \
+  "${tar_command}" --absolute-names -tf "${archive_dir}/${layer_path}" \
     | sed -nE \
       -e 's#^/nix/store/([^/]+).*#/nix/store/\1#p' \
       -e 's#^\./nix/store/([^/]+).*#/nix/store/\1#p' \
@@ -91,15 +91,12 @@ while IFS= read -r runtime_path; do
     exit 1
   fi
 
-  if ! derivation_path="$(nix-store --query --deriver "${runtime_path}" 2>/dev/null)"; then
-    continue
-  fi
-  if [[ "${derivation_path}" == "unknown-deriver" ]]; then
-    continue
-  fi
-
-  printf '%s\t%s\n' "${runtime_path}" "${derivation_path}" \
-    >> "${runtime_derivations_file}"
+  while IFS= read -r derivation_path; do
+    printf '%s\t%s\n' "${runtime_path}" "${derivation_path}" \
+      >> "${runtime_derivations_file}"
+  done < <(
+    nix-store --query --valid-derivers "${runtime_path}" 2>/dev/null || true
+  )
 done < "${runtime_paths_file}"
 sort -u -o "${runtime_derivations_file}" "${runtime_derivations_file}"
 
