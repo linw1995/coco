@@ -1093,7 +1093,13 @@ impl WebGraphRuntime {
         }
 
         if self
-            .expand_reflow_route_columns(kind, revision, &mut columns, &mut routes, &mut old_points)
+            .expand_reflow_affected_routes(
+                kind,
+                revision,
+                &mut columns,
+                &mut routes,
+                &mut old_points,
+            )
             .await?
             .is_none()
         {
@@ -1273,6 +1279,75 @@ impl WebGraphRuntime {
                 return Ok(None);
             };
             routes.extend(added_routes);
+
+            let missing_endpoints = route_endpoint_ids(routes.values())
+                .into_iter()
+                .filter(|node| !old_points.contains_key(node))
+                .collect::<Vec<_>>();
+            let Some(placements) = self
+                .placements_at_revision(kind, &missing_endpoints, revision)
+                .await?
+            else {
+                return Ok(None);
+            };
+            old_points.extend(
+                placements
+                    .into_iter()
+                    .map(|placement| (placement.node, placement.point)),
+            );
+        }
+    }
+
+    async fn expand_reflow_affected_routes(
+        &self,
+        kind: LayoutKind,
+        revision: Revision,
+        columns: &mut BTreeMap<i32, Vec<NodePlacement>>,
+        routes: &mut BTreeMap<EdgeId, RoutedEdge>,
+        old_points: &mut BTreeMap<NodeId, Point>,
+    ) -> crate::Result<Option<()>> {
+        loop {
+            if self
+                .expand_reflow_route_columns(kind, revision, columns, routes, old_points)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+
+            let affected_nodes = columns
+                .values()
+                .flatten()
+                .map(|placement| placement.node.clone())
+                .collect::<BTreeSet<_>>();
+            let mut affected_sources = affected_nodes.clone();
+            let mut affected_targets = affected_nodes.clone();
+            for route in routes.values() {
+                if affected_nodes.contains(&route.edge.target) {
+                    affected_sources.insert(route.edge.source.clone());
+                }
+                if affected_nodes.contains(&route.edge.source) {
+                    affected_targets.insert(route.edge.target.clone());
+                }
+            }
+            let affected_endpoints = affected_sources
+                .union(&affected_targets)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let Some(incident_routes) = self
+                .incident_routes_at_revision(kind, &affected_endpoints, revision)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let previous_route_count = routes.len();
+            routes.extend(incident_routes.into_iter().filter(|(_, route)| {
+                affected_sources.contains(&route.edge.source)
+                    || affected_targets.contains(&route.edge.target)
+            }));
+            if routes.len() == previous_route_count {
+                return Ok(Some(()));
+            }
 
             let missing_endpoints = route_endpoint_ids(routes.values())
                 .into_iter()
@@ -2370,6 +2445,95 @@ mod tests {
         assert!(routes.contains_key(&transitive_edge));
         let lower_target_x = old_points[&lower_target_id].x;
         assert!(columns.contains_key(&lower_target_x.saturating_sub(GRAPH_RANK_STEP)));
+    }
+
+    #[tokio::test]
+    async fn reflow_affected_routes_include_endpoint_siblings() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let source = append_anchor(&writer, &root, Vec::new(), "source").await;
+        let lower_1 = append_anchor(&writer, &root, Vec::new(), "lower 1").await;
+        let lower_2 = append_anchor(&writer, &lower_1, Vec::new(), "lower 2").await;
+        let lower_3 = append_anchor(&writer, &lower_2, Vec::new(), "lower 3").await;
+        let target = append_anchor(
+            &writer,
+            &lower_3,
+            vec![MergeParent::merge(source.clone())],
+            "target",
+        )
+        .await;
+        let adjacent = append_anchor(&writer, &source, Vec::new(), "adjacent").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        let revision = runtime.store.state().await.unwrap().unwrap().revision;
+        let adjacent_id = NodeId::new(adjacent).unwrap();
+        let adjacent_point = runtime
+            .store
+            .node_placements(LayoutKind::All, std::slice::from_ref(&adjacent_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .value[0]
+            .point;
+        let placements = runtime
+            .column_at_revision(LayoutKind::All, adjacent_point.x, revision)
+            .await
+            .unwrap()
+            .unwrap();
+        let column_nodes = placements
+            .iter()
+            .map(|placement| placement.node.clone())
+            .collect::<BTreeSet<_>>();
+        let mut columns = BTreeMap::from([(adjacent_point.x, placements.clone())]);
+        let mut old_points = placements
+            .into_iter()
+            .map(|placement| (placement.node, placement.point))
+            .collect::<BTreeMap<_, _>>();
+        let mut routes = runtime
+            .incident_routes_at_revision(LayoutKind::All, &column_nodes, revision)
+            .await
+            .unwrap()
+            .unwrap();
+        let endpoint_ids = route_endpoint_ids(routes.values())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let endpoint_placements = runtime
+            .placements_at_revision(LayoutKind::All, &endpoint_ids, revision)
+            .await
+            .unwrap()
+            .unwrap();
+        old_points.extend(
+            endpoint_placements
+                .into_iter()
+                .map(|placement| (placement.node, placement.point)),
+        );
+
+        runtime
+            .expand_reflow_affected_routes(
+                LayoutKind::All,
+                revision,
+                &mut columns,
+                &mut routes,
+                &mut old_points,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let sibling = EdgeId::new(
+            EdgeKind::Merge,
+            NodeId::new(source).unwrap(),
+            NodeId::new(target).unwrap(),
+        );
+        assert!(routes.contains_key(&sibling));
+        for x in intermediate_columns(
+            &BTreeMap::from([(sibling.clone(), routes[&sibling].clone())]),
+            &old_points,
+        ) {
+            assert!(columns.contains_key(&x));
+        }
     }
 
     #[tokio::test]
