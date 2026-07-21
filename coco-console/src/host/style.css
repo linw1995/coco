@@ -444,15 +444,12 @@ body {
   padding-bottom: 1rem;
 }
 
-.node-detail {
-  display: none;
-}
-
-.node-detail:target {
+.panel-fragment .node-detail {
   display: block;
 }
 
-body:has(.node-detail:target) .node-details-default {
+leptos-island:has(> .panel-fragment) > .node-details-default,
+leptos-island:has(> .panel-fragment) > .provider-context-default {
   display: none;
 }
 

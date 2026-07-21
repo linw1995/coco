@@ -65,7 +65,7 @@ fn render_document(root: AnyView) -> String {
             <body>{root}</body>
         </html>
     };
-    format!("<!doctype html>{}", rendered.to_html())
+    format!("<!doctype html>{}", rendered.to_html_branching())
 }
 
 fn render_root(mode: ViewMode, revision: u64) -> AnyView {
@@ -289,6 +289,8 @@ mod tests {
             .find("hydrateIslands(document.body, mod)")
             .expect("island loader should be rendered");
         assert!(bootstrap < loader);
+        assert!(page.contains("<!--bo-"));
+        assert!(page.contains("<!--bc-"));
         assert_eq!(page.matches("<leptos-island").count(), 2);
         assert!(page.contains("Select a node to inspect its content."));
         assert!(page.contains("Select a node to inspect its provider context."));

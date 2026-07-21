@@ -49,14 +49,14 @@ pub fn NodeDetailPanel(graph_mode: String) -> impl IntoView {
     });
 
     view! {
-        <Suspense fallback=render_default_node_detail>
+        <Transition fallback=render_default_node_detail>
             {move || Suspend::new(async move {
                 match detail.await {
                     Ok(html) => render_panel_html(html),
                     Err(error) => render_node_detail_error(error),
                 }
             })}
-        </Suspense>
+        </Transition>
     }
 }
 
@@ -74,14 +74,14 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
     });
 
     view! {
-        <Suspense fallback=render_default_provider_context>
+        <Transition fallback=render_default_provider_context>
             {move || Suspend::new(async move {
                 match provider_context.await {
                     Ok(html) => render_provider_context_html(html),
                     Err(error) => render_provider_context_error(error),
                 }
             })}
-        </Suspense>
+        </Transition>
     }
 }
 

@@ -13,8 +13,7 @@ use web_sys::{
 
 use super::refresh::{
     PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
-    node_selection_needs_hash_change, pending_update_for_viewport_change, version_refresh_action,
-    viewport_update_active,
+    pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -1547,7 +1546,7 @@ fn graph_item_i32(element: &Element, attr: &str) -> Option<i32> {
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let installers: [GraphListenerInstaller; 9] = [
-        install_node_detail_listener,
+        install_detail_link_listener,
         install_follow_toggle_listener,
         install_mouse_pan_listener,
         install_wheel_listener,
@@ -1785,39 +1784,46 @@ fn install_provider_context_rendered_listener(
     Ok(())
 }
 
-fn install_node_detail_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let node_group = graph.borrow().node_group.clone();
+fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let document = graph.borrow().document.clone();
     let detail_graph = graph.clone();
     let detail_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
-        let Some(link) = node_link_from_event(&event) else {
+        let Some(link) = detail_link_from_event(&event) else {
             return;
         };
-        let Some(target) = link.get_attribute("data-node-target") else {
+        let Some(hash) = link.get_attribute("href") else {
             return;
         };
 
         event.prevent_default();
         event.stop_propagation();
-        select_node_detail(detail_graph.clone(), target);
+        select_detail_link(detail_graph.clone(), hash);
     });
-    node_group
-        .add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
+    document.add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
     detail_closure.forget();
     Ok(())
 }
 
-fn node_link_from_event(event: &MouseEvent) -> Option<Element> {
+fn detail_link_from_event(event: &MouseEvent) -> Option<Element> {
+    if event.button() != 0
+        || event.alt_key()
+        || event.ctrl_key()
+        || event.meta_key()
+        || event.shift_key()
+    {
+        return None;
+    }
     let target = event.target()?.dyn_into::<Element>().ok()?;
-    target.closest(".node-link").ok().flatten()
+    target.closest("a[href^=\"#detail-\"]").ok().flatten()
 }
 
-fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
+fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
     let window = {
         let graph = graph.borrow();
         graph.window.clone()
     };
 
-    match set_selected_node_hash(&window, &target) {
+    match update_detail_hash(&window, &hash) {
         Ok(true) => return,
         Ok(false) => {}
         Err(error) => {
@@ -1829,15 +1835,14 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
     focus_selected_node_in_graph(graph);
 }
 
-fn set_selected_node_hash(window: &Window, target: &str) -> Result<bool, JsValue> {
-    if !node_selection_needs_hash_change(
-        selected_node_target(window).as_deref(),
-        selected_provider_context_target(window).as_deref(),
-        target,
-    ) {
+fn update_detail_hash(window: &Window, hash: &str) -> Result<bool, JsValue> {
+    if window.location().hash()? == hash {
         return Ok(false);
     }
-    window.location().set_hash(target)?;
+    window
+        .history()?
+        .push_state_with_url(&JsValue::NULL, "", Some(hash))?;
+    window.dispatch_event(&web_sys::Event::new("hashchange")?)?;
     Ok(true)
 }
 
@@ -1936,10 +1941,6 @@ fn graph_focus_point_from_rendered_node(
 
 fn selected_node_target(window: &Window) -> Option<String> {
     selected_panel_selection(window).target
-}
-
-fn selected_provider_context_target(window: &Window) -> Option<String> {
-    selected_panel_selection(window).context
 }
 
 fn selected_panel_selection(window: &Window) -> PanelSelection {
@@ -2393,25 +2394,25 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_node_selection_uses_one_refresh_trigger() {
+    fn graph_items_detail_navigation_uses_history_and_one_refresh_trigger() {
         let fixture = GraphFixture::new();
         let window = fixture.graph.borrow().window.clone();
 
         assert!(
-            set_selected_node_hash(&window, "detail-aaaaaaaa")
+            update_detail_hash(&window, "#detail-aaaaaaaa")
                 .expect_throw("new selection hash should be set")
         );
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-aaaaaaaa"
+        );
         assert!(
-            !set_selected_node_hash(&window, "detail-aaaaaaaa")
+            !update_detail_hash(&window, "#detail-aaaaaaaa")
                 .expect_throw("unchanged selection should be detected")
         );
-        window
-            .location()
-            .set_hash("detail-aaaaaaaa?context=detail-context")
-            .expect_throw("provider context hash should be set");
         assert!(
-            set_selected_node_hash(&window, "detail-aaaaaaaa")
-                .expect_throw("provider context selection should be cleared")
+            update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-context")
+                .expect_throw("provider context hash should be set")
         );
     }
 
