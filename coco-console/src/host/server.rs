@@ -22,13 +22,12 @@ use super::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
 };
 use super::publisher::ConsolePublisher;
-use super::render::{
-    ProviderContextItem, render_index_page, render_node_detail_fragment,
-    render_provider_context_default_fragment, render_provider_context_items_fragment,
-    render_provider_context_missing_fragment,
-};
+use super::render::render_index_page;
 use crate::Result;
-use crate::api::Point as ApiPoint;
+use crate::api::{
+    NodeDetailResponse, PanelNode, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
+    ProviderContextResponse,
+};
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
@@ -317,19 +316,29 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let Some(target) = query.get("target") else {
-        return html_response(render_node_detail_fragment(None, None));
+        return json_response(&NodeDetailResponse::Default, "node detail");
     };
     let Some(node_id) = node_id_from_target(target) else {
-        return html_response(render_node_detail_fragment(None, Some(target)));
+        return json_response(
+            &NodeDetailResponse::Missing {
+                target: target.to_owned(),
+            },
+            "node detail",
+        );
     };
     match state.store.get_node(node_id).await {
-        Ok(node) => html_response(render_node_detail_fragment(
-            Some(&NodeView::from(&node)),
-            Some(target),
-        )),
-        Err(error) if is_missing_node(&error) => {
-            html_response(render_node_detail_fragment(None, Some(target)))
-        }
+        Ok(node) => json_response(
+            &NodeDetailResponse::Found {
+                node: panel_node(NodeView::from(&node)),
+            },
+            "node detail",
+        ),
+        Err(error) if is_missing_node(&error) => json_response(
+            &NodeDetailResponse::Missing {
+                target: target.to_owned(),
+            },
+            "node detail",
+        ),
         Err(error) => plain_error(error.to_string()),
     }
 }
@@ -343,15 +352,25 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let Some(target) = query.get("target") else {
-        return html_response(render_provider_context_default_fragment());
+        return json_response(&ProviderContextResponse::Default, "provider context");
     };
     let Some(node_id) = node_id_from_target(target) else {
-        return html_response(render_provider_context_missing_fragment(target));
+        return json_response(
+            &ProviderContextResponse::Missing {
+                target: target.to_owned(),
+            },
+            "provider context",
+        );
     };
     let node = match state.store.get_node(node_id).await {
         Ok(node) => node,
         Err(error) if is_missing_node(&error) => {
-            return html_response(render_provider_context_missing_fragment(target));
+            return json_response(
+                &ProviderContextResponse::Missing {
+                    target: target.to_owned(),
+                },
+                "provider context",
+            );
         }
         Err(error) => return plain_error(error.to_string()),
     };
@@ -361,7 +380,10 @@ where
             Err(error) => return plain_error(error.to_string()),
         };
     let Some(selection) = selection else {
-        return html_response(render_provider_context_items_fragment(Vec::new()));
+        return json_response(
+            &ProviderContextResponse::Found { items: Vec::new() },
+            "provider context",
+        );
     };
     let node_ids = selection
         .context
@@ -388,10 +410,36 @@ where
                 x: point.x,
                 y: point.y,
             }),
-            node: node.node,
+            node: provider_context_node(node.node),
         })
         .collect();
-    html_response(render_provider_context_items_fragment(items))
+    json_response(
+        &ProviderContextResponse::Found { items },
+        "provider context",
+    )
+}
+
+fn panel_node(node: NodeView) -> PanelNode {
+    PanelNode {
+        id: node.id,
+        short_id: node.short_id,
+        kind: node.kind,
+        role: node.role,
+        created_at: node.created_at,
+        content: node.content,
+        summary: node.summary,
+    }
+}
+
+fn provider_context_node(node: NodeView) -> ProviderContextNode {
+    ProviderContextNode {
+        id: node.id,
+        short_id: node.short_id,
+        kind: node.kind,
+        role: node.role,
+        created_at: node.created_at,
+        summary: node.summary,
+    }
 }
 
 fn is_missing_node(error: &StoreError) -> bool {
@@ -701,9 +749,12 @@ mod tests {
         )
         .await;
         let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
-        let detail = String::from_utf8(detail_body.to_vec()).unwrap();
-        assert!(detail.contains("direct detail"));
-        assert!(detail.contains(&node_id));
+        let detail: NodeDetailResponse = serde_json::from_slice(&detail_body).unwrap();
+        let NodeDetailResponse::Found { node } = detail else {
+            panic!("node detail should be found");
+        };
+        assert_eq!(node.content, "direct detail");
+        assert_eq!(node.id, node_id);
     }
 
     #[tokio::test]
@@ -765,11 +816,17 @@ mod tests {
         )
         .await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(body.contains("provider context selection"));
-        assert!(body.contains("provider-context-node visible selected"));
-        assert!(body.contains("data-node-x"));
+        assert!(!String::from_utf8_lossy(&body).contains("\"content\":"));
+        let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
+        let ProviderContextResponse::Found { items } = response else {
+            panic!("provider context should be found");
+        };
+        let selected = items
+            .iter()
+            .find(|item| item.selected)
+            .expect("selected provider context item should exist");
+        assert_eq!(selected.node.summary, "provider context selection");
+        assert!(selected.point.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

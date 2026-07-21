@@ -6,6 +6,51 @@ pub struct Point {
     pub y: i32,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PanelNode {
+    pub id: String,
+    pub short_id: String,
+    pub kind: String,
+    pub role: String,
+    pub created_at: String,
+    pub content: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NodeDetailResponse {
+    Default,
+    Missing { target: String },
+    Found { node: PanelNode },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderContextItem {
+    pub context_target: String,
+    pub node: ProviderContextNode,
+    pub selected: bool,
+    pub point: Option<Point>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderContextNode {
+    pub id: String,
+    pub short_id: String,
+    pub kind: String,
+    pub role: String,
+    pub created_at: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProviderContextResponse {
+    Default,
+    Missing { target: String },
+    Found { items: Vec<ProviderContextItem> },
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphCanvas {
     pub width: i32,

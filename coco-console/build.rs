@@ -2,7 +2,7 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
 use snafu::prelude::*;
@@ -10,7 +10,6 @@ use snafu::prelude::*;
 type BuildResult<T> = Result<T, BuildError>;
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
-const JS_ASSET: &str = "coco_console.js";
 const COVERAGE_ENV_VARS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE"];
 
 #[derive(Debug, Snafu)]
@@ -29,12 +28,6 @@ enum BuildError {
 
     #[snafu(display("{program} exited with {status}"))]
     CommandFailed { program: String, status: ExitStatus },
-
-    #[snafu(display("Failed to read generated loader {}: {source}", path.display()))]
-    ReadGeneratedLoader { path: PathBuf, source: io::Error },
-
-    #[snafu(display("Failed to write generated loader {}: {source}", path.display()))]
-    WriteGeneratedLoader { path: PathBuf, source: io::Error },
 }
 
 fn main() {
@@ -45,6 +38,7 @@ fn main() {
 
 fn run() -> BuildResult<()> {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/panels.rs");
     println!("cargo:rerun-if-changed=src/wasm/client.rs");
     println!("cargo:rerun-if-changed=src/wasm/viewport.rs");
     println!("cargo:rerun-if-changed=web-graph-migrations");
@@ -89,8 +83,6 @@ fn run() -> BuildResult<()> {
             .arg(&pkg_dir)
             .arg(&wasm_file),
     )?;
-    append_auto_start(&pkg_dir.join(JS_ASSET))?;
-
     Ok(())
 }
 
@@ -120,16 +112,4 @@ fn host_coverage_is_enabled() -> bool {
             .is_ok_and(|value| value.contains("instrument-coverage"))
 }
 
-fn append_auto_start(path: &Path) -> BuildResult<()> {
-    let mut js = fs::read_to_string(path).context(ReadGeneratedLoaderSnafu {
-        path: path.to_path_buf(),
-    })?;
-    if !js.contains("__wbg_init();") {
-        js.push_str("\n__wbg_init();\n");
-        fs::write(path, js).context(WriteGeneratedLoaderSnafu {
-            path: path.to_path_buf(),
-        })?;
-    }
-    Ok(())
-}
 // grcov: ignore-end

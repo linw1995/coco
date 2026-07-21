@@ -1,4 +1,5 @@
 mod api;
+mod panels;
 
 #[allow(dead_code)]
 mod web_graph;

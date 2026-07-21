@@ -13,14 +13,15 @@ use web_sys::{
 
 use super::refresh::{
     PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
-    node_selection_needs_hash_change, pending_update_for_viewport_change, version_refresh_action,
-    viewport_update_active,
+    pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem,
     GraphViewportResponse, Point,
 };
+use crate::panels::PROVIDER_CONTEXT_RENDERED_EVENT;
+use crate::panels::PanelSelection;
 use crate::viewport::{
     MIN_OVERSCAN, ViewportDrag, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
 };
@@ -75,8 +76,9 @@ struct ViewportPatchInput {
     fetch: ViewportFetch,
 }
 
-#[cfg_attr(not(test), wasm_bindgen::prelude::wasm_bindgen(start))]
-pub fn start() {
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn hydrate() {
+    leptos::mount::hydrate_islands();
     spawn_local(async {
         if let Err(error) = run().await {
             web_sys::console::error_1(&error);
@@ -88,24 +90,14 @@ async fn run() -> Result<(), JsValue> {
     let graph = setup_graph()?;
     render_full_viewport(graph.clone()).await?;
     install_graph_events_or_log(graph.clone());
-    refresh_initial_selection(graph).await
+    focus_selected_node_in_graph(graph);
+    Ok(())
 }
 
 fn install_graph_events_or_log(graph: Rc<RefCell<VirtualGraph>>) {
     if let Err(error) = install_graph_events(graph) {
         web_sys::console::error_1(&error);
     }
-}
-
-async fn refresh_initial_selection(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let has_selected_node = {
-        let graph = graph.borrow();
-        selected_node_target(&graph.window).is_some()
-    };
-    if has_selected_node {
-        refresh_selected_node_detail_from_graph(graph.clone()).await?;
-    }
-    Ok(())
 }
 
 fn setup_graph() -> Result<Rc<RefCell<VirtualGraph>>, JsValue> {
@@ -1553,15 +1545,16 @@ fn graph_item_i32(element: &Element, attr: &str) -> Option<i32> {
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let installers: [GraphListenerInstaller; 8] = [
-        install_node_detail_listener,
+    let installers: [GraphListenerInstaller; 9] = [
+        install_detail_link_listener,
         install_follow_toggle_listener,
         install_mouse_pan_listener,
         install_wheel_listener,
         install_resize_listener,
         install_time_scale_listener,
         install_time_scale_keyboard_listener,
-        install_hashchange_node_detail_listener,
+        install_hashchange_node_selection_listener,
+        install_provider_context_rendered_listener,
     ];
     for install in installers {
         install(graph.clone())?;
@@ -1757,59 +1750,80 @@ fn install_time_scale_keyboard_listener(graph: Rc<RefCell<VirtualGraph>>) -> Res
     Ok(())
 }
 
-fn install_hashchange_node_detail_listener(
+fn install_hashchange_node_selection_listener(
     graph: Rc<RefCell<VirtualGraph>>,
 ) -> Result<(), JsValue> {
-    let detail_graph = graph.clone();
-    let detail_window = graph.borrow().window.clone();
-    let detail_closure = Closure::<dyn FnMut()>::new(move || {
-        let graph = detail_graph.clone();
-        spawn_local(async move {
-            if let Err(error) = refresh_selected_node_detail_from_graph(graph).await {
-                web_sys::console::error_1(&error);
-            }
-        });
+    let selection_graph = graph.clone();
+    let selection_window = graph.borrow().window.clone();
+    let selection_closure = Closure::<dyn FnMut()>::new(move || {
+        focus_selected_node_in_graph(selection_graph.clone());
     });
-    detail_window
-        .add_event_listener_with_callback("hashchange", detail_closure.as_ref().unchecked_ref())?;
-    detail_closure.forget();
+    selection_window.add_event_listener_with_callback(
+        "hashchange",
+        selection_closure.as_ref().unchecked_ref(),
+    )?;
+    selection_closure.forget();
 
     Ok(())
 }
 
-fn install_node_detail_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let node_group = graph.borrow().node_group.clone();
+fn install_provider_context_rendered_listener(
+    graph: Rc<RefCell<VirtualGraph>>,
+) -> Result<(), JsValue> {
+    let context_graph = graph.clone();
+    let context_window = graph.borrow().window.clone();
+    let context_closure = Closure::<dyn FnMut()>::new(move || {
+        focus_selected_node_in_graph(context_graph.clone());
+    });
+    context_window.add_event_listener_with_callback(
+        PROVIDER_CONTEXT_RENDERED_EVENT,
+        context_closure.as_ref().unchecked_ref(),
+    )?;
+    context_closure.forget();
+
+    Ok(())
+}
+
+fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let document = graph.borrow().document.clone();
     let detail_graph = graph.clone();
     let detail_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
-        let Some(link) = node_link_from_event(&event) else {
+        let Some(link) = detail_link_from_event(&event) else {
             return;
         };
-        let Some(target) = link.get_attribute("data-node-target") else {
+        let Some(hash) = link.get_attribute("href") else {
             return;
         };
 
         event.prevent_default();
         event.stop_propagation();
-        select_node_detail(detail_graph.clone(), target);
+        select_detail_link(detail_graph.clone(), hash);
     });
-    node_group
-        .add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
+    document.add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
     detail_closure.forget();
     Ok(())
 }
 
-fn node_link_from_event(event: &MouseEvent) -> Option<Element> {
+fn detail_link_from_event(event: &MouseEvent) -> Option<Element> {
+    if event.button() != 0
+        || event.alt_key()
+        || event.ctrl_key()
+        || event.meta_key()
+        || event.shift_key()
+    {
+        return None;
+    }
     let target = event.target()?.dyn_into::<Element>().ok()?;
-    target.closest(".node-link").ok().flatten()
+    target.closest("a[href^=\"#detail-\"]").ok().flatten()
 }
 
-fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
+fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
     let window = {
         let graph = graph.borrow();
         graph.window.clone()
     };
 
-    match set_selected_node_hash(&window, &target) {
+    match update_detail_hash(&window, &hash) {
         Ok(true) => return,
         Ok(false) => {}
         Err(error) => {
@@ -1818,277 +1832,18 @@ fn select_node_detail(graph: Rc<RefCell<VirtualGraph>>, target: String) {
         }
     }
 
-    spawn_local(async move {
-        if let Err(error) = refresh_selected_node_detail_from_graph(graph).await {
-            web_sys::console::error_1(&error);
-        }
-    });
+    focus_selected_node_in_graph(graph);
 }
 
-fn set_selected_node_hash(window: &Window, target: &str) -> Result<bool, JsValue> {
-    if !node_selection_needs_hash_change(
-        selected_node_target(window).as_deref(),
-        selected_provider_context_target(window).as_deref(),
-        target,
-    ) {
+fn update_detail_hash(window: &Window, hash: &str) -> Result<bool, JsValue> {
+    if window.location().hash()? == hash {
         return Ok(false);
     }
-    window.location().set_hash(target)?;
+    window
+        .history()?
+        .push_state_with_url(&JsValue::NULL, "", Some(hash))?;
+    window.dispatch_event(&web_sys::Event::new("hashchange")?)?;
     Ok(true)
-}
-
-async fn refresh_selected_node_detail_from_graph(
-    graph: Rc<RefCell<VirtualGraph>>,
-) -> Result<(), JsValue> {
-    let (window, document) = {
-        let graph = graph.borrow();
-        (graph.window.clone(), graph.document.clone())
-    };
-    refresh_selected_node_detail(&window, &document).await?;
-    focus_selected_node_in_graph(graph);
-    Ok(())
-}
-
-struct SelectedNodeDetailRequest {
-    target: Option<String>,
-    context: Option<String>,
-    detail_url: String,
-    provider_context_url: String,
-}
-
-async fn refresh_selected_node_detail(window: &Window, document: &Document) -> Result<(), JsValue> {
-    let request = selected_node_detail_request(window, document)?;
-    let detail_html = fetch_text(window, &request.detail_url).await?;
-    let provider_context_html = fetch_text(window, &request.provider_context_url).await?;
-    render_node_detail_if_current(window, document, request.target.clone(), &detail_html)?;
-    render_provider_context_if_current(
-        window,
-        document,
-        request.target,
-        request.context,
-        &provider_context_html,
-    )
-}
-
-fn selected_node_detail_request(
-    window: &Window,
-    document: &Document,
-) -> Result<SelectedNodeDetailRequest, JsValue> {
-    let target = selected_node_target(window);
-    let context = selected_provider_context_target(window);
-    render_loading_node_detail_if_current(window, document, target.as_deref())?;
-    render_loading_provider_context_if_current(
-        window,
-        document,
-        target.as_deref(),
-        context.as_deref(),
-    )?;
-    let graph_mode = current_graph_mode(document);
-    let detail_url = node_detail_url(target.as_deref(), &graph_mode);
-    let provider_context_url =
-        provider_context_url(target.as_deref(), context.as_deref(), &graph_mode);
-    Ok(SelectedNodeDetailRequest {
-        target,
-        context,
-        detail_url,
-        provider_context_url,
-    })
-}
-
-fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
-    target
-        .map(|target| {
-            format!(
-                "/api/node-detail?target={}&mode={}",
-                percent_encode(target),
-                graph_mode
-            )
-        })
-        .unwrap_or_else(|| format!("/api/node-detail?mode={graph_mode}"))
-}
-
-fn provider_context_url(target: Option<&str>, context: Option<&str>, graph_mode: &str) -> String {
-    let mut query = format!("mode={graph_mode}");
-    if let Some(target) = target {
-        query.push_str("&target=");
-        query.push_str(&percent_encode(target));
-    }
-    if let Some(context) = context {
-        query.push_str("&context=");
-        query.push_str(&percent_encode(context));
-    }
-    format!("/api/provider-context?{query}")
-}
-
-fn render_node_detail_if_current(
-    window: &Window,
-    document: &Document,
-    target: Option<String>,
-    html: &str,
-) -> Result<(), JsValue> {
-    if selected_node_target(window) == target {
-        let slot = query_required(document, ".node-detail-slot")?;
-        slot.set_inner_html(html);
-        mark_selected_node_detail(&slot)?;
-    }
-    Ok(())
-}
-
-fn render_provider_context_if_current(
-    window: &Window,
-    document: &Document,
-    target: Option<String>,
-    context: Option<String>,
-    html: &str,
-) -> Result<(), JsValue> {
-    if selected_node_target(window) == target && selected_provider_context_target(window) == context
-    {
-        let slot = query_required(document, ".provider-context-slot")?;
-        slot.set_inner_html(html);
-    }
-    Ok(())
-}
-
-fn render_loading_node_detail_if_current(
-    window: &Window,
-    document: &Document,
-    target: Option<&str>,
-) -> Result<(), JsValue> {
-    let Some(target) = target else {
-        return clear_selected_node_detail(document);
-    };
-    if selected_node_target(window).as_deref() != Some(target) {
-        return Ok(());
-    }
-    let detail = loading_node_detail(document, target)?;
-    replace_node_detail_slot(document, &detail)
-}
-
-fn render_loading_provider_context_if_current(
-    window: &Window,
-    document: &Document,
-    target: Option<&str>,
-    context: Option<&str>,
-) -> Result<(), JsValue> {
-    if selected_node_target(window).as_deref() != target
-        || selected_provider_context_target(window).as_deref() != context
-    {
-        return Ok(());
-    }
-    let provider_context = loading_provider_context(document, target)?;
-    replace_provider_context_slot(document, &provider_context)
-}
-
-fn replace_node_detail_slot(document: &Document, detail: &Element) -> Result<(), JsValue> {
-    let slot = query_required(document, ".node-detail-slot")?;
-    slot.set_inner_html("");
-    slot.append_child(detail)?;
-    Ok(())
-}
-
-fn replace_provider_context_slot(
-    document: &Document,
-    provider_context: &Element,
-) -> Result<(), JsValue> {
-    let slot = query_required(document, ".provider-context-slot")?;
-    slot.set_inner_html("");
-    slot.append_child(provider_context)?;
-    Ok(())
-}
-
-fn clear_selected_node_detail(document: &Document) -> Result<(), JsValue> {
-    let Some(detail) = document.query_selector(".node-detail.node-detail-selected")? else {
-        return Ok(());
-    };
-    detail.class_list().remove_1("node-detail-selected")
-}
-
-fn loading_node_detail(document: &Document, target: &str) -> Result<Element, JsValue> {
-    let section = node_detail_section(document, target)?;
-    append_text_child(document, &section, "h2", "Node")?;
-    let list = loading_detail_list(document)?;
-    section.append_child(&list)?;
-    Ok(section)
-}
-
-fn loading_provider_context(document: &Document, target: Option<&str>) -> Result<Element, JsValue> {
-    let section = classed_element(document, "section", "provider-context-section")?;
-    append_text_child(document, &section, "h2", "Provider Context")?;
-    let message = if target.is_some() {
-        "Loading provider context..."
-    } else {
-        "Select a node to inspect its provider context."
-    };
-    let paragraph = classed_element(document, "p", "provider-context-empty")?;
-    paragraph.set_text_content(Some(message));
-    section.append_child(&paragraph)?;
-    Ok(section)
-}
-
-fn node_detail_section(document: &Document, target: &str) -> Result<Element, JsValue> {
-    let section = document.create_element("section")?;
-    set_attributes(
-        &section,
-        [
-            ("id", target.to_owned()),
-            (
-                "class",
-                "node-details node-detail node-detail-selected".to_owned(),
-            ),
-        ],
-    )?;
-    Ok(section)
-}
-
-fn loading_detail_list(document: &Document) -> Result<Element, JsValue> {
-    let list = classed_element(document, "dl", "detail-list")?;
-    let row = detail_row(document, "Selection", "Loading node detail...")?;
-    list.append_child(&row)?;
-    Ok(list)
-}
-
-fn detail_row(document: &Document, term: &str, detail: &str) -> Result<Element, JsValue> {
-    let row = document.create_element("div")?;
-    append_text_child(document, &row, "dt", term)?;
-    append_text_child(document, &row, "dd", detail)?;
-    Ok(row)
-}
-
-fn classed_element(document: &Document, tag: &str, class: &str) -> Result<Element, JsValue> {
-    let element = document.create_element(tag)?;
-    element.set_attribute("class", class)?;
-    Ok(element)
-}
-
-fn append_text_child(
-    document: &Document,
-    parent: &Element,
-    tag: &str,
-    text: &str,
-) -> Result<(), JsValue> {
-    let child = text_element(document, tag, text)?;
-    parent.append_child(&child)?;
-    Ok(())
-}
-
-fn text_element(document: &Document, tag: &str, text: &str) -> Result<Element, JsValue> {
-    let element = document.create_element(tag)?;
-    element.set_text_content(Some(text));
-    Ok(element)
-}
-
-fn mark_selected_node_detail(slot: &Element) -> Result<(), JsValue> {
-    let Some(detail) = slot.query_selector(".node-detail")? else {
-        return Ok(());
-    };
-    let class = detail.get_attribute("class").unwrap_or_default();
-    if !class
-        .split_ascii_whitespace()
-        .any(|part| part == "node-detail-selected")
-    {
-        detail.set_attribute("class", &format!("{class} node-detail-selected"))?;
-    }
-    Ok(())
 }
 
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
@@ -2185,28 +1940,11 @@ fn graph_focus_point_from_rendered_node(
 }
 
 fn selected_node_target(window: &Window) -> Option<String> {
-    let hash = selected_hash(window)?;
-    let target = hash
-        .split_once('?')
-        .map(|(target, _)| target)
-        .unwrap_or(&hash);
-    (!target.is_empty() && target.starts_with("detail-")).then(|| target.to_owned())
+    selected_panel_selection(window).target
 }
 
-fn selected_provider_context_target(window: &Window) -> Option<String> {
-    let hash = selected_hash(window)?;
-    let (_, query) = hash.split_once('?')?;
-    query.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
-        (name == "context" && value.starts_with("detail-")).then(|| value.to_owned())
-    })
-}
-
-fn selected_hash(window: &Window) -> Option<String> {
-    let hash = window.location().hash().ok()?;
-    hash.strip_prefix('#')
-        .filter(|target| !target.is_empty())
-        .map(str::to_owned)
+fn selected_panel_selection(window: &Window) -> PanelSelection {
+    PanelSelection::from_hash(&window.location().hash().unwrap_or_default())
 }
 
 fn pan_from_wheel(graph: &mut VirtualGraph, event: &WheelEvent) {
@@ -2656,54 +2394,58 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_render_loading_provider_context() {
-        let fixture = GraphFixture::new();
-        let document = fixture.graph.borrow().document.clone();
-        let loading = loading_provider_context(&document, Some("detail-aaaaaaaa"))
-            .expect_throw("loading provider context should render");
-        assert_eq!(
-            loading
-                .query_selector(".provider-context-empty")
-                .expect_throw("loading message query should succeed")
-                .expect_throw("loading message should exist")
-                .text_content()
-                .as_deref(),
-            Some("Loading provider context...")
-        );
-        let empty = loading_provider_context(&document, None)
-            .expect_throw("empty provider context should render");
-        assert_eq!(
-            empty
-                .query_selector(".provider-context-empty")
-                .expect_throw("empty message query should succeed")
-                .expect_throw("empty message should exist")
-                .text_content()
-                .as_deref(),
-            Some("Select a node to inspect its provider context.")
-        );
-    }
-
-    #[wasm_bindgen_test]
-    fn graph_items_node_selection_uses_one_refresh_trigger() {
+    fn graph_items_detail_navigation_uses_history_and_one_refresh_trigger() {
         let fixture = GraphFixture::new();
         let window = fixture.graph.borrow().window.clone();
 
         assert!(
-            set_selected_node_hash(&window, "detail-aaaaaaaa")
+            update_detail_hash(&window, "#detail-aaaaaaaa")
                 .expect_throw("new selection hash should be set")
         );
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-aaaaaaaa"
+        );
         assert!(
-            !set_selected_node_hash(&window, "detail-aaaaaaaa")
+            !update_detail_hash(&window, "#detail-aaaaaaaa")
                 .expect_throw("unchanged selection should be detected")
         );
-        window
-            .location()
-            .set_hash("detail-aaaaaaaa?context=detail-context")
-            .expect_throw("provider context hash should be set");
         assert!(
-            set_selected_node_hash(&window, "detail-aaaaaaaa")
-                .expect_throw("provider context selection should be cleared")
+            update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-context")
+                .expect_throw("provider context hash should be set")
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_detail_link_detection_handles_plain_clicks() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        let link = document
+            .create_element("a")
+            .expect_throw("detail link should be created");
+        link.set_attribute("href", "#detail-aaaaaaaa")
+            .expect_throw("detail link target should be set");
+        fixture
+            .root
+            .append_child(&link)
+            .expect_throw("detail link should be mounted");
+
+        let captured_hash = Rc::new(RefCell::new(None));
+        let closure_hash = captured_hash.clone();
+        let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+            closure_hash.replace(
+                detail_link_from_event(&event).and_then(|link| link.get_attribute("href")),
+            );
+        });
+        link.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+            .expect_throw("detail link listener should be installed");
+
+        link.dispatch_event(&mouse_event("click", 0, 0, 0, 0))
+            .expect_throw("detail click should dispatch");
+
+        link.remove_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+            .expect_throw("detail link listener should be removed");
+        assert_eq!(captured_hash.borrow().as_deref(), Some("#detail-aaaaaaaa"));
     }
 
     #[wasm_bindgen_test]
