@@ -91,15 +91,12 @@ while IFS= read -r runtime_path; do
     exit 1
   fi
 
-  if ! derivation_path="$(nix-store --query --deriver "${runtime_path}" 2>/dev/null)"; then
-    continue
-  fi
-  if [[ "${derivation_path}" == "unknown-deriver" ]]; then
-    continue
-  fi
-
-  printf '%s\t%s\n' "${runtime_path}" "${derivation_path}" \
-    >> "${runtime_derivations_file}"
+  while IFS= read -r derivation_path; do
+    printf '%s\t%s\n' "${runtime_path}" "${derivation_path}" \
+      >> "${runtime_derivations_file}"
+  done < <(
+    nix-store --query --valid-derivers "${runtime_path}" 2>/dev/null || true
+  )
 done < "${runtime_paths_file}"
 sort -u -o "${runtime_derivations_file}" "${runtime_derivations_file}"
 

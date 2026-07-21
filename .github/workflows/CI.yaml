@@ -104,6 +104,7 @@ jobs:
               - "LICENSE"
               - "NOTICE"
               - "THIRD_PARTY_NOTICES.html"
+              - "scripts/export-container-sources.sh"
               - "coco-*/src/**"
               - "coco-*/tests/**"
               - "coco-console/build.rs"
@@ -272,3 +273,6 @@ jobs:
 
       - name: Build Docker image
         run: nix build --out-link image .#coco-image --print-build-logs
+
+      - name: Export corresponding sources
+        run: scripts/export-container-sources.sh image container-sources.tar.gz linux-amd64
