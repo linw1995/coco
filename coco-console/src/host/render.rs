@@ -59,6 +59,7 @@ fn render_document(root: AnyView) -> String {
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>"CoCo Console"</title>
                 <link rel="stylesheet" href="/style.css" />
+                <link rel="license" href="/third-party-notices.html" />
                 <script>{HYDRATION_BOOTSTRAP}</script>
                 <HydrationScripts options=options islands=true/>
             </head>

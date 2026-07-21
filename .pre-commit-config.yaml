@@ -71,6 +71,27 @@ repos:
         pass_filenames: false
         always_run: true
 
+      - id: license-policy-consistency
+        name: license-policy-consistency
+        entry: python3 scripts/check-license-policy.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-deny-licenses
+        name: cargo-deny-licenses
+        entry: cargo deny --locked check licenses
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: third-party-notices
+        name: third-party-notices
+        entry: scripts/check-third-party-notices.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+
 # Configuration for specific hooks
 default_stages: [pre-commit]
 fail_fast: false

@@ -9,6 +9,9 @@ coco-console/pkg
 !scripts/run-cov.sh
 !scripts/run-wasm-cov.sh
 !scripts/test-builtin-skill-scripts.sh
+!scripts/generate-third-party-notices.sh
+!scripts/check-third-party-notices.sh
+!scripts/export-container-sources.sh
 
 # CoCo
 config.toml

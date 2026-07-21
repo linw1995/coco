@@ -36,6 +36,7 @@ use crate::host::web_graph_view::{
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
+const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.html");
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
@@ -134,6 +135,7 @@ where
         .route("/", get(index_page::<S>).post(method_not_allowed))
         .route("/index.html", get(index_page::<S>))
         .route("/style.css", get(style_css))
+        .route("/third-party-notices.html", get(third_party_notices))
         .route("/api/graph/viewport", get(graph_viewport::<S>))
         .route(
             "/api/graph/viewport/items/diff",
@@ -192,6 +194,14 @@ async fn style_css() -> Response {
         StatusCode::OK,
         "text/css; charset=utf-8",
         Body::from(STYLE_CSS),
+    )
+}
+
+async fn third_party_notices() -> Response {
+    response_with_body(
+        StatusCode::OK,
+        "text/html; charset=utf-8",
+        Body::from(THIRD_PARTY_NOTICES),
     )
 }
 
@@ -630,6 +640,7 @@ mod tests {
         Anchor, BranchStore, Kind, NewNode, NodeStore, Role, SessionAnchor, SessionRole,
         SqliteStore,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::ConsoleStore;
     use crate::host::web_graph_view::node_target_id;
@@ -761,8 +772,8 @@ mod tests {
         assert!(body.contains("data-node-x"));
     }
 
-    #[tokio::test]
-    async fn server_with_graph_store_path_starts_and_shuts_down() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_serves_third_party_notices_and_shuts_down() {
         let source = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(source.clone(), publisher.clone());
@@ -778,6 +789,20 @@ mod tests {
         .unwrap();
 
         assert_ne!(handle.addr().port(), 0);
+        let mut stream = tokio::net::TcpStream::connect(handle.addr()).await.unwrap();
+        stream
+            .write_all(
+                b"GET /third-party-notices.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("content-type: text/html; charset=utf-8\r\n"));
+        assert!(response.contains("CoCo Third-Party Notices"));
+        assert!(response.contains("Apache License 2.0"));
         handle.shutdown().await.unwrap();
     }
 }
