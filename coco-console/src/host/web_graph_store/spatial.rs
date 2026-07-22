@@ -12,10 +12,12 @@ use super::schema::{
     web_graph_node_spatial_items, web_graph_route_spatial_index, web_graph_route_spatial_items,
 };
 use super::*;
+use crate::host::web_graph_view::GRAPH_ROW_STEP;
 
 const NODE_BOUNDS_HALF_WIDTH: i32 = 64;
 const NODE_BOUNDS_TOP: i32 = 24;
 const NODE_BOUNDS_BOTTOM: i32 = 52;
+const ROW_COLLISION_RADIUS: i32 = GRAPH_ROW_STEP / 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
@@ -257,7 +259,7 @@ pub async fn load_routes_intersecting_nodes(
 
     let mut routes = BTreeMap::new();
     for node in nodes {
-        let bounds = node_bounds(node.point);
+        let bounds = node_row_collision_bounds(node.point);
         let rows = web_graph_route_spatial_index::table
             .inner_join(
                 web_graph_route_spatial_items::table.on(web_graph_route_spatial_index::spatial_id
@@ -307,7 +309,7 @@ pub async fn load_nodes_intersecting_routes(
 
     let mut nodes = BTreeMap::new();
     for route in routes {
-        let bounds = route_bounds(route.route);
+        let bounds = route_row_collision_bounds(route.route);
         let rows = web_graph_node_spatial_index::table
             .inner_join(
                 web_graph_node_spatial_items::table.on(web_graph_node_spatial_index::spatial_id
@@ -772,6 +774,14 @@ fn node_bounds(point: Point) -> SpatialBounds {
     }
 }
 
+fn node_row_collision_bounds(point: Point) -> SpatialBounds {
+    SpatialBounds {
+        min_y: point.y.saturating_sub(ROW_COLLISION_RADIUS),
+        max_y: point.y.saturating_add(ROW_COLLISION_RADIUS),
+        ..node_bounds(point)
+    }
+}
+
 fn route_bounds(route: BezierRoute) -> SpatialBounds {
     let points = [route.source, route.control_1, route.control_2, route.target];
     SpatialBounds {
@@ -779,6 +789,15 @@ fn route_bounds(route: BezierRoute) -> SpatialBounds {
         max_x: points.iter().map(|point| point.x).max().unwrap_or_default(),
         min_y: points.iter().map(|point| point.y).min().unwrap_or_default(),
         max_y: points.iter().map(|point| point.y).max().unwrap_or_default(),
+    }
+}
+
+fn route_row_collision_bounds(route: BezierRoute) -> SpatialBounds {
+    let bounds = route_bounds(route);
+    SpatialBounds {
+        min_y: bounds.min_y.saturating_sub(ROW_COLLISION_RADIUS),
+        max_y: bounds.max_y.saturating_add(ROW_COLLISION_RADIUS),
+        ..bounds
     }
 }
 

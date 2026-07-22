@@ -2419,6 +2419,55 @@ mod tests {
         .unwrap()
     }
 
+    fn row_collision_graph() -> Graph {
+        let source = node("source");
+        let target = node("target");
+        let blocker = node("blocker");
+        let edge = EdgeId::new(EdgeKind::Primary, source.clone(), target.clone());
+        Graph::from_snapshot(Snapshot {
+            format_version: FORMAT_VERSION,
+            revision: Revision::new(1),
+            source_version: SourceVersion::new(1),
+            topology: TopologySnapshot {
+                nodes: vec![source.clone(), target.clone(), blocker.clone()],
+                edges: vec![edge.clone()],
+            },
+            layouts: LayoutSnapshots {
+                anchors: empty_layout(),
+                all: LayoutSnapshot {
+                    canvas: Canvas {
+                        width: 400,
+                        height: 180,
+                    },
+                    nodes: vec![
+                        NodePlacement {
+                            node: source,
+                            point: point(24, 128),
+                        },
+                        NodePlacement {
+                            node: target,
+                            point: point(300, 128),
+                        },
+                        NodePlacement {
+                            node: blocker,
+                            point: point(160, 128),
+                        },
+                    ],
+                    edges: vec![RoutedEdge {
+                        edge,
+                        route: BezierRoute {
+                            source: point(44, 93),
+                            control_1: point(120, 93),
+                            control_2: point(200, 93),
+                            target: point(276, 93),
+                        },
+                    }],
+                },
+            },
+        })
+        .unwrap()
+    }
+
     fn empty_graph(revision: u64, source_version: u64) -> Graph {
         Graph::from_snapshot(Snapshot {
             format_version: FORMAT_VERSION,
@@ -3110,6 +3159,30 @@ mod tests {
             .value;
         assert!(nodes.contains(&source));
         assert!(nodes.iter().any(|node| node.node == routes[0].edge.target));
+    }
+
+    #[tokio::test]
+    async fn reflow_spatial_candidates_cover_the_full_row_collision_radius() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&row_collision_graph()).await.unwrap();
+        let blocker = placement("blocker", 160, 128);
+
+        let routes = store
+            .edge_routes_intersecting_nodes(LayoutKind::All, std::slice::from_ref(&blocker))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(routes.len(), 1);
+
+        let nodes = store
+            .node_placements_intersecting_routes(LayoutKind::All, std::slice::from_ref(&routes[0]))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert!(nodes.contains(&blocker));
     }
 
     #[tokio::test]
