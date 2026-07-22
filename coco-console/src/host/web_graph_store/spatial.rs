@@ -18,6 +18,7 @@ const NODE_BOUNDS_HALF_WIDTH: i32 = 64;
 const NODE_BOUNDS_TOP: i32 = 24;
 const NODE_BOUNDS_BOTTOM: i32 = 52;
 const ROW_COLLISION_RADIUS: i32 = GRAPH_ROW_STEP / 2;
+const SPATIAL_CANDIDATE_PAGE_SIZE: i64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
@@ -89,6 +90,17 @@ struct SpatialBounds {
     max_x: i32,
     min_y: i32,
     max_y: i32,
+}
+
+impl SpatialBounds {
+    fn union(self, other: Self) -> Self {
+        Self {
+            min_x: self.min_x.min(other.min_x),
+            max_x: self.max_x.max(other.max_x),
+            min_y: self.min_y.min(other.min_y),
+            max_y: self.max_y.max(other.max_y),
+        }
+    }
 }
 
 #[derive(Debug, Insertable)]
@@ -257,9 +269,16 @@ pub async fn load_routes_intersecting_nodes(
 ) -> std::result::Result<Vec<RoutedEdge>, TransactionError> {
     use diesel_async::RunQueryDsl;
 
+    let Some(bounds) = nodes
+        .iter()
+        .map(|node| node_row_collision_bounds(node.point))
+        .reduce(SpatialBounds::union)
+    else {
+        return Ok(Vec::new());
+    };
     let mut routes = BTreeMap::new();
-    for node in nodes {
-        let bounds = node_row_collision_bounds(node.point);
+    let mut after = i32::MIN;
+    loop {
         let rows = web_graph_route_spatial_index::table
             .inner_join(
                 web_graph_route_spatial_items::table.on(web_graph_route_spatial_index::spatial_id
@@ -289,10 +308,20 @@ pub async fn load_routes_intersecting_nodes(
             .filter(web_graph_route_spatial_index::max_x.ge(Some(bounds.min_x)))
             .filter(web_graph_route_spatial_index::min_y.le(Some(bounds.max_y)))
             .filter(web_graph_route_spatial_index::max_y.ge(Some(bounds.min_y)))
-            .select(RouteRow::as_select())
-            .load::<RouteRow>(connection)
+            .filter(web_graph_route_spatial_items::spatial_id.gt(after))
+            .order(web_graph_route_spatial_items::spatial_id.asc())
+            .limit(SPATIAL_CANDIDATE_PAGE_SIZE)
+            .select((
+                web_graph_route_spatial_items::spatial_id,
+                RouteRow::as_select(),
+            ))
+            .load::<(i32, RouteRow)>(connection)
             .await?;
-        for route in rows.into_iter().map(stored_route) {
+        let Some((last_spatial_id, _)) = rows.last() else {
+            break;
+        };
+        after = *last_spatial_id;
+        for route in rows.into_iter().map(|(_, row)| stored_route(row)) {
             let route = route?;
             routes.insert(route.edge.clone(), route);
         }
@@ -307,9 +336,16 @@ pub async fn load_nodes_intersecting_routes(
 ) -> std::result::Result<Vec<NodePlacement>, TransactionError> {
     use diesel_async::RunQueryDsl;
 
+    let Some(bounds) = routes
+        .iter()
+        .map(|route| route_row_collision_bounds(route.route))
+        .reduce(SpatialBounds::union)
+    else {
+        return Ok(Vec::new());
+    };
     let mut nodes = BTreeMap::new();
-    for route in routes {
-        let bounds = route_row_collision_bounds(route.route);
+    let mut after = i32::MIN;
+    loop {
         let rows = web_graph_node_spatial_index::table
             .inner_join(
                 web_graph_node_spatial_items::table.on(web_graph_node_spatial_index::spatial_id
@@ -331,10 +367,20 @@ pub async fn load_nodes_intersecting_routes(
             .filter(web_graph_node_spatial_index::max_x.ge(Some(bounds.min_x)))
             .filter(web_graph_node_spatial_index::min_y.le(Some(bounds.max_y)))
             .filter(web_graph_node_spatial_index::max_y.ge(Some(bounds.min_y)))
-            .select(PlacementRow::as_select())
-            .load::<PlacementRow>(connection)
+            .filter(web_graph_node_spatial_items::spatial_id.gt(after))
+            .order(web_graph_node_spatial_items::spatial_id.asc())
+            .limit(SPATIAL_CANDIDATE_PAGE_SIZE)
+            .select((
+                web_graph_node_spatial_items::spatial_id,
+                PlacementRow::as_select(),
+            ))
+            .load::<(i32, PlacementRow)>(connection)
             .await?;
-        for node in rows.into_iter().map(stored_placement) {
+        let Some((last_spatial_id, _)) = rows.last() else {
+            break;
+        };
+        after = *last_spatial_id;
+        for node in rows.into_iter().map(|(_, row)| stored_placement(row)) {
             let node = node?;
             nodes.insert(node.node.clone(), node);
         }

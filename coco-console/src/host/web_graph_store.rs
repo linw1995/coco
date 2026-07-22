@@ -3186,6 +3186,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflow_spatial_candidates_page_large_result_sets() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&fanout_graph(128)).await.unwrap();
+        let source = placement("source", 80, 80);
+
+        let routes = store
+            .edge_routes_intersecting_nodes(LayoutKind::All, std::slice::from_ref(&source))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(routes.len(), 128);
+
+        let nodes = store
+            .node_placements_intersecting_routes(LayoutKind::All, &routes)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(nodes.len(), 129);
+        assert!(nodes.contains(&source));
+    }
+
+    #[tokio::test]
     async fn viewport_pagination_is_bounded_and_query_scoped() {
         let directory = TestDirectory::new();
         let store = WebGraphStore::open(&directory.path).await.unwrap();
