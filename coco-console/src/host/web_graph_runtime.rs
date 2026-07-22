@@ -71,6 +71,12 @@ struct EnsureResult {
     added_nodes: Vec<String>,
 }
 
+enum ReflowStep {
+    ExpandRoutes(BTreeMap<EdgeId, RoutedEdge>),
+    ExpandColumns(BTreeSet<i32>),
+    Complete(LayoutPatch),
+}
+
 #[derive(Debug)]
 struct CatchUpProgress {
     started_at: Instant,
@@ -413,6 +419,95 @@ fn collision_columns(
                     .any(|route| route_reserves_node(route, placement))
         })
         .map(|placement| placement.point.x)
+        .collect()
+}
+
+fn reflow_placement_updates(
+    columns: &BTreeMap<i32, Vec<NodePlacement>>,
+    final_points: &BTreeMap<NodeId, Point>,
+) -> BTreeMap<NodeId, NodePlacement> {
+    columns
+        .values()
+        .flatten()
+        .filter_map(|placement| {
+            let point = final_points[&placement.node];
+            (point != placement.point).then(|| {
+                (
+                    placement.node.clone(),
+                    NodePlacement {
+                        node: placement.node.clone(),
+                        point,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn affected_reflow_endpoints(
+    new_nodes_by_column: &BTreeMap<i32, BTreeMap<NodeId, usize>>,
+    placement_updates: &BTreeMap<NodeId, NodePlacement>,
+    routes: &BTreeMap<EdgeId, RoutedEdge>,
+) -> (BTreeSet<NodeId>, BTreeSet<NodeId>) {
+    let mut affected_nodes = new_nodes_by_column
+        .values()
+        .flat_map(BTreeMap::keys)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    affected_nodes.extend(placement_updates.keys().cloned());
+    let mut affected_sources = affected_nodes.clone();
+    let mut affected_targets = affected_nodes.clone();
+    for route in routes.values() {
+        if affected_nodes.contains(&route.edge.target) {
+            affected_sources.insert(route.edge.source.clone());
+        }
+        if affected_nodes.contains(&route.edge.source) {
+            affected_targets.insert(route.edge.target.clone());
+        }
+    }
+    (affected_sources, affected_targets)
+}
+
+fn reroute_affected_edges(
+    routes: &BTreeMap<EdgeId, RoutedEdge>,
+    affected_sources: &BTreeSet<NodeId>,
+    affected_targets: &BTreeSet<NodeId>,
+    old_points: &BTreeMap<NodeId, Point>,
+    final_points: &BTreeMap<NodeId, Point>,
+) -> Vec<RoutedEdge> {
+    let source_offsets = endpoint_source_offsets(routes, affected_sources, final_points);
+    let target_offsets = endpoint_target_offsets(routes, affected_targets, final_points);
+    routes
+        .values()
+        .filter_map(|routed| {
+            if !affected_sources.contains(&routed.edge.source)
+                && !affected_targets.contains(&routed.edge.target)
+            {
+                return None;
+            }
+            let old_source = old_points[&routed.edge.source];
+            let old_target = old_points[&routed.edge.target];
+            let source_offset = source_offsets
+                .get(&routed.edge)
+                .copied()
+                .unwrap_or_else(|| routed.route.source.y.saturating_sub(old_source.y));
+            let target_offset = target_offsets
+                .get(&routed.edge)
+                .copied()
+                .unwrap_or_else(|| routed.route.target.y.saturating_sub(old_target.y));
+            let route = route_edge_with_offsets(
+                final_points[&routed.edge.source],
+                final_points[&routed.edge.target],
+                EndpointPortOffsets {
+                    source: source_offset,
+                    target: target_offset,
+                },
+            );
+            (route != routed.route).then(|| RoutedEdge {
+                edge: routed.edge.clone(),
+                route,
+            })
+        })
         .collect()
 }
 
@@ -1088,250 +1183,219 @@ impl WebGraphRuntime {
         let mut dirty_columns = new_nodes_by_column.keys().copied().collect::<BTreeSet<_>>();
         let mut forced_routes = BTreeMap::<EdgeId, RoutedEdge>::new();
         loop {
-            let mut columns = BTreeMap::<i32, Vec<NodePlacement>>::new();
-            for x in dirty_columns.iter().copied() {
-                let Some(placements) = self.column_at_revision(kind, x, revision).await? else {
-                    return Ok(None);
-                };
-                columns.insert(x, placements);
-            }
-            let column_placements = columns.values().flatten().cloned().collect::<Vec<_>>();
-            let column_nodes = column_placements
-                .iter()
-                .map(|placement| placement.node.clone())
-                .collect::<BTreeSet<_>>();
-            let Some(mut routes) = self
-                .incident_routes_at_revision(kind, &column_nodes, revision)
-                .await?
-            else {
-                return Ok(None);
-            };
-            let Some(crossing_routes) = self
-                .routes_intersecting_placements_at_revision(kind, &column_placements, revision)
-                .await?
-            else {
-                return Ok(None);
-            };
-            routes.extend(crossing_routes.into_iter().filter(|(_, route)| {
-                column_placements
-                    .iter()
-                    .any(|placement| route_reserves_node(route, placement))
-            }));
-            routes.extend(forced_routes.clone());
-
-            let mut old_points = column_placements
-                .iter()
-                .map(|placement| (placement.node.clone(), placement.point))
-                .collect::<BTreeMap<_, _>>();
-            let route_endpoints = route_endpoint_ids(routes.values());
-            let Some(endpoint_placements) = self
-                .placements_at_revision(
+            let Some(step) = self
+                .build_reflow_step(
                     kind,
-                    &route_endpoints.into_iter().collect::<Vec<_>>(),
                     revision,
+                    &new_nodes_by_column,
+                    &dirty_columns,
+                    &forced_routes,
                 )
                 .await?
             else {
                 return Ok(None);
             };
-            old_points.extend(
-                endpoint_placements
-                    .into_iter()
-                    .map(|placement| (placement.node, placement.point)),
-            );
-            let Some(endpoint_fans) = self
-                .endpoint_fans_at_revision(kind, revision, &routes, &mut old_points)
-                .await?
-            else {
-                return Ok(None);
-            };
-
-            let new_nodes_by_column = new_nodes_by_column.clone();
-            let (columns, new_nodes_by_column, mut routes, mut old_points, final_points) =
-                tokio::task::spawn_blocking(move || {
-                    let final_points = reflow_points(
-                        &columns,
-                        &new_nodes_by_column,
-                        &routes,
-                        &endpoint_fans,
-                        &old_points,
-                    );
-                    (
-                        columns,
-                        new_nodes_by_column,
-                        routes,
-                        old_points,
-                        final_points,
-                    )
-                })
-                .await
-                .context(JoinWebGraphReflowSnafu)?;
-            let mut final_points = final_points.context(WebGraphOrderSnafu)?;
-            let reflow_edges = routes.keys().cloned().collect::<BTreeSet<_>>();
-            let placement_updates = columns
-                .values()
-                .flatten()
-                .filter_map(|placement| {
-                    let point = final_points[&placement.node];
-                    (point != placement.point).then(|| {
-                        (
-                            placement.node.clone(),
-                            NodePlacement {
-                                node: placement.node.clone(),
-                                point,
-                            },
-                        )
-                    })
-                })
-                .collect::<BTreeMap<_, _>>();
-
-            let mut affected_nodes = new_nodes_by_column
-                .values()
-                .flat_map(BTreeMap::keys)
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            affected_nodes.extend(placement_updates.keys().cloned());
-            let mut affected_sources = affected_nodes.clone();
-            let mut affected_targets = affected_nodes.clone();
-            for route in routes.values() {
-                if affected_nodes.contains(&route.edge.target) {
-                    affected_sources.insert(route.edge.source.clone());
-                }
-                if affected_nodes.contains(&route.edge.source) {
-                    affected_targets.insert(route.edge.target.clone());
-                }
+            match step {
+                ReflowStep::ExpandRoutes(routes) => forced_routes.extend(routes),
+                ReflowStep::ExpandColumns(columns) => dirty_columns.extend(columns),
+                ReflowStep::Complete(patch) => return Ok(Some(patch)),
             }
-            let affected_endpoints = affected_sources
-                .union(&affected_targets)
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let Some(endpoint_routes) = self
-                .incident_routes_at_revision(kind, &affected_endpoints, revision)
-                .await?
-            else {
+        }
+    }
+
+    async fn build_reflow_step(
+        &self,
+        kind: LayoutKind,
+        revision: Revision,
+        new_nodes_by_column: &BTreeMap<i32, BTreeMap<NodeId, usize>>,
+        dirty_columns: &BTreeSet<i32>,
+        forced_routes: &BTreeMap<EdgeId, RoutedEdge>,
+    ) -> crate::Result<Option<ReflowStep>> {
+        let mut columns = BTreeMap::<i32, Vec<NodePlacement>>::new();
+        for x in dirty_columns.iter().copied() {
+            let Some(placements) = self.column_at_revision(kind, x, revision).await? else {
                 return Ok(None);
             };
-            routes.extend(endpoint_routes);
+            columns.insert(x, placements);
+        }
+        let column_placements = columns.values().flatten().cloned().collect::<Vec<_>>();
+        let column_nodes = column_placements
+            .iter()
+            .map(|placement| placement.node.clone())
+            .collect::<BTreeSet<_>>();
+        let Some(mut routes) = self
+            .incident_routes_at_revision(kind, &column_nodes, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(crossing_routes) = self
+            .routes_intersecting_placements_at_revision(kind, &column_placements, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        routes.extend(crossing_routes.into_iter().filter(|(_, route)| {
+            column_placements
+                .iter()
+                .any(|placement| route_reserves_node(route, placement))
+        }));
+        routes.extend(forced_routes.clone());
 
-            let route_endpoints = route_endpoint_ids(routes.values());
-            let missing_endpoints = route_endpoints
+        let mut old_points = column_placements
+            .iter()
+            .map(|placement| (placement.node.clone(), placement.point))
+            .collect::<BTreeMap<_, _>>();
+        let route_endpoints = route_endpoint_ids(routes.values());
+        let Some(endpoint_placements) = self
+            .placements_at_revision(
+                kind,
+                &route_endpoints.into_iter().collect::<Vec<_>>(),
+                revision,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        old_points.extend(
+            endpoint_placements
                 .into_iter()
-                .filter(|node| !old_points.contains_key(node))
-                .collect::<Vec<_>>();
-            let Some(endpoint_placements) = self
-                .placements_at_revision(kind, &missing_endpoints, revision)
-                .await?
-            else {
-                return Ok(None);
-            };
-            for placement in endpoint_placements {
-                final_points.insert(placement.node.clone(), placement.point);
-                old_points.insert(placement.node, placement.point);
-            }
+                .map(|placement| (placement.node, placement.point)),
+        );
+        let Some(endpoint_fans) = self
+            .endpoint_fans_at_revision(kind, revision, &routes, &mut old_points)
+            .await?
+        else {
+            return Ok(None);
+        };
 
-            let source_offsets = endpoint_source_offsets(&routes, &affected_sources, &final_points);
-            let target_offsets = endpoint_target_offsets(&routes, &affected_targets, &final_points);
-            let mut route_updates = Vec::new();
-            for routed in routes.values() {
-                if !affected_sources.contains(&routed.edge.source)
-                    && !affected_targets.contains(&routed.edge.target)
-                {
-                    continue;
-                }
-                let old_source = old_points[&routed.edge.source];
-                let old_target = old_points[&routed.edge.target];
-                let source_offset = source_offsets
-                    .get(&routed.edge)
-                    .copied()
-                    .unwrap_or_else(|| routed.route.source.y.saturating_sub(old_source.y));
-                let target_offset = target_offsets
-                    .get(&routed.edge)
-                    .copied()
-                    .unwrap_or_else(|| routed.route.target.y.saturating_sub(old_target.y));
-                let route = route_edge_with_offsets(
-                    final_points[&routed.edge.source],
-                    final_points[&routed.edge.target],
-                    EndpointPortOffsets {
-                        source: source_offset,
-                        target: target_offset,
-                    },
+        let new_nodes_by_column = new_nodes_by_column.clone();
+        let (columns, new_nodes_by_column, mut routes, mut old_points, final_points) =
+            tokio::task::spawn_blocking(move || {
+                let final_points = reflow_points(
+                    &columns,
+                    &new_nodes_by_column,
+                    &routes,
+                    &endpoint_fans,
+                    &old_points,
                 );
-                if route != routed.route {
-                    route_updates.push(RoutedEdge {
-                        edge: routed.edge.clone(),
-                        route,
-                    });
-                }
-            }
+                (
+                    columns,
+                    new_nodes_by_column,
+                    routes,
+                    old_points,
+                    final_points,
+                )
+            })
+            .await
+            .context(JoinWebGraphReflowSnafu)?;
+        let mut final_points = final_points.context(WebGraphOrderSnafu)?;
+        let reflow_edges = routes.keys().cloned().collect::<BTreeSet<_>>();
+        let placement_updates = reflow_placement_updates(&columns, &final_points);
+        let (affected_sources, affected_targets) =
+            affected_reflow_endpoints(&new_nodes_by_column, &placement_updates, &routes);
+        let affected_endpoints = affected_sources
+            .union(&affected_targets)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let Some(endpoint_routes) = self
+            .incident_routes_at_revision(kind, &affected_endpoints, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        routes.extend(endpoint_routes);
 
-            let projected_placements = columns
-                .values()
-                .flatten()
-                .map(|placement| {
-                    placement_updates
-                        .get(&placement.node)
-                        .cloned()
-                        .unwrap_or_else(|| placement.clone())
-                })
-                .collect::<Vec<_>>();
-            let Some(projected_crossings) = self
-                .routes_intersecting_placements_at_revision(kind, &projected_placements, revision)
-                .await?
-            else {
-                return Ok(None);
-            };
-            let previous_forced_count = forced_routes.len();
-            forced_routes.extend(projected_crossings.into_iter().filter(|(edge, route)| {
+        let route_endpoints = route_endpoint_ids(routes.values());
+        let missing_endpoints = route_endpoints
+            .into_iter()
+            .filter(|node| !old_points.contains_key(node))
+            .collect::<Vec<_>>();
+        let Some(endpoint_placements) = self
+            .placements_at_revision(kind, &missing_endpoints, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        for placement in endpoint_placements {
+            final_points.insert(placement.node.clone(), placement.point);
+            old_points.insert(placement.node, placement.point);
+        }
+        let route_updates = reroute_affected_edges(
+            &routes,
+            &affected_sources,
+            &affected_targets,
+            &old_points,
+            &final_points,
+        );
+
+        let projected_placements = columns
+            .values()
+            .flatten()
+            .map(|placement| {
+                placement_updates
+                    .get(&placement.node)
+                    .cloned()
+                    .unwrap_or_else(|| placement.clone())
+            })
+            .collect::<Vec<_>>();
+        let Some(projected_crossings) = self
+            .routes_intersecting_placements_at_revision(kind, &projected_placements, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let expanded_routes = projected_crossings
+            .into_iter()
+            .filter(|(edge, route)| {
                 !reflow_edges.contains(edge)
+                    && !forced_routes.contains_key(edge)
                     && projected_placements
                         .iter()
                         .any(|placement| route_reserves_node(route, placement))
-            }));
-            if forced_routes.len() != previous_forced_count {
-                continue;
-            }
-
-            let Some(collision_candidates) = self
-                .placements_intersecting_routes_at_revision(kind, &route_updates, revision)
-                .await?
-            else {
-                return Ok(None);
-            };
-            let previous_dirty_count = dirty_columns.len();
-            let expanded_columns =
-                collision_columns(&route_updates, &collision_candidates, &dirty_columns);
-            dirty_columns.extend(expanded_columns);
-            if dirty_columns.len() != previous_dirty_count {
-                continue;
-            }
-
-            let canvas = self
-                .store
-                .canvas(kind)
-                .await
-                .context(WebGraphStoreSnafu)?
-                .context(WebGraphNotInitializedSnafu)?;
-            if canvas.state.revision != revision {
-                return Ok(None);
-            }
-            let next_height = placement_updates
-                .values()
-                .map(|placement| placement.point.y.saturating_add(GRAPH_PADDING))
-                .max()
-                .unwrap_or(canvas.value.height)
-                .max(canvas.value.height);
-            let next_canvas = Canvas {
-                width: canvas.value.width,
-                height: next_height,
-            };
-
-            return Ok(Some(LayoutPatch {
-                canvas: (next_canvas != canvas.value).then_some(next_canvas),
-                upsert_nodes: placement_updates.into_values().collect(),
-                upsert_edges: route_updates,
-                ..LayoutPatch::default()
-            }));
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !expanded_routes.is_empty() {
+            return Ok(Some(ReflowStep::ExpandRoutes(expanded_routes)));
         }
+
+        let Some(collision_candidates) = self
+            .placements_intersecting_routes_at_revision(kind, &route_updates, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let expanded_columns =
+            collision_columns(&route_updates, &collision_candidates, dirty_columns);
+        if !expanded_columns.is_empty() {
+            return Ok(Some(ReflowStep::ExpandColumns(expanded_columns)));
+        }
+
+        let canvas = self
+            .store
+            .canvas(kind)
+            .await
+            .context(WebGraphStoreSnafu)?
+            .context(WebGraphNotInitializedSnafu)?;
+        if canvas.state.revision != revision {
+            return Ok(None);
+        }
+        let next_height = placement_updates
+            .values()
+            .map(|placement| placement.point.y.saturating_add(GRAPH_PADDING))
+            .max()
+            .unwrap_or(canvas.value.height)
+            .max(canvas.value.height);
+        let next_canvas = Canvas {
+            width: canvas.value.width,
+            height: next_height,
+        };
+        Ok(Some(ReflowStep::Complete(LayoutPatch {
+            canvas: (next_canvas != canvas.value).then_some(next_canvas),
+            upsert_nodes: placement_updates.into_values().collect(),
+            upsert_edges: route_updates,
+            ..LayoutPatch::default()
+        })))
     }
 
     async fn routes_intersecting_placements_at_revision(
