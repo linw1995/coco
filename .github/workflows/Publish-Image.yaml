@@ -226,7 +226,6 @@ jobs:
           sha_tag="${SHA_TAG_PREFIX}-${GITHUB_SHA::12}"
           source_ref="${image}:${sha_tag}-sources-${ARCH}"
           release_path="dist/${ARTIFACT_PREFIX}-${ARCH}-source-release.tar.gz"
-          manifest_path="dist/${ARTIFACT_PREFIX}-sources-${ARCH}.manifest.json"
           descriptor_path="dist/${ARTIFACT_PREFIX}-sources-${ARCH}.descriptor.json"
 
           nix run nixpkgs#crane -- append \
@@ -234,28 +233,31 @@ jobs:
             --new_layer "${release_path}" \
             --new_tag "${source_ref}"
 
-          manifest_digest="$(nix run nixpkgs#crane -- digest "${source_ref}")"
-          if [[ ! "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Invalid architecture source manifest digest."
+          manifest_descriptor="$(
+            docker buildx imagetools inspect \
+              "${source_ref}" \
+              --format '{{json .Manifest}}'
+          )"
+          if ! jq -e '
+            .mediaType == "application/vnd.oci.image.manifest.v1+json"
+            and (.digest | test("^sha256:[0-9a-f]{64}$"))
+            and ((.size | type) == "number")
+            and (.size > 0)
+          ' <<< "${manifest_descriptor}" >/dev/null; then
+            echo "::error::Invalid architecture source manifest descriptor."
+            echo "${manifest_descriptor}" >&2
             exit 1
           fi
-          nix run nixpkgs#crane -- manifest "${source_ref}" > "${manifest_path}"
-          manifest_size="$(wc -c < "${manifest_path}" | tr -d ' ')"
-          media_type="$(jq -r '.mediaType' "${manifest_path}")"
-          jq -n \
+          jq \
             --arg arch "${ARCH}" \
-            --arg digest "${manifest_digest}" \
-            --arg media_type "${media_type}" \
-            --argjson size "${manifest_size}" \
-            '{
-              mediaType: $media_type,
-              digest: $digest,
-              size: $size,
+            '. + {
               platform: {
                 architecture: $arch,
                 os: "linux"
               }
-            }' > "${descriptor_path}"
+            }' \
+            <<< "${manifest_descriptor}" \
+            > "${descriptor_path}"
 
       - name: Publish architecture Docker image
         shell: bash
@@ -268,7 +270,6 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           image_archive="dist/${ARTIFACT_PREFIX}-${ARCH}.tar.gz"
           docker_tar="${image_archive%.gz}"
-          manifest_path="dist/${ARTIFACT_PREFIX}-runtime-${ARCH}.manifest.json"
           descriptor_path="dist/${ARTIFACT_PREFIX}-runtime-${ARCH}.descriptor.json"
 
           gzip -dc "${image_archive}" > "${docker_tar}"
@@ -282,25 +283,31 @@ jobs:
           nix run nixpkgs#crane -- push \
             "${docker_tar}" \
             "${image}@${manifest_digest}"
-          nix run nixpkgs#crane -- manifest \
-            "${image}@${manifest_digest}" \
-            > "${manifest_path}"
-          manifest_size="$(wc -c < "${manifest_path}" | tr -d ' ')"
-          media_type="$(jq -r '.mediaType' "${manifest_path}")"
-          jq -n \
+          manifest_descriptor="$(
+            docker buildx imagetools inspect \
+              "${image}@${manifest_digest}" \
+              --format '{{json .Manifest}}'
+          )"
+          if ! jq -e --arg digest "${manifest_digest}" '
+            .mediaType == "application/vnd.docker.distribution.manifest.v2+json"
+            and (.digest == $digest)
+            and ((.size | type) == "number")
+            and (.size > 0)
+          ' <<< "${manifest_descriptor}" >/dev/null; then
+            echo "::error::Invalid architecture Docker manifest descriptor."
+            echo "${manifest_descriptor}" >&2
+            exit 1
+          fi
+          jq \
             --arg arch "${ARCH}" \
-            --arg digest "${manifest_digest}" \
-            --arg media_type "${media_type}" \
-            --argjson size "${manifest_size}" \
-            '{
-              mediaType: $media_type,
-              digest: $digest,
-              size: $size,
+            '. + {
               platform: {
                 architecture: $arch,
                 os: "linux"
               }
-            }' > "${descriptor_path}"
+            }' \
+            <<< "${manifest_descriptor}" \
+            > "${descriptor_path}"
 
       - name: Upload publication metadata
         uses: actions/upload-artifact@v7
