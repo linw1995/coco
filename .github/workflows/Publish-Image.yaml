@@ -76,12 +76,57 @@ jobs:
           mkdir -p dist
           cp --dereference image "dist/${ARTIFACT_PREFIX}-${ARCH}.tar.gz"
 
-      - name: Export corresponding sources
+      - name: Inspect corresponding sources
+        id: source_inspect
         shell: bash
         env:
           ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
           ARCH: ${{ matrix.arch }}
-        run: scripts/export-container-sources.sh image "dist/${ARTIFACT_PREFIX}-${ARCH}-sources.tar.gz" "linux-${ARCH}"
+        run: |
+          set -euo pipefail
+
+          state_dir=".container-source-state"
+          scripts/export-container-sources.sh \
+            inspect \
+            image \
+            "${state_dir}" \
+            "linux-${ARCH}"
+          dependency_key="$(< "${state_dir}/DEPENDENCY_KEY")"
+          if [[ ! "${dependency_key}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid dependency source key."
+            exit 1
+          fi
+          printf 'dependency_key=%s\n' "${dependency_key}" >> "${GITHUB_OUTPUT}"
+          cp \
+            "${state_dir}/DEPENDENCY_KEY" \
+            "dist/${ARTIFACT_PREFIX}-${ARCH}-source-dependency-key.txt"
+
+      - name: Restore dependency source layer
+        id: source_dependency_cache
+        uses: actions/cache@v5
+        with:
+          path: .container-source-cache/dependencies.tar.gz
+          key: container-source-dependencies-v1-${{ steps.source_inspect.outputs.dependency_key }}
+
+      - name: Export dependency sources
+        if: steps.source_dependency_cache.outputs.cache-hit != 'true'
+        run: scripts/export-container-sources.sh dependencies .container-source-state .container-source-cache/dependencies.tar.gz
+
+      - name: Export release sources
+        shell: bash
+        env:
+          ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          dependencies_path="dist/${ARTIFACT_PREFIX}-${ARCH}-source-dependencies.tar.gz"
+          release_path="dist/${ARTIFACT_PREFIX}-${ARCH}-source-release.tar.gz"
+          ln .container-source-cache/dependencies.tar.gz "${dependencies_path}"
+          scripts/export-container-sources.sh \
+            release \
+            .container-source-state \
+            "${release_path}"
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v7
@@ -89,7 +134,9 @@ jobs:
           name: "${{ inputs.artifact-prefix }}-image-${{ matrix.arch }}"
           path: |
             dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}.tar.gz
-            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-sources.tar.gz
+            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-source-dependencies.tar.gz
+            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-source-release.tar.gz
+            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-source-dependency-key.txt
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
@@ -127,20 +174,34 @@ jobs:
 
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha_tag="${SHA_TAG_PREFIX}-${GITHUB_SHA::12}"
-          artifact_files=(artifacts/"${ARTIFACT_PREFIX}"-*.tar.gz)
+          artifact_files=(artifacts/"${ARTIFACT_PREFIX}"-*)
           image_files=()
-          declare -A source_layers=()
+          declare -A dependency_keys=()
+          declare -A dependency_layers=()
+          declare -A release_layers=()
 
           for artifact_file in "${artifact_files[@]}"; do
             case "$(basename "${artifact_file}")" in
               "${ARTIFACT_PREFIX}-amd64.tar.gz" | "${ARTIFACT_PREFIX}-arm64.tar.gz")
                 image_files+=("${artifact_file}")
                 ;;
-              "${ARTIFACT_PREFIX}-amd64-sources.tar.gz")
-                source_layers[amd64]="${artifact_file}"
+              "${ARTIFACT_PREFIX}-amd64-source-dependencies.tar.gz")
+                dependency_layers[amd64]="${artifact_file}"
                 ;;
-              "${ARTIFACT_PREFIX}-arm64-sources.tar.gz")
-                source_layers[arm64]="${artifact_file}"
+              "${ARTIFACT_PREFIX}-arm64-source-dependencies.tar.gz")
+                dependency_layers[arm64]="${artifact_file}"
+                ;;
+              "${ARTIFACT_PREFIX}-amd64-source-release.tar.gz")
+                release_layers[amd64]="${artifact_file}"
+                ;;
+              "${ARTIFACT_PREFIX}-arm64-source-release.tar.gz")
+                release_layers[arm64]="${artifact_file}"
+                ;;
+              "${ARTIFACT_PREFIX}-amd64-source-dependency-key.txt")
+                dependency_keys[amd64]="$(< "${artifact_file}")"
+                ;;
+              "${ARTIFACT_PREFIX}-arm64-source-dependency-key.txt")
+                dependency_keys[arm64]="$(< "${artifact_file}")"
                 ;;
               *)
                 echo "::error::Unexpected Docker publication artifact: ${artifact_file}"
@@ -156,6 +217,7 @@ jobs:
 
           manifest_refs=()
           source_layer_args=()
+          declare -A included_dependency_keys=()
 
           for image_file in "${image_files[@]}"; do
             case "$(basename "${image_file}")" in
@@ -171,9 +233,15 @@ jobs:
                 ;;
             esac
 
-            source_layer="${source_layers[${arch}]:-}"
-            if [[ -z "${source_layer}" ]]; then
-              echo "::error::No corresponding source artifact was built for ${arch}."
+            dependency_key="${dependency_keys[${arch}]:-}"
+            dependency_layer="${dependency_layers[${arch}]:-}"
+            release_layer="${release_layers[${arch}]:-}"
+            if [[ ! "${dependency_key}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid dependency source key for ${arch}."
+              exit 1
+            fi
+            if [[ -z "${dependency_layer}" || -z "${release_layer}" ]]; then
+              echo "::error::Incomplete corresponding source artifacts for ${arch}."
               exit 1
             fi
 
@@ -183,7 +251,11 @@ jobs:
             digest="$(nix run nixpkgs#crane -- digest --tarball "${docker_tar}")"
             nix run nixpkgs#crane -- push "${docker_tar}" "${image}@${digest}"
             manifest_refs+=("${image}@${digest}")
-            source_layer_args+=("--new_layer" "${source_layer}")
+            if [[ -z "${included_dependency_keys[${dependency_key}]:-}" ]]; then
+              source_layer_args+=("--new_layer" "${dependency_layer}")
+              included_dependency_keys[${dependency_key}]=1
+            fi
+            source_layer_args+=("--new_layer" "${release_layer}")
           done
 
           publish_image() {

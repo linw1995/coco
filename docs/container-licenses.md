@@ -29,6 +29,13 @@ runtime image, the exporter records its derivation and collects the derivation's
 source, patch, Cargo vendor, and Go module inputs. It also includes the exact
 CoCo flake source and the locked Nixpkgs source used to build the image.
 
+The exporter fingerprints the dependency source closure discovered from the
+actual runtime image together with the export format. CI and CD reuse a cached
+dependency layer when that fingerprint is unchanged, while always generating
+release-specific source and metadata layers. The cache only avoids rebuilding
+identical layers; every published `-sources` image contains all layers needed
+to retrieve its corresponding source independently of the cache.
+
 The source image combines source inputs from every successfully built
 architecture included in the matching runtime image. Its `/sources` directory
 contains:
@@ -43,6 +50,8 @@ contains:
 - `SOURCE_STORE_PATHS-<platform>.txt`: the collected source input paths.
 - `SOURCE_DERIVATIONS-<platform>.tsv`: source path-to-parent-derivation
   mappings.
+- `DEPENDENCY_SOURCE_KEY-<platform>.txt`: the dependency source closure
+  fingerprint used to identify reusable source layers.
 
 ## Extract Sources
 
