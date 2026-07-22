@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       artifact-prefix:
-        description: "Prefix for Docker image artifact files."
+        description: "Prefix for Docker image publication metadata."
         required: true
         type: string
       amd64-output:
@@ -65,7 +65,7 @@ jobs:
             extra-platforms = ${{ matrix.extra-platforms }}
         run: nix build --out-link image "${{ matrix.nix-output }}" --print-build-logs
 
-      - name: Prepare Docker image artifact
+      - name: Prepare Docker image
         shell: bash
         env:
           ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
@@ -80,7 +80,6 @@ jobs:
         id: source_inspect
         shell: bash
         env:
-          ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
@@ -97,20 +96,81 @@ jobs:
             exit 1
           fi
           printf 'dependency_key=%s\n' "${dependency_key}" >> "${GITHUB_OUTPUT}"
-          cp \
-            "${state_dir}/DEPENDENCY_KEY" \
-            "dist/${ARTIFACT_PREFIX}-${ARCH}-source-dependency-key.txt"
 
-      - name: Restore dependency source layer
-        id: source_dependency_cache
-        uses: actions/cache@v5
-        with:
-          path: .container-source-cache/dependencies.tar.gz
-          key: container-source-dependencies-v1-${{ steps.source_inspect.outputs.dependency_key }}
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Check dependency source layer
+        id: source_dependency
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          DEPENDENCY_KEY: ${{ steps.source_inspect.outputs.dependency_key }}
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          dependency_tag="source-dependencies-v1-linux-${ARCH}-${DEPENDENCY_KEY}"
+          dependency_tag_ref="${image}:${dependency_tag}"
+
+          if dependency_result="$(
+            nix run nixpkgs#crane -- digest "${dependency_tag_ref}" 2>&1
+          )"; then
+            if [[ ! "${dependency_result}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid dependency source manifest digest."
+              exit 1
+            fi
+            cache_hit="true"
+            echo "Found dependency source layer ${dependency_tag_ref}@${dependency_result}."
+          elif grep -Eqi \
+            '(MANIFEST_UNKNOWN|manifest unknown|NAME_UNKNOWN|name unknown|not found|404)' \
+            <<< "${dependency_result}"; then
+            cache_hit="false"
+            echo "Dependency source layer ${dependency_tag_ref} is missing."
+          else
+            echo "${dependency_result}" >&2
+            exit 1
+          fi
+
+          printf 'cache_hit=%s\n' "${cache_hit}" >> "${GITHUB_OUTPUT}"
+          printf 'tag_ref=%s\n' "${dependency_tag_ref}" >> "${GITHUB_OUTPUT}"
 
       - name: Export dependency sources
-        if: steps.source_dependency_cache.outputs.cache-hit != 'true'
-        run: scripts/export-container-sources.sh dependencies .container-source-state .container-source-cache/dependencies.tar.gz
+        if: steps.source_dependency.outputs.cache_hit != 'true'
+        run: scripts/export-container-sources.sh dependencies .container-source-state .container-source-dependencies.tar.gz
+
+      - name: Publish dependency source layer
+        if: steps.source_dependency.outputs.cache_hit != 'true'
+        env:
+          DEPENDENCY_TAG_REF: ${{ steps.source_dependency.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+
+          nix run nixpkgs#crane -- append \
+            --oci-empty-base \
+            --new_layer .container-source-dependencies.tar.gz \
+            --new_tag "${DEPENDENCY_TAG_REF}"
+
+      - name: Resolve dependency source layer
+        id: resolved_source_dependency
+        shell: bash
+        env:
+          DEPENDENCY_TAG_REF: ${{ steps.source_dependency.outputs.tag_ref }}
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          dependency_digest="$(
+            nix run nixpkgs#crane -- digest "${DEPENDENCY_TAG_REF}"
+          )"
+          if [[ ! "${dependency_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid dependency source manifest digest."
+            exit 1
+          fi
+          printf 'ref=%s@%s\n' \
+            "${image}" \
+            "${dependency_digest}" \
+            >> "${GITHUB_OUTPUT}"
 
       - name: Export release sources
         shell: bash
@@ -120,24 +180,109 @@ jobs:
         run: |
           set -euo pipefail
 
-          dependencies_path="dist/${ARTIFACT_PREFIX}-${ARCH}-source-dependencies.tar.gz"
           release_path="dist/${ARTIFACT_PREFIX}-${ARCH}-source-release.tar.gz"
-          ln .container-source-cache/dependencies.tar.gz "${dependencies_path}"
           scripts/export-container-sources.sh \
             release \
             .container-source-state \
             "${release_path}"
 
-      - name: Upload Docker image artifact
+      - name: Publish architecture source image
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
+          DEPENDENCY_REF: ${{ steps.resolved_source_dependency.outputs.ref }}
+          SHA_TAG_PREFIX: ${{ inputs.sha-tag-prefix }}
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha_tag="${SHA_TAG_PREFIX}-${GITHUB_SHA::12}"
+          source_ref="${image}:${sha_tag}-sources-${ARCH}"
+          release_path="dist/${ARTIFACT_PREFIX}-${ARCH}-source-release.tar.gz"
+          manifest_path="dist/${ARTIFACT_PREFIX}-sources-${ARCH}.manifest.json"
+          descriptor_path="dist/${ARTIFACT_PREFIX}-sources-${ARCH}.descriptor.json"
+
+          nix run nixpkgs#crane -- append \
+            --base "${DEPENDENCY_REF}" \
+            --new_layer "${release_path}" \
+            --new_tag "${source_ref}"
+
+          manifest_digest="$(nix run nixpkgs#crane -- digest "${source_ref}")"
+          if [[ ! "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid architecture source manifest digest."
+            exit 1
+          fi
+          nix run nixpkgs#crane -- manifest "${source_ref}" > "${manifest_path}"
+          manifest_size="$(wc -c < "${manifest_path}" | tr -d ' ')"
+          media_type="$(jq -r '.mediaType' "${manifest_path}")"
+          jq -n \
+            --arg arch "${ARCH}" \
+            --arg digest "${manifest_digest}" \
+            --arg media_type "${media_type}" \
+            --argjson size "${manifest_size}" \
+            '{
+              mediaType: $media_type,
+              digest: $digest,
+              size: $size,
+              platform: {
+                architecture: $arch,
+                os: "linux"
+              }
+            }' > "${descriptor_path}"
+
+      - name: Publish architecture Docker image
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          image_archive="dist/${ARTIFACT_PREFIX}-${ARCH}.tar.gz"
+          docker_tar="${image_archive%.gz}"
+          manifest_path="dist/${ARTIFACT_PREFIX}-runtime-${ARCH}.manifest.json"
+          descriptor_path="dist/${ARTIFACT_PREFIX}-runtime-${ARCH}.descriptor.json"
+
+          gzip -dc "${image_archive}" > "${docker_tar}"
+          manifest_digest="$(
+            nix run nixpkgs#crane -- digest --tarball "${docker_tar}"
+          )"
+          if [[ ! "${manifest_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid architecture Docker manifest digest."
+            exit 1
+          fi
+          nix run nixpkgs#crane -- push \
+            "${docker_tar}" \
+            "${image}@${manifest_digest}"
+          nix run nixpkgs#crane -- manifest \
+            "${image}@${manifest_digest}" \
+            > "${manifest_path}"
+          manifest_size="$(wc -c < "${manifest_path}" | tr -d ' ')"
+          media_type="$(jq -r '.mediaType' "${manifest_path}")"
+          jq -n \
+            --arg arch "${ARCH}" \
+            --arg digest "${manifest_digest}" \
+            --arg media_type "${media_type}" \
+            --argjson size "${manifest_size}" \
+            '{
+              mediaType: $media_type,
+              digest: $digest,
+              size: $size,
+              platform: {
+                architecture: $arch,
+                os: "linux"
+              }
+            }' > "${descriptor_path}"
+
+      - name: Upload publication metadata
         uses: actions/upload-artifact@v7
         with:
-          name: "${{ inputs.artifact-prefix }}-image-${{ matrix.arch }}"
+          name: "${{ inputs.artifact-prefix }}-image-metadata-${{ matrix.arch }}"
           path: |
-            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}.tar.gz
-            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-source-dependencies.tar.gz
-            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-source-release.tar.gz
-            dist/${{ inputs.artifact-prefix }}-${{ matrix.arch }}-source-dependency-key.txt
-          compression-level: 0
+            dist/${{ inputs.artifact-prefix }}-runtime-${{ matrix.arch }}.descriptor.json
+            dist/${{ inputs.artifact-prefix }}-sources-${{ matrix.arch }}.descriptor.json
           if-no-files-found: error
           retention-days: 1
 
@@ -147,14 +292,11 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-nix
-
-      - name: Download Docker image artifacts
+      - name: Download publication metadata
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: "${{ inputs.artifact-prefix }}-image-*"
+          pattern: "${{ inputs.artifact-prefix }}-image-metadata-*"
           merge-multiple: true
 
       - name: Login to GitHub Container Registry
@@ -174,121 +316,94 @@ jobs:
 
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha_tag="${SHA_TAG_PREFIX}-${GITHUB_SHA::12}"
-          artifact_files=(artifacts/"${ARTIFACT_PREFIX}"-*)
-          image_files=()
-          declare -A dependency_keys=()
-          declare -A dependency_layers=()
-          declare -A release_layers=()
+          runtime_descriptors=()
+          source_descriptors=()
 
+          validate_descriptor() {
+            local descriptor_path="$1"
+            local arch="$2"
+
+            if ! jq -e --arg arch "${arch}" '
+              (
+                .mediaType == "application/vnd.oci.image.manifest.v1+json"
+                or
+                .mediaType == "application/vnd.docker.distribution.manifest.v2+json"
+              )
+              and (.digest | test("^sha256:[0-9a-f]{64}$"))
+              and ((.size | type) == "number")
+              and (.size > 0)
+              and (.platform.os == "linux")
+              and (.platform.architecture == $arch)
+            ' "${descriptor_path}" >/dev/null; then
+              echo "::error::Invalid publication descriptor: ${descriptor_path}"
+              exit 1
+            fi
+          }
+
+          artifact_files=(artifacts/*)
           for artifact_file in "${artifact_files[@]}"; do
             case "$(basename "${artifact_file}")" in
-              "${ARTIFACT_PREFIX}-amd64.tar.gz" | "${ARTIFACT_PREFIX}-arm64.tar.gz")
-                image_files+=("${artifact_file}")
-                ;;
-              "${ARTIFACT_PREFIX}-amd64-source-dependencies.tar.gz")
-                dependency_layers[amd64]="${artifact_file}"
-                ;;
-              "${ARTIFACT_PREFIX}-arm64-source-dependencies.tar.gz")
-                dependency_layers[arm64]="${artifact_file}"
-                ;;
-              "${ARTIFACT_PREFIX}-amd64-source-release.tar.gz")
-                release_layers[amd64]="${artifact_file}"
-                ;;
-              "${ARTIFACT_PREFIX}-arm64-source-release.tar.gz")
-                release_layers[arm64]="${artifact_file}"
-                ;;
-              "${ARTIFACT_PREFIX}-amd64-source-dependency-key.txt")
-                dependency_keys[amd64]="$(< "${artifact_file}")"
-                ;;
-              "${ARTIFACT_PREFIX}-arm64-source-dependency-key.txt")
-                dependency_keys[arm64]="$(< "${artifact_file}")"
+              "${ARTIFACT_PREFIX}-runtime-amd64.descriptor.json" | \
+              "${ARTIFACT_PREFIX}-runtime-arm64.descriptor.json" | \
+              "${ARTIFACT_PREFIX}-sources-amd64.descriptor.json" | \
+              "${ARTIFACT_PREFIX}-sources-arm64.descriptor.json")
                 ;;
               *)
-                echo "::error::Unexpected Docker publication artifact: ${artifact_file}"
+                echo "::error::Unexpected publication metadata: ${artifact_file}"
                 exit 1
                 ;;
             esac
           done
 
-          if ((${#image_files[@]} == 0)); then
-            echo "::error::No Docker image artifacts were built."
+          for arch in amd64 arm64; do
+            runtime_descriptor="artifacts/${ARTIFACT_PREFIX}-runtime-${arch}.descriptor.json"
+            source_descriptor="artifacts/${ARTIFACT_PREFIX}-sources-${arch}.descriptor.json"
+            if [[ ! -e "${runtime_descriptor}" && ! -e "${source_descriptor}" ]]; then
+              continue
+            fi
+            if [[ ! -f "${runtime_descriptor}" || ! -f "${source_descriptor}" ]]; then
+              echo "::error::Incomplete publication metadata for ${arch}."
+              exit 1
+            fi
+
+            validate_descriptor "${runtime_descriptor}" "${arch}"
+            validate_descriptor "${source_descriptor}" "${arch}"
+            runtime_descriptors+=("${runtime_descriptor}")
+            source_descriptors+=("${source_descriptor}")
+          done
+
+          if ((${#runtime_descriptors[@]} == 0)); then
+            echo "::error::No Docker image manifests were built."
             exit 1
           fi
 
-          manifest_refs=()
-          source_layer_args=()
-          declare -A included_dependency_keys=()
-
-          for image_file in "${image_files[@]}"; do
-            case "$(basename "${image_file}")" in
-              "${ARTIFACT_PREFIX}-amd64.tar.gz")
-                arch="amd64"
-                ;;
-              "${ARTIFACT_PREFIX}-arm64.tar.gz")
-                arch="arm64"
-                ;;
-              *)
-                echo "::error::Unexpected Docker image artifact: ${image_file}"
-                exit 1
-                ;;
-            esac
-
-            dependency_key="${dependency_keys[${arch}]:-}"
-            dependency_layer="${dependency_layers[${arch}]:-}"
-            release_layer="${release_layers[${arch}]:-}"
-            if [[ ! "${dependency_key}" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "::error::Invalid dependency source key for ${arch}."
-              exit 1
-            fi
-            if [[ -z "${dependency_layer}" || -z "${release_layer}" ]]; then
-              echo "::error::Incomplete corresponding source artifacts for ${arch}."
-              exit 1
-            fi
-
-            docker_tar="${image_file%.gz}"
-            gzip -dc "${image_file}" > "${docker_tar}"
-
-            digest="$(nix run nixpkgs#crane -- digest --tarball "${docker_tar}")"
-            nix run nixpkgs#crane -- push "${docker_tar}" "${image}@${digest}"
-            manifest_refs+=("${image}@${digest}")
-            if [[ -z "${included_dependency_keys[${dependency_key}]:-}" ]]; then
-              source_layer_args+=("--new_layer" "${dependency_layer}")
-              included_dependency_keys[${dependency_key}]=1
-            fi
-            source_layer_args+=("--new_layer" "${release_layer}")
-          done
-
-          publish_image() {
+          publish_index() {
             local tag="$1"
+            shift
+            local descriptor_args=()
+            local descriptor_path
 
-            if ((${#manifest_refs[@]} == 1)); then
-              nix run nixpkgs#crane -- copy "${manifest_refs[0]}" "${image}:${tag}"
-              return
-            fi
-
-            manifest_args=()
-            for manifest_ref in "${manifest_refs[@]}"; do
-              manifest_args+=("--manifest" "${manifest_ref}")
+            for descriptor_path in "$@"; do
+              descriptor_args+=("--file" "${descriptor_path}")
             done
-
-            nix run nixpkgs#crane -- index append "${manifest_args[@]}" --tag "${image}:${tag}"
+            docker buildx imagetools create \
+              "${descriptor_args[@]}" \
+              --tag "${image}:${tag}"
           }
 
           publish_alias() {
             local tag="$1"
 
-            nix run nixpkgs#crane -- copy \
-              "${image}:${sha_tag}-sources" \
-              "${image}:${tag}-sources"
-            publish_image "${tag}"
+            docker buildx imagetools create \
+              --tag "${image}:${tag}-sources" \
+              "${image}:${sha_tag}-sources"
+            docker buildx imagetools create \
+              --tag "${image}:${tag}" \
+              "${image}:${sha_tag}"
           }
 
-          nix run nixpkgs#crane -- append \
-            --oci-empty-base \
-            "${source_layer_args[@]}" \
-            --new_tag "${image}:${sha_tag}-sources"
-
-          publish_image "${sha_tag}"
+          publish_index "${sha_tag}-sources" "${source_descriptors[@]}"
+          publish_index "${sha_tag}" "${runtime_descriptors[@]}"
 
           if [[ "${PUBLISH_LATEST_ON_MAIN}" == "true" && "${GITHUB_REF_TYPE}" == "branch" && "${GITHUB_REF_NAME}" == "main" ]]; then
             publish_alias "latest"

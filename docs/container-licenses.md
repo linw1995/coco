@@ -30,15 +30,16 @@ source, patch, Cargo vendor, and Go module inputs. It also includes the exact
 CoCo flake source and the locked Nixpkgs source used to build the image.
 
 The exporter fingerprints the dependency source closure discovered from the
-actual runtime image together with the export format. CI and CD reuse a cached
-dependency layer when that fingerprint is unchanged, while always generating
-release-specific source and metadata layers. The cache only avoids rebuilding
-identical layers; every published `-sources` image contains all layers needed
-to retrieve its corresponding source independently of the cache.
+actual runtime image together with the export format. CI uses an Actions cache
+for that dependency layer. CD instead stores the layer in GHCR under a stable
+platform-and-fingerprint tag. When the tag already exists, the architecture
+job reuses its manifest by digest without generating, restoring, or passing the
+large layer through workflow artifacts. A missing tag is regenerated before
+publication. Release-specific source and metadata layers are always generated.
 
-The source image combines source inputs from every successfully built
-architecture included in the matching runtime image. Its `/sources` directory
-contains:
+The matching `-sources` tag is a multi-platform OCI index. Every successfully
+built runtime platform has a corresponding source manifest containing its
+dependency and release layers. Each platform's `/sources` directory contains:
 
 - `flake/coco`: the exact CoCo source archive.
 - `flake/nixpkgs`: the exact pinned Nixpkgs source archive and packaging rules.
@@ -55,23 +56,26 @@ contains:
 
 ## Extract Sources
 
-Prefer an immutable `sha-*` tag when matching sources for an audit:
+Prefer an immutable `sha-*` tag when matching sources for an audit. Select the
+same platform as the runtime image being audited:
 
 ```bash
 image_ref="ghcr.io/linw1995/coco:sha-0123456789ab"
 source_ref="${image_ref}-sources"
-source_container="$(docker create "${source_ref}" /bin/true)"
-docker cp "${source_container}:/sources" ./coco-container-sources
+platform="linux/amd64"
+source_container="$(docker create --platform "${platform}" "${source_ref}" /bin/true)"
+docker cp "${source_container}:/sources" ./coco-container-sources-amd64
 docker rm "${source_container}"
 ```
 
 The source image does not need to run. The explicit `/bin/true` command only
-allows Docker to create a stopped container for `docker cp`.
+allows Docker to create a stopped container for `docker cp`. Repeat with
+`linux/arm64` when auditing the ARM64 runtime manifest.
 
 If `crane` is available, extract the source filesystem directly:
 
 ```bash
-crane export "${source_ref}" - | tar -xf -
+crane export --platform "${platform}" "${source_ref}" - | tar -xf -
 ```
 
 Mutable image aliases, including `latest`, receive a matching `-sources` alias
