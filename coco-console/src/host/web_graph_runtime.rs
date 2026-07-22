@@ -422,6 +422,27 @@ fn collision_columns(
         .collect()
 }
 
+fn reflow_route_expansion(
+    projected_crossings: BTreeMap<EdgeId, RoutedEdge>,
+    route_updates: &[RoutedEdge],
+    projected_placements: &[NodePlacement],
+    reflow_edges: &BTreeSet<EdgeId>,
+    forced_routes: &BTreeMap<EdgeId, RoutedEdge>,
+) -> BTreeMap<EdgeId, RoutedEdge> {
+    projected_crossings
+        .into_values()
+        .chain(route_updates.iter().cloned())
+        .filter(|route| {
+            !reflow_edges.contains(&route.edge)
+                && !forced_routes.contains_key(&route.edge)
+                && projected_placements
+                    .iter()
+                    .any(|placement| route_reserves_node(route, placement))
+        })
+        .map(|route| (route.edge.clone(), route))
+        .collect()
+}
+
 fn reflow_placement_updates(
     columns: &BTreeMap<i32, Vec<NodePlacement>>,
     final_points: &BTreeMap<NodeId, Point>,
@@ -1345,16 +1366,13 @@ impl WebGraphRuntime {
         else {
             return Ok(None);
         };
-        let expanded_routes = projected_crossings
-            .into_iter()
-            .filter(|(edge, route)| {
-                !reflow_edges.contains(edge)
-                    && !forced_routes.contains_key(edge)
-                    && projected_placements
-                        .iter()
-                        .any(|placement| route_reserves_node(route, placement))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let expanded_routes = reflow_route_expansion(
+            projected_crossings,
+            &route_updates,
+            &projected_placements,
+            &reflow_edges,
+            forced_routes,
+        );
         if !expanded_routes.is_empty() {
             return Ok(Some(ReflowStep::ExpandRoutes(expanded_routes)));
         }
@@ -2120,6 +2138,50 @@ mod tests {
             projected[&source_to_lower].route.source.y,
             points[&source].y + edge_port_offset(1, 2)
         );
+    }
+
+    #[test]
+    fn updated_sibling_routes_expand_reflow_within_dirty_columns() {
+        let source = NodeId::new("source").unwrap();
+        let target = NodeId::new("target").unwrap();
+        let blocker = NodeId::new("blocker").unwrap();
+        let edge = EdgeId::new(EdgeKind::Primary, source.clone(), target.clone());
+        let old_route = RoutedEdge {
+            edge: edge.clone(),
+            route: route_edge_with_offsets(
+                Point { x: 56, y: 56 },
+                Point { x: 280, y: 56 },
+                EndpointPortOffsets {
+                    source: 0,
+                    target: 0,
+                },
+            ),
+        };
+        let updated_route = RoutedEdge {
+            edge: edge.clone(),
+            route: route_edge_with_offsets(
+                Point { x: 56, y: 128 },
+                Point { x: 280, y: 128 },
+                EndpointPortOffsets {
+                    source: 0,
+                    target: 0,
+                },
+            ),
+        };
+        let projected_placements = [NodePlacement {
+            node: blocker,
+            point: Point { x: 168, y: 128 },
+        }];
+
+        let expanded = reflow_route_expansion(
+            BTreeMap::from([(edge.clone(), old_route)]),
+            std::slice::from_ref(&updated_route),
+            &projected_placements,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(expanded, BTreeMap::from([(edge, updated_route)]));
     }
 
     #[test]
