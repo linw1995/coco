@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use diesel::sqlite::SqliteConnection;
@@ -245,6 +246,98 @@ pub async fn load_viewport_page(
         edges,
         next_cursor,
     })
+}
+
+pub async fn load_routes_intersecting_nodes(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    nodes: &[NodePlacement],
+) -> std::result::Result<Vec<RoutedEdge>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let mut routes = BTreeMap::new();
+    for node in nodes {
+        let bounds = node_bounds(node.point);
+        let rows = web_graph_route_spatial_index::table
+            .inner_join(
+                web_graph_route_spatial_items::table.on(web_graph_route_spatial_index::spatial_id
+                    .eq(web_graph_route_spatial_items::spatial_id.nullable())),
+            )
+            .inner_join(
+                web_graph_edge_routes::table.on(web_graph_route_spatial_items::layout_kind
+                    .eq(web_graph_edge_routes::layout_kind)
+                    .and(
+                        web_graph_route_spatial_items::edge_kind
+                            .eq(web_graph_edge_routes::edge_kind),
+                    )
+                    .and(
+                        web_graph_route_spatial_items::source_id
+                            .eq(web_graph_edge_routes::source_id),
+                    )
+                    .and(
+                        web_graph_route_spatial_items::target_id
+                            .eq(web_graph_edge_routes::target_id),
+                    )),
+            )
+            .filter(
+                web_graph_route_spatial_index::layout_kind
+                    .eq(Some(layout_kind_value(kind).as_bytes().to_vec())),
+            )
+            .filter(web_graph_route_spatial_index::min_x.le(Some(bounds.max_x)))
+            .filter(web_graph_route_spatial_index::max_x.ge(Some(bounds.min_x)))
+            .filter(web_graph_route_spatial_index::min_y.le(Some(bounds.max_y)))
+            .filter(web_graph_route_spatial_index::max_y.ge(Some(bounds.min_y)))
+            .select(RouteRow::as_select())
+            .load::<RouteRow>(connection)
+            .await?;
+        for route in rows.into_iter().map(stored_route) {
+            let route = route?;
+            routes.insert(route.edge.clone(), route);
+        }
+    }
+    Ok(routes.into_values().collect())
+}
+
+pub async fn load_nodes_intersecting_routes(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    routes: &[RoutedEdge],
+) -> std::result::Result<Vec<NodePlacement>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let mut nodes = BTreeMap::new();
+    for route in routes {
+        let bounds = route_bounds(route.route);
+        let rows = web_graph_node_spatial_index::table
+            .inner_join(
+                web_graph_node_spatial_items::table.on(web_graph_node_spatial_index::spatial_id
+                    .eq(web_graph_node_spatial_items::spatial_id.nullable())),
+            )
+            .inner_join(
+                web_graph_node_placements::table.on(web_graph_node_spatial_items::layout_kind
+                    .eq(web_graph_node_placements::layout_kind)
+                    .and(
+                        web_graph_node_spatial_items::node_id
+                            .eq(web_graph_node_placements::node_id),
+                    )),
+            )
+            .filter(
+                web_graph_node_spatial_index::layout_kind
+                    .eq(Some(layout_kind_value(kind).as_bytes().to_vec())),
+            )
+            .filter(web_graph_node_spatial_index::min_x.le(Some(bounds.max_x)))
+            .filter(web_graph_node_spatial_index::max_x.ge(Some(bounds.min_x)))
+            .filter(web_graph_node_spatial_index::min_y.le(Some(bounds.max_y)))
+            .filter(web_graph_node_spatial_index::max_y.ge(Some(bounds.min_y)))
+            .select(PlacementRow::as_select())
+            .load::<PlacementRow>(connection)
+            .await?;
+        for node in rows.into_iter().map(stored_placement) {
+            let node = node?;
+            nodes.insert(node.node.clone(), node);
+        }
+    }
+    Ok(nodes.into_values().collect())
 }
 
 async fn load_viewport_nodes(

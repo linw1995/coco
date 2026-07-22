@@ -18,6 +18,9 @@ pub enum Error {
     #[snafu(display("Console server task failed: {source}"))]
     JoinConsoleServer { source: tokio::task::JoinError },
 
+    #[snafu(display("Web graph reflow task failed: {source}"))]
+    JoinWebGraphReflow { source: tokio::task::JoinError },
+
     #[snafu(display("Web graph store operation failed: {source}"))]
     WebGraphStore {
         source: crate::host::web_graph_store::Error,

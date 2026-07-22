@@ -289,6 +289,56 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
+    pub async fn edge_routes_intersecting_nodes(
+        &self,
+        kind: LayoutKind,
+        nodes: &[NodePlacement],
+    ) -> Result<Option<GraphRead<Vec<RoutedEdge>>>> {
+        validate_read_batch_size(nodes.len())?;
+        let path = self.path.clone();
+        let nodes = nodes.to_vec();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let routes =
+                    spatial::load_routes_intersecting_nodes(connection, kind, &nodes).await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: routes,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn node_placements_intersecting_routes(
+        &self,
+        kind: LayoutKind,
+        routes: &[RoutedEdge],
+    ) -> Result<Option<GraphRead<Vec<NodePlacement>>>> {
+        validate_read_batch_size(routes.len())?;
+        let path = self.path.clone();
+        let routes = routes.to_vec();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let nodes =
+                    spatial::load_nodes_intersecting_routes(connection, kind, &routes).await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: nodes,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
     pub async fn node_placements_page(
         &self,
         kind: LayoutKind,
@@ -3035,6 +3085,31 @@ mod tests {
             edges.iter().all(|edge| edge.route.target.y <= 500),
             "offscreen fanout edges must not enter the rendered viewport"
         );
+    }
+
+    #[tokio::test]
+    async fn spatial_candidates_support_bounded_reflow_expansion() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&fanout_graph(3)).await.unwrap();
+        let source = placement("source", 80, 80);
+
+        let routes = store
+            .edge_routes_intersecting_nodes(LayoutKind::All, std::slice::from_ref(&source))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(routes.len(), 3);
+
+        let nodes = store
+            .node_placements_intersecting_routes(LayoutKind::All, std::slice::from_ref(&routes[0]))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert!(nodes.contains(&source));
+        assert!(nodes.iter().any(|node| node.node == routes[0].edge.target));
     }
 
     #[tokio::test]
