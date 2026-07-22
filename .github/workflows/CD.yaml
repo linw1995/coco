@@ -7,6 +7,9 @@ on:
       - "main"
     tags:
       - "v*"
+  release:
+    types:
+      - published
 
 permissions:
   contents: read
@@ -22,4 +25,5 @@ jobs:
       sha-tag-prefix: sha
       publish-latest-on-main: true
       publish-git-tag: true
+      publish-sources: ${{ github.event_name == 'release' }}
     secrets: inherit

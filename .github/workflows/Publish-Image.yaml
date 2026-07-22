@@ -34,6 +34,11 @@ on:
         required: false
         default: false
         type: boolean
+      publish-sources:
+        description: "Publish corresponding source images."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -77,6 +82,7 @@ jobs:
           cp --dereference image "dist/${ARTIFACT_PREFIX}-${ARCH}.tar.gz"
 
       - name: Export corresponding sources
+        if: inputs.publish-sources
         shell: bash
         env:
           ARTIFACT_PREFIX: ${{ inputs.artifact-prefix }}
@@ -120,6 +126,7 @@ jobs:
           MANUAL_TAG: ${{ inputs.manual-tag }}
           PUBLISH_LATEST_ON_MAIN: ${{ inputs.publish-latest-on-main }}
           PUBLISH_GIT_TAG: ${{ inputs.publish-git-tag }}
+          PUBLISH_SOURCES: ${{ inputs.publish-sources }}
           SHA_TAG_PREFIX: ${{ inputs.sha-tag-prefix }}
         run: |
           set -euo pipefail
@@ -171,10 +178,13 @@ jobs:
                 ;;
             esac
 
-            source_layer="${source_layers[${arch}]:-}"
-            if [[ -z "${source_layer}" ]]; then
-              echo "::error::No corresponding source artifact was built for ${arch}."
-              exit 1
+            if [[ "${PUBLISH_SOURCES}" == "true" ]]; then
+              source_layer="${source_layers[${arch}]:-}"
+              if [[ -z "${source_layer}" ]]; then
+                echo "::error::No corresponding source artifact was built for ${arch}."
+                exit 1
+              fi
+              source_layer_args+=("--new_layer" "${source_layer}")
             fi
 
             docker_tar="${image_file%.gz}"
@@ -183,7 +193,6 @@ jobs:
             digest="$(nix run nixpkgs#crane -- digest --tarball "${docker_tar}")"
             nix run nixpkgs#crane -- push "${docker_tar}" "${image}@${digest}"
             manifest_refs+=("${image}@${digest}")
-            source_layer_args+=("--new_layer" "${source_layer}")
           done
 
           publish_image() {
@@ -205,16 +214,20 @@ jobs:
           publish_alias() {
             local tag="$1"
 
-            nix run nixpkgs#crane -- copy \
-              "${image}:${sha_tag}-sources" \
-              "${image}:${tag}-sources"
+            if [[ "${PUBLISH_SOURCES}" == "true" ]]; then
+              nix run nixpkgs#crane -- copy \
+                "${image}:${sha_tag}-sources" \
+                "${image}:${tag}-sources"
+            fi
             publish_image "${tag}"
           }
 
-          nix run nixpkgs#crane -- append \
-            --oci-empty-base \
-            "${source_layer_args[@]}" \
-            --new_tag "${image}:${sha_tag}-sources"
+          if [[ "${PUBLISH_SOURCES}" == "true" ]]; then
+            nix run nixpkgs#crane -- append \
+              --oci-empty-base \
+              "${source_layer_args[@]}" \
+              --new_tag "${image}:${sha_tag}-sources"
+          fi
 
           publish_image "${sha_tag}"
 
