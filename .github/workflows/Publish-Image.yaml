@@ -112,28 +112,41 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           dependency_tag="source-dependencies-v1-linux-${ARCH}-${DEPENDENCY_KEY}"
           dependency_tag_ref="${image}:${dependency_tag}"
+          dependency_error="${RUNNER_TEMP}/dependency-source-${ARCH}.log"
 
-          if dependency_result="$(
-            nix run nixpkgs#crane -- digest "${dependency_tag_ref}" 2>&1
+          if dependency_descriptor="$(
+            docker buildx imagetools inspect \
+              "${dependency_tag_ref}" \
+              --format '{{json .Manifest}}' \
+              2> "${dependency_error}"
           )"; then
-            if [[ ! "${dependency_result}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            if ! dependency_digest="$(
+              jq -er \
+                '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' \
+                <<< "${dependency_descriptor}"
+            )"; then
               echo "::error::Invalid dependency source manifest digest."
+              echo "${dependency_descriptor}" >&2
               exit 1
             fi
             cache_hit="true"
-            echo "Found dependency source layer ${dependency_tag_ref}@${dependency_result}."
+            echo "Found dependency source layer ${dependency_tag_ref}@${dependency_digest}."
           elif grep -Eqi \
             '(MANIFEST_UNKNOWN|manifest unknown|NAME_UNKNOWN|name unknown|not found|404)' \
-            <<< "${dependency_result}"; then
+            "${dependency_error}"; then
             cache_hit="false"
+            dependency_digest=""
             echo "Dependency source layer ${dependency_tag_ref} is missing."
           else
-            echo "${dependency_result}" >&2
+            cat "${dependency_error}" >&2
             exit 1
           fi
 
-          printf 'cache_hit=%s\n' "${cache_hit}" >> "${GITHUB_OUTPUT}"
-          printf 'tag_ref=%s\n' "${dependency_tag_ref}" >> "${GITHUB_OUTPUT}"
+          {
+            printf 'cache_hit=%s\n' "${cache_hit}"
+            printf 'digest=%s\n' "${dependency_digest}"
+            printf 'tag_ref=%s\n' "${dependency_tag_ref}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Export dependency sources
         if: steps.source_dependency.outputs.cache_hit != 'true'
@@ -155,14 +168,27 @@ jobs:
         id: resolved_source_dependency
         shell: bash
         env:
+          CACHE_HIT: ${{ steps.source_dependency.outputs.cache_hit }}
+          CACHED_DIGEST: ${{ steps.source_dependency.outputs.digest }}
           DEPENDENCY_TAG_REF: ${{ steps.source_dependency.outputs.tag_ref }}
         run: |
           set -euo pipefail
 
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          dependency_digest="$(
-            nix run nixpkgs#crane -- digest "${DEPENDENCY_TAG_REF}"
-          )"
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            dependency_digest="${CACHED_DIGEST}"
+          else
+            dependency_descriptor="$(
+              docker buildx imagetools inspect \
+                "${DEPENDENCY_TAG_REF}" \
+                --format '{{json .Manifest}}'
+            )"
+            dependency_digest="$(
+              jq -er \
+                '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' \
+                <<< "${dependency_descriptor}"
+            )"
+          fi
           if [[ ! "${dependency_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::Invalid dependency source manifest digest."
             exit 1
