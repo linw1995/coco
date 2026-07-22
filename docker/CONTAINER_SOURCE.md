@@ -10,10 +10,12 @@ License material is available inside the image at:
 - `/share/licenses/coco-container` for the GPL, LGPL, and MPL license texts
   used by container runtime components.
 
-For every published image tag `TAG` at `ghcr.io/linw1995/coco:TAG`, the CD
-workflow publishes the corresponding source image at
-`ghcr.io/linw1995/coco:TAG-sources`. The source image contains the source
-inputs for every architecture present in the runtime image and includes:
+Every stable or prerelease GitHub Release publishes the corresponding source
+image at `ghcr.io/linw1995/coco:TAG-sources`, together with an immutable
+`sha-<commit>-sources` tag. Continuous images published from branch pushes,
+tag pushes, and manual workflow runs do not publish source images. The source
+image contains the source inputs for every architecture present in the runtime
+image and includes:
 
 - The exact CoCo flake source and locked Nixpkgs source.
 - Runtime Nix derivations and their exact source, patch, Cargo vendor, and Go
@@ -37,6 +39,6 @@ Alternatively, use `crane export`:
 crane export "${source_ref}" - | tar -xf -
 ```
 
-The immutable `sha-*` tag pair is the preferred reference for audits and
-long-term source matching. Mutable aliases such as `latest` also receive a
-matching `-sources` alias whenever they are published.
+For released images, the immutable `sha-*` tag pair is the preferred reference
+for audits and long-term source matching. Continuous aliases such as `latest`
+do not receive a matching `-sources` alias.

@@ -15,13 +15,15 @@ The image contains the following directories:
   LGPL-3.0, and MPL-2.0 license texts, plus source retrieval instructions.
 
 The image also carries OCI labels for the project license, source repository,
-documentation, and the corresponding-source tag convention.
+and documentation.
 
 ## Matching Source Image
 
-For every image tag `TAG` published at `ghcr.io/linw1995/coco:TAG`, the CD
-workflow publishes a matching source image at
-`ghcr.io/linw1995/coco:TAG-sources`.
+Every stable or prerelease GitHub Release publishes a matching source image for
+its release tag `TAG` at `ghcr.io/linw1995/coco:TAG-sources`. The release
+workflow also publishes an immutable `sha-<commit>-sources` tag for the exact
+commit used by that release. Continuous images published from branch pushes,
+tag pushes, and manual workflow runs do not publish source images.
 
 The source image is generated from the actual built image, rather than from a
 manually maintained package list. For every Nix store path present in the
@@ -46,7 +48,8 @@ contains:
 
 ## Extract Sources
 
-Prefer an immutable `sha-*` tag when matching sources for an audit:
+For a released image, prefer its immutable `sha-*` tag when matching sources
+for an audit:
 
 ```bash
 image_ref="ghcr.io/linw1995/coco:sha-0123456789ab"
@@ -65,6 +68,6 @@ If `crane` is available, extract the source filesystem directly:
 crane export "${source_ref}" - | tar -xf -
 ```
 
-Mutable image aliases, including `latest`, receive a matching `-sources` alias
-in the same workflow run. The immutable SHA pair remains the stable record when
-an alias later moves.
+Each GitHub Release publishes both the release-tagged source image and the
+immutable SHA pair. Continuous aliases such as `latest` do not receive a
+matching `-sources` alias.
