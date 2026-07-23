@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use diesel::sqlite::SqliteConnection;
@@ -11,10 +12,13 @@ use super::schema::{
     web_graph_node_spatial_items, web_graph_route_spatial_index, web_graph_route_spatial_items,
 };
 use super::*;
+use crate::host::web_graph_view::GRAPH_ROW_STEP;
 
 const NODE_BOUNDS_HALF_WIDTH: i32 = 64;
 const NODE_BOUNDS_TOP: i32 = 24;
 const NODE_BOUNDS_BOTTOM: i32 = 52;
+const ROW_COLLISION_RADIUS: i32 = GRAPH_ROW_STEP / 2;
+const SPATIAL_CANDIDATE_PAGE_SIZE: i64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
@@ -86,6 +90,17 @@ struct SpatialBounds {
     max_x: i32,
     min_y: i32,
     max_y: i32,
+}
+
+impl SpatialBounds {
+    fn union(self, other: Self) -> Self {
+        Self {
+            min_x: self.min_x.min(other.min_x),
+            max_x: self.max_x.max(other.max_x),
+            min_y: self.min_y.min(other.min_y),
+            max_y: self.max_y.max(other.max_y),
+        }
+    }
 }
 
 #[derive(Debug, Insertable)]
@@ -245,6 +260,132 @@ pub async fn load_viewport_page(
         edges,
         next_cursor,
     })
+}
+
+pub async fn load_routes_intersecting_nodes(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    nodes: &[NodePlacement],
+) -> std::result::Result<Vec<RoutedEdge>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let Some(bounds) = nodes
+        .iter()
+        .map(|node| node_row_collision_bounds(node.point))
+        .reduce(SpatialBounds::union)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut routes = BTreeMap::new();
+    let mut after = i32::MIN;
+    loop {
+        let rows = web_graph_route_spatial_index::table
+            .inner_join(
+                web_graph_route_spatial_items::table.on(web_graph_route_spatial_index::spatial_id
+                    .eq(web_graph_route_spatial_items::spatial_id.nullable())),
+            )
+            .inner_join(
+                web_graph_edge_routes::table.on(web_graph_route_spatial_items::layout_kind
+                    .eq(web_graph_edge_routes::layout_kind)
+                    .and(
+                        web_graph_route_spatial_items::edge_kind
+                            .eq(web_graph_edge_routes::edge_kind),
+                    )
+                    .and(
+                        web_graph_route_spatial_items::source_id
+                            .eq(web_graph_edge_routes::source_id),
+                    )
+                    .and(
+                        web_graph_route_spatial_items::target_id
+                            .eq(web_graph_edge_routes::target_id),
+                    )),
+            )
+            .filter(
+                web_graph_route_spatial_index::layout_kind
+                    .eq(Some(layout_kind_value(kind).as_bytes().to_vec())),
+            )
+            .filter(web_graph_route_spatial_index::min_x.le(Some(bounds.max_x)))
+            .filter(web_graph_route_spatial_index::max_x.ge(Some(bounds.min_x)))
+            .filter(web_graph_route_spatial_index::min_y.le(Some(bounds.max_y)))
+            .filter(web_graph_route_spatial_index::max_y.ge(Some(bounds.min_y)))
+            .filter(web_graph_route_spatial_items::spatial_id.gt(after))
+            .order(web_graph_route_spatial_items::spatial_id.asc())
+            .limit(SPATIAL_CANDIDATE_PAGE_SIZE)
+            .select((
+                web_graph_route_spatial_items::spatial_id,
+                RouteRow::as_select(),
+            ))
+            .load::<(i32, RouteRow)>(connection)
+            .await?;
+        let Some((last_spatial_id, _)) = rows.last() else {
+            break;
+        };
+        after = *last_spatial_id;
+        for route in rows.into_iter().map(|(_, row)| stored_route(row)) {
+            let route = route?;
+            routes.insert(route.edge.clone(), route);
+        }
+    }
+    Ok(routes.into_values().collect())
+}
+
+pub async fn load_nodes_intersecting_routes(
+    connection: &mut AsyncSqliteConnection,
+    kind: LayoutKind,
+    routes: &[RoutedEdge],
+) -> std::result::Result<Vec<NodePlacement>, TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    let Some(bounds) = routes
+        .iter()
+        .map(|route| route_row_collision_bounds(route.route))
+        .reduce(SpatialBounds::union)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut nodes = BTreeMap::new();
+    let mut after = i32::MIN;
+    loop {
+        let rows = web_graph_node_spatial_index::table
+            .inner_join(
+                web_graph_node_spatial_items::table.on(web_graph_node_spatial_index::spatial_id
+                    .eq(web_graph_node_spatial_items::spatial_id.nullable())),
+            )
+            .inner_join(
+                web_graph_node_placements::table.on(web_graph_node_spatial_items::layout_kind
+                    .eq(web_graph_node_placements::layout_kind)
+                    .and(
+                        web_graph_node_spatial_items::node_id
+                            .eq(web_graph_node_placements::node_id),
+                    )),
+            )
+            .filter(
+                web_graph_node_spatial_index::layout_kind
+                    .eq(Some(layout_kind_value(kind).as_bytes().to_vec())),
+            )
+            .filter(web_graph_node_spatial_index::min_x.le(Some(bounds.max_x)))
+            .filter(web_graph_node_spatial_index::max_x.ge(Some(bounds.min_x)))
+            .filter(web_graph_node_spatial_index::min_y.le(Some(bounds.max_y)))
+            .filter(web_graph_node_spatial_index::max_y.ge(Some(bounds.min_y)))
+            .filter(web_graph_node_spatial_items::spatial_id.gt(after))
+            .order(web_graph_node_spatial_items::spatial_id.asc())
+            .limit(SPATIAL_CANDIDATE_PAGE_SIZE)
+            .select((
+                web_graph_node_spatial_items::spatial_id,
+                PlacementRow::as_select(),
+            ))
+            .load::<(i32, PlacementRow)>(connection)
+            .await?;
+        let Some((last_spatial_id, _)) = rows.last() else {
+            break;
+        };
+        after = *last_spatial_id;
+        for node in rows.into_iter().map(|(_, row)| stored_placement(row)) {
+            let node = node?;
+            nodes.insert(node.node.clone(), node);
+        }
+    }
+    Ok(nodes.into_values().collect())
 }
 
 async fn load_viewport_nodes(
@@ -679,6 +820,14 @@ fn node_bounds(point: Point) -> SpatialBounds {
     }
 }
 
+fn node_row_collision_bounds(point: Point) -> SpatialBounds {
+    SpatialBounds {
+        min_y: point.y.saturating_sub(ROW_COLLISION_RADIUS),
+        max_y: point.y.saturating_add(ROW_COLLISION_RADIUS),
+        ..node_bounds(point)
+    }
+}
+
 fn route_bounds(route: BezierRoute) -> SpatialBounds {
     let points = [route.source, route.control_1, route.control_2, route.target];
     SpatialBounds {
@@ -686,6 +835,15 @@ fn route_bounds(route: BezierRoute) -> SpatialBounds {
         max_x: points.iter().map(|point| point.x).max().unwrap_or_default(),
         min_y: points.iter().map(|point| point.y).min().unwrap_or_default(),
         max_y: points.iter().map(|point| point.y).max().unwrap_or_default(),
+    }
+}
+
+fn route_row_collision_bounds(route: BezierRoute) -> SpatialBounds {
+    let bounds = route_bounds(route);
+    SpatialBounds {
+        min_y: bounds.min_y.saturating_sub(ROW_COLLISION_RADIUS),
+        max_y: bounds.max_y.saturating_add(ROW_COLLISION_RADIUS),
+        ..bounds
     }
 }
 

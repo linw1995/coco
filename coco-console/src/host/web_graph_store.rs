@@ -289,6 +289,56 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
+    pub async fn edge_routes_intersecting_nodes(
+        &self,
+        kind: LayoutKind,
+        nodes: &[NodePlacement],
+    ) -> Result<Option<GraphRead<Vec<RoutedEdge>>>> {
+        validate_read_batch_size(nodes.len())?;
+        let path = self.path.clone();
+        let nodes = nodes.to_vec();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let routes =
+                    spatial::load_routes_intersecting_nodes(connection, kind, &nodes).await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: routes,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn node_placements_intersecting_routes(
+        &self,
+        kind: LayoutKind,
+        routes: &[RoutedEdge],
+    ) -> Result<Option<GraphRead<Vec<NodePlacement>>>> {
+        validate_read_batch_size(routes.len())?;
+        let path = self.path.clone();
+        let routes = routes.to_vec();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let nodes =
+                    spatial::load_nodes_intersecting_routes(connection, kind, &routes).await?;
+                Ok(Some(GraphRead {
+                    state,
+                    value: nodes,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
     pub async fn node_placements_page(
         &self,
         kind: LayoutKind,
@@ -2369,6 +2419,55 @@ mod tests {
         .unwrap()
     }
 
+    fn row_collision_graph() -> Graph {
+        let source = node("source");
+        let target = node("target");
+        let blocker = node("blocker");
+        let edge = EdgeId::new(EdgeKind::Primary, source.clone(), target.clone());
+        Graph::from_snapshot(Snapshot {
+            format_version: FORMAT_VERSION,
+            revision: Revision::new(1),
+            source_version: SourceVersion::new(1),
+            topology: TopologySnapshot {
+                nodes: vec![source.clone(), target.clone(), blocker.clone()],
+                edges: vec![edge.clone()],
+            },
+            layouts: LayoutSnapshots {
+                anchors: empty_layout(),
+                all: LayoutSnapshot {
+                    canvas: Canvas {
+                        width: 400,
+                        height: 180,
+                    },
+                    nodes: vec![
+                        NodePlacement {
+                            node: source,
+                            point: point(24, 128),
+                        },
+                        NodePlacement {
+                            node: target,
+                            point: point(300, 128),
+                        },
+                        NodePlacement {
+                            node: blocker,
+                            point: point(160, 128),
+                        },
+                    ],
+                    edges: vec![RoutedEdge {
+                        edge,
+                        route: BezierRoute {
+                            source: point(44, 93),
+                            control_1: point(120, 93),
+                            control_2: point(200, 93),
+                            target: point(276, 93),
+                        },
+                    }],
+                },
+            },
+        })
+        .unwrap()
+    }
+
     fn empty_graph(revision: u64, source_version: u64) -> Graph {
         Graph::from_snapshot(Snapshot {
             format_version: FORMAT_VERSION,
@@ -3035,6 +3134,80 @@ mod tests {
             edges.iter().all(|edge| edge.route.target.y <= 500),
             "offscreen fanout edges must not enter the rendered viewport"
         );
+    }
+
+    #[tokio::test]
+    async fn spatial_candidates_support_bounded_reflow_expansion() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&fanout_graph(3)).await.unwrap();
+        let source = placement("source", 80, 80);
+
+        let routes = store
+            .edge_routes_intersecting_nodes(LayoutKind::All, std::slice::from_ref(&source))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(routes.len(), 3);
+
+        let nodes = store
+            .node_placements_intersecting_routes(LayoutKind::All, std::slice::from_ref(&routes[0]))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert!(nodes.contains(&source));
+        assert!(nodes.iter().any(|node| node.node == routes[0].edge.target));
+    }
+
+    #[tokio::test]
+    async fn reflow_spatial_candidates_cover_the_full_row_collision_radius() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&row_collision_graph()).await.unwrap();
+        let blocker = placement("blocker", 160, 128);
+
+        let routes = store
+            .edge_routes_intersecting_nodes(LayoutKind::All, std::slice::from_ref(&blocker))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(routes.len(), 1);
+
+        let nodes = store
+            .node_placements_intersecting_routes(LayoutKind::All, std::slice::from_ref(&routes[0]))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert!(nodes.contains(&blocker));
+    }
+
+    #[tokio::test]
+    async fn reflow_spatial_candidates_page_large_result_sets() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&fanout_graph(128)).await.unwrap();
+        let source = placement("source", 80, 80);
+
+        let routes = store
+            .edge_routes_intersecting_nodes(LayoutKind::All, std::slice::from_ref(&source))
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(routes.len(), 128);
+
+        let nodes = store
+            .node_placements_intersecting_routes(LayoutKind::All, &routes)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(nodes.len(), 129);
+        assert!(nodes.contains(&source));
     }
 
     #[tokio::test]
