@@ -421,11 +421,6 @@ body {
   display: contents;
 }
 
-.panel-content ~ .node-details-default,
-.panel-content ~ .provider-context-default {
-  display: none;
-}
-
 .side {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);

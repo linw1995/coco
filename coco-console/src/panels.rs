@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use serde::de::DeserializeOwned;
 
 use crate::api::{NodeDetailResponse, PanelNode, ProviderContextItem, ProviderContextResponse};
@@ -7,6 +8,7 @@ use crate::api::{NodeDetailResponse, PanelNode, ProviderContextItem, ProviderCon
 use leptos::{
     ev,
     leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
+    task::spawn_local,
 };
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue};
@@ -19,10 +21,19 @@ const NODE_TARGET_PREFIX: &str = "detail-";
 #[cfg(target_arch = "wasm32")]
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
 
+#[cfg(any(target_arch = "wasm32", test))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PanelSelection {
     pub target: Option<String>,
     pub context: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+enum PanelState<T> {
+    Empty,
+    Loading,
+    Ready(T),
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -43,86 +54,97 @@ impl PanelSelection {
 
 #[island]
 pub fn NodeDetailPanel(graph_mode: String) -> impl IntoView {
-    let selection = use_panel_selection();
-    let detail = LocalResource::new(move || {
-        let target = selection.get().target;
-        let url = node_detail_url(target.as_deref(), &graph_mode);
-        fetch_panel_data::<NodeDetailResponse>(url)
-    });
+    let state = RwSignal::new(PanelState::Empty);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let selection = use_panel_selection();
+        let selected_target = Memo::new(move |_| selection.get().target);
+        Effect::new(move || {
+            let Some(target) = selected_target.get() else {
+                state.set(PanelState::Empty);
+                return;
+            };
+            state.set(PanelState::Loading);
+            let url = node_detail_url(Some(&target), &graph_mode);
+            spawn_local(async move {
+                let response = fetch_panel_data::<NodeDetailResponse>(url).await;
+                if selected_target.get_untracked().as_deref() == Some(&target) {
+                    state.set(PanelState::Ready(response));
+                }
+            });
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = graph_mode;
 
     view! {
-        <Suspense fallback=|| view! { <NodeDetailDefault/> }>
-            {move || Suspend::new(async move {
-                match detail.await {
-                    Ok(response) => view! {
-                        <div class="panel-content"><NodeDetailContent response=response/></div>
-                    }.into_any(),
-                    Err(error) => view! {
-                        <div class="panel-content"><NodeDetailError error=error/></div>
-                    }.into_any(),
-                }
-            })}
-        </Suspense>
+        <div class="panel-content">
+            <NodeDetailPanelContent state=state/>
+        </div>
     }
 }
 
 #[island]
 pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
-    let selection = use_panel_selection();
-    let provider_context = LocalResource::new(move || {
-        let selection = selection.get();
-        let url = provider_context_url(
-            selection.target.as_deref(),
-            selection.context.as_deref(),
-            &graph_mode,
-        );
-        fetch_panel_data::<ProviderContextResponse>(url)
-    });
+    let state = RwSignal::new(PanelState::Empty);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let selection = use_panel_selection();
+        let selected_context = Memo::new(move |_| {
+            let selection = selection.get();
+            selection.target.map(|target| (target, selection.context))
+        });
+        Effect::new(move || {
+            let Some(request) = selected_context.get() else {
+                state.set(PanelState::Empty);
+                return;
+            };
+            state.set(PanelState::Loading);
+            let url = provider_context_url(Some(&request.0), request.1.as_deref(), &graph_mode);
+            spawn_local(async move {
+                let response = fetch_panel_data::<ProviderContextResponse>(url).await;
+                if selected_context.get_untracked().as_ref() == Some(&request) {
+                    if response.is_ok() {
+                        notify_provider_context_rendered();
+                    }
+                    state.set(PanelState::Ready(response));
+                }
+            });
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = graph_mode;
 
     view! {
-        <Suspense fallback=|| view! { <ProviderContextDefault/> }>
-            {move || Suspend::new(async move {
-                match provider_context.await {
-                    Ok(response) => {
-                        notify_provider_context_rendered();
-                        view! {
-                            <div class="panel-content">
-                                <ProviderContextContent response=response/>
-                            </div>
-                        }.into_any()
-                    }
-                    Err(error) => view! {
-                        <div class="panel-content"><ProviderContextError error=error/></div>
-                    }.into_any(),
-                }
-            })}
-        </Suspense>
+        <div class="panel-content">
+            <ProviderContextPanelContent state=state/>
+        </div>
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn use_panel_selection() -> RwSignal<PanelSelection> {
-    let selection = RwSignal::new(current_panel_selection());
-    #[cfg(target_arch = "wasm32")]
-    {
-        let listener = window_event_listener(ev::hashchange, move |_| {
-            selection.set(current_panel_selection());
-        });
-        on_cleanup(move || listener.remove());
-    }
+    let selection = RwSignal::new(PanelSelection::default());
+    Effect::new(move || {
+        selection.set(current_panel_selection());
+    });
+    let listener = window_event_listener(ev::hashchange, move |_| {
+        selection.set(current_panel_selection());
+    });
+    on_cleanup(move || listener.remove());
     selection
 }
 
+#[cfg(target_arch = "wasm32")]
 fn current_panel_selection() -> PanelSelection {
-    #[cfg(target_arch = "wasm32")]
-    {
-        PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        PanelSelection::default()
-    }
+    PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
     target
         .map(|target| {
@@ -134,6 +156,7 @@ fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
         .unwrap_or_else(|| format!("/api/node-detail?mode={graph_mode}"))
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn provider_context_url(target: Option<&str>, context: Option<&str>, graph_mode: &str) -> String {
     let mut query = format!("mode={graph_mode}");
     if let Some(target) = target {
@@ -147,33 +170,26 @@ fn provider_context_url(target: Option<&str>, context: Option<&str>, graph_mode:
     format!("/api/provider-context?{query}")
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn fetch_panel_data<T>(url: String) -> Result<T, String>
 where
     T: DeserializeOwned,
 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let window = web_sys::window().ok_or_else(|| "window is unavailable".to_owned())?;
-        let response = JsFuture::from(window.fetch_with_str(&url))
-            .await
-            .map_err(js_error_message)?
-            .dyn_into::<Response>()
-            .map_err(js_error_message)?;
-        if !response.ok() {
-            return Err(format!("request failed with status {}", response.status()));
-        }
-        let text = JsFuture::from(response.text().map_err(js_error_message)?)
-            .await
-            .map_err(js_error_message)?
-            .as_string()
-            .ok_or_else(|| "response text is not a string".to_owned())?;
-        serde_json::from_str(&text).map_err(|error| format!("invalid panel response: {error}"))
+    let window = web_sys::window().ok_or_else(|| "window is unavailable".to_owned())?;
+    let response = JsFuture::from(window.fetch_with_str(&url))
+        .await
+        .map_err(js_error_message)?
+        .dyn_into::<Response>()
+        .map_err(js_error_message)?;
+    if !response.ok() {
+        return Err(format!("request failed with status {}", response.status()));
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = url;
-        std::future::pending().await
-    }
+    let text = JsFuture::from(response.text().map_err(js_error_message)?)
+        .await
+        .map_err(js_error_message)?
+        .as_string()
+        .ok_or_else(|| "response text is not a string".to_owned())?;
+    serde_json::from_str(&text).map_err(|error| format!("invalid panel response: {error}"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -193,125 +209,179 @@ fn notify_provider_context_rendered() {
     });
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn notify_provider_context_rendered() {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodeDetailViewModel {
+    class: &'static str,
+    target: String,
+    status_label: &'static str,
+    status_message: String,
+    status_detail_label: &'static str,
+    status_detail: String,
+    node: Option<PanelNode>,
+}
 
-#[component]
-fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
-    match response {
-        NodeDetailResponse::Default => view! { <NodeDetailDefault/> }.into_any(),
-        NodeDetailResponse::Missing { target } => {
-            view! { <NodeDetailMissing target=target/> }.into_any()
+impl NodeDetailViewModel {
+    fn from_state(state: PanelState<Result<NodeDetailResponse, String>>) -> Self {
+        let mut model = Self {
+            class: "node-details node-details-default",
+            target: String::new(),
+            status_label: "Selection",
+            status_message: "Select a node to inspect its content.".to_owned(),
+            status_detail_label: "",
+            status_detail: String::new(),
+            node: None,
+        };
+        match state {
+            PanelState::Empty | PanelState::Ready(Ok(NodeDetailResponse::Default)) => {}
+            PanelState::Loading => {
+                model.class = "node-details node-details-loading";
+                model.status_message = "Loading node detail...".to_owned();
+            }
+            PanelState::Ready(Ok(NodeDetailResponse::Missing { target })) => {
+                model.status_message = "The selected node is no longer available.".to_owned();
+                model.status_detail_label = "Target";
+                model.status_detail = target;
+            }
+            PanelState::Ready(Ok(NodeDetailResponse::Found { node })) => {
+                model.class = "node-details node-detail";
+                model.target = format!("{NODE_TARGET_PREFIX}{}", node.id);
+                model.node = Some(node);
+            }
+            PanelState::Ready(Err(error)) => {
+                model.status_label = "Error";
+                model.status_message = "Failed to load node detail.".to_owned();
+                model.status_detail_label = "Reason";
+                model.status_detail = error;
+            }
         }
-        NodeDetailResponse::Found { node } => view! { <NodeDetail node=node/> }.into_any(),
+        model
     }
 }
 
 #[component]
-fn NodeDetail(node: PanelNode) -> impl IntoView {
-    let target = format!("{NODE_TARGET_PREFIX}{}", node.id);
-    view! {
-        <section id=target class="node-details node-detail">
-            <h2>"Node"</h2>
-            <dl class="detail-list">
-                <div><dt>"Id"</dt><dd>{node.id}</dd></div>
-                <div><dt>"Kind"</dt><dd>{node.kind}</dd></div>
-                <div><dt>"Role"</dt><dd>{node.role}</dd></div>
-                <div><dt>"Created"</dt><dd>{node.created_at}</dd></div>
-                <div><dt>"Labels"</dt><dd>"None"</dd></div>
-                <div><dt>"Content"</dt><dd>{node.content}</dd></div>
-            </dl>
-        </section>
-    }
-}
+fn NodeDetailPanelContent(
+    state: RwSignal<PanelState<Result<NodeDetailResponse, String>>>,
+) -> impl IntoView {
+    let model = Memo::new(move |_| NodeDetailViewModel::from_state(state.get()));
+    let has_node = move || model.get().node.is_some();
 
-#[component]
-fn NodeDetailDefault() -> impl IntoView {
     view! {
-        <section class="node-details node-details-default">
+        <section
+            id=move || model.get().target
+            class=move || model.get().class
+        >
             <h2>"Node"</h2>
             <dl class="detail-list">
-                <div>
-                    <dt>"Selection"</dt>
-                    <dd>"Select a node to inspect its content."</dd>
+                <div hidden=has_node>
+                    <dt>{move || model.get().status_label}</dt>
+                    <dd>{move || model.get().status_message}</dd>
+                </div>
+                <div hidden=move || model.get().status_detail.is_empty()>
+                    <dt>{move || model.get().status_detail_label}</dt>
+                    <dd>{move || model.get().status_detail}</dd>
+                </div>
+                <div hidden=move || !has_node()>
+                    <dt>"Id"</dt>
+                    <dd>{move || model.get().node.map(|node| node.id).unwrap_or_default()}</dd>
+                </div>
+                <div hidden=move || !has_node()>
+                    <dt>"Kind"</dt>
+                    <dd>{move || model.get().node.map(|node| node.kind).unwrap_or_default()}</dd>
+                </div>
+                <div hidden=move || !has_node()>
+                    <dt>"Role"</dt>
+                    <dd>{move || model.get().node.map(|node| node.role).unwrap_or_default()}</dd>
+                </div>
+                <div hidden=move || !has_node()>
+                    <dt>"Created"</dt>
+                    <dd>{move || model.get().node.map(|node| node.created_at).unwrap_or_default()}</dd>
+                </div>
+                <div hidden=move || !has_node()><dt>"Labels"</dt><dd>"None"</dd></div>
+                <div hidden=move || !has_node()>
+                    <dt>"Content"</dt>
+                    <dd>{move || model.get().node.map(|node| node.content).unwrap_or_default()}</dd>
                 </div>
             </dl>
         </section>
     }
 }
 
-#[component]
-fn NodeDetailMissing(target: String) -> impl IntoView {
-    view! {
-        <section class="node-details node-details-default">
-            <h2>"Node"</h2>
-            <dl class="detail-list">
-                <div>
-                    <dt>"Selection"</dt>
-                    <dd>"The selected node is no longer available."</dd>
-                </div>
-                <div><dt>"Target"</dt><dd>{target}</dd></div>
-            </dl>
-        </section>
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderContextViewModel {
+    class: &'static str,
+    message: String,
+    detail: String,
+    items: Vec<ProviderContextItem>,
 }
 
-#[component]
-fn NodeDetailError(error: String) -> impl IntoView {
-    view! {
-        <section class="node-details node-details-default">
-            <h2>"Node"</h2>
-            <dl class="detail-list">
-                <div><dt>"Error"</dt><dd>"Failed to load node detail."</dd></div>
-                <div><dt>"Reason"</dt><dd>{error}</dd></div>
-            </dl>
-        </section>
-    }
-}
-
-#[component]
-fn ProviderContextContent(response: ProviderContextResponse) -> AnyView {
-    match response {
-        ProviderContextResponse::Default => view! { <ProviderContextDefault/> }.into_any(),
-        ProviderContextResponse::Missing { target } => {
-            view! { <ProviderContextMissing target=target/> }.into_any()
+impl ProviderContextViewModel {
+    fn from_state(state: PanelState<Result<ProviderContextResponse, String>>) -> Self {
+        let mut model = Self {
+            class: "provider-context-section provider-context-default",
+            message: "Select a node to inspect its provider context.".to_owned(),
+            detail: String::new(),
+            items: Vec::new(),
+        };
+        match state {
+            PanelState::Empty | PanelState::Ready(Ok(ProviderContextResponse::Default)) => {}
+            PanelState::Loading => {
+                model.class = "provider-context-section provider-context-loading";
+                model.message = "Loading provider context...".to_owned();
+            }
+            PanelState::Ready(Ok(ProviderContextResponse::Missing { target })) => {
+                model.message = "The selected node is no longer available.".to_owned();
+                model.detail = target;
+            }
+            PanelState::Ready(Ok(ProviderContextResponse::Found { items })) => {
+                model.class = "provider-context-section";
+                if items.is_empty() {
+                    model.message = "No provider context nodes.".to_owned();
+                } else {
+                    model.message.clear();
+                    model.items = items;
+                }
+            }
+            PanelState::Ready(Err(error)) => {
+                model.message = "Failed to load provider context.".to_owned();
+                model.detail = error;
+            }
         }
-        ProviderContextResponse::Found { items } => {
-            view! { <ProviderContextList items=items/> }.into_any()
-        }
+        model
     }
 }
 
 #[component]
-fn ProviderContextDefault() -> impl IntoView {
+fn ProviderContextPanelContent(
+    state: RwSignal<PanelState<Result<ProviderContextResponse, String>>>,
+) -> impl IntoView {
+    let model = Memo::new(move |_| ProviderContextViewModel::from_state(state.get()));
+
     view! {
-        <section class="provider-context-section provider-context-default">
+        <section class=move || model.get().class>
             <h2>"Provider Context"</h2>
-            <p class="provider-context-empty">"Select a node to inspect its provider context."</p>
+            <p
+                class="provider-context-empty"
+                hidden=move || model.get().message.is_empty()
+            >
+                {move || model.get().message}
+            </p>
+            <p
+                class="provider-context-target"
+                hidden=move || model.get().detail.is_empty()
+            >
+                {move || model.get().detail}
+            </p>
+            <ol
+                class="provider-context-list"
+                hidden=move || model.get().items.is_empty()
+            >
+                <For
+                    each=move || model.get().items
+                    key=|item| (item.node.id.clone(), item.context_target.clone())
+                    children=move |item| view! { <ProviderContextRow item=item/> }
+                />
+            </ol>
         </section>
-    }
-}
-
-#[component]
-fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
-    if items.is_empty() {
-        view! {
-            <section class="provider-context-section">
-                <h2>"Provider Context"</h2>
-                <p class="provider-context-empty">"No provider context nodes."</p>
-            </section>
-        }
-        .into_any()
-    } else {
-        view! {
-            <section class="provider-context-section">
-                <h2>"Provider Context"</h2>
-                <ol class="provider-context-list">
-                    {items.into_iter().map(|item| view! { <ProviderContextRow item=item/> }).collect::<Vec<_>>()}
-                </ol>
-            </section>
-        }
-        .into_any()
     }
 }
 
@@ -362,28 +432,6 @@ fn provider_context_node_class(visible: bool, selected: bool) -> &'static str {
     }
 }
 
-#[component]
-fn ProviderContextMissing(target: String) -> impl IntoView {
-    view! {
-        <section class="provider-context-section provider-context-default">
-            <h2>"Provider Context"</h2>
-            <p class="provider-context-empty">"The selected node is no longer available."</p>
-            <p class="provider-context-target">{target}</p>
-        </section>
-    }
-}
-
-#[component]
-fn ProviderContextError(error: String) -> impl IntoView {
-    view! {
-        <section class="provider-context-section provider-context-default">
-            <h2>"Provider Context"</h2>
-            <p class="provider-context-empty">"Failed to load provider context."</p>
-            <p class="provider-context-target">{error}</p>
-        </section>
-    }
-}
-
 #[cfg(any(target_arch = "wasm32", test))]
 fn provider_context_target(query: &str) -> Option<String> {
     query.split('&').find_map(|part| {
@@ -392,6 +440,7 @@ fn provider_context_target(query: &str) -> Option<String> {
     })
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn percent_encode(value: &str) -> String {
     value
         .bytes()
@@ -451,40 +500,85 @@ mod tests {
         let provider = view! { <ProviderContextPanel graph_mode="all".to_owned()/> }.to_html();
 
         assert!(node.contains("leptos-island"));
+        assert!(node.contains("panel-content"));
         assert!(node.contains("Select a node to inspect its content."));
         assert!(!node.contains("Provider Context"));
         assert_eq!(node.matches("<section").count(), 1);
         assert!(provider.contains("leptos-island"));
+        assert!(provider.contains("panel-content"));
         assert!(provider.contains("Select a node to inspect its provider context."));
         assert!(!provider.contains("<h2>Node</h2>"));
         assert_eq!(provider.matches("<section").count(), 1);
     }
 
     #[test]
-    fn panel_components_render_typed_success_and_error_states() {
-        let node = view! {
-            <NodeDetailContent response=NodeDetailResponse::Found {
+    fn panel_states_render_empty_loading_and_ready_content() {
+        let empty = NodeDetailViewModel::from_state(PanelState::Empty);
+        let loading = NodeDetailViewModel::from_state(PanelState::Loading);
+        let ready =
+            NodeDetailViewModel::from_state(PanelState::Ready(Ok(NodeDetailResponse::Found {
                 node: PanelNode {
                     id: "node-1".to_owned(),
                     short_id: "node-1".to_owned(),
                     kind: "text".to_owned(),
                     role: "User".to_owned(),
                     created_at: "now".to_owned(),
-                    content: "<script>alert(1)</script>".to_owned(),
+                    content: "content".to_owned(),
                     summary: "summary".to_owned(),
                 },
-            }/>
+            })));
+        let error = NodeDetailViewModel::from_state(PanelState::Ready(Err("failed".to_owned())));
+        let provider_loading = ProviderContextViewModel::from_state(PanelState::Loading);
+        let provider_ready = ProviderContextViewModel::from_state(PanelState::Ready(Ok(
+            ProviderContextResponse::Found { items: Vec::new() },
+        )));
+
+        assert_eq!(
+            empty.status_message,
+            "Select a node to inspect its content."
+        );
+        assert_eq!(loading.status_message, "Loading node detail...");
+        assert_eq!(
+            ready.node.as_ref().map(|node| node.id.as_str()),
+            Some("node-1")
+        );
+        assert_eq!(error.status_message, "Failed to load node detail.");
+        assert_eq!(provider_loading.message, "Loading provider context...");
+        assert_eq!(provider_ready.message, "No provider context nodes.");
+    }
+
+    #[test]
+    fn panel_components_render_typed_success_and_error_states() {
+        let owner = Owner::new();
+        owner.set();
+        let node_state = RwSignal::new(PanelState::Ready(Ok(NodeDetailResponse::Found {
+            node: PanelNode {
+                id: "node-1".to_owned(),
+                short_id: "node-1".to_owned(),
+                kind: "text".to_owned(),
+                role: "User".to_owned(),
+                created_at: "now".to_owned(),
+                content: "<script>alert(1)</script>".to_owned(),
+                summary: "summary".to_owned(),
+            },
+        })));
+        let provider_state = RwSignal::new(PanelState::Ready(Ok(ProviderContextResponse::Found {
+            items: Vec::new(),
+        })));
+        let node_error_state = RwSignal::new(PanelState::Ready(Err("node failed".to_owned())));
+        let provider_error_state =
+            RwSignal::new(PanelState::Ready(Err("provider failed".to_owned())));
+        let node = view! {
+            <NodeDetailPanelContent state=node_state/>
         }
         .to_html();
         let provider = view! {
-            <ProviderContextContent response=ProviderContextResponse::Found {
-                items: Vec::new(),
-            }/>
+            <ProviderContextPanelContent state=provider_state/>
         }
         .to_html();
-        let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
+        let node_error = view! { <NodeDetailPanelContent state=node_error_state/> }.to_html();
         let provider_error =
-            view! { <ProviderContextError error="provider failed".to_owned()/> }.to_html();
+            view! { <ProviderContextPanelContent state=provider_error_state/> }.to_html();
 
         assert!(node.contains("&lt;script&gt;"));
         assert!(!node.contains("<script>"));
@@ -493,6 +587,8 @@ mod tests {
         assert!(node_error.contains("node failed"));
         assert!(provider_error.contains("Failed to load provider context."));
         assert!(provider_error.contains("provider failed"));
+
+        owner.cleanup();
     }
 }
 
