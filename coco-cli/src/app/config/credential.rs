@@ -75,6 +75,13 @@ fn resolve_route(service: String, route: CredentialRouteConfig) -> Result<NonoCr
 }
 
 fn validate_route(service: &str, route: &CredentialRouteConfig) -> Result<()> {
+    validate_service_name(service)?;
+    validate_upstream(service, &route.upstream)?;
+    validate_endpoints(service, &route.endpoints)?;
+    validate_injection(service, route)
+}
+
+fn validate_service_name(service: &str) -> Result<()> {
     if service.is_empty()
         || !service
             .bytes()
@@ -85,8 +92,11 @@ fn validate_route(service: &str, route: &CredentialRouteConfig) -> Result<()> {
             "service name must contain only ASCII letters, digits, '-' or '_'",
         ));
     }
+    Ok(())
+}
 
-    let upstream = url::Url::parse(&route.upstream)
+fn validate_upstream(service: &str, value: &str) -> Result<()> {
+    let upstream = url::Url::parse(value)
         .map_err(|_| invalid_route(service, "upstream must be a valid HTTPS URL"))?;
     if upstream.scheme() != "https"
         || upstream.host_str().is_none()
@@ -99,82 +109,93 @@ fn validate_route(service: &str, route: &CredentialRouteConfig) -> Result<()> {
             "upstream must be an HTTPS URL without credentials or a fragment",
         ));
     }
+    Ok(())
+}
 
-    if route.endpoints.is_empty() {
+fn validate_endpoints(service: &str, endpoints: &[CredentialEndpointConfig]) -> Result<()> {
+    if endpoints.is_empty() {
         return Err(invalid_route(
             service,
             "at least one endpoint rule is required",
         ));
     }
-    for endpoint in &route.endpoints {
-        if endpoint.method.is_empty()
-            || (endpoint.method != "*"
-                && !endpoint
-                    .method
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphabetic()))
-            || !endpoint.path.starts_with('/')
-        {
+
+    for endpoint in endpoints {
+        if !valid_endpoint_method(&endpoint.method) || !endpoint.path.starts_with('/') {
             return Err(invalid_route(
                 service,
                 "endpoint method must be an HTTP method or '*' and path must start with '/'",
             ));
         }
     }
+    Ok(())
+}
 
+fn valid_endpoint_method(method: &str) -> bool {
+    method == "*" || (!method.is_empty() && method.bytes().all(|byte| byte.is_ascii_alphabetic()))
+}
+
+fn validate_injection(service: &str, route: &CredentialRouteConfig) -> Result<()> {
     match route.inject_mode {
-        NonoCredentialInjectMode::Header => {
-            if route.inject_header.as_deref().is_none_or(str::is_empty) {
-                return Err(invalid_route(
-                    service,
-                    "header injection requires inject_header",
-                ));
-            }
-            if route
-                .credential_format
-                .as_deref()
-                .is_some_and(|format| !format.contains("{}"))
-            {
-                return Err(invalid_route(
-                    service,
-                    "credential_format must contain a '{}' placeholder",
-                ));
-            }
-        }
-        NonoCredentialInjectMode::UrlPath => {
-            let (Some(path_pattern), Some(path_replacement)) = (
-                route
-                    .path_pattern
-                    .as_deref()
-                    .filter(|value| !value.is_empty()),
-                route
-                    .path_replacement
-                    .as_deref()
-                    .filter(|value| !value.is_empty()),
-            ) else {
-                return Err(invalid_route(
-                    service,
-                    "URL path injection requires path_pattern and path_replacement",
-                ));
-            };
-            if !path_pattern.contains("{}") || !path_replacement.contains("{}") {
-                return Err(invalid_route(
-                    service,
-                    "path_pattern and path_replacement must contain a '{}' placeholder",
-                ));
-            }
-        }
-        NonoCredentialInjectMode::QueryParam => {
-            if route.query_param_name.as_deref().is_none_or(str::is_empty) {
-                return Err(invalid_route(
-                    service,
-                    "query parameter injection requires query_param_name",
-                ));
-            }
-        }
-        NonoCredentialInjectMode::BasicAuth => {}
+        NonoCredentialInjectMode::Header => validate_header_injection(service, route),
+        NonoCredentialInjectMode::UrlPath => validate_url_path_injection(service, route),
+        NonoCredentialInjectMode::QueryParam => validate_query_param_injection(service, route),
+        NonoCredentialInjectMode::BasicAuth => Ok(()),
     }
+}
 
+fn validate_header_injection(service: &str, route: &CredentialRouteConfig) -> Result<()> {
+    if route.inject_header.as_deref().is_none_or(str::is_empty) {
+        return Err(invalid_route(
+            service,
+            "header injection requires inject_header",
+        ));
+    }
+    if route
+        .credential_format
+        .as_deref()
+        .is_some_and(|format| !format.contains("{}"))
+    {
+        return Err(invalid_route(
+            service,
+            "credential_format must contain a '{}' placeholder",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_url_path_injection(service: &str, route: &CredentialRouteConfig) -> Result<()> {
+    let (Some(path_pattern), Some(path_replacement)) = (
+        route
+            .path_pattern
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+        route
+            .path_replacement
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+    ) else {
+        return Err(invalid_route(
+            service,
+            "URL path injection requires path_pattern and path_replacement",
+        ));
+    };
+    if !path_pattern.contains("{}") || !path_replacement.contains("{}") {
+        return Err(invalid_route(
+            service,
+            "path_pattern and path_replacement must contain a '{}' placeholder",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_query_param_injection(service: &str, route: &CredentialRouteConfig) -> Result<()> {
+    if route.query_param_name.as_deref().is_none_or(str::is_empty) {
+        return Err(invalid_route(
+            service,
+            "query parameter injection requires query_param_name",
+        ));
+    }
     Ok(())
 }
 
