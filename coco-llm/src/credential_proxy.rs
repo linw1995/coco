@@ -121,9 +121,11 @@ pub fn prepare_profile(
             .fail();
         }
 
-        let secret = std::env::var_os(&route.secret_env).ok_or_else(|| Error::MissingSecret {
-            name: route.secret_env.clone(),
-        })?;
+        let secret = std::env::var_os(&route.secret_env)
+            .filter(|secret| !secret.is_empty())
+            .context(MissingSecretSnafu {
+                name: route.secret_env.clone(),
+            })?;
         let secret_path = secret_dir.join(&route.service);
         write_secret(&secret_path, &secret)?;
 
@@ -244,5 +246,20 @@ mod tests {
             std::fs::metadata(secret_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[tokio::test]
+    async fn empty_secret_is_reported_as_missing() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let error = crate::with_process_env_async(
+            &[("COCO_TELEGRAM_BOT_TOKEN", Some(OsStr::new("")))],
+            || async { prepare_profile(runtime_root.path(), &[telegram_route()]).unwrap_err() },
+        )
+        .await;
+
+        assert!(matches!(
+            error,
+            Error::MissingSecret { name } if name == "COCO_TELEGRAM_BOT_TOKEN"
+        ));
     }
 }

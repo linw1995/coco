@@ -208,6 +208,7 @@ const MAX_RUNTIME_SOCKET_PATH_LEN: usize = 107;
 const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
 const SESSION_POLL_INTERVAL_MS: u64 = 25;
 const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
+const COCO_CRONTAB_DIR_ENV: &str = "COCO_CRONTAB_DIR";
 const COCO_EXEC_SANDBOX_ENV: &str = "COCO_EXEC_SANDBOX";
 const COCO_EXEC_WORKSPACE_ENV: &str = "COCO_EXEC_WORKSPACE";
 const COCO_LOG_DIR_ENV: &str = "COCO_LOG_DIR";
@@ -1167,6 +1168,7 @@ fn nono_exec_env() -> Vec<(OsString, OsString)> {
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "NO_COLOR",
+        COCO_CRONTAB_DIR_ENV,
     ];
     NAMES
         .iter()
@@ -3338,7 +3340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_command_nono_mode_does_not_inherit_unapproved_environment_secrets() {
+    async fn exec_command_nono_mode_filters_secrets_and_preserves_managed_environment() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_bin = tempfile::tempdir().unwrap();
         let bash_path = resolve_bash_path_locked().await;
@@ -3363,11 +3365,15 @@ mod tests {
                     "COCO_TEST_EXEC_SECRET",
                     Some(OsStr::new("must-not-enter-sandbox")),
                 ),
+                (
+                    COCO_CRONTAB_DIR_ENV,
+                    Some(OsStr::new("/var/lib/coco/crontabs")),
+                ),
             ],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf '%s' \"${{COCO_TEST_EXEC_SECRET:-}}\"","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s|%s' \"${{COCO_TEST_EXEC_SECRET:-}}\" \"$COCO_CRONTAB_DIR\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -3376,7 +3382,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("stdout:\n\nstderr:"));
+        assert!(output.contains("stdout:\n|/var/lib/coco/crontabs"));
         assert!(!output.contains("must-not-enter-sandbox"));
     }
 
