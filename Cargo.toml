@@ -31,6 +31,7 @@ tokio = { version = "1.52.1", features = [
 # CLI and configuration.
 clap = { version = "4.6.1", features = ["derive", "env"] }
 toml = "1.1.2"
+url = "2.5.8"
 
 # Serialization.
 serde = { version = "1.0.228", features = ["derive"] }

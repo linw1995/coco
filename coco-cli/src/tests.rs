@@ -4984,6 +4984,57 @@ allowed_chat_ids = ["123", "-456"]
 }
 
 #[test]
+fn credential_routes_load_from_config_toml() {
+    let tempdir = tempdir().unwrap();
+    let config_path = tempdir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"[exec.credentials.telegram]
+upstream = "https://api.telegram.org"
+secret = "${COCO_TELEGRAM_BOT_TOKEN}"
+inject_mode = "url_path"
+path_pattern = "/bot{}/"
+path_replacement = "/bot{}/"
+
+[[exec.credentials.telegram.endpoints]]
+method = "post"
+path = "/bot*/sendMessage"
+"#,
+    )
+    .unwrap();
+
+    let config = crate::app::config::load_config_from(&config_path).unwrap();
+    let route = config.credential_routes.first().unwrap();
+
+    assert_eq!(route.service, "telegram");
+    assert_eq!(route.secret_env, "COCO_TELEGRAM_BOT_TOKEN");
+    assert_eq!(route.endpoint_rules[0].method, "POST");
+    assert_eq!(route.endpoint_rules[0].path, "/bot*/sendMessage");
+}
+
+#[test]
+fn credential_routes_require_an_endpoint_rule() {
+    let tempdir = tempdir().unwrap();
+    let config_path = tempdir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"[exec.credentials.github]
+upstream = "https://api.github.com"
+secret = "${GITHUB_TOKEN}"
+inject_mode = "header"
+inject_header = "Authorization"
+
+"#,
+    )
+    .unwrap();
+
+    let error = crate::app::config::load_config_from(&config_path).unwrap_err();
+
+    assert!(matches!(error, crate::Error::InvalidCredentialRoute { .. }));
+    assert!(error.to_string().contains("endpoint rule"));
+}
+
+#[test]
 fn provider_profiles_load_from_default_config() {
     let profiles = crate::app::config::load_cwd_provider_profiles().unwrap();
     let profile = profiles.get_provider_profile("openai-codex").unwrap();

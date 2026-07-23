@@ -7,6 +7,8 @@ import urllib.error
 import urllib.request
 
 TOKEN_ENV_NAMES = ("COCO_TELEGRAM_BOT_TOKEN",)
+BASE_URL_ENV_NAME = "TELEGRAM_BASE_URL"
+DEFAULT_BASE_URL = "https://api.telegram.org"
 
 
 def resolve_token(explicit_token: str | None) -> str:
@@ -21,9 +23,13 @@ def resolve_token(explicit_token: str | None) -> str:
     )
 
 
+def api_base_url() -> str:
+    return os.environ.get(BASE_URL_ENV_NAME, DEFAULT_BASE_URL).rstrip("/")
+
+
 def post_api(token: str, method: str, payload: dict) -> dict:
     request = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/{method}",
+        f"{api_base_url()}/bot{token}/{method}",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",

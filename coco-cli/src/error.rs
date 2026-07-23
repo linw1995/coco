@@ -50,6 +50,9 @@ pub enum Error {
         source: std::env::VarError,
     },
 
+    #[snafu(display("Invalid credential route {service:?}: {message}"))]
+    InvalidCredentialRoute { service: String, message: String },
+
     #[snafu(display("Invalid tool value {value:?} from {source_name:?}"))]
     InvalidToolConfiguration {
         source_name: &'static str,

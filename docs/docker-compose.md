@@ -182,6 +182,51 @@ The Telegram channel only receives messages. Outbound replies must be sent by
 the built-in runner-role `telegram` skill, so configure the target session with
 tools that can call that skill.
 
+Grant the installed Telegram skill access to the bot credential through nono
+by appending the route below to `.coco-data/config.toml`:
+
+```toml
+[exec.credentials.telegram]
+upstream = "https://api.telegram.org"
+secret = "${COCO_TELEGRAM_BOT_TOKEN}"
+inject_mode = "url_path"
+path_pattern = "/bot{}/"
+path_replacement = "/bot{}/"
+
+[[exec.credentials.telegram.endpoints]]
+method = "POST"
+path = "/bot*/sendMessage"
+
+[[exec.credentials.telegram.endpoints]]
+method = "POST"
+path = "/bot*/sendPhoto"
+
+[[exec.credentials.telegram.endpoints]]
+method = "POST"
+path = "/bot*/sendDocument"
+
+[[exec.credentials.telegram.endpoints]]
+method = "POST"
+path = "/bot*/sendVoice"
+
+[[exec.credentials.telegram.endpoints]]
+method = "POST"
+path = "/bot*/editMessageText"
+
+[[exec.credentials.telegram.endpoints]]
+method = "POST"
+path = "/bot*/getFile"
+
+[[exec.credentials.telegram.endpoints]]
+method = "GET"
+path = "/file/bot*/**"
+```
+
+The skill receives a phantom token and `TELEGRAM_BASE_URL`; the real bot token
+is handed to the nono supervisor through an isolated short-lived file that is
+not visible in the sandbox. See [Credential Proxy](credential-proxy.md) for the
+generic route format and sandbox-mode behavior.
+
 ## Start and Stop
 
 Start:

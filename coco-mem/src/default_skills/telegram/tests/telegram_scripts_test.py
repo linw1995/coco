@@ -60,6 +60,14 @@ class TelegramSendScriptTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "Telegram token is missing"):
                 module.resolve_token(None)
 
+    def test_api_base_url_prefers_nono_proxy(self) -> None:
+        module = load_script(SEND_SCRIPT)
+
+        with mock.patch.dict(
+            os.environ, {"TELEGRAM_BASE_URL": "http://127.0.0.1:1234/telegram/"}
+        ):
+            self.assertEqual(module.api_base_url(), "http://127.0.0.1:1234/telegram")
+
     def test_main_sends_each_chunk_to_each_chat_without_network(self) -> None:
         module = load_script(SEND_SCRIPT)
         calls = []
