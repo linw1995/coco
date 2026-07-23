@@ -60,7 +60,13 @@ pub fn NodeDetailPanel(graph_mode: String) -> impl IntoView {
     {
         let selection = use_panel_selection();
         let selected_target = Memo::new(move |_| selection.get().target);
+        let request_generation = RwSignal::new(0_u64);
         Effect::new(move || {
+            let generation = request_generation
+                .get_untracked()
+                .checked_add(1)
+                .expect("node detail request generation overflow");
+            request_generation.set(generation);
             let Some(target) = selected_target.get() else {
                 state.set(PanelState::Empty);
                 return;
@@ -69,7 +75,7 @@ pub fn NodeDetailPanel(graph_mode: String) -> impl IntoView {
             let url = node_detail_url(Some(&target), &graph_mode);
             spawn_local(async move {
                 let response = fetch_panel_data::<NodeDetailResponse>(url).await;
-                if selected_target.get_untracked().as_deref() == Some(&target) {
+                if request_generation.get_untracked() == generation {
                     state.set(PanelState::Ready(response));
                 }
             });
@@ -97,7 +103,13 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
             let selection = selection.get();
             selection.target.map(|target| (target, selection.context))
         });
+        let request_generation = RwSignal::new(0_u64);
         Effect::new(move || {
+            let generation = request_generation
+                .get_untracked()
+                .checked_add(1)
+                .expect("provider context request generation overflow");
+            request_generation.set(generation);
             let Some(request) = selected_context.get() else {
                 state.set(PanelState::Empty);
                 return;
@@ -106,7 +118,7 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
             let url = provider_context_url(Some(&request.0), request.1.as_deref(), &graph_mode);
             spawn_local(async move {
                 let response = fetch_panel_data::<ProviderContextResponse>(url).await;
-                if selected_context.get_untracked().as_ref() == Some(&request) {
+                if request_generation.get_untracked() == generation {
                     if response.is_ok() {
                         notify_provider_context_rendered();
                     }
@@ -377,7 +389,7 @@ fn ProviderContextPanelContent(
             >
                 <For
                     each=move || model.get().items
-                    key=|item| (item.node.id.clone(), item.context_target.clone())
+                    key=ProviderContextItem::clone
                     children=move |item| view! { <ProviderContextRow item=item/> }
                 />
             </ol>

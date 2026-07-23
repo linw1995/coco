@@ -25,7 +25,7 @@ pub enum NodeDetailResponse {
     Found { node: PanelNode },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct ProviderContextItem {
     pub context_target: String,
     pub node: ProviderContextNode,
@@ -33,7 +33,7 @@ pub struct ProviderContextItem {
     pub point: Option<Point>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct ProviderContextNode {
     pub id: String,
     pub short_id: String,
