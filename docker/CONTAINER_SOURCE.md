@@ -12,8 +12,8 @@ License material is available inside the image at:
 
 For every published image tag `TAG` at `ghcr.io/linw1995/coco:TAG`, the CD
 workflow publishes the corresponding source image at
-`ghcr.io/linw1995/coco:TAG-sources`. The source image contains the source
-inputs for every architecture present in the runtime image and includes:
+`ghcr.io/linw1995/coco:TAG-sources`. This tag is a multi-platform OCI index.
+Each runtime platform has a corresponding source manifest that includes:
 
 - The exact CoCo flake source and locked Nixpkgs source.
 - Runtime Nix derivations and their exact source, patch, Cargo vendor, and Go
@@ -26,15 +26,19 @@ Extract the source bundle with Docker without running the source image:
 ```bash
 image_ref="ghcr.io/linw1995/coco:sha-0123456789ab"
 source_ref="${image_ref}-sources"
-source_container="$(docker create "${source_ref}" /bin/true)"
-docker cp "${source_container}:/sources" ./coco-container-sources
+platform="linux/amd64"
+source_container="$(docker create --platform "${platform}" "${source_ref}" /bin/true)"
+docker cp "${source_container}:/sources" ./coco-container-sources-amd64
 docker rm "${source_container}"
 ```
+
+Repeat with `linux/arm64` to extract the sources for the ARM64 runtime
+manifest.
 
 Alternatively, use `crane export`:
 
 ```bash
-crane export "${source_ref}" - | tar -xf -
+crane export --platform "${platform}" "${source_ref}" - | tar -xf -
 ```
 
 The immutable `sha-*` tag pair is the preferred reference for audits and

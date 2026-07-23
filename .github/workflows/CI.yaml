@@ -274,5 +274,35 @@ jobs:
       - name: Build Docker image
         run: nix build --out-link image .#coco-image --print-build-logs
 
-      - name: Export corresponding sources
-        run: scripts/export-container-sources.sh image container-sources.tar.gz linux-amd64
+      - name: Inspect corresponding sources
+        id: source_inspect
+        run: |
+          scripts/export-container-sources.sh inspect image container-source-state linux-amd64
+
+          dependency_key="$(< container-source-state/DEPENDENCY_KEY)"
+          if [[ ! "${dependency_key}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid dependency source key."
+            exit 1
+          fi
+          printf 'dependency_key=%s\n' "${dependency_key}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore dependency source layer
+        id: source_dependency_cache
+        uses: actions/cache@v5
+        with:
+          path: .container-source-cache/dependencies.tar.gz
+          key: container-source-dependencies-v1-${{ steps.source_inspect.outputs.dependency_key }}
+
+      - name: Export dependency sources
+        if: steps.source_dependency_cache.outputs.cache-hit != 'true'
+        run: scripts/export-container-sources.sh dependencies container-source-state .container-source-cache/dependencies.tar.gz
+
+      - name: Export release sources
+        run: |
+          scripts/export-container-sources.sh release container-source-state container-source-release.tar.gz
+          mkdir container-sources
+          tar -xzf .container-source-cache/dependencies.tar.gz -C container-sources
+          tar -xzf container-source-release.tar.gz -C container-sources
+          test -d container-sources/sources/flake/coco
+          test -d container-sources/sources/flake/nixpkgs
+          test -s container-sources/sources/RUNTIME_STORE_PATHS-linux-amd64.txt

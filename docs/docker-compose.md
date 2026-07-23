@@ -244,8 +244,8 @@ can build `.#coco-image-linux-arm64` locally.
 
 ## Licenses and Corresponding Source
 
-Published image tags have matching `-sources` tags in GHCR. The runtime image
-also contains project, dependency, and container license files. See
+Published image tags have matching multi-platform `-sources` tags in GHCR. The
+runtime image also contains project, dependency, and container license files. See
 [Container Licenses and Corresponding Source](container-licenses.md) for the
 layout and extraction commands.
 
