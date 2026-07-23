@@ -453,9 +453,11 @@ mod tests {
         assert!(node.contains("leptos-island"));
         assert!(node.contains("Select a node to inspect its content."));
         assert!(!node.contains("Provider Context"));
+        assert_eq!(node.matches("<section").count(), 1);
         assert!(provider.contains("leptos-island"));
         assert!(provider.contains("Select a node to inspect its provider context."));
         assert!(!provider.contains("<h2>Node</h2>"));
+        assert_eq!(provider.matches("<section").count(), 1);
     }
 
     #[test]

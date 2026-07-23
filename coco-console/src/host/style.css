@@ -421,8 +421,8 @@ body {
   display: contents;
 }
 
-leptos-island:has(> .panel-content) > .node-details-default,
-leptos-island:has(> .panel-content) > .provider-context-default {
+.panel-content ~ .node-details-default,
+.panel-content ~ .provider-context-default {
   display: none;
 }
 
