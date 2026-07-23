@@ -129,7 +129,7 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
 #[cfg(target_arch = "wasm32")]
 fn use_panel_selection() -> RwSignal<PanelSelection> {
     let selection = RwSignal::new(PanelSelection::default());
-    Effect::new(move || {
+    request_animation_frame(move || {
         selection.set(current_panel_selection());
     });
     let listener = window_event_listener(ev::hashchange, move |_| {
@@ -602,7 +602,7 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    fn graph_items_panel_selection_signals_track_hash_changes_independently() {
+    async fn graph_items_panel_selection_signals_track_hash_changes_independently() {
         let owner = Owner::new();
         owner.set();
         let window = web_sys::window().expect_throw("window should be available");
@@ -628,11 +628,25 @@ mod wasm_tests {
         assert_eq!(node_selection.get_untracked(), expected);
         assert_eq!(context_selection.get_untracked(), expected);
 
+        next_animation_frame().await;
         owner.cleanup();
         window
             .location()
             .set_hash("")
             .expect_throw("hash should be cleared");
+    }
+
+    async fn next_animation_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            request_animation_frame(move || {
+                resolve
+                    .call0(&JsValue::NULL)
+                    .expect_throw("animation frame promise should resolve");
+            });
+        });
+        JsFuture::from(promise)
+            .await
+            .expect_throw("animation frame should run");
     }
 
     #[wasm_bindgen_test]
