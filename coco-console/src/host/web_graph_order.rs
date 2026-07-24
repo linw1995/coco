@@ -10,9 +10,6 @@ use crate::web_graph::{EdgeKind, NodeId, NodePlacement, Point};
 pub enum Error {
     #[snafu(display("Web graph order {order} exceeds the layout coordinate range"))]
     CoordinateOverflow { order: usize },
-
-    #[snafu(display("Web graph reflow did not converge after {iterations} iterations"))]
-    ReflowDidNotConverge { iterations: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -40,6 +37,7 @@ pub fn stable_column_order(
         .iter()
         .map(|placement| (placement.node.clone(), placement.point))
         .collect::<BTreeMap<_, _>>();
+    let available_rows = available_rows(placements.len() + 1, reserved_edge_rows);
     let mut fixed = Vec::new();
     let mut pending = placements
         .iter()
@@ -59,7 +57,7 @@ pub fn stable_column_order(
     });
 
     for node in pending {
-        let index = best_insertion_index(&fixed, &node, incoming, reserved_edge_rows);
+        let index = best_insertion_index(&fixed, &node, incoming, &available_rows);
         fixed.insert(index, node);
     }
 
@@ -67,16 +65,34 @@ pub fn stable_column_order(
         .into_iter()
         .map(|placement| (placement.node, placement.point.x))
         .collect::<BTreeMap<_, _>>();
-    fixed
+    let ordered = fixed
         .into_iter()
-        .enumerate()
-        .map(|(order, node)| {
+        .map(|node| NodePlacement {
+            point: Point {
+                x: x_by_node[&node],
+                y: 0,
+            },
+            node,
+        })
+        .collect::<Vec<_>>();
+    place_column_order(&ordered, reserved_edge_rows)
+}
+
+fn place_column_order(
+    ordered: &[NodePlacement],
+    reserved_edge_rows: &BTreeSet<usize>,
+) -> Result<Vec<NodePlacement>> {
+    let available_rows = available_rows(ordered.len(), reserved_edge_rows);
+    ordered
+        .iter()
+        .zip(available_rows)
+        .map(|(placement, row)| {
             Ok(NodePlacement {
                 point: Point {
-                    x: x_by_node[&node],
-                    y: order_y(available_row(order, reserved_edge_rows))?,
+                    x: placement.point.x,
+                    y: order_y(row)?,
                 },
-                node,
+                node: placement.node.clone(),
             })
         })
         .collect()
@@ -134,7 +150,7 @@ fn best_insertion_index(
     fixed: &[NodeId],
     node: &NodeId,
     incoming: &BTreeMap<NodeId, Vec<IncomingEdge>>,
-    reserved_edge_rows: &BTreeSet<usize>,
+    available_rows: &[usize],
 ) -> usize {
     let new_edges = incoming.get(node).map(Vec::as_slice).unwrap_or_default();
     let mut deltas = vec![CrossingDelta::default(); fixed.len() + 2];
@@ -166,7 +182,7 @@ fn best_insertion_index(
     for (index, delta) in deltas.into_iter().take(fixed.len() + 1).enumerate() {
         crossings += delta;
         let target_y = i64::from(GRAPH_PADDING).saturating_add(
-            i64::try_from(available_row(index, reserved_edge_rows))
+            i64::try_from(available_rows[index])
                 .unwrap_or(i64::MAX)
                 .saturating_mul(i64::from(GRAPH_ROW_STEP)),
         );
@@ -200,14 +216,26 @@ fn best_insertion_index(
     best.expect("a column always has an insertion gap").1
 }
 
-fn available_row(mut index: usize, reserved_edge_rows: &BTreeSet<usize>) -> usize {
-    for reserved in reserved_edge_rows {
-        if *reserved > index {
-            break;
+fn available_rows(count: usize, reserved_edge_rows: &BTreeSet<usize>) -> Vec<usize> {
+    let mut rows = Vec::with_capacity(count);
+    let mut row = 0_usize;
+    let mut reserved = reserved_edge_rows.iter().copied().peekable();
+    while rows.len() < count {
+        match reserved.peek().copied() {
+            Some(reserved_row) if reserved_row < row => {
+                reserved.next();
+            }
+            Some(reserved_row) if reserved_row == row => {
+                row = row.saturating_add(1);
+                reserved.next();
+            }
+            _ => {
+                rows.push(row);
+                row = row.saturating_add(1);
+            }
         }
-        index = index.saturating_add(1);
     }
-    index
+    rows
 }
 
 pub fn reserved_rows_from_placements(placements: &[NodePlacement]) -> BTreeSet<usize> {
@@ -462,6 +490,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(ordered, vec![placement("a", 1), placement("b", 2)]);
+    }
+
+    #[test]
+    fn available_rows_skip_sparse_reserved_rows() {
+        assert_eq!(
+            available_rows(5, &BTreeSet::from([0, 2, 3, 7])),
+            vec![1, 4, 5, 6, 8]
+        );
     }
 
     #[test]
