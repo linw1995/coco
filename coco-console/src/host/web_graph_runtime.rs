@@ -17,8 +17,8 @@ use super::error::{
 };
 use super::publisher::ConsolePublisher;
 use super::web_graph_order::{
-    Error as OrderError, IncomingEdge, Result as OrderResult, nearest_row_for_y,
-    reserved_rows_from_placements, stable_column_order,
+    IncomingEdge, Result as OrderResult, nearest_row_for_y, reserved_rows_from_placements,
+    stable_column_order,
 };
 use super::web_graph_store::{Error as StoreError, StoredGraphState, Viewport, WebGraphStore};
 use super::web_graph_view::{
@@ -42,6 +42,9 @@ const RETRY_MIN_DELAY: Duration = Duration::from_millis(25);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const CATCH_UP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+// Lane routing is bounded by the current page topology, so use the store batch size to avoid
+// repeating column ordering and route projection for every source row.
+const CATCH_UP_SOURCE_PAGE_SIZE: usize = GRAPH_READ_BATCH_SIZE;
 // Full node payloads can be large, so release the source connection between small batches.
 const SOURCE_NODE_HYDRATION_BATCH_SIZE: usize = 16;
 
@@ -187,9 +190,9 @@ fn route_endpoint_ids<'a>(routes: impl Iterator<Item = &'a RoutedEdge>) -> BTree
         .collect()
 }
 
-fn route_y_at_x(route: BezierRoute, x: i32) -> i32 {
-    const SCALE: i64 = 1 << 16;
+const BEZIER_PARAMETER_SCALE: i64 = 1 << 16;
 
+fn route_y_at_x(route: BezierRoute, x: i32) -> i32 {
     if x <= route.source.x {
         return route.source.y;
     }
@@ -197,8 +200,20 @@ fn route_y_at_x(route: BezierRoute, x: i32) -> i32 {
         return route.target.y;
     }
 
+    let t = route_parameter_at_x(route, x);
+    cubic_coordinate(
+        route.source.y,
+        route.control_1.y,
+        route.control_2.y,
+        route.target.y,
+        t,
+        BEZIER_PARAMETER_SCALE,
+    )
+}
+
+fn route_parameter_at_x(route: BezierRoute, x: i32) -> i64 {
     let mut lower = 0_i64;
-    let mut upper = SCALE;
+    let mut upper = BEZIER_PARAMETER_SCALE;
     while upper - lower > 1 {
         let middle = lower + (upper - lower) / 2;
         let middle_x = cubic_coordinate(
@@ -207,7 +222,7 @@ fn route_y_at_x(route: BezierRoute, x: i32) -> i32 {
             route.control_2.x,
             route.target.x,
             middle,
-            SCALE,
+            BEZIER_PARAMETER_SCALE,
         );
         if middle_x < x {
             lower = middle;
@@ -215,14 +230,7 @@ fn route_y_at_x(route: BezierRoute, x: i32) -> i32 {
             upper = middle;
         }
     }
-    cubic_coordinate(
-        route.source.y,
-        route.control_1.y,
-        route.control_2.y,
-        route.target.y,
-        lower + (upper - lower) / 2,
-        SCALE,
-    )
+    lower + (upper - lower) / 2
 }
 
 fn cubic_coordinate(
@@ -260,6 +268,77 @@ fn cubic_coordinate(
             i32::MAX
         }
     })
+}
+
+fn minimum_control_lane_y(route: BezierRoute, x: i32, minimum_y: i32) -> i32 {
+    let t = i128::from(route_parameter_at_x(route, x));
+    let scale = i128::from(BEZIER_PARAMETER_SCALE);
+    let inverse = scale - t;
+    let denominator = scale.saturating_pow(3);
+    let endpoint_numerator = i128::from(route.source.y)
+        .saturating_mul(inverse.saturating_pow(3))
+        .saturating_add(i128::from(route.target.y).saturating_mul(t.saturating_pow(3)));
+    // Both control points share one lane, so their Bernstein coefficients collapse to
+    // 3 * (1 - t) * t. Solving that linear term gives the lane directly.
+    let lane_coefficient = 3_i128
+        .saturating_mul(inverse)
+        .saturating_mul(t)
+        .saturating_mul(scale);
+    if lane_coefficient == 0 {
+        return minimum_y;
+    }
+    let required_numerator = i128::from(minimum_y)
+        .saturating_mul(denominator)
+        .saturating_sub(endpoint_numerator);
+    let lane_y = if required_numerator <= 0 {
+        0
+    } else {
+        required_numerator.saturating_add(lane_coefficient - 1) / lane_coefficient
+    };
+    i32::try_from(lane_y).unwrap_or(i32::MAX)
+}
+
+fn route_edge_around_nodes(
+    source: Point,
+    target: Point,
+    offsets: EndpointPortOffsets,
+    obstacles: &[NodePlacement],
+) -> BezierRoute {
+    let mut route = route_edge_with_offsets(source, target, offsets);
+    let relevant = obstacles
+        .iter()
+        .filter(|placement| placement.point.x > source.x && placement.point.x < target.x)
+        .collect::<Vec<_>>();
+    if relevant.is_empty() {
+        return route;
+    }
+    // Route below obstacles because the canvas origin is at the top and can grow downward.
+    let mut lane_y = route.source.y.max(route.target.y);
+    for placement in &relevant {
+        let minimum_y = placement
+            .point
+            .y
+            .saturating_add(GRAPH_ROW_STEP / 2)
+            .saturating_add(1);
+        lane_y = lane_y.max(minimum_control_lane_y(
+            route,
+            placement.point.x.saturating_sub(GRAPH_NODE_RADIUS),
+            minimum_y,
+        ));
+        lane_y = lane_y.max(minimum_control_lane_y(
+            route,
+            placement.point.x.saturating_add(GRAPH_NODE_RADIUS),
+            minimum_y,
+        ));
+    }
+    route.control_1.y = lane_y;
+    route.control_2.y = lane_y;
+    debug_assert!(
+        relevant
+            .iter()
+            .all(|placement| !route_reserves_placement(route, placement))
+    );
+    route
 }
 
 fn endpoint_source_offsets(
@@ -373,6 +452,7 @@ fn reroute_at_points(
         .collect()
 }
 
+#[cfg(test)]
 fn reserved_edge_rows(
     routes: &BTreeMap<EdgeId, RoutedEdge>,
     columns: &BTreeSet<i32>,
@@ -394,15 +474,23 @@ fn reserved_edge_rows(
 }
 
 fn route_reserves_node(routed: &RoutedEdge, placement: &NodePlacement) -> bool {
-    let x = placement.point.x;
-    if x <= routed.route.source.x || x >= routed.route.target.x {
+    route_reserves_placement(routed.route, placement)
+}
+
+fn route_reserves_placement(route: BezierRoute, placement: &NodePlacement) -> bool {
+    route_reserves_point(route, placement.point)
+}
+
+fn route_reserves_point(route: BezierRoute, point: Point) -> bool {
+    let x = point.x;
+    if x <= route.source.x || x >= route.target.x {
         return false;
     }
-    let left_y = route_y_at_x(routed.route, x.saturating_sub(GRAPH_NODE_RADIUS));
-    let right_y = route_y_at_x(routed.route, x.saturating_add(GRAPH_NODE_RADIUS));
+    let left_y = route_y_at_x(route, x.saturating_sub(GRAPH_NODE_RADIUS));
+    let right_y = route_y_at_x(route, x.saturating_add(GRAPH_NODE_RADIUS));
     let first_row = nearest_row_for_y(left_y.min(right_y));
     let last_row = nearest_row_for_y(left_y.max(right_y));
-    (first_row..=last_row).contains(&nearest_row_for_y(placement.point.y))
+    (first_row..=last_row).contains(&nearest_row_for_y(point.y))
 }
 
 fn collision_columns(
@@ -489,23 +577,19 @@ fn affected_reflow_endpoints(
     (affected_sources, affected_targets)
 }
 
-fn reroute_affected_edges(
+fn reroute_edges_around_nodes(
     routes: &BTreeMap<EdgeId, RoutedEdge>,
     affected_sources: &BTreeSet<NodeId>,
     affected_targets: &BTreeSet<NodeId>,
     old_points: &BTreeMap<NodeId, Point>,
     final_points: &BTreeMap<NodeId, Point>,
+    obstacles: &[NodePlacement],
 ) -> Vec<RoutedEdge> {
     let source_offsets = endpoint_source_offsets(routes, affected_sources, final_points);
     let target_offsets = endpoint_target_offsets(routes, affected_targets, final_points);
     routes
         .values()
         .filter_map(|routed| {
-            if !affected_sources.contains(&routed.edge.source)
-                && !affected_targets.contains(&routed.edge.target)
-            {
-                return None;
-            }
             let old_source = old_points[&routed.edge.source];
             let old_target = old_points[&routed.edge.target];
             let source_offset = source_offsets
@@ -516,13 +600,14 @@ fn reroute_affected_edges(
                 .get(&routed.edge)
                 .copied()
                 .unwrap_or_else(|| routed.route.target.y.saturating_sub(old_target.y));
-            let route = route_edge_with_offsets(
+            let route = route_edge_around_nodes(
                 final_points[&routed.edge.source],
                 final_points[&routed.edge.target],
                 EndpointPortOffsets {
                     source: source_offset,
                     target: target_offset,
                 },
+                obstacles,
             );
             (route != routed.route).then(|| RoutedEdge {
                 edge: routed.edge.clone(),
@@ -532,131 +617,59 @@ fn reroute_affected_edges(
         .collect()
 }
 
-fn reflow_iteration_limit(
-    columns: &BTreeMap<i32, Vec<NodePlacement>>,
-    routes: &BTreeMap<EdgeId, RoutedEdge>,
-) -> usize {
-    let placements = columns
-        .values()
-        .fold(0_usize, |total, column| total.saturating_add(column.len()));
-    let lane_slots = routes
-        .values()
-        .map(|route| {
-            columns
-                .range((
-                    std::ops::Bound::Excluded(route.route.source.x),
-                    std::ops::Bound::Excluded(route.route.target.x),
-                ))
-                .count()
-        })
-        .fold(0_usize, usize::saturating_add);
-    let layout_slots = placements.saturating_add(lane_slots);
-    let coordinate_rows = usize::try_from(
-        (i64::from(i32::MAX) - i64::from(GRAPH_PADDING)) / i64::from(GRAPH_ROW_STEP),
-    )
-    .unwrap_or(usize::MAX);
-    layout_slots
-        .saturating_mul(layout_slots)
-        .min(coordinate_rows)
-        .max(8)
-}
-
-fn reflow_points(
+fn order_points(
     columns: &BTreeMap<i32, Vec<NodePlacement>>,
     new_nodes_by_column: &BTreeMap<i32, BTreeMap<NodeId, usize>>,
     routes: &BTreeMap<EdgeId, RoutedEdge>,
     endpoint_fans: &BTreeMap<EdgeId, RoutedEdge>,
     old_points: &BTreeMap<NodeId, Point>,
 ) -> OrderResult<BTreeMap<NodeId, Point>> {
-    let column_xs = columns.keys().copied().collect::<BTreeSet<_>>();
     let baseline_reserved_rows = columns
         .iter()
         .map(|(x, placements)| (*x, reserved_rows_from_placements(placements)))
         .collect::<BTreeMap<_, _>>();
     let empty_new_nodes = BTreeMap::new();
-    let maximum_iterations = reflow_iteration_limit(columns, routes);
+    let initial_routes = reroute_at_points(routes, endpoint_fans, old_points);
+    let initial_routes_by_target = initial_routes.values().fold(
+        BTreeMap::<&str, Vec<&RoutedEdge>>::new(),
+        |mut routes_by_target, route| {
+            routes_by_target
+                .entry(route.edge.target.as_str())
+                .or_default()
+                .push(route);
+            routes_by_target
+        },
+    );
     let mut final_points = old_points.clone();
-    let mut seen = BTreeSet::new();
-    let mut accumulated_edge_rows = BTreeMap::<i32, BTreeSet<usize>>::new();
-    for _ in 0..maximum_iterations {
-        let projected_routes = reroute_at_points(routes, endpoint_fans, &final_points);
-        let projected_routes_by_target = projected_routes.values().fold(
-            BTreeMap::<&str, Vec<&RoutedEdge>>::new(),
-            |mut routes_by_target, route| {
-                routes_by_target
-                    .entry(route.edge.target.as_str())
-                    .or_default()
-                    .push(route);
-                routes_by_target
-            },
-        );
-        let edge_rows_by_column = reserved_edge_rows(&projected_routes, &column_xs);
-        for (x, rows) in edge_rows_by_column {
-            accumulated_edge_rows.entry(x).or_default().extend(rows);
-        }
-        let mut next_points = final_points.clone();
-        for (x, placements) in columns {
-            let incoming = placements
-                .iter()
-                .map(|placement| {
-                    let edges = projected_routes_by_target
-                        .get(placement.node.as_str())
-                        .into_iter()
-                        .flatten()
-                        .map(|route| IncomingEdge {
-                            kind: route.edge.kind,
-                            source_y: next_points[&route.edge.source].y,
-                        })
-                        .collect::<Vec<_>>();
-                    (placement.node.clone(), edges)
-                })
-                .collect::<BTreeMap<_, _>>();
-            let mut reserved_rows = baseline_reserved_rows[x].clone();
-            if let Some(edge_rows) = accumulated_edge_rows.get(x) {
-                reserved_rows.extend(edge_rows);
-            }
-            let ordered = stable_column_order(
-                placements,
-                new_nodes_by_column.get(x).unwrap_or(&empty_new_nodes),
-                &incoming,
-                &reserved_rows,
-            )?;
-            next_points.extend(
-                ordered
+    for (x, placements) in columns {
+        let incoming = placements
+            .iter()
+            .map(|placement| {
+                let edges = initial_routes_by_target
+                    .get(placement.node.as_str())
                     .into_iter()
-                    .map(|placement| (placement.node, placement.point)),
-            );
-        }
-        let next_routes = reroute_at_points(routes, endpoint_fans, &next_points);
-        let next_edge_rows = reserved_edge_rows(&next_routes, &column_xs);
-        let has_overlap = columns.iter().any(|(x, placements)| {
-            next_edge_rows.get(x).is_some_and(|edge_rows| {
-                placements.iter().any(|placement| {
-                    edge_rows.contains(&nearest_row_for_y(next_points[&placement.node].y))
-                })
+                    .flatten()
+                    .map(|route| IncomingEdge {
+                        kind: route.edge.kind,
+                        source_y: final_points[&route.edge.source].y,
+                    })
+                    .collect::<Vec<_>>();
+                (placement.node.clone(), edges)
             })
-        });
-        if !has_overlap {
-            return Ok(next_points);
-        }
-        let signature = (
-            next_points
-                .iter()
-                .map(|(node, point)| (node.clone(), point.x, point.y))
-                .collect::<Vec<_>>(),
-            accumulated_edge_rows
-                .iter()
-                .map(|(x, rows)| (*x, rows.iter().copied().collect::<Vec<_>>()))
-                .collect::<Vec<_>>(),
+            .collect::<BTreeMap<_, _>>();
+        let ordered = stable_column_order(
+            placements,
+            new_nodes_by_column.get(x).unwrap_or(&empty_new_nodes),
+            &incoming,
+            &baseline_reserved_rows[x],
+        )?;
+        final_points.extend(
+            ordered
+                .into_iter()
+                .map(|placement| (placement.node.clone(), placement.point)),
         );
-        if !seen.insert(signature) {
-            break;
-        }
-        final_points = next_points;
     }
-    Err(OrderError::ReflowDidNotConverge {
-        iterations: maximum_iterations,
-    })
+    Ok(final_points)
 }
 
 impl WebGraphRuntime {
@@ -766,8 +779,12 @@ impl WebGraphRuntime {
     }
 
     pub async fn catch_up(&self) -> crate::Result<()> {
-        let page_size =
-            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE).expect("graph read batch size is non-zero");
+        let page_size = NonZeroUsize::new(CATCH_UP_SOURCE_PAGE_SIZE)
+            .expect("catch-up source page size is non-zero");
+        self.catch_up_with_page_size(page_size).await
+    }
+
+    async fn catch_up_with_page_size(&self, page_size: NonZeroUsize) -> crate::Result<()> {
         let mut progress: Option<CatchUpProgress> = None;
         loop {
             let state = self
@@ -1203,7 +1220,22 @@ impl WebGraphRuntime {
 
         let mut dirty_columns = new_nodes_by_column.keys().copied().collect::<BTreeSet<_>>();
         let mut forced_routes = BTreeMap::<EdgeId, RoutedEdge>::new();
+        #[cfg(test)]
+        let mut expansion_steps = 0_usize;
         loop {
+            #[cfg(test)]
+            {
+                expansion_steps = expansion_steps.saturating_add(1);
+                if std::env::var_os("COCO_WEB_GRAPH_FUZZ_TRACE_EXPANSION").is_some()
+                    && expansion_steps.is_multiple_of(10)
+                {
+                    eprintln!(
+                        "web graph fuzz expansion layout={kind:?} step={expansion_steps} dirty_columns={} forced_routes={}",
+                        dirty_columns.len(),
+                        forced_routes.len()
+                    );
+                }
+            }
             let Some(step) = self
                 .build_reflow_step(
                     kind,
@@ -1293,7 +1325,7 @@ impl WebGraphRuntime {
         let new_nodes_by_column = new_nodes_by_column.clone();
         let (columns, new_nodes_by_column, mut routes, mut old_points, final_points) =
             tokio::task::spawn_blocking(move || {
-                let final_points = reflow_points(
+                let final_points = order_points(
                     &columns,
                     &new_nodes_by_column,
                     &routes,
@@ -1342,14 +1374,6 @@ impl WebGraphRuntime {
             final_points.insert(placement.node.clone(), placement.point);
             old_points.insert(placement.node, placement.point);
         }
-        let route_updates = reroute_affected_edges(
-            &routes,
-            &affected_sources,
-            &affected_targets,
-            &old_points,
-            &final_points,
-        );
-
         let projected_placements = columns
             .values()
             .flatten()
@@ -1360,6 +1384,15 @@ impl WebGraphRuntime {
                     .unwrap_or_else(|| placement.clone())
             })
             .collect::<Vec<_>>();
+        let route_updates = reroute_edges_around_nodes(
+            &routes,
+            &affected_sources,
+            &affected_targets,
+            &old_points,
+            &final_points,
+            &projected_placements,
+        );
+
         let Some(projected_crossings) = self
             .routes_intersecting_placements_at_revision(kind, &projected_placements, revision)
             .await?
@@ -1401,6 +1434,14 @@ impl WebGraphRuntime {
         let next_height = placement_updates
             .values()
             .map(|placement| placement.point.y.saturating_add(GRAPH_PADDING))
+            .chain(route_updates.iter().map(|routed| {
+                routed
+                    .route
+                    .control_1
+                    .y
+                    .max(routed.route.control_2.y)
+                    .saturating_add(GRAPH_PADDING)
+            }))
             .max()
             .unwrap_or(canvas.value.height)
             .max(canvas.value.height);
@@ -2010,6 +2051,7 @@ fn empty_viewport_response(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::time::Duration;
 
     use coco_mem::{
@@ -2023,6 +2065,31 @@ mod tests {
 
     use super::*;
     use crate::host::store::ConsoleStore;
+
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn new(seed: u64) -> Self {
+            Self(seed.max(1))
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            value
+        }
+
+        fn index(&mut self, upper: usize) -> usize {
+            usize::try_from(self.next_u64() % u64::try_from(upper).unwrap()).unwrap()
+        }
+
+        fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
+            self.next_u64() % denominator < numerator
+        }
+    }
 
     #[test]
     fn catch_up_progress_tracks_dynamic_backlog_and_page_stats() {
@@ -2278,7 +2345,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_reflow_reaches_a_fixed_point_for_cross_linked_routes() {
+    fn lane_routing_avoids_cross_linked_nodes_without_reflow() {
         let nodes = (0..8)
             .map(|index| NodeId::new(format!("node-{index}")).unwrap())
             .collect::<Vec<_>>();
@@ -2342,9 +2409,36 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let reflowed =
-            reflow_points(&columns, &BTreeMap::new(), &routes, &routes, &points).unwrap();
-        let projected = reroute_at_points(&routes, &routes, &reflowed);
+        let reflowed = order_points(&columns, &BTreeMap::new(), &routes, &routes, &points).unwrap();
+        let projected_placements = columns
+            .values()
+            .flatten()
+            .map(|placement| NodePlacement {
+                node: placement.node.clone(),
+                point: reflowed[&placement.node],
+            })
+            .collect::<Vec<_>>();
+        let projected = routes
+            .values()
+            .map(|routed| {
+                let route = route_edge_around_nodes(
+                    reflowed[&routed.edge.source],
+                    reflowed[&routed.edge.target],
+                    EndpointPortOffsets {
+                        source: 0,
+                        target: 0,
+                    },
+                    &projected_placements,
+                );
+                (
+                    routed.edge.clone(),
+                    RoutedEdge {
+                        edge: routed.edge.clone(),
+                        route,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let edge_rows = reserved_edge_rows(
             &projected,
             &columns.keys().copied().collect::<BTreeSet<_>>(),
@@ -2441,7 +2535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edges_reserve_rows_in_intermediate_columns_for_every_layout() {
+    async fn long_edges_route_below_intermediate_nodes_for_every_layout() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let upper = append_anchor(&writer, &root, Vec::new(), "upper").await;
@@ -2473,7 +2567,7 @@ mod tests {
                 .unwrap()
                 .value[0]
                 .point;
-            assert_eq!(middle_point.y, GRAPH_PADDING + GRAPH_ROW_STEP);
+            assert_eq!(middle_point.y, GRAPH_PADDING);
             let viewport = runtime.viewport(mode, complete_viewport()).await.unwrap();
             let crossing = viewport
                 .edges
@@ -2502,13 +2596,23 @@ mod tests {
                     y: crossing.route.target.y,
                 },
             };
-            assert_eq!(nearest_row_for_y(route_y_at_x(route, middle_point.x)), 0);
-            assert!(viewport.canvas.height >= middle_point.y + GRAPH_PADDING);
+            assert!(
+                nearest_row_for_y(route_y_at_x(route, middle_point.x))
+                    > nearest_row_for_y(middle_point.y)
+            );
+            assert!(
+                viewport.canvas.height
+                    >= route
+                        .control_1
+                        .y
+                        .max(route.control_2.y)
+                        .saturating_add(GRAPH_PADDING)
+            );
         }
     }
 
     #[tokio::test]
-    async fn long_edge_reflows_every_intermediate_column_in_the_same_catch_up_page() {
+    async fn long_edge_routing_updates_every_intermediate_column_in_one_page() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let upper = append_anchor(&writer, &root, Vec::new(), "upper").await;
@@ -2590,7 +2694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edge_lane_reflow_preserves_parallel_branch_order_across_columns() {
+    async fn lane_routing_preserves_parallel_branch_order_across_columns() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let upper_0 = append_anchor(&writer, &root, Vec::new(), "upper 0").await;
@@ -2684,7 +2788,7 @@ mod tests {
                 .unwrap()
                 .value[0]
                 .point;
-            assert_eq!(middle_point.y, GRAPH_PADDING + GRAPH_ROW_STEP);
+            assert_eq!(middle_point.y, GRAPH_PADDING);
         }
     }
 
@@ -3167,6 +3271,225 @@ mod tests {
             crate::Error::WebGraphSourceCursorMismatch { row_id, .. }
                 if row_id == next.row_id
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "deterministic fuzz campaign selected with COCO_WEB_GRAPH_FUZZ_SEED"]
+    async fn fuzz_catch_up_random_dag_seed() {
+        let seed = env::var("COCO_WEB_GRAPH_FUZZ_SEED")
+            .map(|seed| seed.parse::<u64>().unwrap())
+            .unwrap_or(1);
+        let mut rng = FuzzRng::new(seed);
+        let default_baseline_nodes = 48 + rng.index(48);
+        let default_backlog_nodes = 24 + rng.index(48);
+        let baseline_nodes = env::var("COCO_WEB_GRAPH_FUZZ_BASELINE_NODES")
+            .map(|count| count.parse::<usize>().unwrap())
+            .unwrap_or(default_baseline_nodes);
+        let backlog_nodes = env::var("COCO_WEB_GRAPH_FUZZ_BACKLOG_NODES")
+            .map(|count| count.parse::<usize>().unwrap())
+            .unwrap_or(default_backlog_nodes);
+        let page_size = env::var("COCO_WEB_GRAPH_FUZZ_PAGE_SIZE")
+            .map(|count| NonZeroUsize::new(count.parse::<usize>().unwrap()).unwrap())
+            .unwrap_or_else(|_| NonZeroUsize::new(CATCH_UP_SOURCE_PAGE_SIZE).unwrap());
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let mut node_ids = vec![root];
+
+        append_fuzz_nodes(&writer, &mut node_ids, &mut rng, baseline_nodes, seed).await;
+        eprintln!(
+            "web graph fuzz seed={seed} phase=baseline nodes={baseline_nodes} backlog={backlog_nodes} page_size={page_size}"
+        );
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        let baseline_started = Instant::now();
+        if env::var_os("COCO_WEB_GRAPH_FUZZ_TRACE").is_some() {
+            let mut revisions = runtime.subscribe();
+            revisions.borrow_and_update();
+            let catch_up_runtime = runtime.clone();
+            let mut catch_up =
+                tokio::spawn(
+                    async move { catch_up_runtime.catch_up_with_page_size(page_size).await },
+                );
+            let mut checkpoint_started = Instant::now();
+            loop {
+                tokio::select! {
+                    result = &mut catch_up => {
+                        result.unwrap().unwrap();
+                        break;
+                    }
+                    changed = revisions.changed() => {
+                        changed.unwrap();
+                        revisions.borrow_and_update();
+                        let state = runtime.store.state().await.unwrap().unwrap();
+                        eprintln!(
+                            "web graph fuzz seed={seed} checkpoint={} row_id={} elapsed_ms={}",
+                            state.source_version.get(),
+                            state.source_cursor.as_ref().unwrap().row_id,
+                            checkpoint_started.elapsed().as_millis()
+                        );
+                        checkpoint_started = Instant::now();
+                    }
+                }
+            }
+        } else {
+            runtime.catch_up_with_page_size(page_size).await.unwrap();
+        }
+        let anchors_canvas = runtime
+            .store
+            .canvas(LayoutKind::Anchors)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        let all_canvas = runtime
+            .store
+            .canvas(LayoutKind::All)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        for (mode, canvas) in [
+            (ViewMode::Anchors, anchors_canvas),
+            (ViewMode::All, all_canvas),
+        ] {
+            let viewport = runtime
+                .viewport(
+                    mode,
+                    GraphViewportRequest {
+                        x: 0,
+                        y: 0,
+                        width: canvas.width,
+                        height: canvas.height,
+                        overscan: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_viewport_routes_avoid_nodes(&viewport);
+        }
+        eprintln!(
+            "web graph fuzz seed={seed} phase=baseline-completed elapsed_ms={} anchors_height={} all_height={}",
+            baseline_started.elapsed().as_millis(),
+            anchors_canvas.height,
+            all_canvas.height,
+        );
+
+        append_fuzz_nodes(&writer, &mut node_ids, &mut rng, backlog_nodes, seed).await;
+        let backlog_started = Instant::now();
+        eprintln!("web graph fuzz seed={seed} phase=backlog");
+        runtime.catch_up_with_page_size(page_size).await.unwrap();
+        eprintln!(
+            "web graph fuzz seed={seed} phase=backlog-completed elapsed_ms={}",
+            backlog_started.elapsed().as_millis()
+        );
+    }
+
+    fn assert_viewport_routes_avoid_nodes(viewport: &GraphViewportResponse) {
+        for edge in &viewport.edges {
+            let route = BezierRoute {
+                source: Point {
+                    x: edge.route.source.x,
+                    y: edge.route.source.y,
+                },
+                control_1: Point {
+                    x: edge.route.control_1.x,
+                    y: edge.route.control_1.y,
+                },
+                control_2: Point {
+                    x: edge.route.control_2.x,
+                    y: edge.route.control_2.y,
+                },
+                target: Point {
+                    x: edge.route.target.x,
+                    y: edge.route.target.y,
+                },
+            };
+            for node in &viewport.nodes {
+                if node.id == edge.source_id || node.id == edge.target_id {
+                    continue;
+                }
+                assert!(
+                    !route_reserves_point(
+                        route,
+                        Point {
+                            x: node.x,
+                            y: node.y,
+                        }
+                    ),
+                    "edge {} crosses node {}",
+                    edge.key,
+                    node.id
+                );
+            }
+        }
+    }
+
+    async fn append_fuzz_nodes(
+        store: &impl NodeStore,
+        node_ids: &mut Vec<String>,
+        rng: &mut FuzzRng,
+        count: usize,
+        seed: u64,
+    ) {
+        for index in 0..count {
+            let parent_index = match rng.index(4) {
+                0 => node_ids.len() - 1,
+                1 => 0,
+                2 => {
+                    let window_start = node_ids.len().saturating_sub(8);
+                    window_start + rng.index(node_ids.len() - window_start)
+                }
+                _ => rng.index(node_ids.len()),
+            };
+            let parent = node_ids[parent_index].clone();
+            let node_id = if rng.chance(3, 4) {
+                let mut merge_parent_indices = BTreeSet::new();
+                let merge_parent_count = rng.index(4);
+                for _ in 0..merge_parent_count {
+                    let candidate_index = rng.index(node_ids.len());
+                    if candidate_index != parent_index {
+                        merge_parent_indices.insert(candidate_index);
+                    }
+                }
+                let merge_parent_indices = merge_parent_indices.into_iter().collect::<Vec<_>>();
+                let shadow_ordinal = (!merge_parent_indices.is_empty() && rng.chance(1, 3))
+                    .then(|| rng.index(merge_parent_indices.len()));
+                if env::var_os("COCO_WEB_GRAPH_FUZZ_TRACE").is_some() {
+                    eprintln!(
+                        "web graph fuzz seed={seed} node={} kind=anchor parent={parent_index} merge_parents={merge_parent_indices:?} shadow_ordinal={shadow_ordinal:?}",
+                        node_ids.len(),
+                    );
+                }
+                let merge_parents = merge_parent_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, node_index)| {
+                        if shadow_ordinal == Some(ordinal) {
+                            MergeParent::shadow(node_ids[*node_index].clone())
+                        } else {
+                            MergeParent::merge(node_ids[*node_index].clone())
+                        }
+                    })
+                    .collect();
+                append_anchor(
+                    store,
+                    &parent,
+                    merge_parents,
+                    &format!("fuzz seed {seed} node {index}"),
+                )
+                .await
+            } else {
+                if env::var_os("COCO_WEB_GRAPH_FUZZ_TRACE").is_some() {
+                    eprintln!(
+                        "web graph fuzz seed={seed} node={} kind=text parent={parent_index}",
+                        node_ids.len()
+                    );
+                }
+                append_text(store, &parent, &format!("fuzz seed {seed} node {index}")).await
+            };
+            node_ids.push(node_id);
+        }
     }
 
     async fn append_text(store: &impl NodeStore, parent: &str, text: &str) -> String {
