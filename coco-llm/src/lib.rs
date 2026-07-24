@@ -1,3 +1,4 @@
+mod credential_proxy;
 mod image_tool;
 mod runtime_bridge;
 mod skill;
@@ -38,6 +39,7 @@ use snafu::IntoError;
 use snafu::prelude::*;
 use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
+pub use credential_proxy::{NonoCredentialEndpoint, NonoCredentialInjectMode, NonoCredentialRoute};
 pub use skill::{
     ExecutorError, SkillInvocationRequest, SkillInvocationResult, SkillSearchExecutor,
     SkillSearchRequest,
@@ -699,6 +701,7 @@ pub struct ToolRuntimeEnv {
     pub session_role: SessionRole,
     pub current_skill_name: Option<String>,
     pub active_skill: Option<ActiveSkillRuntimeContext>,
+    pub credential_routes: Vec<NonoCredentialRoute>,
     pub store_path: Option<PathBuf>,
     pub enable_coco_shim: bool,
     pub cli_bridge: UnifiedExecCliBridgeHandle,
@@ -713,6 +716,14 @@ impl std::fmt::Debug for ToolRuntimeEnv {
             .field("session_role", &self.session_role)
             .field("current_skill_name", &self.current_skill_name)
             .field("active_skill", &self.active_skill)
+            .field(
+                "credential_routes",
+                &self
+                    .credential_routes
+                    .iter()
+                    .map(|route| route.service.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .field("store_path", &self.store_path)
             .field("enable_coco_shim", &self.enable_coco_shim)
             .field("cli_bridge", &self.cli_bridge)
@@ -962,6 +973,7 @@ pub struct RuntimeCapabilities {
     pub unified_exec_cli_bridge: UnifiedExecCliBridgeHandle,
     pub skill_search_executor: SkillSearchExecutorHandle,
     pub store_path: Option<PathBuf>,
+    pub credential_routes: Vec<NonoCredentialRoute>,
     backend_retry_initial_delay: Duration,
     unified_exec_sessions: unified_exec_tool::UnifiedExecSessionStoreHandle,
 }
@@ -972,6 +984,7 @@ impl Default for RuntimeCapabilities {
             unified_exec_cli_bridge: UnifiedExecCliBridgeHandle::default(),
             skill_search_executor: SkillSearchExecutorHandle::default(),
             store_path: None,
+            credential_routes: Vec::new(),
             backend_retry_initial_delay: DEFAULT_BACKEND_RETRY_INITIAL_DELAY,
             unified_exec_sessions: unified_exec_tool::session_store(),
         }
@@ -996,6 +1009,7 @@ pub struct LlmServiceBuilder<B, S> {
     unified_exec_cli_bridge: Option<UnifiedExecCliBridgeHandle>,
     skill_search_executor: Option<SkillSearchExecutorHandle>,
     store_path: Option<PathBuf>,
+    credential_routes: Vec<NonoCredentialRoute>,
 }
 
 #[derive(Debug, Snafu)]
@@ -1202,6 +1216,11 @@ impl<B, S> LlmServiceBuilder<B, S> {
         self
     }
 
+    pub fn with_credential_routes(mut self, routes: Vec<NonoCredentialRoute>) -> Self {
+        self.credential_routes = routes;
+        self
+    }
+
     pub fn build(self) -> LlmService<B, S> {
         LlmService {
             store: self.store,
@@ -1211,6 +1230,7 @@ impl<B, S> LlmServiceBuilder<B, S> {
                 unified_exec_cli_bridge: self.unified_exec_cli_bridge.unwrap_or_default(),
                 skill_search_executor: self.skill_search_executor.unwrap_or_default(),
                 store_path: self.store_path,
+                credential_routes: self.credential_routes,
                 backend_retry_initial_delay: self.backend_retry_initial_delay,
                 unified_exec_sessions: unified_exec_tool::session_store(),
             },
@@ -1231,6 +1251,7 @@ impl<B, S> LlmService<B, S> {
             unified_exec_cli_bridge: None,
             skill_search_executor: None,
             store_path: None,
+            credential_routes: Vec::new(),
         }
     }
 
@@ -2597,6 +2618,7 @@ where
                 session_role: context.session_anchor.role,
                 current_skill_name: current_skill_name_from_prompt(&context.session_anchor.prompt),
                 active_skill: None,
+                credential_routes: self.runtime.credential_routes.clone(),
                 store_path: self.runtime.store_path.clone(),
                 enable_coco_shim: context.session_anchor.enable_coco_shim,
                 cli_bridge: self.runtime.unified_exec_cli_bridge.clone(),
@@ -5274,6 +5296,7 @@ mod tests {
                 session_role: SessionRole::Orchestrator,
                 current_skill_name: None,
                 active_skill: None,
+                credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: UnifiedExecCliBridgeHandle::default(),
@@ -5345,6 +5368,7 @@ mod tests {
                 session_role: SessionRole::Orchestrator,
                 current_skill_name: None,
                 active_skill: None,
+                credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: UnifiedExecCliBridgeHandle::default(),
@@ -9560,6 +9584,7 @@ mod tests {
                 session_role: SessionRole::Orchestrator,
                 current_skill_name: None,
                 active_skill: None,
+                credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: UnifiedExecCliBridgeHandle::default(),

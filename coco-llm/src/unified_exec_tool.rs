@@ -15,15 +15,14 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-
 use crate::{
     COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
     COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_SKILL_DIR_ENV, COCO_SKILL_NAME_ENV,
     COCO_SKILL_PERSIST_DIR_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
-    ToolInvocationContext, ToolRuntimeEnv,
+    ToolInvocationContext, ToolRuntimeEnv, credential_proxy,
 };
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 #[derive(Debug, Clone)]
 pub struct UnifiedExecToolRuntime {
@@ -209,6 +208,7 @@ const MAX_RUNTIME_SOCKET_PATH_LEN: usize = 107;
 const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
 const SESSION_POLL_INTERVAL_MS: u64 = 25;
 const COCO_DAEMON_SOCKET_ENV: &str = "COCO_DAEMON_SOCKET";
+const COCO_CRONTAB_DIR_ENV: &str = "COCO_CRONTAB_DIR";
 const COCO_EXEC_SANDBOX_ENV: &str = "COCO_EXEC_SANDBOX";
 const COCO_EXEC_WORKSPACE_ENV: &str = "COCO_EXEC_WORKSPACE";
 const COCO_LOG_DIR_ENV: &str = "COCO_LOG_DIR";
@@ -295,6 +295,9 @@ pub enum UnifiedExecToolError {
 
     #[snafu(display("unified exec tool could not locate `nono` in PATH"))]
     NonoNotFound,
+
+    #[snafu(display("unified exec tool could not prepare credential proxy: {source}"))]
+    CredentialProxy { source: credential_proxy::Error },
 
     #[snafu(display("unified exec tool could not spawn process: {source}"))]
     SpawnProcess { source: io::Error },
@@ -1074,6 +1077,7 @@ fn nono_execution_spec(
     nono: PathBuf,
     request: &ExecCommandRequest,
     extra_allow_paths: &[PathBuf],
+    credential_profile: Option<&Path>,
 ) -> ExecutionSpec {
     let mut args = vec![
         OsString::from("run"),
@@ -1096,6 +1100,10 @@ fn nono_execution_spec(
         args.push(OsString::from("--allow"));
         args.push(extra_allow_path.as_os_str().to_owned());
     }
+    if let Some(credential_profile) = credential_profile {
+        args.push(OsString::from("--profile"));
+        args.push(credential_profile.as_os_str().to_owned());
+    }
     args.extend([OsString::from("--"), request.shell.clone()]);
     args.extend(shell_execution_args(&request.cmd));
     ExecutionSpec {
@@ -1109,18 +1117,63 @@ fn resolve_execution_spec(
     request: &ExecCommandRequest,
     path_env: Option<&OsStr>,
     extra_allow_paths: &[PathBuf],
+    credential_runtime_root: &Path,
 ) -> std::result::Result<ExecutionSpec, UnifiedExecToolError> {
-    match request.sandbox_mode {
-        ExecSandboxMode::Off => Ok(shell_execution_spec(request)),
-        ExecSandboxMode::Auto => match find_program_in_path("nono", path_env) {
-            Some(nono) => Ok(nono_execution_spec(nono, request, extra_allow_paths)),
-            None => Ok(shell_execution_spec(request)),
-        },
-        ExecSandboxMode::Nono => {
-            let nono = find_program_in_path("nono", path_env).context(NonoNotFoundSnafu)?;
-            Ok(nono_execution_spec(nono, request, extra_allow_paths))
+    let nono = match request.sandbox_mode {
+        ExecSandboxMode::Off => return Ok(shell_execution_spec(request)),
+        ExecSandboxMode::Auto => {
+            let Some(nono) = find_program_in_path("nono", path_env) else {
+                return Ok(shell_execution_spec(request));
+            };
+            nono
         }
-    }
+        ExecSandboxMode::Nono => {
+            find_program_in_path("nono", path_env).context(NonoNotFoundSnafu)?
+        }
+    };
+    let credential_profile = credential_proxy::prepare_profile(
+        credential_runtime_root,
+        &request.context.credential_routes,
+    )
+    .context(CredentialProxySnafu)?;
+    Ok(nono_execution_spec(
+        nono,
+        request,
+        extra_allow_paths,
+        credential_profile.as_deref(),
+    ))
+}
+
+fn nono_exec_env() -> Vec<(OsString, OsString)> {
+    const NAMES: &[&str] = &[
+        "PATH",
+        "HOME",
+        "SHELL",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "COLORTERM",
+        "TZ",
+        "TZDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NIX_SSL_CERT_FILE",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "NO_COLOR",
+        COCO_CRONTAB_DIR_ENV,
+    ];
+    NAMES
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+        .collect()
 }
 
 fn next_runtime_socket_dir(runtime_root: &Path) -> PathBuf {
@@ -1528,7 +1581,7 @@ async fn execute_command(
     request: ExecCommandRequest,
     sessions: UnifiedExecSessionStoreHandle,
 ) -> std::result::Result<String, UnifiedExecToolError> {
-    let coco_command = Some(prepare_coco_command_path_injection(
+    let coco_command = prepare_coco_command_path_injection(
         &request.workspace_root,
         if request.context.enable_coco_shim {
             CocoCommandShimMode::Enabled
@@ -1536,16 +1589,13 @@ async fn execute_command(
             CocoCommandShimMode::Disabled
         },
         request.context.active_skill.is_some(),
-    )?);
+    )?;
     let runtime_server = if request.context.enable_coco_shim {
         start_coco_cli_runtime_server(&request.workspace_root, &request.context).await?
     } else {
         None
     };
-    let mut extra_allow_paths = coco_command
-        .as_ref()
-        .map(|command| command.extra_allow_paths.clone())
-        .unwrap_or_default();
+    let mut extra_allow_paths = coco_command.extra_allow_paths.clone();
     if let Some(runtime_server) = &runtime_server {
         extra_allow_paths.push(runtime_server.socket_dir.clone());
     }
@@ -1563,10 +1613,14 @@ async fn execute_command(
     if let Some(active_skill) = &request.context.active_skill {
         extra_allow_paths.push(active_skill.directory.clone());
     }
-    let path_env = coco_command
-        .as_ref()
-        .map(|command| join_path_entries(command.path_entries.clone()));
-    let execution = resolve_execution_spec(&request, path_env.as_deref(), &extra_allow_paths)?;
+    let path_env = join_path_entries(coco_command.path_entries.clone());
+    let execution = resolve_execution_spec(
+        &request,
+        Some(path_env.as_os_str()),
+        &extra_allow_paths,
+        &coco_command.root_dir,
+    )?;
+    let coco_command = Some(coco_command);
     let nono = execution
         .nono
         .as_ref()
@@ -1600,6 +1654,10 @@ async fn execute_command(
 
     let mut command = Command::new(&execution.program);
     command.kill_on_drop(true);
+    if execution.nono.is_some() {
+        command.env_clear();
+        command.envs(nono_exec_env());
+    }
     command
         .args(&execution.args)
         .current_dir(&request.workdir)
@@ -1750,6 +1808,12 @@ async fn execute_pty_command(
     let mut command = CommandBuilder::new(execution.program.as_os_str());
     command.args(execution.args.iter().map(OsString::as_os_str));
     command.cwd(&request.workdir);
+    if execution.nono.is_some() {
+        command.env_clear();
+        for (name, value) in nono_exec_env() {
+            command.env(name, value);
+        }
+    }
     command.env(COCO_EXEC_WORKSPACE_ENV, &request.workspace_root);
     command.env_remove(COCO_DAEMON_SOCKET_ENV);
     command.env_remove(COCO_SESSION_BRANCH_ENV);
@@ -1981,10 +2045,29 @@ mod tests {
             session_role: coco_mem::SessionRole::Orchestrator,
             current_skill_name: None,
             active_skill: None,
+            credential_routes: Vec::new(),
             store_path: None,
             enable_coco_shim,
             cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
             skill_executor: crate::SkillSearchExecutorHandle::default(),
+        }
+    }
+
+    fn test_credential_route() -> crate::NonoCredentialRoute {
+        crate::NonoCredentialRoute {
+            service: "telegram".to_owned(),
+            upstream: "https://api.telegram.org".to_owned(),
+            secret_env: "COCO_TELEGRAM_BOT_TOKEN".to_owned(),
+            inject_mode: crate::NonoCredentialInjectMode::UrlPath,
+            inject_header: None,
+            credential_format: None,
+            path_pattern: Some("/bot{}/".to_owned()),
+            path_replacement: Some("/bot{}/".to_owned()),
+            query_param_name: None,
+            endpoint_rules: vec![crate::NonoCredentialEndpoint {
+                method: "POST".to_owned(),
+                path: "/bot*/sendMessage".to_owned(),
+            }],
         }
     }
 
@@ -2296,7 +2379,7 @@ mod tests {
             parent_tool_use_id: None,
         };
         let runtime_dir = temp_root.path().join(".coco-runtime").join("socket-dir");
-        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, &[runtime_dir]);
+        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, &[runtime_dir], None);
 
         let template = command_template(&spec);
 
@@ -2331,7 +2414,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_execution_spec_uses_nono_when_available_in_nono_mode() {
+    fn resolve_execution_spec_requires_nono_in_nono_mode() {
         let temp_root = tempfile::tempdir().unwrap();
         let request = ExecCommandRequest {
             cmd: "pwd".to_owned(),
@@ -2346,8 +2429,9 @@ mod tests {
             parent_tool_use_id: None,
         };
         let path_env = OsString::from("/tmp/nono-bin:/tmp/bash-bin");
-        let spec = resolve_execution_spec(&request, Some(path_env.as_os_str()), &[]);
-        assert!(matches!(spec, Err(UnifiedExecToolError::NonoNotFound)));
+        let result =
+            resolve_execution_spec(&request, Some(path_env.as_os_str()), &[], temp_root.path());
+        assert!(matches!(result, Err(UnifiedExecToolError::NonoNotFound)));
     }
 
     #[test]
@@ -2367,7 +2451,12 @@ mod tests {
         };
         let nono = PathBuf::from("/bin/nono");
         let runtime_dir = temp_root.path().join(".coco-runtime").join("socket-dir");
-        let spec = nono_execution_spec(nono.clone(), &request, std::slice::from_ref(&runtime_dir));
+        let spec = nono_execution_spec(
+            nono.clone(),
+            &request,
+            std::slice::from_ref(&runtime_dir),
+            None,
+        );
 
         assert_eq!(spec.program, nono);
         assert_eq!(spec.nono, Some(PathBuf::from("/bin/nono")));
@@ -2416,7 +2505,7 @@ mod tests {
             context: test_context(),
             parent_tool_use_id: None,
         };
-        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, &[]);
+        let spec = nono_execution_spec(PathBuf::from("/bin/nono"), &request, &[], None);
 
         assert!(
             spec.args
@@ -2513,10 +2602,12 @@ mod tests {
         let bash_path = resolve_bash_path_locked().await;
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
+        let mut context = test_context();
+        context.credential_routes = vec![test_credential_route()];
         let runtime = runtime_tool(
             temp_exec_command_tool(),
             workspace.path().to_path_buf(),
-            test_context(),
+            context,
         );
         let path_env = OsString::from(fake_bin.path().as_os_str());
 
@@ -2524,11 +2615,16 @@ mod tests {
             &[
                 ("COCO_EXEC_SANDBOX", Some(OsStr::new("auto"))),
                 ("PATH", Some(path_env.as_os_str())),
+                ("COCO_TELEGRAM_BOT_TOKEN", None),
+                (
+                    "COCO_TEST_EXEC_SECRET",
+                    Some(OsStr::new("inherited-by-fallback")),
+                ),
             ],
             || async {
                 runtime
                     .call(format!(
-                        r#"{{"cmd":"printf 'fallback'","workdir":"{}","shell":"bash"}}"#,
+                        r#"{{"cmd":"printf '%s' \"$COCO_TEST_EXEC_SECRET\"","workdir":"{}","shell":"bash"}}"#,
                         workspace.path().display()
                     ))
                     .await
@@ -2538,7 +2634,7 @@ mod tests {
         .unwrap();
 
         assert!(output.contains("exit_status: 0"));
-        assert!(output.contains("stdout:\nfallback"));
+        assert!(output.contains("stdout:\ninherited-by-fallback"));
     }
 
     #[tokio::test]
@@ -3078,6 +3174,7 @@ mod tests {
                     directory: skill_dir.path().to_path_buf(),
                     persistent_directory: skill_persist_dir.clone(),
                 }),
+                credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -3159,6 +3256,7 @@ mod tests {
                 session_role: coco_mem::SessionRole::Runner,
                 current_skill_name: None,
                 active_skill: None,
+                credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -3207,6 +3305,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_command_off_mode_preserves_original_environment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.credential_routes = vec![test_credential_route()];
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            context,
+        );
+
+        let output = crate::with_process_env_async(
+            &[
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("off"))),
+                ("COCO_TELEGRAM_BOT_TOKEN", None),
+                (
+                    "COCO_TEST_EXEC_SECRET",
+                    Some(OsStr::new("inherited-by-original-shell")),
+                ),
+            ],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"cmd":"printf '%s' \"${{COCO_TEST_EXEC_SECRET:-}}\"","workdir":"{}","shell":"bash"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("stdout:\ninherited-by-original-shell"));
+    }
+
+    #[tokio::test]
+    async fn exec_command_nono_mode_filters_secrets_and_preserves_managed_environment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_bin = tempfile::tempdir().unwrap();
+        let bash_path = resolve_bash_path_locked().await;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bash_path, fake_bin.path().join("bash")).unwrap();
+        write_executable_script(
+            &fake_bin.path().join("nono"),
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    break\n  fi\n  shift\ndone\nexec \"$@\"\n",
+        );
+        let runtime = runtime_tool(
+            temp_exec_command_tool(),
+            workspace.path().to_path_buf(),
+            test_context(),
+        );
+        let path_env = OsString::from(fake_bin.path().as_os_str());
+
+        let output = crate::with_process_env_async(
+            &[
+                ("COCO_EXEC_SANDBOX", Some(OsStr::new("nono"))),
+                ("PATH", Some(path_env.as_os_str())),
+                (
+                    "COCO_TEST_EXEC_SECRET",
+                    Some(OsStr::new("must-not-enter-sandbox")),
+                ),
+                (
+                    COCO_CRONTAB_DIR_ENV,
+                    Some(OsStr::new("/var/lib/coco/crontabs")),
+                ),
+            ],
+            || async {
+                runtime
+                    .call(format!(
+                        r#"{{"cmd":"printf '%s|%s' \"${{COCO_TEST_EXEC_SECRET:-}}\" \"$COCO_CRONTAB_DIR\"","workdir":"{}","shell":"bash"}}"#,
+                        workspace.path().display()
+                    ))
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("stdout:\n|/var/lib/coco/crontabs"));
+        assert!(!output.contains("must-not-enter-sandbox"));
+    }
+
+    #[tokio::test]
     async fn exec_command_runtime_injects_active_skill_env() {
         let workspace = tempfile::tempdir().unwrap();
         let skill_dir = tempfile::tempdir().unwrap();
@@ -3228,6 +3408,7 @@ mod tests {
                     directory: skill_dir.path().to_path_buf(),
                     persistent_directory: skill_persist_dir.clone(),
                 }),
+                credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: false,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -3283,6 +3464,7 @@ mod tests {
                 session_role: coco_mem::SessionRole::Orchestrator,
                 current_skill_name: None,
                 active_skill: None,
+                credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: true,
                 cli_bridge: crate::UnifiedExecCliBridgeHandle::default(),
@@ -3692,6 +3874,7 @@ mod tests {
             session_role: coco_mem::SessionRole::Runner,
             current_skill_name: None,
             active_skill: None,
+            credential_routes: Vec::new(),
             store_path: Some(runtime_store.clone()),
             enable_coco_shim: true,
             cli_bridge: bridge,

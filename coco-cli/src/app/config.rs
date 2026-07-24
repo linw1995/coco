@@ -5,6 +5,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use coco_llm::NonoCredentialRoute;
 use coco_mem::{ProviderProfile, StoreError, StoreResult};
 use serde::Deserialize;
 use snafu::prelude::*;
@@ -17,12 +18,15 @@ use crate::{
     },
 };
 
+mod credential;
+
 const CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub provider_profiles: ProviderProfiles,
     pub channels: ChannelConfigs,
+    pub credential_routes: Vec<NonoCredentialRoute>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -55,6 +59,8 @@ struct ConfigFile {
     providers: HashMap<String, ProviderProfile>,
     #[serde(default)]
     channels: ChannelConfigs,
+    #[serde(default)]
+    exec: credential::ExecConfig,
 }
 
 impl ProviderProfiles {
@@ -115,9 +121,11 @@ pub fn load_config_from(path: impl AsRef<Path>) -> Result<Config> {
         })?,
         None => missing_config_file(),
     };
+    let credential_routes = credential::resolve_routes(config.exec)?;
     Ok(Config {
         provider_profiles: ProviderProfiles::new(config.providers),
         channels: config.channels,
+        credential_routes,
     })
 }
 
@@ -145,6 +153,7 @@ fn missing_config_file() -> ConfigFile {
     ConfigFile {
         providers: test_provider_profiles().profiles,
         channels: ChannelConfigs::default(),
+        exec: credential::ExecConfig::default(),
     }
 }
 

@@ -56,6 +56,7 @@ where
     let config = config::load_cwd_config()?;
     let provider_profiles = config.provider_profiles;
     let channel_configs = config.channels;
+    let credential_routes = config.credential_routes;
     let provider_configs = resolve_provider_runtime_configs(&provider_profiles)?;
     match command {
         Command::Daemon(command) => {
@@ -67,6 +68,7 @@ where
                 provider_profiles.clone(),
                 provider_configs,
                 Some(shared_store.store_path().to_path_buf()),
+                credential_routes,
             );
             daemon::run_daemon_command(
                 command,
@@ -91,6 +93,7 @@ where
                 provider_profiles.clone(),
                 provider_configs,
                 Some(shared_store.store_path().to_path_buf()),
+                credential_routes,
             );
 
             run_with_services_with_provider_profiles(
@@ -154,6 +157,7 @@ fn build_llm_service<B, S>(
     provider_profiles: config::ProviderProfiles,
     provider_configs: HashMap<String, ProviderRuntimeConfig>,
     store_path: Option<PathBuf>,
+    credential_routes: Vec<coco_llm::NonoCredentialRoute>,
 ) -> Arc<LlmService<B, S>>
 where
     B: CompletionBackend + 'static,
@@ -194,6 +198,7 @@ where
             .with_unified_exec_cli_bridge(unified_exec_bridge)
             .with_skill_search_executor(skill_bridge)
             .with_optional_store_path(store_path)
+            .with_credential_routes(credential_routes)
             .build()
     })
 }
