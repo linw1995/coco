@@ -3274,6 +3274,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn random_dag_routes_avoid_nodes() {
+        let seed = 1;
+        let mut rng = FuzzRng::new(seed);
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let mut node_ids = vec![root];
+
+        append_fuzz_nodes(&writer, &mut node_ids, &mut rng, 48, seed).await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+
+        runtime.catch_up().await.unwrap();
+        assert_runtime_routes_avoid_nodes(&runtime).await;
+    }
+
+    #[tokio::test]
     #[ignore = "deterministic fuzz campaign selected with COCO_WEB_GRAPH_FUZZ_SEED"]
     async fn fuzz_catch_up_random_dag_seed() {
         let seed = env::var("COCO_WEB_GRAPH_FUZZ_SEED")
@@ -3335,6 +3352,25 @@ mod tests {
         } else {
             runtime.catch_up_with_page_size(page_size).await.unwrap();
         }
+        let (anchors_canvas, all_canvas) = assert_runtime_routes_avoid_nodes(&runtime).await;
+        eprintln!(
+            "web graph fuzz seed={seed} phase=baseline-completed elapsed_ms={} anchors_height={} all_height={}",
+            baseline_started.elapsed().as_millis(),
+            anchors_canvas.height,
+            all_canvas.height,
+        );
+
+        append_fuzz_nodes(&writer, &mut node_ids, &mut rng, backlog_nodes, seed).await;
+        let backlog_started = Instant::now();
+        eprintln!("web graph fuzz seed={seed} phase=backlog");
+        runtime.catch_up_with_page_size(page_size).await.unwrap();
+        eprintln!(
+            "web graph fuzz seed={seed} phase=backlog-completed elapsed_ms={}",
+            backlog_started.elapsed().as_millis()
+        );
+    }
+
+    async fn assert_runtime_routes_avoid_nodes(runtime: &WebGraphRuntime) -> (Canvas, Canvas) {
         let anchors_canvas = runtime
             .store
             .canvas(LayoutKind::Anchors)
@@ -3368,21 +3404,7 @@ mod tests {
                 .unwrap();
             assert_viewport_routes_avoid_nodes(&viewport);
         }
-        eprintln!(
-            "web graph fuzz seed={seed} phase=baseline-completed elapsed_ms={} anchors_height={} all_height={}",
-            baseline_started.elapsed().as_millis(),
-            anchors_canvas.height,
-            all_canvas.height,
-        );
-
-        append_fuzz_nodes(&writer, &mut node_ids, &mut rng, backlog_nodes, seed).await;
-        let backlog_started = Instant::now();
-        eprintln!("web graph fuzz seed={seed} phase=backlog");
-        runtime.catch_up_with_page_size(page_size).await.unwrap();
-        eprintln!(
-            "web graph fuzz seed={seed} phase=backlog-completed elapsed_ms={}",
-            backlog_started.elapsed().as_millis()
-        );
+        (anchors_canvas, all_canvas)
     }
 
     fn assert_viewport_routes_avoid_nodes(viewport: &GraphViewportResponse) {
