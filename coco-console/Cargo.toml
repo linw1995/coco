@@ -25,6 +25,7 @@ axum = { version = "0.8", default-features = false, features = [
 ] }
 futures-util = "0.3.32"
 leptos = { workspace = true, features = ["islands", "ssr"] }
+leptos_axum = "0.8.10"
 tokio.workspace = true
 tracing.workspace = true
 diesel.workspace = true

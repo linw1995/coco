@@ -22,7 +22,9 @@ mod host {
     pub use config::ConsoleConfig;
     pub use error::{Error, Result};
     pub use publisher::ConsolePublisher;
-    pub use server::{ConsoleServerHandle, start_console_server_with_graph_store_path};
+    pub use server::{
+        ConsoleServerHandle, PanelServerContext, start_console_server_with_graph_store_path,
+    };
     pub use store::ConsoleStore;
 }
 

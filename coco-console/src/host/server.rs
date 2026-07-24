@@ -2,8 +2,10 @@ use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, RawQuery, Request, State};
@@ -14,12 +16,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use coco_mem::{Store, StoreError};
 use futures_util::{StreamExt, stream};
+use leptos::prelude::provide_context;
+use leptos_axum::handle_server_fns_with_context;
 use serde::Serialize;
 use snafu::prelude::*;
 
 use super::config::ConsoleConfig;
 use super::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
+    StoreSnafu,
 };
 use super::publisher::ConsolePublisher;
 use super::render::render_index_page;
@@ -44,6 +49,74 @@ const COCO_CONSOLE_WASM: &[u8] =
 struct AppState<S> {
     store: S,
     web_graph: WebGraphRuntime,
+}
+
+#[async_trait]
+trait PanelDataSource: Send + Sync {
+    async fn node_detail(&self, target: String) -> Result<NodeDetailResponse>;
+
+    async fn provider_context(
+        &self,
+        target: String,
+        context: Option<String>,
+        graph_mode: String,
+    ) -> Result<ProviderContextResponse>;
+}
+
+#[derive(Clone)]
+pub struct PanelServerContext {
+    source: Arc<dyn PanelDataSource>,
+}
+
+impl PanelServerContext {
+    fn new<S>(state: AppState<S>) -> Self
+    where
+        S: Store + Clone + Send + Sync + 'static,
+    {
+        Self {
+            source: Arc::new(state),
+        }
+    }
+
+    pub async fn node_detail(&self, target: String) -> Result<NodeDetailResponse> {
+        self.source.node_detail(target).await
+    }
+
+    pub async fn provider_context(
+        &self,
+        target: String,
+        context: Option<String>,
+        graph_mode: String,
+    ) -> Result<ProviderContextResponse> {
+        self.source
+            .provider_context(target, context, graph_mode)
+            .await
+    }
+}
+
+#[async_trait]
+impl<S> PanelDataSource for AppState<S>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    async fn node_detail(&self, target: String) -> Result<NodeDetailResponse> {
+        load_node_detail(self, &target).await
+    }
+
+    async fn provider_context(
+        &self,
+        target: String,
+        context: Option<String>,
+        graph_mode: String,
+    ) -> Result<ProviderContextResponse> {
+        load_provider_context(
+            self,
+            &target,
+            context.as_deref(),
+            view_mode_from_value(&graph_mode),
+        )
+        .await
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +217,7 @@ where
             "/api/graph/viewport/diff",
             get(graph_viewport_diff_get::<S>).post(graph_viewport_diff_post::<S>),
         )
+        .route("/api/panels/{*fn_name}", get(panel_server_function::<S>))
         .route("/api/node-detail", get(node_detail::<S>))
         .route("/api/provider-context", get(provider_context::<S>))
         .route("/events", get(event_stream::<S>))
@@ -152,6 +226,16 @@ where
         .fallback(not_found)
         .with_state(state)
         .layer(middleware::from_fn(access_log))
+}
+
+async fn panel_server_function<S>(State(state): State<AppState<S>>, request: Request) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let context = PanelServerContext::new(state);
+    handle_server_fns_with_context(move || provide_context(context.clone()), request)
+        .await
+        .into_response()
 }
 
 async fn access_log(
@@ -318,28 +402,29 @@ where
     let Some(target) = query.get("target") else {
         return json_response(&NodeDetailResponse::Default, "node detail");
     };
+    match load_node_detail(&state, target).await {
+        Ok(response) => json_response(&response, "node detail"),
+        Err(error) => plain_error(error.to_string()),
+    }
+}
+
+async fn load_node_detail<S>(state: &AppState<S>, target: &str) -> Result<NodeDetailResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
     let Some(node_id) = node_id_from_target(target) else {
-        return json_response(
-            &NodeDetailResponse::Missing {
-                target: target.to_owned(),
-            },
-            "node detail",
-        );
+        return Ok(NodeDetailResponse::Missing {
+            target: target.to_owned(),
+        });
     };
     match state.store.get_node(node_id).await {
-        Ok(node) => json_response(
-            &NodeDetailResponse::Found {
-                node: panel_node(NodeView::from(&node)),
-            },
-            "node detail",
-        ),
-        Err(error) if is_missing_node(&error) => json_response(
-            &NodeDetailResponse::Missing {
-                target: target.to_owned(),
-            },
-            "node detail",
-        ),
-        Err(error) => plain_error(error.to_string()),
+        Ok(node) => Ok(NodeDetailResponse::Found {
+            node: panel_node(NodeView::from(&node)),
+        }),
+        Err(error) if is_missing_node(&error) => Ok(NodeDetailResponse::Missing {
+            target: target.to_owned(),
+        }),
+        Err(source) => Err(source).context(StoreSnafu),
     }
 }
 
@@ -354,36 +439,45 @@ where
     let Some(target) = query.get("target") else {
         return json_response(&ProviderContextResponse::Default, "provider context");
     };
+    match load_provider_context(
+        &state,
+        target,
+        query.get("context"),
+        view_mode_from_query(&query),
+    )
+    .await
+    {
+        Ok(response) => json_response(&response, "provider context"),
+        Err(error) => plain_error(error.to_string()),
+    }
+}
+
+async fn load_provider_context<S>(
+    state: &AppState<S>,
+    target: &str,
+    context: Option<&str>,
+    view_mode: ViewMode,
+) -> Result<ProviderContextResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
     let Some(node_id) = node_id_from_target(target) else {
-        return json_response(
-            &ProviderContextResponse::Missing {
-                target: target.to_owned(),
-            },
-            "provider context",
-        );
+        return Ok(ProviderContextResponse::Missing {
+            target: target.to_owned(),
+        });
     };
     let node = match state.store.get_node(node_id).await {
         Ok(node) => node,
         Err(error) if is_missing_node(&error) => {
-            return json_response(
-                &ProviderContextResponse::Missing {
-                    target: target.to_owned(),
-                },
-                "provider context",
-            );
+            return Ok(ProviderContextResponse::Missing {
+                target: target.to_owned(),
+            });
         }
-        Err(error) => return plain_error(error.to_string()),
+        Err(source) => return Err(source).context(StoreSnafu),
     };
-    let selection =
-        match provider_context_for_node(&state.store, &node.id, query.get("context")).await {
-            Ok(selection) => selection,
-            Err(error) => return plain_error(error.to_string()),
-        };
+    let selection = provider_context_for_node(&state.store, &node.id, context).await?;
     let Some(selection) = selection else {
-        return json_response(
-            &ProviderContextResponse::Found { items: Vec::new() },
-            "provider context",
-        );
+        return Ok(ProviderContextResponse::Found { items: Vec::new() });
     };
     let node_ids = selection
         .context
@@ -391,14 +485,7 @@ where
         .iter()
         .map(|node| node.node.id.clone())
         .collect::<Vec<_>>();
-    let points = match state
-        .web_graph
-        .node_points(view_mode_from_query(&query), &node_ids)
-        .await
-    {
-        Ok(points) => points,
-        Err(error) => return plain_error(error.to_string()),
-    };
+    let points = state.web_graph.node_points(view_mode, &node_ids).await?;
     let items = selection
         .context
         .nodes
@@ -413,10 +500,7 @@ where
             node: provider_context_node(node.node),
         })
         .collect();
-    json_response(
-        &ProviderContextResponse::Found { items },
-        "provider context",
-    )
+    Ok(ProviderContextResponse::Found { items })
 }
 
 fn panel_node(node: NodeView) -> PanelNode {
@@ -616,6 +700,14 @@ fn view_mode_from_query(query: &QueryParams) -> ViewMode {
     }
 }
 
+fn view_mode_from_value(value: &str) -> ViewMode {
+    if value == "all" {
+        ViewMode::All
+    } else {
+        ViewMode::Anchors
+    }
+}
+
 fn is_truthy_query_value(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes" | "on")
 }
@@ -744,7 +836,7 @@ mod tests {
         assert!(viewport.nodes.iter().any(|node| node.id == node_id));
 
         let detail = node_detail(
-            State(state),
+            State(state.clone()),
             RawQuery(Some(format!("target={}", node_target_id(&node_id)))),
         )
         .await;
@@ -755,6 +847,18 @@ mod tests {
         };
         assert_eq!(node.content, "direct detail");
         assert_eq!(node.id, node_id);
+
+        let request = Request::builder()
+            .uri(format!(
+                "/api/panels/node-detail?target={}",
+                node_target_id(&node_id)
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let detail = panel_server_function(State(state), request).await;
+        let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
+        let detail: NodeDetailResponse = serde_json::from_slice(&detail_body).unwrap();
+        assert!(matches!(detail, NodeDetailResponse::Found { node } if node.id == node_id));
     }
 
     #[tokio::test]
@@ -808,7 +912,7 @@ mod tests {
         let state = AppState { store, web_graph };
 
         let response = provider_context(
-            State(state),
+            State(state.clone()),
             RawQuery(Some(format!(
                 "target={}&mode=all",
                 node_target_id(&selected_id)
@@ -827,6 +931,21 @@ mod tests {
             .expect("selected provider context item should exist");
         assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
+
+        let request = Request::builder()
+            .uri(format!(
+                "/api/panels/provider-context?target={}&graph_mode=all",
+                node_target_id(&selected_id)
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = panel_server_function(State(state), request).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            response,
+            ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
