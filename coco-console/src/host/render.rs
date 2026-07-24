@@ -34,7 +34,7 @@ fn render_document(root: AnyView) -> String {
             <body>{root}</body>
         </html>
     };
-    format!("<!doctype html>{}", rendered.to_html_branching())
+    format!("<!doctype html>{}", rendered.to_html())
 }
 
 fn render_root(mode: ViewMode, revision: u64) -> AnyView {
@@ -43,6 +43,8 @@ fn render_root(mode: ViewMode, revision: u64) -> AnyView {
     let graph_shell = GraphShellTemplate
         .render()
         .expect("graph shell template should render");
+    let provider_context_panel = view! { <ProviderContextPanel graph_mode=graph_mode/> }.into_any();
+    let node_detail_panel = view! { <NodeDetailPanel/> }.into_any();
 
     view! {
         <main
@@ -68,11 +70,11 @@ fn render_root(mode: ViewMode, revision: u64) -> AnyView {
                 </div>
                 <section class="provider-context-panel">
                     <div class="provider-context-slot">
-                        <ProviderContextPanel graph_mode=graph_mode.clone()/>
+                        {provider_context_panel}
                     </div>
                 </section>
                 <aside class="side">
-                    <div class="node-detail-slot"><NodeDetailPanel graph_mode=graph_mode/></div>
+                    <div class="node-detail-slot">{node_detail_panel}</div>
                 </aside>
             </section>
         </main>
@@ -140,10 +142,18 @@ mod tests {
             .expect("island loader should be rendered");
         assert!(bootstrap < graph_loader);
         assert!(graph_loader < island_loader);
-        assert!(page.contains("<!--bo-"));
-        assert!(page.contains("<!--bc-"));
+        assert!(!page.contains("<!--bo-"));
+        assert!(!page.contains("<!--bc-"));
         assert_eq!(page.matches("<leptos-island").count(), 2);
-        assert!(page.contains("Select a node to inspect its content."));
-        assert!(page.contains("Select a node to inspect its provider context."));
+        assert_eq!(
+            page.matches("Select a node to inspect its content.")
+                .count(),
+            1
+        );
+        assert_eq!(
+            page.matches("Select a node to inspect its provider context.")
+                .count(),
+            1
+        );
     }
 }

@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use serde::de::DeserializeOwned;
+use leptos::server_fn::codec::GetUrl;
 
 use crate::api::{NodeDetailResponse, PanelNode, ProviderContextItem, ProviderContextResponse};
 
@@ -8,13 +8,6 @@ use leptos::{
     ev,
     leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
 };
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{JsCast, JsValue};
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures::JsFuture;
-#[cfg(target_arch = "wasm32")]
-use web_sys::Response;
-
 const NODE_TARGET_PREFIX: &str = "detail-";
 #[cfg(target_arch = "wasm32")]
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
@@ -41,144 +34,172 @@ impl PanelSelection {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadedPanel<K, T> {
+    request: K,
+    response: Result<T, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderContextRequest {
+    target: String,
+    context: Option<String>,
+}
+
+#[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
+async fn load_node_detail(target: String) -> Result<NodeDetailResponse, ServerFnError> {
+    let context = expect_context::<crate::host::PanelServerContext>();
+    context
+        .node_detail(target)
+        .await
+        .map_err(|error| ServerFnError::ServerError(error.to_string()))
+}
+
+#[server(
+    prefix = "/api/panels",
+    endpoint = "provider-context",
+    input = GetUrl
+)]
+async fn load_provider_context(
+    target: String,
+    context: Option<String>,
+    graph_mode: String,
+) -> Result<ProviderContextResponse, ServerFnError> {
+    let server = expect_context::<crate::host::PanelServerContext>();
+    server
+        .provider_context(target, context, graph_mode)
+        .await
+        .map_err(|error| ServerFnError::ServerError(error.to_string()))
+}
+
 #[island]
-pub fn NodeDetailPanel(graph_mode: String) -> impl IntoView {
+pub fn NodeDetailPanel() -> impl IntoView {
+    view! { <NodeDetailPanelBody/> }
+}
+
+#[component]
+fn NodeDetailPanelBody() -> impl IntoView {
     let selection = use_panel_selection();
+    let selected_target = Memo::new(move |_| selection.get().target);
     let detail = LocalResource::new(move || {
-        let target = selection.get().target;
-        let url = node_detail_url(target.as_deref(), &graph_mode);
-        fetch_panel_data::<NodeDetailResponse>(url)
+        let request = selected_target.get();
+        async move {
+            let target = request?;
+            let response = load_node_detail(target.clone())
+                .await
+                .map_err(|error| error.to_string());
+            Some(LoadedPanel {
+                request: target,
+                response,
+            })
+        }
     });
 
     view! {
-        <Suspense fallback=|| view! { <NodeDetailDefault/> }>
-            {move || Suspend::new(async move {
-                match detail.await {
-                    Ok(response) => view! {
-                        <div class="panel-content"><NodeDetailContent response=response/></div>
-                    }.into_any(),
-                    Err(error) => view! {
-                        <div class="panel-content"><NodeDetailError error=error/></div>
-                    }.into_any(),
-                }
-            })}
-        </Suspense>
+        <div class="panel-content">
+            {move || node_detail_view(selected_target.get(), detail.get().flatten())}
+        </div>
     }
 }
 
 #[island]
 pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
+    view! { <ProviderContextPanelBody graph_mode/> }
+}
+
+#[component]
+fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     let selection = use_panel_selection();
-    let provider_context = LocalResource::new(move || {
+    let selected_context = Memo::new(move |_| {
         let selection = selection.get();
-        let url = provider_context_url(
-            selection.target.as_deref(),
-            selection.context.as_deref(),
-            &graph_mode,
-        );
-        fetch_panel_data::<ProviderContextResponse>(url)
+        selection.target.map(|target| ProviderContextRequest {
+            target,
+            context: selection.context,
+        })
+    });
+    let provider_context = LocalResource::new(move || {
+        let request = selected_context.get();
+        let graph_mode = graph_mode.clone();
+        async move {
+            let request = request?;
+            let response =
+                load_provider_context(request.target.clone(), request.context.clone(), graph_mode)
+                    .await
+                    .map_err(|error| error.to_string());
+            Some(LoadedPanel { request, response })
+        }
+    });
+    Effect::new(move || {
+        let current = selected_context.get();
+        let loaded = provider_context.get().flatten();
+        if loaded.is_some_and(|loaded| {
+            Some(&loaded.request) == current.as_ref() && loaded.response.is_ok()
+        }) {
+            notify_provider_context_rendered();
+        }
     });
 
     view! {
-        <Suspense fallback=|| view! { <ProviderContextDefault/> }>
-            {move || Suspend::new(async move {
-                match provider_context.await {
-                    Ok(response) => {
-                        notify_provider_context_rendered();
-                        view! {
-                            <div class="panel-content">
-                                <ProviderContextContent response=response/>
-                            </div>
-                        }.into_any()
-                    }
-                    Err(error) => view! {
-                        <div class="panel-content"><ProviderContextError error=error/></div>
-                    }.into_any(),
-                }
-            })}
-        </Suspense>
+        <div class="panel-content">
+            {move || {
+                provider_context_view(
+                    selected_context.get(),
+                    provider_context.get().flatten(),
+                )
+            }}
+        </div>
     }
 }
 
 fn use_panel_selection() -> RwSignal<PanelSelection> {
-    let selection = RwSignal::new(current_panel_selection());
-    #[cfg(target_arch = "wasm32")]
-    {
-        let listener = window_event_listener(ev::hashchange, move |_| {
-            selection.set(current_panel_selection());
-        });
-        on_cleanup(move || listener.remove());
-    }
+    let selection = RwSignal::new(PanelSelection::default());
+    Effect::new(move || subscribe_to_panel_selection(selection));
     selection
 }
 
-fn current_panel_selection() -> PanelSelection {
-    #[cfg(target_arch = "wasm32")]
-    {
-        PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        PanelSelection::default()
-    }
+#[cfg(target_arch = "wasm32")]
+fn subscribe_to_panel_selection(selection: RwSignal<PanelSelection>) {
+    selection.set(current_panel_selection());
+    let listener = window_event_listener(ev::hashchange, move |_| {
+        selection.set(current_panel_selection());
+    });
+    on_cleanup(move || listener.remove());
 }
 
-fn node_detail_url(target: Option<&str>, graph_mode: &str) -> String {
-    target
-        .map(|target| {
-            format!(
-                "/api/node-detail?target={}&mode={graph_mode}",
-                percent_encode(target)
-            )
-        })
-        .unwrap_or_else(|| format!("/api/node-detail?mode={graph_mode}"))
-}
-
-fn provider_context_url(target: Option<&str>, context: Option<&str>, graph_mode: &str) -> String {
-    let mut query = format!("mode={graph_mode}");
-    if let Some(target) = target {
-        query.push_str("&target=");
-        query.push_str(&percent_encode(target));
-    }
-    if let Some(context) = context {
-        query.push_str("&context=");
-        query.push_str(&percent_encode(context));
-    }
-    format!("/api/provider-context?{query}")
-}
-
-async fn fetch_panel_data<T>(url: String) -> Result<T, String>
-where
-    T: DeserializeOwned,
-{
-    #[cfg(target_arch = "wasm32")]
-    {
-        let window = web_sys::window().ok_or_else(|| "window is unavailable".to_owned())?;
-        let response = JsFuture::from(window.fetch_with_str(&url))
-            .await
-            .map_err(js_error_message)?
-            .dyn_into::<Response>()
-            .map_err(js_error_message)?;
-        if !response.ok() {
-            return Err(format!("request failed with status {}", response.status()));
-        }
-        let text = JsFuture::from(response.text().map_err(js_error_message)?)
-            .await
-            .map_err(js_error_message)?
-            .as_string()
-            .ok_or_else(|| "response text is not a string".to_owned())?;
-        serde_json::from_str(&text).map_err(|error| format!("invalid panel response: {error}"))
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = url;
-        std::future::pending().await
-    }
-}
+#[cfg(not(target_arch = "wasm32"))]
+fn subscribe_to_panel_selection(_selection: RwSignal<PanelSelection>) {}
 
 #[cfg(target_arch = "wasm32")]
-fn js_error_message(error: JsValue) -> String {
-    error.as_string().unwrap_or_else(|| format!("{error:?}"))
+fn current_panel_selection() -> PanelSelection {
+    PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
+}
+
+fn node_detail_view(
+    current: Option<String>,
+    loaded: Option<LoadedPanel<String, NodeDetailResponse>>,
+) -> AnyView {
+    match (current.as_ref(), loaded) {
+        (None, _) => view! { <NodeDetailDefault/> }.into_any(),
+        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
+            Ok(response) => view! { <NodeDetailContent response=response/> }.into_any(),
+            Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
+        },
+        _ => view! { <NodeDetailLoading/> }.into_any(),
+    }
+}
+
+fn provider_context_view(
+    current: Option<ProviderContextRequest>,
+    loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
+) -> AnyView {
+    match (current.as_ref(), loaded) {
+        (None, _) => view! { <ProviderContextDefault/> }.into_any(),
+        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
+            Ok(response) => view! { <ProviderContextContent response=response/> }.into_any(),
+            Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
+        },
+        _ => view! { <ProviderContextLoading/> }.into_any(),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -241,6 +262,18 @@ fn NodeDetailDefault() -> impl IntoView {
 }
 
 #[component]
+fn NodeDetailLoading() -> impl IntoView {
+    view! {
+        <section class="node-details node-details-loading">
+            <h2>"Node"</h2>
+            <dl class="detail-list">
+                <div><dt>"Selection"</dt><dd>"Loading node detail..."</dd></div>
+            </dl>
+        </section>
+    }
+}
+
+#[component]
 fn NodeDetailMissing(target: String) -> impl IntoView {
     view! {
         <section class="node-details node-details-default">
@@ -288,6 +321,16 @@ fn ProviderContextDefault() -> impl IntoView {
         <section class="provider-context-section provider-context-default">
             <h2>"Provider Context"</h2>
             <p class="provider-context-empty">"Select a node to inspect its provider context."</p>
+        </section>
+    }
+}
+
+#[component]
+fn ProviderContextLoading() -> impl IntoView {
+    view! {
+        <section class="provider-context-section provider-context-loading">
+            <h2>"Provider Context"</h2>
+            <p class="provider-context-empty">"Loading provider context..."</p>
         </section>
     }
 }
@@ -392,18 +435,6 @@ fn provider_context_target(query: &str) -> Option<String> {
     })
 }
 
-fn percent_encode(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,33 +460,49 @@ mod tests {
     }
 
     #[test]
-    fn panel_urls_encode_selection_independently() {
-        assert_eq!(
-            node_detail_url(Some("detail-node/value"), "all"),
-            "/api/node-detail?target=detail-node%2Fvalue&mode=all"
-        );
-        assert_eq!(node_detail_url(None, "all"), "/api/node-detail?mode=all");
-        assert_eq!(
-            provider_context_url(Some("detail-node"), Some("detail-context/value"), "anchors"),
-            "/api/provider-context?mode=anchors&target=detail-node&context=detail-context%2Fvalue"
-        );
-        assert_eq!(
-            provider_context_url(None, None, "all"),
-            "/api/provider-context?mode=all"
-        );
-    }
-
-    #[test]
     fn panel_islands_render_independent_server_fallbacks() {
-        let node = view! { <NodeDetailPanel graph_mode="all".to_owned()/> }.to_html();
+        let node = view! { <NodeDetailPanel/> }.to_html();
         let provider = view! { <ProviderContextPanel graph_mode="all".to_owned()/> }.to_html();
 
         assert!(node.contains("leptos-island"));
+        assert!(node.contains("panel-content"));
         assert!(node.contains("Select a node to inspect its content."));
         assert!(!node.contains("Provider Context"));
+        assert_eq!(node.matches("<section").count(), 1);
         assert!(provider.contains("leptos-island"));
+        assert!(provider.contains("panel-content"));
         assert!(provider.contains("Select a node to inspect its provider context."));
         assert!(!provider.contains("<h2>Node</h2>"));
+        assert_eq!(provider.matches("<section").count(), 1);
+    }
+
+    #[test]
+    fn panel_results_ignore_responses_for_previous_selections() {
+        let node = node_detail_view(
+            Some("detail-new".to_owned()),
+            Some(LoadedPanel {
+                request: "detail-old".to_owned(),
+                response: Ok(NodeDetailResponse::Default),
+            }),
+        )
+        .to_html();
+        let provider = provider_context_view(
+            Some(ProviderContextRequest {
+                target: "detail-new".to_owned(),
+                context: None,
+            }),
+            Some(LoadedPanel {
+                request: ProviderContextRequest {
+                    target: "detail-old".to_owned(),
+                    context: None,
+                },
+                response: Ok(ProviderContextResponse::Default),
+            }),
+        )
+        .to_html();
+
+        assert!(node.contains("Loading node detail..."));
+        assert!(provider.contains("Loading provider context..."));
     }
 
     #[test]
@@ -498,13 +545,17 @@ mod tests {
 mod wasm_tests {
     use super::*;
 
-    use wasm_bindgen::UnwrapThrowExt;
+    use any_spawner::Executor;
+    use js_sys::Promise;
+    use wasm_bindgen::{JsValue, UnwrapThrowExt};
+    use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    fn graph_items_panel_selection_signals_track_hash_changes_independently() {
+    async fn graph_items_panel_selection_signals_track_hash_changes_independently() {
+        _ = Executor::init_wasm_bindgen();
         let owner = Owner::new();
         owner.set();
         let window = web_sys::window().expect_throw("window should be available");
@@ -514,6 +565,7 @@ mod wasm_tests {
             .expect_throw("initial hash should be set");
         let node_selection = use_panel_selection();
         let context_selection = use_panel_selection();
+        next_task().await;
 
         window
             .location()
@@ -537,14 +589,9 @@ mod wasm_tests {
             .expect_throw("hash should be cleared");
     }
 
-    #[wasm_bindgen_test]
-    async fn graph_items_panel_fetch_deserializes_typed_data() {
-        let response = fetch_panel_data::<NodeDetailResponse>(
-            "data:application/json,%7B%22status%22%3A%22default%22%7D".to_owned(),
-        )
-        .await
-        .expect("typed panel data should be fetched");
-
-        assert_eq!(response, NodeDetailResponse::Default);
+    async fn next_task() {
+        JsFuture::from(Promise::resolve(&JsValue::NULL))
+            .await
+            .expect_throw("task should resolve");
     }
 }
