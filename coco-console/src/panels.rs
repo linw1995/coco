@@ -545,6 +545,7 @@ mod tests {
 mod wasm_tests {
     use super::*;
 
+    use any_spawner::Executor;
     use js_sys::Promise;
     use wasm_bindgen::{JsValue, UnwrapThrowExt};
     use wasm_bindgen_futures::JsFuture;
@@ -554,6 +555,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn graph_items_panel_selection_signals_track_hash_changes_independently() {
+        _ = Executor::init_wasm_bindgen();
         let owner = Owner::new();
         owner.set();
         let window = web_sys::window().expect_throw("window should be available");
