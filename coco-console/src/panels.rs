@@ -194,7 +194,7 @@ fn current_panel_selection() -> PanelSelection {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn reveal_node_detail_on_mobile(target: &str) {
+pub fn reveal_node_detail_on_mobile(target: &str) {
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {
         return;
     };
@@ -213,7 +213,7 @@ fn reveal_node_detail_on_mobile(target: &str) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn reveal_node_detail_on_mobile(_target: &str) {}
+pub fn reveal_node_detail_on_mobile(_target: &str) {}
 
 fn node_detail_view(
     current: Option<String>,

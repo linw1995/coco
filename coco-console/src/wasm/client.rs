@@ -20,8 +20,9 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem,
     GraphViewportResponse, Point,
 };
-use crate::panels::PROVIDER_CONTEXT_RENDERED_EVENT;
-use crate::panels::PanelSelection;
+use crate::panels::{
+    PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, reveal_node_detail_on_mobile,
+};
 use crate::viewport::{
     MIN_OVERSCAN, ViewportDrag, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
 };
@@ -1825,7 +1826,11 @@ fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
 
     match update_detail_hash(&window, &hash) {
         Ok(true) => return,
-        Ok(false) => {}
+        Ok(false) => {
+            if let Some(target) = PanelSelection::from_hash(&hash).target {
+                reveal_node_detail_on_mobile(&target);
+            }
+        }
         Err(error) => {
             web_sys::console::error_1(&error);
             return;
