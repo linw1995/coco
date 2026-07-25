@@ -21,7 +21,8 @@ use crate::api::{
     GraphViewportResponse, Point,
 };
 use crate::panels::{
-    PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, reveal_node_detail_on_mobile,
+    PanelSelection,
+    client::{PROVIDER_CONTEXT_RENDERED_EVENT, reveal_node_detail_on_mobile},
 };
 use crate::viewport::{
     MIN_OVERSCAN, ViewportDrag, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
