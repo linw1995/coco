@@ -152,14 +152,13 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
 }
 
 fn use_panel_selection() -> RwSignal<PanelSelection> {
-    let selection = RwSignal::new(PanelSelection::default());
+    let selection = RwSignal::new(current_panel_selection());
     Effect::new(move || subscribe_to_panel_selection(selection));
     selection
 }
 
 #[cfg(target_arch = "wasm32")]
 fn subscribe_to_panel_selection(selection: RwSignal<PanelSelection>) {
-    selection.set(current_panel_selection());
     let listener = window_event_listener(ev::hashchange, move |_| {
         selection.set(current_panel_selection());
     });
@@ -172,6 +171,11 @@ fn subscribe_to_panel_selection(_selection: RwSignal<PanelSelection>) {}
 #[cfg(target_arch = "wasm32")]
 fn current_panel_selection() -> PanelSelection {
     PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_panel_selection() -> PanelSelection {
+    PanelSelection::default()
 }
 
 fn node_detail_view(
@@ -554,7 +558,8 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    async fn graph_items_panel_selection_signals_track_hash_changes_independently() {
+    async fn graph_items_panel_selection_signals_read_initial_hash_and_track_changes_independently()
+    {
         _ = Executor::init_wasm_bindgen();
         let owner = Owner::new();
         owner.set();
@@ -565,6 +570,12 @@ mod wasm_tests {
             .expect_throw("initial hash should be set");
         let node_selection = use_panel_selection();
         let context_selection = use_panel_selection();
+        let expected_initial = PanelSelection {
+            target: Some("detail-node".to_owned()),
+            context: None,
+        };
+        assert_eq!(node_selection.get_untracked(), expected_initial);
+        assert_eq!(context_selection.get_untracked(), expected_initial);
         next_task().await;
 
         window
