@@ -573,6 +573,7 @@ mod wasm_tests {
         assert_eq!(node_selection.get_untracked(), PanelSelection::default());
         assert_eq!(context_selection.get_untracked(), PanelSelection::default());
         next_animation_frame().await;
+        next_animation_frame().await;
         next_task().await;
         let expected_initial = PanelSelection {
             target: Some("detail-node".to_owned()),
