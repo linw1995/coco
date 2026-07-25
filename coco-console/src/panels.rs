@@ -352,7 +352,7 @@ fn AnchorRangeContent(
         })
         .collect::<Vec<_>>();
     for (index, node) in nodes.into_iter().enumerate() {
-        if index > 0 {
+        if let Some(kind) = node.incoming_edge {
             items.push(view! { <AnchorRangeConnector kind/> }.into_any());
         }
         items.push(view! { <AnchorRangeNodeCard index last_index node/> }.into_any());
@@ -1224,6 +1224,7 @@ mod tests {
             kind: kind.to_owned(),
             role: "User".to_owned(),
             summary: format!("{id} summary"),
+            incoming_edge: None,
         };
         let range = view! {
             <AnchorRangeContent
@@ -1235,8 +1236,14 @@ mod tests {
                 }]
                 nodes=vec![
                     node("source", "prompt"),
-                    node("detail", "text"),
-                    node("target", "prompt"),
+                    AnchorRangeNode {
+                        incoming_edge: Some(GraphViewportEdgeKind::Primary),
+                        ..node("detail", "text")
+                    },
+                    AnchorRangeNode {
+                        incoming_edge: Some(GraphViewportEdgeKind::Merge),
+                        ..node("target", "prompt")
+                    },
                 ]
                 next=vec![AnchorRangeEdge {
                     kind: GraphViewportEdgeKind::Shadow,
@@ -1255,6 +1262,8 @@ mod tests {
         assert!(range.contains("Next relationship"));
         assert!(range.contains("data-edge-kind=\"merge_parent\""));
         assert!(range.contains("data-edge-kind=\"shadow_parent\""));
+        assert!(range.contains("Primary parent"));
+        assert!(range.contains("Merge parent"));
         assert_eq!(range.matches("href=\"#detail-").count(), 3);
     }
 

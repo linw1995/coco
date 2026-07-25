@@ -46,7 +46,7 @@ async fn main() {
         &store,
         &gamma_1,
         "Gamma / 2",
-        vec![MergeParent::merge(alpha_0.clone())],
+        vec![MergeParent::merge(alpha_detail.clone())],
     )
     .await;
     let epsilon_2 = demo_anchor(

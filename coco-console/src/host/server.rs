@@ -14,7 +14,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use coco_mem::{Store, StoreError};
+use coco_mem::{Kind, Node, Store, StoreError};
 use futures_util::{StreamExt, stream};
 use leptos::prelude::provide_context;
 use leptos_axum::handle_server_fns_with_context;
@@ -497,42 +497,103 @@ async fn anchor_range_nodes<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let mut nodes = if kind == GraphViewportEdgeKind::Primary {
-        match state.store.log(source_id, target_id).await {
-            Ok(nodes) => nodes,
-            Err(error) if is_missing_node(&error) => return Ok(None),
-            Err(source) => return Err(source).context(StoreSnafu),
+    let nodes = match kind {
+        GraphViewportEdgeKind::Primary => {
+            let Some(nodes) = load_primary_path(state, source_id, target_id).await? else {
+                return Ok(None);
+            };
+            if nodes.len() < 2
+                || nodes
+                    .last()
+                    .is_none_or(|node| node.kind.anchor_payload_kind().is_none())
+                || nodes[1..nodes.len() - 1]
+                    .iter()
+                    .any(|node| node.kind.anchor_payload_kind().is_some())
+            {
+                return Ok(None);
+            }
+            nodes
+                .into_iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    anchor_range_node(node, (index > 0).then_some(GraphViewportEdgeKind::Primary))
+                })
+                .collect()
         }
-    } else {
-        let source = match state.store.get_node(source_id).await {
-            Ok(node) => node,
-            Err(error) if is_missing_node(&error) => return Ok(None),
-            Err(source) => return Err(source).context(StoreSnafu),
-        };
-        let target = match state.store.get_node(target_id).await {
-            Ok(node) => node,
-            Err(error) if is_missing_node(&error) => return Ok(None),
-            Err(source) => return Err(source).context(StoreSnafu),
-        };
-        vec![target, source]
+        GraphViewportEdgeKind::Merge | GraphViewportEdgeKind::Shadow => {
+            let target = match state.store.get_node(target_id).await {
+                Ok(node) => node,
+                Err(error) if is_missing_node(&error) => return Ok(None),
+                Err(source) => return Err(source).context(StoreSnafu),
+            };
+            let Kind::Anchor(anchor) = &target.kind else {
+                return Ok(None);
+            };
+            let is_shadow = kind == GraphViewportEdgeKind::Shadow;
+            let mut matching_path = None;
+            for parent in anchor
+                .merge_parents()
+                .iter()
+                .filter(|parent| parent.is_shadow() == is_shadow)
+            {
+                let Some(nodes) = load_primary_path(state, source_id, parent.node_id()).await?
+                else {
+                    continue;
+                };
+                if nodes[1..]
+                    .iter()
+                    .any(|node| node.kind.anchor_payload_kind().is_some())
+                {
+                    continue;
+                }
+                matching_path = Some(nodes);
+                break;
+            }
+            let Some(nodes) = matching_path else {
+                return Ok(None);
+            };
+            let mut range = nodes
+                .into_iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    anchor_range_node(node, (index > 0).then_some(GraphViewportEdgeKind::Primary))
+                })
+                .collect::<Vec<_>>();
+            range.push(anchor_range_node(target, Some(kind)));
+            range
+        }
+    };
+    Ok(Some(nodes))
+}
+
+async fn load_primary_path<S>(
+    state: &AppState<S>,
+    source_id: &str,
+    target_id: &str,
+) -> Result<Option<Vec<Node>>>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let mut nodes = match state.store.log(source_id, target_id).await {
+        Ok(nodes) => nodes,
+        Err(error)
+            if is_missing_node(&error) || matches!(error, StoreError::RefsNotConnected { .. }) =>
+        {
+            return Ok(None);
+        }
+        Err(source) => return Err(source).context(StoreSnafu),
     };
     nodes.reverse();
-    if nodes.len() < 2
+    if nodes.is_empty()
         || nodes.first().is_none_or(|node| node.id != source_id)
         || nodes.last().is_none_or(|node| node.id != target_id)
         || nodes
             .first()
             .is_none_or(|node| node.kind.anchor_payload_kind().is_none())
-        || nodes
-            .last()
-            .is_none_or(|node| node.kind.anchor_payload_kind().is_none())
-        || nodes[1..nodes.len() - 1]
-            .iter()
-            .any(|node| node.kind.anchor_payload_kind().is_some())
     {
         return Ok(None);
     }
-    Ok(Some(nodes.into_iter().map(anchor_range_node).collect()))
+    Ok(Some(nodes))
 }
 
 fn adjacent_anchor_edges(
@@ -568,7 +629,10 @@ fn adjacent_anchor_edges(
     (previous, next)
 }
 
-fn anchor_range_node(node: coco_mem::Node) -> AnchorRangeNode {
+fn anchor_range_node(
+    node: coco_mem::Node,
+    incoming_edge: Option<GraphViewportEdgeKind>,
+) -> AnchorRangeNode {
     let node = NodeView::from(&node);
     AnchorRangeNode {
         id: node.id,
@@ -576,6 +640,7 @@ fn anchor_range_node(node: coco_mem::Node) -> AnchorRangeNode {
         kind: node.kind,
         role: node.role,
         summary: node.summary,
+        incoming_edge,
     }
 }
 
@@ -1033,7 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anchor_range_expands_primary_nodes_and_direct_merge_relationships() {
+    async fn anchor_range_expands_primary_merge_and_shadow_paths() {
         let source = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(source.clone(), publisher.clone());
@@ -1082,9 +1147,33 @@ mod tests {
                 role: Role::User,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
-                    vec![MergeParent::merge(source_anchor.clone())],
+                    vec![MergeParent::merge(detail.clone())],
                     PromptAnchor {
                         prompt: "next".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let shadow_detail = store
+            .append(NewNode {
+                parent: source_anchor.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("shadow detail".to_owned()),
+            })
+            .await
+            .unwrap();
+        let shadow_target = store
+            .append(NewNode {
+                parent: next_anchor.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::shadow(shadow_detail.clone())],
+                    PromptAnchor {
+                        prompt: "shadow target".to_owned(),
                         attachments: Vec::new(),
                     },
                 )),
@@ -1138,7 +1227,49 @@ mod tests {
                 .iter()
                 .map(|node| node.id.as_str())
                 .collect::<Vec<_>>(),
-            [&source_anchor, &next_anchor]
+            [&source_anchor, &detail, &next_anchor]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.incoming_edge)
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some(GraphViewportEdgeKind::Primary),
+                Some(GraphViewportEdgeKind::Merge),
+            ]
+        );
+
+        let shadow = load_anchor_range(
+            &state,
+            &source_anchor,
+            &shadow_target,
+            GraphViewportEdgeKind::Shadow,
+        )
+        .await
+        .unwrap();
+        let AnchorRangeResponse::Found { kind, nodes, .. } = shadow else {
+            panic!("shadow anchor relationship should exist");
+        };
+        assert_eq!(kind, GraphViewportEdgeKind::Shadow);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            [&source_anchor, &shadow_detail, &shadow_target]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.incoming_edge)
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some(GraphViewportEdgeKind::Primary),
+                Some(GraphViewportEdgeKind::Shadow),
+            ]
         );
     }
 

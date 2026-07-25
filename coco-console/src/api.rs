@@ -22,6 +22,7 @@ pub struct AnchorRangeNode {
     pub kind: String,
     pub role: String,
     pub summary: String,
+    pub incoming_edge: Option<GraphViewportEdgeKind>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
