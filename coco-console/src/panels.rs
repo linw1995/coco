@@ -101,6 +101,7 @@ fn NodeDetailPanelBody() -> impl IntoView {
             })
         }
     });
+    #[cfg(target_arch = "wasm32")]
     Effect::new(move || {
         let current = selected_target.get();
         let loaded = detail.get().flatten();
@@ -188,6 +189,7 @@ fn current_panel_selection() -> PanelSelection {
     PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 fn current_node_detail_is_loaded(
     current: Option<&str>,
     loaded: Option<&LoadedPanel<String, NodeDetailResponse>>,
@@ -219,9 +221,6 @@ fn reveal_node_detail(document: web_sys::Document, viewport_width: i32) {
         }
     });
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn reveal_node_detail_on_mobile() {}
 
 fn node_detail_view(
     current: Option<String>,
