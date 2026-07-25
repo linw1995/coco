@@ -9,6 +9,9 @@ version.workspace = true
 test-utils = []
 
 [dependencies]
+# Shared domain types.
+coco-types = { path = "../coco-types" }
+
 # Storage.
 async-trait.workspace = true
 diesel.workspace = true
@@ -24,9 +27,6 @@ nanoid.workspace = true
 # Serialization.
 serde.workspace = true
 serde_json.workspace = true
-
-# Hashing.
-sha2 = "0.11.0"
 
 # Error handling.
 snafu.workspace = true

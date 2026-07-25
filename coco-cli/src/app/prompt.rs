@@ -14,8 +14,8 @@ use coco_llm::{
 use coco_mem::{
     AnchorPayload, JobStore, Kind, MergeParent, MessageQueueItem, NodeStore, Store, StoreError,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Value, json};
 use snafu::prelude::*;
 use tokio::process::Command;
 
@@ -96,13 +96,100 @@ struct PromptBaseNodeView {
     merge_parents: Vec<MergeParent>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const QUEUED_PROMPT_REQUEST_VERSION: u64 = 2;
+const LEGACY_NULLABLE_SESSION_PATCH_FIELDS: &[&str] = &[
+    "provider_profile",
+    "provider",
+    "temperature",
+    "max_tokens",
+    "additional_params",
+];
+
+#[derive(Debug, Clone)]
 pub struct QueuedPromptRequest {
     pub job_id: String,
     pub branch: String,
     pub prompt: String,
     pub merge_parents: Vec<MergeParent>,
     pub session_patch: Option<SessionConfigPatch>,
+}
+
+#[derive(Serialize)]
+struct QueuedPromptRequestRef<'a> {
+    version: u64,
+    job_id: &'a str,
+    branch: &'a str,
+    prompt: &'a str,
+    merge_parents: &'a [MergeParent],
+    session_patch: &'a Option<SessionConfigPatch>,
+}
+
+#[derive(Deserialize)]
+struct QueuedPromptRequestFields {
+    job_id: String,
+    branch: String,
+    prompt: String,
+    merge_parents: Vec<MergeParent>,
+    session_patch: Option<SessionConfigPatch>,
+}
+
+impl Serialize for QueuedPromptRequest {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        QueuedPromptRequestRef {
+            version: QUEUED_PROMPT_REQUEST_VERSION,
+            job_id: &self.job_id,
+            branch: &self.branch,
+            prompt: &self.prompt,
+            merge_parents: &self.merge_parents,
+            session_patch: &self.session_patch,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for QueuedPromptRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        match value.get("version") {
+            None => normalize_legacy_queued_prompt_request(&mut value),
+            Some(Value::Number(version))
+                if version.as_u64() == Some(QUEUED_PROMPT_REQUEST_VERSION) => {}
+            Some(version) => {
+                return Err(serde::de::Error::custom(format!(
+                    "unsupported queued prompt request version {version}"
+                )));
+            }
+        }
+        let fields: QueuedPromptRequestFields =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            job_id: fields.job_id,
+            branch: fields.branch,
+            prompt: fields.prompt,
+            merge_parents: fields.merge_parents,
+            session_patch: fields.session_patch,
+        })
+    }
+}
+
+fn normalize_legacy_queued_prompt_request(value: &mut Value) {
+    let Some(session_patch) = value
+        .get_mut("session_patch")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for field in LEGACY_NULLABLE_SESSION_PATCH_FIELDS {
+        if session_patch.get(*field).is_some_and(Value::is_null) {
+            session_patch.remove(*field);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -733,4 +820,91 @@ fn render_merge_parents(parents: &[MergeParent]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{rendered}]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_patch(session_patch: SessionConfigPatch) -> QueuedPromptRequest {
+        QueuedPromptRequest {
+            job_id: "job-1".to_owned(),
+            branch: "main".to_owned(),
+            prompt: "Continue".to_owned(),
+            merge_parents: Vec::new(),
+            session_patch: Some(session_patch),
+        }
+    }
+
+    #[test]
+    fn legacy_queued_prompt_request_treats_null_patch_fields_as_absent() {
+        let request: QueuedPromptRequest = serde_json::from_value(json!({
+            "job_id": "job-1",
+            "branch": "main",
+            "prompt": "Continue",
+            "merge_parents": [],
+            "session_patch": {
+                "role": "runner",
+                "provider_profile": null,
+                "provider": null,
+                "temperature": null,
+                "max_tokens": null,
+                "additional_params": null
+            }
+        }))
+        .unwrap();
+
+        let patch = request.session_patch.unwrap();
+        assert!(patch.role.is_some());
+        assert_eq!(patch.provider_profile, None);
+        assert_eq!(patch.provider, None);
+        assert_eq!(patch.temperature, None);
+        assert_eq!(patch.max_tokens, None);
+        assert_eq!(patch.additional_params, None);
+    }
+
+    #[test]
+    fn current_queued_prompt_request_preserves_explicit_null_patch_fields() {
+        let request = request_with_patch(SessionConfigPatch {
+            provider_profile: Some(None),
+            provider: Some(None),
+            temperature: Some(None),
+            max_tokens: Some(None),
+            additional_params: Some(None),
+            ..SessionConfigPatch::default()
+        });
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["version"], QUEUED_PROMPT_REQUEST_VERSION);
+        for field in LEGACY_NULLABLE_SESSION_PATCH_FIELDS {
+            assert!(value["session_patch"][field].is_null());
+        }
+
+        let decoded: QueuedPromptRequest = serde_json::from_value(value).unwrap();
+        let patch = decoded.session_patch.unwrap();
+        assert_eq!(patch.provider_profile, Some(None));
+        assert_eq!(patch.provider, Some(None));
+        assert_eq!(patch.temperature, Some(None));
+        assert_eq!(patch.max_tokens, Some(None));
+        assert_eq!(patch.additional_params, Some(None));
+    }
+
+    #[test]
+    fn queued_prompt_request_rejects_unsupported_version() {
+        let error = serde_json::from_value::<QueuedPromptRequest>(json!({
+            "version": 3,
+            "job_id": "job-1",
+            "branch": "main",
+            "prompt": "Continue",
+            "merge_parents": [],
+            "session_patch": null
+        }))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported queued prompt request version 3")
+        );
+    }
 }

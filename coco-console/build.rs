@@ -46,6 +46,8 @@ fn run() -> BuildResult<()> {
     println!("cargo:rerun-if-changed=src/wasm/viewport.rs");
     println!("cargo:rerun-if-changed=web-graph-migrations");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=../coco-types/Cargo.toml");
+    println!("cargo:rerun-if-changed=../coco-types/src");
 
     if env::var("TARGET").is_ok_and(|target| target == WASM_TARGET) {
         return Ok(());

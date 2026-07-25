@@ -1,10 +1,12 @@
 // CoCo Memory Implementation
 
+mod default_skills;
 mod error;
 mod schema;
 pub mod store;
-mod types;
 
+pub use coco_types::*;
+pub(crate) use default_skills::default_skill_groups;
 pub use error::{StoreError, StoreResult};
 pub use store::{
     BranchAppendSessionState, BranchSessionStateUpdate, BranchStore, GRAPH_READ_BATCH_SIZE,
@@ -13,4 +15,3 @@ pub use store::{
     MessageQueueStore, NodeStore, PersistentStore, PresetStore, ProcessShareableStore,
     SessionStore, SkillStore, SqliteGraphStore, SqliteStore, Store,
 };
-pub use types::*;

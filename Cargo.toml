@@ -6,6 +6,7 @@ members = [
   "coco-core",
   "coco-llm",
   "coco-mem",
+  "coco-types",
 ]
 resolver = "2"
 

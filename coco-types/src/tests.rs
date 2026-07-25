@@ -674,6 +674,32 @@ fn session_anchor_patch_updates_selected_fields() {
 }
 
 #[test]
+fn session_anchor_patch_round_trip_preserves_clear_operations() {
+    let patch = SessionAnchorPatch {
+        provider_profile: Some(None),
+        provider: Some(Some("openai".to_owned())),
+        temperature: Some(None),
+        max_tokens: None,
+        additional_params: Some(None),
+        ..SessionAnchorPatch::default()
+    };
+
+    let encoded = serde_json::to_value(&patch).unwrap();
+    assert_eq!(encoded["provider_profile"], serde_json::Value::Null);
+    assert_eq!(encoded["provider"], "openai");
+    assert_eq!(encoded["temperature"], serde_json::Value::Null);
+    assert!(encoded.get("max_tokens").is_none());
+    assert_eq!(encoded["additional_params"], serde_json::Value::Null);
+
+    let decoded: SessionAnchorPatch = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.provider_profile, Some(None));
+    assert_eq!(decoded.provider, Some(Some("openai".to_owned())));
+    assert_eq!(decoded.temperature, Some(None));
+    assert_eq!(decoded.max_tokens, None);
+    assert_eq!(decoded.additional_params, Some(None));
+}
+
+#[test]
 fn preset_applies_session_and_role_settings() {
     let updated = Preset {
         role: SessionRole::Runner,
