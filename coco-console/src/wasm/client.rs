@@ -541,9 +541,37 @@ impl VirtualGraph {
         if element.parent_element().is_none() {
             self.edge_group.append_child(&element)?;
         }
+        self.upsert_edge_hit_target(&edge)?;
         self.rendered
             .edges
             .insert(edge.key.clone(), edge.fingerprint());
+        Ok(())
+    }
+
+    fn upsert_edge_hit_target(&self, edge: &GraphViewportEdge) -> Result<(), JsValue> {
+        if self.graph_mode != "anchors" {
+            return Ok(());
+        }
+        let id = edge_hit_target_id(&edge.key);
+        let element = self
+            .document
+            .get_element_by_id(&id)
+            .map_or_else(|| svg_element(&self.document, "path"), Ok)?;
+        set_attributes(
+            &element,
+            [
+                ("id", id),
+                ("class", "edge-hit-target".to_owned()),
+                ("d", bezier_path(edge.route)),
+                ("data-anchor-range", "true".to_owned()),
+                ("data-edge-kind", edge.kind.key_part().to_owned()),
+                ("data-source-id", edge.source_id.clone()),
+                ("data-target-id", edge.target_id.clone()),
+            ],
+        )?;
+        if element.parent_element().is_none() {
+            self.edge_group.append_child(&element)?;
+        }
         Ok(())
     }
 
@@ -713,6 +741,9 @@ impl VirtualGraph {
 
     fn remove_key(&mut self, key: &str) {
         if let Some(element) = self.document.get_element_by_id(&render_element_id(key)) {
+            element.remove();
+        }
+        if let Some(element) = self.document.get_element_by_id(&edge_hit_target_id(key)) {
             element.remove();
         }
         self.rendered.nodes.remove(key);
@@ -974,6 +1005,10 @@ fn edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
         GraphViewportEdgeKind::Merge => ("edge merge-parent", "url(#merge-arrowhead)"),
         GraphViewportEdgeKind::Shadow => ("edge shadow-parent", "url(#shadow-arrowhead)"),
     }
+}
+
+fn edge_hit_target_id(key: &str) -> String {
+    format!("{}-hit", render_element_id(key))
 }
 
 fn apply_graph_viewport_metadata(

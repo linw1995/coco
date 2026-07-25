@@ -5,14 +5,20 @@ use coco_types::{
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
 
-use crate::api::{NodeDetailResponse, ProviderContextItem, ProviderContextResponse};
+use crate::api::{
+    AnchorRangeEdge, AnchorRangeNode, AnchorRangeResponse, GraphViewportEdgeKind,
+    NodeDetailResponse, ProviderContextItem, ProviderContextResponse,
+};
 
 #[cfg(target_arch = "wasm32")]
 use leptos::{
     ev,
     leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
 };
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 const NODE_TARGET_PREFIX: &str = "detail-";
+const ANCHOR_RANGE_ID: &str = "anchor-range";
 #[cfg(target_arch = "wasm32")]
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
 
@@ -50,11 +56,31 @@ struct ProviderContextRequest {
     context: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AnchorRangeRequest {
+    source: String,
+    target: String,
+    kind: GraphViewportEdgeKind,
+}
+
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
 async fn load_node_detail(target: String) -> Result<NodeDetailResponse, ServerFnError> {
     let context = expect_context::<crate::host::PanelServerContext>();
     context
         .node_detail(target)
+        .await
+        .map_err(|error| ServerFnError::ServerError(error.to_string()))
+}
+
+#[server(prefix = "/api/panels", endpoint = "anchor-range", input = GetUrl)]
+async fn load_anchor_range(
+    source: String,
+    target: String,
+    kind: GraphViewportEdgeKind,
+) -> Result<AnchorRangeResponse, ServerFnError> {
+    let context = expect_context::<crate::host::PanelServerContext>();
+    context
+        .anchor_range(source, target, kind)
         .await
         .map_err(|error| ServerFnError::ServerError(error.to_string()))
 }
@@ -111,6 +137,11 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
     view! { <ProviderContextPanelBody graph_mode/> }
 }
 
+#[island]
+pub fn AnchorRangeExpansion() -> impl IntoView {
+    view! { <AnchorRangeExpansionBody/> }
+}
+
 #[component]
 fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     let selection = use_panel_selection();
@@ -155,10 +186,92 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     }
 }
 
+#[component]
+fn AnchorRangeExpansionBody() -> impl IntoView {
+    let selection = RwSignal::new(None::<AnchorRangeRequest>);
+    Effect::new(move || subscribe_to_anchor_range(selection));
+    let range = LocalResource::new(move || {
+        let request = selection.get();
+        async move {
+            let request = request?;
+            let response =
+                load_anchor_range(request.source.clone(), request.target.clone(), request.kind)
+                    .await
+                    .map_err(|error| error.to_string());
+            Some(LoadedPanel { request, response })
+        }
+    });
+
+    view! {
+        <section
+            id=ANCHOR_RANGE_ID
+            class="anchor-range"
+            class:open=move || selection.get().is_some()
+            aria-label="Expanded anchor range"
+            aria-live="polite"
+        >
+            <header class="anchor-range-header">
+                <div>
+                    <p>"Expanded range"</p>
+                    <h2>"Anchor relationship"</h2>
+                </div>
+                <button
+                    type="button"
+                    aria-label="Collapse expanded range"
+                    on:click=move |_| selection.set(None)
+                >
+                    "Collapse"
+                </button>
+            </header>
+            {move || anchor_range_view(selection.get(), range.get().flatten())}
+        </section>
+    }
+}
+
 fn use_panel_selection() -> RwSignal<PanelSelection> {
     let selection = RwSignal::new(PanelSelection::default());
     Effect::new(move || subscribe_to_panel_selection(selection));
     selection
+}
+
+#[cfg(target_arch = "wasm32")]
+fn subscribe_to_anchor_range(selection: RwSignal<Option<AnchorRangeRequest>>) {
+    let listener = window_event_listener(ev::click, move |event| {
+        let Some(request) = anchor_range_request_from_event(&event) else {
+            return;
+        };
+        event.prevent_default();
+        event.stop_propagation();
+        selection.set(Some(request));
+    });
+    on_cleanup(move || listener.remove());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn subscribe_to_anchor_range(_selection: RwSignal<Option<AnchorRangeRequest>>) {}
+
+#[cfg(target_arch = "wasm32")]
+fn anchor_range_request_from_event(event: &web_sys::MouseEvent) -> Option<AnchorRangeRequest> {
+    if event.button() != 0
+        || event.alt_key()
+        || event.ctrl_key()
+        || event.meta_key()
+        || event.shift_key()
+    {
+        return None;
+    }
+    let trigger = event
+        .target()?
+        .dyn_into::<web_sys::Element>()
+        .ok()?
+        .closest("[data-anchor-range=\"true\"][data-edge-kind][data-source-id][data-target-id]")
+        .ok()
+        .flatten()?;
+    Some(AnchorRangeRequest {
+        source: trigger.get_attribute("data-source-id")?,
+        target: trigger.get_attribute("data-target-id")?,
+        kind: GraphViewportEdgeKind::from_key_part(&trigger.get_attribute("data-edge-kind")?)?,
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -189,6 +302,140 @@ fn node_detail_view(
             Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
         },
         _ => view! { <NodeDetailLoading/> }.into_any(),
+    }
+}
+
+fn anchor_range_view(
+    current: Option<AnchorRangeRequest>,
+    loaded: Option<LoadedPanel<AnchorRangeRequest, AnchorRangeResponse>>,
+) -> AnyView {
+    match (current.as_ref(), loaded) {
+        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
+            Ok(AnchorRangeResponse::Found {
+                kind,
+                previous,
+                nodes,
+                next,
+            }) => view! {
+                <AnchorRangeContent kind previous nodes next/>
+            }
+            .into_any(),
+            Ok(AnchorRangeResponse::Missing) => view! {
+                <p class="anchor-range-state">"The selected relationship is no longer available."</p>
+            }
+            .into_any(),
+            Err(error) => view! {
+                <p class="anchor-range-state">{format!("Failed to load anchor range: {error}")}</p>
+            }
+            .into_any(),
+        },
+        _ => view! {
+            <p class="anchor-range-state">"Loading anchor range..."</p>
+        }
+        .into_any(),
+    }
+}
+
+#[component]
+fn AnchorRangeContent(
+    kind: GraphViewportEdgeKind,
+    previous: Vec<AnchorRangeEdge>,
+    nodes: Vec<AnchorRangeNode>,
+    next: Vec<AnchorRangeEdge>,
+) -> impl IntoView {
+    let detail_count = nodes.len().saturating_sub(2);
+    let last_index = nodes.len().saturating_sub(1);
+    let mut items = previous
+        .into_iter()
+        .map(|edge| {
+            view! { <AnchorRangeNavigation label="Previous relationship" edge/> }.into_any()
+        })
+        .collect::<Vec<_>>();
+    for (index, node) in nodes.into_iter().enumerate() {
+        if index > 0 {
+            items.push(view! { <AnchorRangeConnector kind/> }.into_any());
+        }
+        items.push(view! { <AnchorRangeNodeCard index last_index node/> }.into_any());
+    }
+    items.extend(
+        next.into_iter().map(|edge| {
+            view! { <AnchorRangeNavigation label="Next relationship" edge/> }.into_any()
+        }),
+    );
+
+    view! {
+        <div class="anchor-range-summary">
+            <span>{anchor_range_kind_label(kind)}</span>
+            <strong>{format!(
+                "{detail_count} detail node{}",
+                if detail_count == 1 { "" } else { "s" },
+            )}</strong>
+        </div>
+        <ol class="anchor-range-track">{items}</ol>
+    }
+}
+
+#[component]
+fn AnchorRangeNodeCard(index: usize, last_index: usize, node: AnchorRangeNode) -> impl IntoView {
+    let label = if index == 0 {
+        "Source anchor"
+    } else if index == last_index {
+        "Target anchor"
+    } else {
+        "Detail node"
+    };
+    let target = format!("#{NODE_TARGET_PREFIX}{}", node.id);
+    view! {
+        <li class="anchor-range-node">
+            <a href=target>
+                <span>{label}</span>
+                <strong>{node.kind}</strong>
+                <code title=node.id>{node.short_id}</code>
+                <small>{node.role}</small>
+                <p>{if node.summary.is_empty() { "No content".to_owned() } else { node.summary }}</p>
+            </a>
+        </li>
+    }
+}
+
+#[component]
+fn AnchorRangeConnector(kind: GraphViewportEdgeKind) -> impl IntoView {
+    view! {
+        <li class="anchor-range-edge" aria-label=anchor_range_kind_label(kind)>
+            <span></span>
+            <small>{anchor_range_kind_label(kind)}</small>
+        </li>
+    }
+}
+
+#[component]
+fn AnchorRangeNavigation(label: &'static str, edge: AnchorRangeEdge) -> impl IntoView {
+    let source = shorten_id(&edge.source);
+    let target = shorten_id(&edge.target);
+    view! {
+        <li class="anchor-range-edge anchor-range-navigation">
+            <button
+                type="button"
+                data-anchor-range="true"
+                data-edge-kind=edge.kind.key_part()
+                data-source-id=edge.source
+                data-target-id=edge.target
+                aria-label=label
+            >
+                <span></span>
+                <small>{label}</small>
+                <code>{source}" → "{target}</code>
+                <em>{anchor_range_kind_label(edge.kind)}</em>
+            </button>
+        </li>
+    }
+}
+
+fn anchor_range_kind_label(kind: GraphViewportEdgeKind) -> &'static str {
+    match kind {
+        GraphViewportEdgeKind::Primary => "Primary parent",
+        GraphViewportEdgeKind::Merge => "Merge parent",
+        GraphViewportEdgeKind::Shadow => "Shadow parent",
     }
 }
 
@@ -896,6 +1143,7 @@ mod tests {
     fn panel_islands_render_independent_server_fallbacks() {
         let node = view! { <NodeDetailPanel/> }.to_html();
         let provider = view! { <ProviderContextPanel graph_mode="all".to_owned()/> }.to_html();
+        let range = view! { <AnchorRangeExpansion/> }.to_html();
 
         assert!(node.contains("leptos-island"));
         assert!(node.contains("panel-content"));
@@ -907,6 +1155,9 @@ mod tests {
         assert!(provider.contains("Select a node to inspect its provider context."));
         assert!(!provider.contains("<h2>Node</h2>"));
         assert_eq!(provider.matches("<section").count(), 1);
+        assert!(range.contains("anchor-range"));
+        assert!(range.contains("Expanded range"));
+        assert!(!range.contains("<dialog"));
     }
 
     #[test]
@@ -963,6 +1214,48 @@ mod tests {
         assert!(node_error.contains("node failed"));
         assert!(provider_error.contains("Failed to load provider context."));
         assert!(provider_error.contains("provider failed"));
+    }
+
+    #[test]
+    fn anchor_range_renders_nodes_and_adjacent_relationships() {
+        let node = |id: &str, kind: &str| AnchorRangeNode {
+            id: id.to_owned(),
+            short_id: id.to_owned(),
+            kind: kind.to_owned(),
+            role: "User".to_owned(),
+            summary: format!("{id} summary"),
+        };
+        let range = view! {
+            <AnchorRangeContent
+                kind=GraphViewportEdgeKind::Primary
+                previous=vec![AnchorRangeEdge {
+                    kind: GraphViewportEdgeKind::Merge,
+                    source: "previous".to_owned(),
+                    target: "source".to_owned(),
+                }]
+                nodes=vec![
+                    node("source", "prompt"),
+                    node("detail", "text"),
+                    node("target", "prompt"),
+                ]
+                next=vec![AnchorRangeEdge {
+                    kind: GraphViewportEdgeKind::Shadow,
+                    source: "target".to_owned(),
+                    target: "next".to_owned(),
+                }]
+            />
+        }
+        .to_html();
+
+        assert!(range.contains("1 detail node"));
+        assert!(range.contains("Source anchor"));
+        assert!(range.contains("Detail node"));
+        assert!(range.contains("Target anchor"));
+        assert!(range.contains("Previous relationship"));
+        assert!(range.contains("Next relationship"));
+        assert!(range.contains("data-edge-kind=\"merge_parent\""));
+        assert!(range.contains("data-edge-kind=\"shadow_parent\""));
+        assert_eq!(range.matches("href=\"#detail-").count(), 3);
     }
 
     #[test]

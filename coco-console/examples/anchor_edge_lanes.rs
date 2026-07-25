@@ -24,7 +24,16 @@ async fn main() {
     let delta_1 = demo_anchor(&store, &delta_0, "Delta / 1", Vec::new()).await;
     let gamma_1 = demo_anchor(&store, &gamma_0, "Gamma / 1", Vec::new()).await;
     let beta_1 = demo_anchor(&store, &beta_0, "Beta / 1", Vec::new()).await;
-    let alpha_1 = demo_anchor(&store, &alpha_0, "Alpha / 1", Vec::new()).await;
+    let alpha_detail = store
+        .append(NewNode {
+            parent: alpha_0.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text("Alpha intermediate detail".to_owned()),
+        })
+        .await
+        .expect("failed to append demo detail");
+    let alpha_1 = demo_anchor(&store, &alpha_detail, "Alpha / 1", Vec::new()).await;
 
     let alpha_2 = demo_anchor(
         &store,

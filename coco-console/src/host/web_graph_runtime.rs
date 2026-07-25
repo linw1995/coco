@@ -756,6 +756,35 @@ impl WebGraphRuntime {
         }
     }
 
+    pub async fn incident_edges(
+        &self,
+        mode: ViewMode,
+        node_ids: &[String],
+    ) -> crate::Result<Vec<GraphViewportEdge>> {
+        let node_ids = node_ids
+            .iter()
+            .map(|node_id| NodeId::new(node_id.clone()).context(WebGraphModelSnafu))
+            .collect::<crate::Result<BTreeSet<_>>>()?;
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        loop {
+            let state = self
+                .store
+                .state()
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            if let Some(routes) = self
+                .incident_routes_at_revision(layout_kind(mode), &node_ids, state.revision)
+                .await?
+            {
+                return Ok(routes.into_values().map(viewport_edge).collect());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub async fn drive(self, mut source_changes: watch::Receiver<u64>) -> Infallible {
         let mut retry_delay = RETRY_MIN_DELAY;
         loop {
