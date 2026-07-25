@@ -58,11 +58,32 @@ mkdir -p "${profraw_dir}" "${objects_dir}" "${result_dir}"
 
 env "CC_wasm32-unknown-unknown=${CC}" \
   cargo test -p coco-console --target wasm32-unknown-unknown graph_items_ --no-run
-env \
-  -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
-  -u http_proxy -u https_proxy -u all_proxy \
-  "CC_wasm32-unknown-unknown=${CC}" \
-  cargo test -p coco-console --target wasm32-unknown-unknown graph_items_
+
+profdata_path="${result_dir}/wasm.profdata"
+max_test_attempts=5
+profraw_files=()
+for ((attempt = 1; attempt <= max_test_attempts; attempt++)); do
+  rm -f "${profraw_dir}"/*.profraw "${profdata_path}"
+  env \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    -u http_proxy -u https_proxy -u all_proxy \
+    "CC_wasm32-unknown-unknown=${CC}" \
+    cargo test -p coco-console --target wasm32-unknown-unknown graph_items_
+
+  # The runner can close the browser before its asynchronous coverage upload finishes.
+  mapfile -d "" profraw_files < <(
+    find "${profraw_dir}" -maxdepth 1 -type f -name "*.profraw" -print0
+  )
+  if [[ "${#profraw_files[@]}" -gt 0 ]] &&
+    "${llvm_profdata}" merge -sparse "${profraw_files[@]}" -o "${profdata_path}"; then
+    break
+  fi
+  if [[ "${attempt}" -eq "${max_test_attempts}" ]]; then
+    echo "No valid profraw data was generated after ${attempt} wasm coverage attempts." >&2
+    exit 1
+  fi
+  echo "Wasm tests passed without valid coverage data; retrying (${attempt}/${max_test_attempts})." >&2
+done
 
 mapfile -d "" llvm_ir_files < <(find "${wasm_deps_dir}" -name "*.ll" -print0)
 if [[ "${#llvm_ir_files[@]}" -eq 0 ]]; then
@@ -91,16 +112,9 @@ if [[ -z "${llvm_cov_main_object}" ]]; then
   exit 1
 fi
 
-profraw_files=("${profraw_dir}"/*.profraw)
-if [[ "${#profraw_files[@]}" -eq 0 ]]; then
-  echo "No profraw files were generated for wasm coverage." >&2
-  exit 1
-fi
-
-"${llvm_profdata}" merge -sparse "${profraw_files[@]}" -o "${result_dir}/wasm.profdata"
 "${llvm_cov}" export \
   --format=lcov \
-  --instr-profile="${result_dir}/wasm.profdata" \
+  --instr-profile="${profdata_path}" \
   "${llvm_cov_main_object}" \
   "${llvm_cov_extra_objects[@]}" \
   >"${result_dir}/wasm.lcov.info"
