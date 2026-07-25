@@ -159,7 +159,7 @@ fn use_panel_selection() -> RwSignal<PanelSelection> {
 
 #[cfg(target_arch = "wasm32")]
 fn subscribe_to_panel_selection(selection: RwSignal<PanelSelection>) {
-    selection.set(current_panel_selection());
+    request_animation_frame(move || selection.set(current_panel_selection()));
     let listener = window_event_listener(ev::hashchange, move |_| {
         selection.set(current_panel_selection());
     });
@@ -554,7 +554,8 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    async fn graph_items_panel_selection_signals_track_hash_changes_independently() {
+    async fn graph_items_panel_selection_signals_read_initial_hash_and_track_changes_independently()
+    {
         _ = Executor::init_wasm_bindgen();
         let owner = Owner::new();
         owner.set();
@@ -565,7 +566,22 @@ mod wasm_tests {
             .expect_throw("initial hash should be set");
         let node_selection = use_panel_selection();
         let context_selection = use_panel_selection();
+        let loaded_selection = LocalResource::new(move || {
+            let selection = node_selection.get();
+            async move { selection }
+        });
+        assert_eq!(node_selection.get_untracked(), PanelSelection::default());
+        assert_eq!(context_selection.get_untracked(), PanelSelection::default());
+        next_animation_frame().await;
+        next_animation_frame().await;
         next_task().await;
+        let expected_initial = PanelSelection {
+            target: Some("detail-node".to_owned()),
+            context: None,
+        };
+        assert_eq!(node_selection.get_untracked(), expected_initial);
+        assert_eq!(context_selection.get_untracked(), expected_initial);
+        assert_eq!(loaded_selection.await, expected_initial);
 
         window
             .location()
@@ -593,5 +609,18 @@ mod wasm_tests {
         JsFuture::from(Promise::resolve(&JsValue::NULL))
             .await
             .expect_throw("task should resolve");
+    }
+
+    async fn next_animation_frame() {
+        let promise = Promise::new(&mut |resolve, _| {
+            request_animation_frame(move || {
+                resolve
+                    .call0(&JsValue::UNDEFINED)
+                    .expect_throw("animation frame promise should resolve");
+            });
+        });
+        JsFuture::from(promise)
+            .await
+            .expect_throw("animation frame should run");
     }
 }
