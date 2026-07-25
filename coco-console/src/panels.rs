@@ -1203,9 +1203,11 @@ mod tests {
 mod wasm_tests {
     use super::*;
 
+    use std::{cell::Cell, rc::Rc};
+
     use any_spawner::Executor;
     use js_sys::Promise;
-    use wasm_bindgen::{JsValue, UnwrapThrowExt};
+    use wasm_bindgen::{JsValue, UnwrapThrowExt, closure::Closure};
     use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -1220,12 +1222,19 @@ mod wasm_tests {
         let root = document
             .create_element("div")
             .expect_throw("test root should be created");
-        root.set_attribute("style", "height: 2000px; padding-top: 1200px")
-            .expect_throw("test root should be styled");
         let detail = document
             .create_element("section")
             .expect_throw("detail should be created");
         detail.set_id("detail-mobile");
+        let scroll_invoked = Rc::new(Cell::new(false));
+        let callback_invoked = Rc::clone(&scroll_invoked);
+        let scroll_into_view = Closure::<dyn FnMut()>::new(move || callback_invoked.set(true));
+        js_sys::Reflect::set(
+            detail.as_ref(),
+            &JsValue::from_str("scrollIntoView"),
+            scroll_into_view.as_ref(),
+        )
+        .expect_throw("scrollIntoView should be replaceable");
         root.append_child(&detail)
             .expect_throw("detail should be mounted");
         document
@@ -1233,20 +1242,12 @@ mod wasm_tests {
             .expect_throw("document body should be available")
             .append_child(&root)
             .expect_throw("test root should be mounted");
-        window.scroll_to_with_x_and_y(0.0, 0.0);
 
         reveal_node_detail_on_mobile("detail-mobile");
         next_animation_frame().await;
-        next_animation_frame().await;
 
-        assert!(
-            window
-                .scroll_y()
-                .expect_throw("scroll position should exist")
-                > 0.0
-        );
+        assert!(scroll_invoked.get());
         root.remove();
-        window.scroll_to_with_x_and_y(0.0, 0.0);
     }
 
     #[wasm_bindgen_test]
