@@ -8,7 +8,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AbortController, AbortSignal, Document, Element, EventSource, KeyboardEvent, MessageEvent,
-    MouseEvent, RequestInit, Response, WheelEvent, Window,
+    MouseEvent, RequestInit, ResizeObserver, Response, WheelEvent, Window,
 };
 
 use super::refresh::{
@@ -222,6 +222,7 @@ struct VirtualGraph {
     version_refresh_scheduled: bool,
     version_refresh_abort: Option<AbortController>,
     events: Option<EventSource>,
+    resize_observer: Option<ResizeObserver>,
 }
 
 impl VirtualGraph {
@@ -264,6 +265,7 @@ impl VirtualGraph {
             version_refresh_scheduled: false,
             version_refresh_abort: None,
             events: None,
+            resize_observer: None,
         };
         graph.apply_follow_toggle_state()?;
         Ok(graph)
@@ -1585,7 +1587,7 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
         install_follow_toggle_listener,
         install_mouse_pan_listener,
         install_wheel_listener,
-        install_resize_listener,
+        install_resize_observer,
         install_time_scale_listener,
         install_time_scale_keyboard_listener,
         install_hashchange_node_selection_listener,
@@ -1736,16 +1738,17 @@ fn install_wheel_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValu
     Ok(())
 }
 
-fn install_resize_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+fn install_resize_observer(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let graph_wrap = graph.borrow().graph_wrap.clone();
     let resize_graph = graph.clone();
-    let resize_window = graph.borrow().window.clone();
     let resize_closure = Closure::<dyn FnMut()>::new(move || {
         update_viewport(resize_graph.clone(), |graph| {
             graph.resize_viewport();
         });
     });
-    resize_window
-        .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
+    let resize_observer = ResizeObserver::new(resize_closure.as_ref().unchecked_ref())?;
+    resize_observer.observe(&graph_wrap);
+    graph.borrow_mut().resize_observer = Some(resize_observer);
     resize_closure.forget();
     Ok(())
 }
