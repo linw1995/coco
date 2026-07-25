@@ -8,7 +8,9 @@ use leptos::server_fn::codec::GetUrl;
 use crate::api::{NodeDetailResponse, ProviderContextItem, ProviderContextResponse};
 
 #[cfg(target_arch = "wasm32")]
-pub mod client;
+mod client;
+#[cfg(target_arch = "wasm32")]
+pub use client::{PROVIDER_CONTEXT_RENDERED_EVENT, reveal_node_detail_on_mobile};
 
 const NODE_TARGET_PREFIX: &str = "detail-";
 pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
@@ -100,7 +102,7 @@ fn NodeDetailPanelBody() -> impl IntoView {
         let current = selected_target.get();
         let loaded = detail.get().flatten();
         if current_node_detail_is_loaded(current.as_deref(), loaded.as_ref()) {
-            client::reveal_node_detail_on_mobile();
+            reveal_node_detail_on_mobile();
         }
     });
 
