@@ -4,6 +4,8 @@ use leptos::{html::HtmlElement, prelude::*};
 use crate::host::web_graph_view::ViewMode;
 use crate::panels::{NodeDetailPanel, ProviderContextPanel};
 
+use super::CLIENT_ASSET_VERSION;
+
 const HYDRATION_BOOTSTRAP: &str = "__RESOLVED_RESOURCES=[];\
 __SERIALIZED_ERRORS=[];\
 __PENDING_RESOURCES=[];\
@@ -19,7 +21,10 @@ pub fn render_index_page(mode: ViewMode, revision: u64) -> String {
 }
 
 fn render_document(root: AnyView) -> String {
-    let options = LeptosOptions::builder().output_name("coco_console").build();
+    let options = LeptosOptions::builder()
+        .output_name("coco_console")
+        .site_pkg_dir(format!("pkg/{CLIENT_ASSET_VERSION}"))
+        .build();
     let rendered: View<HtmlElement<_, _, _>> = view! {
         <html lang="en">
             <head>
@@ -130,7 +135,9 @@ mod tests {
         assert!(page.contains("data-version=\"7\""));
         assert!(page.contains("data-graph-mode=\"all\""));
         assert!(page.contains("virtual-graph"));
-        assert!(page.contains("/pkg/coco_console.js"));
+        assert!(page.contains(&format!("/pkg/{CLIENT_ASSET_VERSION}/coco_console.js")));
+        assert!(page.contains(&format!("/pkg/{CLIENT_ASSET_VERSION}/coco_console_bg.wasm")));
+        assert!(!page.contains("\"/pkg/coco_console.js\""));
         let bootstrap = page
             .find("__INCOMPLETE_CHUNKS=[]")
             .expect("hydration globals should be initialized");

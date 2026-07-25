@@ -8,7 +8,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{ConnectInfo, RawQuery, Request, State};
+use axum::extract::{ConnectInfo, Path, RawQuery, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -21,6 +21,7 @@ use leptos_axum::handle_server_fns_with_context;
 use serde::Serialize;
 use snafu::prelude::*;
 
+use super::CLIENT_ASSET_VERSION;
 use super::config::ConsoleConfig;
 use super::error::{
     BindConsoleSnafu, ConfigureConsoleSocketSnafu, JoinConsoleServerSnafu, ServeConsoleSnafu,
@@ -221,8 +222,8 @@ where
         .route("/api/node-detail", get(node_detail::<S>))
         .route("/api/provider-context", get(provider_context::<S>))
         .route("/events", get(event_stream::<S>))
-        .route("/pkg/coco_console.js", get(client_js))
-        .route("/pkg/coco_console_bg.wasm", get(client_wasm))
+        .route("/pkg/{version}/coco_console.js", get(client_js))
+        .route("/pkg/{version}/coco_console_bg.wasm", get(client_wasm))
         .fallback(not_found)
         .with_state(state)
         .layer(middleware::from_fn(access_log))
@@ -553,7 +554,10 @@ where
     Sse::new(initial.chain(changes)).into_response()
 }
 
-async fn client_js() -> Response {
+async fn client_js(Path(version): Path<String>) -> Response {
+    if version != CLIENT_ASSET_VERSION {
+        return not_found().await;
+    }
     response_with_body(
         StatusCode::OK,
         "text/javascript; charset=utf-8",
@@ -561,7 +565,10 @@ async fn client_js() -> Response {
     )
 }
 
-async fn client_wasm() -> Response {
+async fn client_wasm(Path(version): Path<String>) -> Response {
+    if version != CLIENT_ASSET_VERSION {
+        return not_found().await;
+    }
     response_with_body(
         StatusCode::OK,
         "application/wasm",
@@ -806,6 +813,32 @@ mod tests {
     #[test]
     fn malformed_percent_encoding_is_preserved() {
         assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
+    }
+
+    #[tokio::test]
+    async fn client_assets_require_the_current_build_version() {
+        let js = client_js(Path(CLIENT_ASSET_VERSION.to_owned())).await;
+        assert_eq!(js.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(js.into_body(), usize::MAX).await.unwrap(),
+            COCO_CONSOLE_JS
+        );
+
+        let wasm = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned())).await;
+        assert_eq!(wasm.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(wasm.into_body(), usize::MAX).await.unwrap(),
+            COCO_CONSOLE_WASM
+        );
+
+        assert_eq!(
+            client_js(Path("stale-build".to_owned())).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client_wasm(Path("stale-build".to_owned())).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

@@ -23,6 +23,9 @@ enum BuildError {
     #[snafu(display("Failed to create wasm package directory {}: {source}", path.display()))]
     CreatePackageDirectory { path: PathBuf, source: io::Error },
 
+    #[snafu(display("Failed to read wasm asset {}: {source}", path.display()))]
+    ReadAsset { path: PathBuf, source: io::Error },
+
     #[snafu(display("Failed to run {program}: {source}"))]
     RunCommand { program: String, source: io::Error },
 
@@ -83,7 +86,25 @@ fn run() -> BuildResult<()> {
             .arg(&pkg_dir)
             .arg(&wasm_file),
     )?;
+    let asset_version = asset_version(&pkg_dir)?;
+    println!("cargo:rustc-env=COCO_CONSOLE_ASSET_VERSION={asset_version}");
     Ok(())
+}
+
+fn asset_version(pkg_dir: &std::path::Path) -> BuildResult<String> {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for name in ["coco_console.js", "coco_console_bg.wasm"] {
+        let path = pkg_dir.join(name);
+        let bytes = fs::read(&path).context(ReadAssetSnafu { path })?;
+        for byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    Ok(format!("{hash:016x}"))
 }
 
 fn run_command(command: &mut Command) -> BuildResult<()> {

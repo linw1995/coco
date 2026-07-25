@@ -6,6 +6,8 @@ mod web_graph;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod host {
+    const CLIENT_ASSET_VERSION: &str = env!("COCO_CONSOLE_ASSET_VERSION");
+
     mod api;
     mod config;
     mod error;
