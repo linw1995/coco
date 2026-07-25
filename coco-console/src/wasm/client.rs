@@ -1823,12 +1823,18 @@ fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
         let graph = graph.borrow();
         graph.window.clone()
     };
+    let reveals_current_detail = window
+        .location()
+        .hash()
+        .is_ok_and(|current_hash| same_detail_target(&current_hash, &hash));
 
     match update_detail_hash(&window, &hash) {
-        Ok(true) => return,
-        Ok(false) => {
-            if let Some(target) = PanelSelection::from_hash(&hash).target {
-                reveal_node_detail_on_mobile(&target);
+        Ok(changed) => {
+            if reveals_current_detail {
+                reveal_node_detail_on_mobile();
+            }
+            if changed {
+                return;
             }
         }
         Err(error) => {
@@ -1838,6 +1844,12 @@ fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
     }
 
     focus_selected_node_in_graph(graph);
+}
+
+fn same_detail_target(current_hash: &str, next_hash: &str) -> bool {
+    let current = PanelSelection::from_hash(current_hash).target;
+    let next = PanelSelection::from_hash(next_hash).target;
+    current.is_some() && current == next
 }
 
 fn update_detail_hash(window: &Window, hash: &str) -> Result<bool, JsValue> {
@@ -2420,8 +2432,24 @@ mod tests {
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa"
         );
+        assert!(same_detail_target(
+            "#detail-aaaaaaaa",
+            "#detail-aaaaaaaa?context=detail-context"
+        ));
+        assert!(!same_detail_target(
+            "#detail-aaaaaaaa",
+            "#detail-bbbbbbbb?context=detail-context"
+        ));
+        select_detail_link(
+            fixture.graph.clone(),
+            "#detail-aaaaaaaa?context=detail-context".to_owned(),
+        );
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-aaaaaaaa?context=detail-context"
+        );
         assert!(
-            update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-context")
+            update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-other")
                 .expect_throw("provider context hash should be set")
         );
     }

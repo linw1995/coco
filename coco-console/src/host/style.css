@@ -874,6 +874,10 @@ leptos-island:has(> .panel-content) > .provider-context-default {
     height: clamp(20rem, 58svh, 36rem);
   }
 
+  .graph-wrap {
+    touch-action: pan-y;
+  }
+
   .provider-context-panel,
   .side {
     border-left: 0;

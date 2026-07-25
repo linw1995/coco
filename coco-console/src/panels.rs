@@ -15,6 +15,7 @@ use leptos::{
 const NODE_TARGET_PREFIX: &str = "detail-";
 #[cfg(target_arch = "wasm32")]
 const MOBILE_VIEWPORT_MAX_WIDTH: i32 = 860;
+pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
 #[cfg(target_arch = "wasm32")]
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
 
@@ -103,8 +104,8 @@ fn NodeDetailPanelBody() -> impl IntoView {
     Effect::new(move || {
         let current = selected_target.get();
         let loaded = detail.get().flatten();
-        if let Some(target) = loaded_node_detail_target(current.as_deref(), loaded.as_ref()) {
-            reveal_node_detail_on_mobile(target);
+        if current_node_detail_is_loaded(current.as_deref(), loaded.as_ref()) {
+            reveal_node_detail_on_mobile();
         }
     });
 
@@ -187,42 +188,40 @@ fn current_panel_selection() -> PanelSelection {
     PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
 }
 
-fn loaded_node_detail_target<'a>(
-    current: Option<&'a str>,
+fn current_node_detail_is_loaded(
+    current: Option<&str>,
     loaded: Option<&LoadedPanel<String, NodeDetailResponse>>,
-) -> Option<&'a str> {
-    let current = current?;
-    let loaded = loaded?;
-    (loaded.request == current && matches!(&loaded.response, Ok(NodeDetailResponse::Found { .. })))
-        .then_some(current)
+) -> bool {
+    current
+        .zip(loaded)
+        .is_some_and(|(current, loaded)| loaded.request == current)
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn reveal_node_detail_on_mobile(target: &str) {
+pub fn reveal_node_detail_on_mobile() {
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {
         return;
     };
     let Some(viewport_width) = document.document_element().map(|root| root.client_width()) else {
         return;
     };
-    reveal_node_detail(document, target, viewport_width);
+    reveal_node_detail(document, viewport_width);
 }
 
 #[cfg(target_arch = "wasm32")]
-fn reveal_node_detail(document: web_sys::Document, target: &str, viewport_width: i32) {
+fn reveal_node_detail(document: web_sys::Document, viewport_width: i32) {
     if viewport_width > MOBILE_VIEWPORT_MAX_WIDTH {
         return;
     }
-    let target = target.to_owned();
     request_animation_frame(move || {
-        if let Some(detail) = document.get_element_by_id(&target) {
+        if let Some(detail) = document.get_element_by_id(NODE_DETAIL_PANEL_ID) {
             detail.scroll_into_view();
         }
     });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn reveal_node_detail_on_mobile(_target: &str) {}
+pub fn reveal_node_detail_on_mobile() {}
 
 fn node_detail_view(
     current: Option<String>,
@@ -939,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_node_detail_target_requires_current_found_response() {
+    fn current_node_detail_is_loaded_accepts_every_current_response() {
         let found = LoadedPanel {
             request: "detail-node".to_owned(),
             response: Ok(NodeDetailResponse::Found {
@@ -952,21 +951,29 @@ mod tests {
                 target: "detail-node".to_owned(),
             }),
         };
+        let failed = LoadedPanel {
+            request: "detail-node".to_owned(),
+            response: Err("backend unavailable".to_owned()),
+        };
 
-        assert_eq!(
-            loaded_node_detail_target(Some("detail-node"), Some(&found)),
-            Some("detail-node")
-        );
-        assert_eq!(
-            loaded_node_detail_target(Some("detail-other"), Some(&found)),
-            None
-        );
-        assert_eq!(
-            loaded_node_detail_target(Some("detail-node"), Some(&missing)),
-            None
-        );
-        assert_eq!(loaded_node_detail_target(None, Some(&found)), None);
-        assert_eq!(loaded_node_detail_target(Some("detail-node"), None), None);
+        assert!(current_node_detail_is_loaded(
+            Some("detail-node"),
+            Some(&found)
+        ));
+        assert!(current_node_detail_is_loaded(
+            Some("detail-node"),
+            Some(&missing)
+        ));
+        assert!(current_node_detail_is_loaded(
+            Some("detail-node"),
+            Some(&failed)
+        ));
+        assert!(!current_node_detail_is_loaded(
+            Some("detail-other"),
+            Some(&found)
+        ));
+        assert!(!current_node_detail_is_loaded(None, Some(&found)));
+        assert!(!current_node_detail_is_loaded(Some("detail-node"), None));
     }
 
     #[test]
@@ -1230,7 +1237,7 @@ mod wasm_tests {
         let detail = document
             .create_element("section")
             .expect_throw("detail should be created");
-        detail.set_id("detail-mobile");
+        detail.set_id(NODE_DETAIL_PANEL_ID);
         let scroll_invoked = Rc::new(Cell::new(false));
         let callback_invoked = Rc::clone(&scroll_invoked);
         let scroll_into_view = Closure::<dyn FnMut()>::new(move || callback_invoked.set(true));
@@ -1248,7 +1255,7 @@ mod wasm_tests {
             .append_child(&root)
             .expect_throw("test root should be mounted");
 
-        reveal_node_detail(document, "detail-mobile", MOBILE_VIEWPORT_MAX_WIDTH);
+        reveal_node_detail(document, MOBILE_VIEWPORT_MAX_WIDTH);
         next_animation_frame().await;
 
         assert!(scroll_invoked.get());
