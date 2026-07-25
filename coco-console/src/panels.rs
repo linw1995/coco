@@ -1,6 +1,6 @@
 use coco_types::{
     AnchorPayload, Kind, Node, PromptAttachment, SessionAnchor, SessionAnchorPatch,
-    SkillInvocationMode, ToolResult, ToolUse,
+    SkillInvocationAnchor, SkillInvocationMode, Tool, ToolResult, ToolUse,
 };
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
@@ -295,122 +295,9 @@ fn NodeDetail(node: Node) -> impl IntoView {
 #[component]
 fn NodeDetailBody(kind: Kind) -> AnyView {
     match kind {
-        Kind::Anchor(anchor) => match anchor.payload {
-            AnchorPayload::Session(session) => {
-                let SessionAnchor {
-                    role,
-                    provider_profile,
-                    provider,
-                    model,
-                    tools,
-                    system_prompt,
-                    prompt,
-                    temperature,
-                    max_tokens,
-                    additional_params,
-                    enable_coco_shim,
-                    active_skill,
-                } = *session;
-                let session_role = role.as_str();
-                let tools = tools.into_iter().map(|tool| tool.name).collect();
-                let provider = provider.unwrap_or_else(|| "Profile default".to_owned());
-                let provider_profile = provider_profile.unwrap_or_else(|| "Default".to_owned());
-                let temperature =
-                    temperature.map_or_else(|| "Default".to_owned(), |value| value.to_string());
-                let max_tokens =
-                    max_tokens.map_or_else(|| "Default".to_owned(), |value| value.to_string());
-                let additional_params = additional_params.map(|value| pretty_json(&value));
-                view! {
-                    <div class="node-detail-body session-detail">
-                        <dl class="node-detail-properties">
-                            <div><dt>"Session role"</dt><dd>{humanize_kind(session_role)}</dd></div>
-                            <div><dt>"Model"</dt><dd>{model}</dd></div>
-                            <div><dt>"Provider"</dt><dd>{provider}</dd></div>
-                            <div><dt>"Profile"</dt><dd>{provider_profile}</dd></div>
-                            <div><dt>"Temperature"</dt><dd>{temperature}</dd></div>
-                            <div><dt>"Max tokens"</dt><dd>{max_tokens}</dd></div>
-                            <div>
-                                <dt>"CoCo shim"</dt>
-                                <dd>{if enable_coco_shim { "Enabled" } else { "Disabled" }}</dd>
-                            </div>
-                        </dl>
-                        <DetailTags label="Tools" values=tools empty="None configured"/>
-                        {active_skill.map(|skill| view! {
-                            <section class="node-detail-callout">
-                                <span>"Active skill"</span>
-                                <strong>{skill.name}</strong>
-                                {skill.handoff.map(|handoff| view! { <p>{handoff}</p> })}
-                            </section>
-                        })}
-                        <DetailTextBlock label="Prompt" content=prompt/>
-                        <DetailTextBlock label="System prompt" content=system_prompt/>
-                        {additional_params.map(|params| view! {
-                            <DetailCodeBlock label="Additional params" content=params/>
-                        })}
-                    </div>
-                }
-                .into_any()
-            }
-            AnchorPayload::SessionPatch(patch) => {
-                let fields = session_patch_fields(patch);
-                let content = if fields.is_empty() {
-                    view! { <p class="node-detail-empty">"No configuration changes."</p> }
-                        .into_any()
-                } else {
-                    view! {
-                        <dl class="node-detail-properties patch-properties">
-                            {fields.into_iter().map(|(name, value)| view! {
-                                <div><dt>{name}</dt><dd>{value}</dd></div>
-                            }).collect::<Vec<_>>()}
-                        </dl>
-                    }
-                    .into_any()
-                };
-                view! {
-                    <div class="node-detail-body">
-                        <section class="node-detail-section">
-                            <h3>"Configuration changes"</h3>
-                            {content}
-                        </section>
-                    </div>
-                }
-                .into_any()
-            }
-            AnchorPayload::Prompt(prompt) => view! {
-                <div class="node-detail-body">
-                    <DetailTextBlock label="Prompt" content=prompt.prompt/>
-                    <PromptAttachments attachments=prompt.attachments/>
-                </div>
-            }
-            .into_any(),
-            AnchorPayload::SkillInvocation(invocation) => {
-                let (mode, prompt) = match invocation.mode {
-                    SkillInvocationMode::InheritContext => ("Inherit context", None),
-                    SkillInvocationMode::Handoff { prompt } => ("Handoff", Some(prompt)),
-                };
-                view! {
-                    <div class="node-detail-body">
-                        <dl class="node-detail-properties">
-                            <div><dt>"Skill"</dt><dd>{invocation.skill_name}</dd></div>
-                            <div><dt>"Mode"</dt><dd>{mode}</dd></div>
-                        </dl>
-                        {prompt.map(|prompt| view! {
-                            <DetailTextBlock label="Handoff prompt" content=prompt/>
-                        })}
-                    </div>
-                }
-                .into_any()
-            }
-            AnchorPayload::SkillResult(result) => view! {
-                <div class="node-detail-body">
-                    <dl class="node-detail-properties">
-                        <div><dt>"Skill"</dt><dd>{result.skill_name}</dd></div>
-                    </dl>
-                    <DetailTextBlock label="Output" content=result.output/>
-                </div>
-            }
-            .into_any(),
-        },
+        Kind::Anchor(anchor) => {
+            view! { <AnchorDetailBody payload=anchor.payload/> }.into_any()
+        }
         Kind::ToolUse(items) => view! {
             <div class="node-detail-body node-detail-items">
                 {items.into_iter().map(|item| view! { <ToolUseDetail item=item/> }).collect::<Vec<_>>()}
@@ -441,87 +328,199 @@ fn NodeDetailBody(kind: Kind) -> AnyView {
     }
 }
 
-fn session_patch_fields(patch: SessionAnchorPatch) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    if let Some(role) = patch.role {
-        push_patch_field(&mut fields, "Role", role.as_str());
+#[component]
+fn AnchorDetailBody(payload: AnchorPayload) -> AnyView {
+    match payload {
+        AnchorPayload::Session(session) => {
+            view! { <SessionAnchorDetail session=*session/> }.into_any()
+        }
+        AnchorPayload::SessionPatch(patch) => {
+            view! { <SessionPatchDetail patch=patch/> }.into_any()
+        }
+        AnchorPayload::Prompt(prompt) => view! {
+            <div class="node-detail-body">
+                <DetailTextBlock label="Prompt" content=prompt.prompt/>
+                <PromptAttachments attachments=prompt.attachments/>
+            </div>
+        }
+        .into_any(),
+        AnchorPayload::SkillInvocation(invocation) => {
+            view! { <SkillInvocationDetail invocation=invocation/> }.into_any()
+        }
+        AnchorPayload::SkillResult(result) => view! {
+            <div class="node-detail-body">
+                <dl class="node-detail-properties">
+                    <div><dt>"Skill"</dt><dd>{result.skill_name}</dd></div>
+                </dl>
+                <DetailTextBlock label="Output" content=result.output/>
+            </div>
+        }
+        .into_any(),
     }
-    if let Some(provider_profile) = patch.provider_profile {
-        push_patch_field(
-            &mut fields,
-            "Provider profile",
-            provider_profile.unwrap_or_else(|| "None".to_owned()),
-        );
-    }
-    if let Some(provider) = patch.provider {
-        push_patch_field(
-            &mut fields,
-            "Provider",
-            provider.unwrap_or_else(|| "None".to_owned()),
-        );
-    }
-    if let Some(model) = patch.model {
-        push_patch_field(&mut fields, "Model", model);
-    }
-    if let Some(tools) = patch.tools {
-        push_patch_field(
-            &mut fields,
-            "Tools",
-            if tools.is_empty() {
-                "None".to_owned()
-            } else {
-                tools
-                    .into_iter()
-                    .map(|tool| tool.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            },
-        );
-    }
-    if let Some(system_prompt) = patch.system_prompt {
-        push_patch_field(&mut fields, "System prompt", system_prompt);
-    }
-    if let Some(temperature) = patch.temperature {
-        push_patch_field(
-            &mut fields,
-            "Temperature",
-            temperature.map_or_else(|| "None".to_owned(), |value| value.to_string()),
-        );
-    }
-    if let Some(max_tokens) = patch.max_tokens {
-        push_patch_field(
-            &mut fields,
-            "Max tokens",
-            max_tokens.map_or_else(|| "None".to_owned(), |value| value.to_string()),
-        );
-    }
-    if let Some(additional_params) = patch.additional_params {
-        push_patch_field(
-            &mut fields,
-            "Additional params",
-            additional_params.map_or_else(|| "None".to_owned(), |value| pretty_json(&value)),
-        );
-    }
-    if let Some(enable_coco_shim) = patch.enable_coco_shim {
-        push_patch_field(
-            &mut fields,
-            "CoCo shim",
-            if enable_coco_shim {
-                "Enabled"
-            } else {
-                "Disabled"
-            },
-        );
-    }
-    fields
 }
 
-fn push_patch_field(
-    fields: &mut Vec<(String, String)>,
-    name: impl Into<String>,
-    value: impl Into<String>,
-) {
-    fields.push((name.into(), value.into()));
+#[component]
+fn SessionAnchorDetail(session: SessionAnchor) -> impl IntoView {
+    let SessionAnchor {
+        role,
+        provider_profile,
+        provider,
+        model,
+        tools,
+        system_prompt,
+        prompt,
+        temperature,
+        max_tokens,
+        additional_params,
+        enable_coco_shim,
+        active_skill,
+    } = session;
+    let session_role = role.as_str();
+    let tools = tools.into_iter().map(|tool| tool.name).collect();
+    let provider = provider.unwrap_or_else(|| "Profile default".to_owned());
+    let provider_profile = provider_profile.unwrap_or_else(|| "Default".to_owned());
+    let temperature = temperature.map_or_else(|| "Default".to_owned(), |value| value.to_string());
+    let max_tokens = max_tokens.map_or_else(|| "Default".to_owned(), |value| value.to_string());
+    let additional_params = additional_params.map(|value| pretty_json(&value));
+    view! {
+        <div class="node-detail-body session-detail">
+            <dl class="node-detail-properties">
+                <div><dt>"Session role"</dt><dd>{humanize_kind(session_role)}</dd></div>
+                <div><dt>"Model"</dt><dd>{model}</dd></div>
+                <div><dt>"Provider"</dt><dd>{provider}</dd></div>
+                <div><dt>"Profile"</dt><dd>{provider_profile}</dd></div>
+                <div><dt>"Temperature"</dt><dd>{temperature}</dd></div>
+                <div><dt>"Max tokens"</dt><dd>{max_tokens}</dd></div>
+                <div>
+                    <dt>"CoCo shim"</dt>
+                    <dd>{if enable_coco_shim { "Enabled" } else { "Disabled" }}</dd>
+                </div>
+            </dl>
+            <DetailTags label="Tools" values=tools empty="None configured"/>
+            {active_skill.map(|skill| view! {
+                <section class="node-detail-callout">
+                    <span>"Active skill"</span>
+                    <strong>{skill.name}</strong>
+                    {skill.handoff.map(|handoff| view! { <p>{handoff}</p> })}
+                </section>
+            })}
+            <DetailTextBlock label="Prompt" content=prompt/>
+            <DetailTextBlock label="System prompt" content=system_prompt/>
+            {additional_params.map(|params| view! {
+                <DetailCodeBlock label="Additional params" content=params/>
+            })}
+        </div>
+    }
+}
+
+#[component]
+fn SessionPatchDetail(patch: SessionAnchorPatch) -> impl IntoView {
+    let fields = session_patch_fields(patch);
+    let content = if fields.is_empty() {
+        view! { <p class="node-detail-empty">"No configuration changes."</p> }.into_any()
+    } else {
+        view! {
+            <dl class="node-detail-properties patch-properties">
+                {fields.into_iter().map(|(name, value)| view! {
+                    <div><dt>{name}</dt><dd>{value}</dd></div>
+                }).collect::<Vec<_>>()}
+            </dl>
+        }
+        .into_any()
+    };
+    view! {
+        <div class="node-detail-body">
+            <section class="node-detail-section">
+                <h3>"Configuration changes"</h3>
+                {content}
+            </section>
+        </div>
+    }
+}
+
+#[component]
+fn SkillInvocationDetail(invocation: SkillInvocationAnchor) -> impl IntoView {
+    let (mode, prompt) = match invocation.mode {
+        SkillInvocationMode::InheritContext => ("Inherit context", None),
+        SkillInvocationMode::Handoff { prompt } => ("Handoff", Some(prompt)),
+    };
+    view! {
+        <div class="node-detail-body">
+            <dl class="node-detail-properties">
+                <div><dt>"Skill"</dt><dd>{invocation.skill_name}</dd></div>
+                <div><dt>"Mode"</dt><dd>{mode}</dd></div>
+            </dl>
+            {prompt.map(|prompt| view! {
+                <DetailTextBlock label="Handoff prompt" content=prompt/>
+            })}
+        </div>
+    }
+}
+
+fn session_patch_fields(patch: SessionAnchorPatch) -> Vec<(String, String)> {
+    [
+        patch.role.map(|value| patch_field("Role", value.as_str())),
+        patch.provider_profile.map(|value| {
+            patch_field(
+                "Provider profile",
+                value.unwrap_or_else(|| "None".to_owned()),
+            )
+        }),
+        patch
+            .provider
+            .map(|value| patch_field("Provider", value.unwrap_or_else(|| "None".to_owned()))),
+        patch.model.map(|value| patch_field("Model", value)),
+        patch
+            .tools
+            .map(|value| patch_field("Tools", format_patch_tools(value))),
+        patch
+            .system_prompt
+            .map(|value| patch_field("System prompt", value)),
+        patch.temperature.map(|value| {
+            patch_field(
+                "Temperature",
+                value.map_or_else(|| "None".to_owned(), |value| value.to_string()),
+            )
+        }),
+        patch.max_tokens.map(|value| {
+            patch_field(
+                "Max tokens",
+                value.map_or_else(|| "None".to_owned(), |value| value.to_string()),
+            )
+        }),
+        patch.additional_params.map(|value| {
+            patch_field(
+                "Additional params",
+                value.map_or_else(|| "None".to_owned(), |value| pretty_json(&value)),
+            )
+        }),
+        patch
+            .enable_coco_shim
+            .map(|value| patch_field("CoCo shim", format_coco_shim(value))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn patch_field(name: &str, value: impl Into<String>) -> (String, String) {
+    (name.to_owned(), value.into())
+}
+
+fn format_patch_tools(tools: Vec<Tool>) -> String {
+    if tools.is_empty() {
+        "None".to_owned()
+    } else {
+        tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn format_coco_shim(enabled: bool) -> &'static str {
+    if enabled { "Enabled" } else { "Disabled" }
 }
 
 fn node_kind_name(kind: &Kind) -> &'static str {
@@ -859,7 +858,7 @@ fn provider_context_target(query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coco_types::{Anchor, SessionRole, Tool};
+    use coco_types::{Anchor, PromptAnchor, SessionRole, SkillResultAnchor};
 
     fn test_node(kind: Kind) -> Node {
         serde_json::from_value(serde_json::json!({
@@ -1002,6 +1001,61 @@ mod tests {
             ])/>
         }
         .to_html();
+        let session_patch = view! {
+            <NodeDetailBody kind=Kind::Anchor(Anchor::session_patch(
+                Vec::new(),
+                SessionAnchorPatch {
+                    model: Some("gpt-patched".to_owned()),
+                    ..SessionAnchorPatch::default()
+                },
+            ))/>
+        }
+        .to_html();
+        let prompt = view! {
+            <NodeDetailBody kind=Kind::Anchor(Anchor::prompt(
+                Vec::new(),
+                PromptAnchor {
+                    prompt: "Review this".to_owned(),
+                    attachments: Vec::new(),
+                },
+            ))/>
+        }
+        .to_html();
+        let skill_invocation = view! {
+            <NodeDetailBody kind=Kind::Anchor(Anchor::skill_invocation(
+                Vec::new(),
+                SkillInvocationAnchor {
+                    skill_name: "review".to_owned(),
+                    mode: SkillInvocationMode::Handoff {
+                        prompt: "Inspect the change".to_owned(),
+                    },
+                },
+            ))/>
+        }
+        .to_html();
+        let skill_result = view! {
+            <NodeDetailBody kind=Kind::Anchor(Anchor::skill_result(
+                Vec::new(),
+                SkillResultAnchor {
+                    skill_name: "review".to_owned(),
+                    output: "Looks good".to_owned(),
+                },
+            ))/>
+        }
+        .to_html();
+        let tool_result = view! {
+            <NodeDetailBody kind=Kind::tool_results(vec![
+                ToolResult {
+                    id: "toolu-1".to_owned(),
+                    output: "done".to_owned(),
+                },
+            ])/>
+        }
+        .to_html();
+        let text = view! {
+            <NodeDetailBody kind=Kind::Text("Plain response".to_owned())/>
+        }
+        .to_html();
         let failure = view! {
             <NodeDetailBody kind=Kind::Failure("backend unavailable".to_owned())/>
         }
@@ -1019,8 +1073,57 @@ mod tests {
         for expected in ["exec_command", "toolu-1", "cmd", "true"] {
             assert!(tool_use.contains(expected));
         }
+        assert!(session_patch.contains("gpt-patched"));
+        assert!(prompt.contains("Review this"));
+        assert!(skill_invocation.contains("Inspect the change"));
+        assert!(skill_result.contains("Looks good"));
+        assert!(tool_result.contains("done"));
+        assert!(text.contains("Plain response"));
         assert!(failure.contains("node-detail-failure"));
         assert!(failure.contains("backend unavailable"));
+    }
+
+    #[test]
+    fn session_patch_fields_format_every_change() {
+        let fields = session_patch_fields(SessionAnchorPatch {
+            role: Some(SessionRole::Runner),
+            provider_profile: Some(None),
+            provider: Some(Some("openai".to_owned())),
+            model: Some("gpt-test".to_owned()),
+            tools: Some(vec![Tool {
+                name: "exec_command".to_owned(),
+                description: "Run a command".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]),
+            system_prompt: Some("Updated instructions".to_owned()),
+            temperature: Some(None),
+            max_tokens: Some(Some(2048)),
+            additional_params: Some(Some(serde_json::json!({"seed": 7}))),
+            enable_coco_shim: Some(false),
+        });
+
+        assert_eq!(
+            fields,
+            vec![
+                ("Role".to_owned(), "runner".to_owned()),
+                ("Provider profile".to_owned(), "None".to_owned()),
+                ("Provider".to_owned(), "openai".to_owned()),
+                ("Model".to_owned(), "gpt-test".to_owned()),
+                ("Tools".to_owned(), "exec_command".to_owned()),
+                (
+                    "System prompt".to_owned(),
+                    "Updated instructions".to_owned()
+                ),
+                ("Temperature".to_owned(), "None".to_owned()),
+                ("Max tokens".to_owned(), "2048".to_owned()),
+                (
+                    "Additional params".to_owned(),
+                    "{\n  \"seed\": 7\n}".to_owned()
+                ),
+                ("CoCo shim".to_owned(), "Disabled".to_owned()),
+            ]
+        );
+        assert!(session_patch_fields(SessionAnchorPatch::default()).is_empty());
     }
 }
 
