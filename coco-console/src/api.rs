@@ -26,6 +26,11 @@ pub struct AnchorRangeNode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AnchorRangePath {
+    pub nodes: Vec<AnchorRangeNode>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AnchorRangeEdge {
     pub kind: GraphViewportEdgeKind,
     pub source: String,
@@ -39,7 +44,7 @@ pub enum AnchorRangeResponse {
     Found {
         kind: GraphViewportEdgeKind,
         previous: Vec<AnchorRangeEdge>,
-        nodes: Vec<AnchorRangeNode>,
+        paths: Vec<AnchorRangePath>,
         next: Vec<AnchorRangeEdge>,
     },
 }

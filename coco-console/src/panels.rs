@@ -6,7 +6,7 @@ use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
 
 use crate::api::{
-    AnchorRangeEdge, AnchorRangeNode, AnchorRangeResponse, GraphViewportEdgeKind,
+    AnchorRangeEdge, AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdgeKind,
     NodeDetailResponse, ProviderContextItem, ProviderContextResponse,
 };
 
@@ -331,10 +331,10 @@ fn anchor_range_view(
             Ok(AnchorRangeResponse::Found {
                 kind,
                 previous,
-                nodes,
+                paths,
                 next,
             }) => view! {
-                <AnchorRangeContent kind previous nodes next/>
+                <AnchorRangeContent kind previous paths next/>
             }
             .into_any(),
             Ok(AnchorRangeResponse::Missing) => view! {
@@ -357,23 +357,41 @@ fn anchor_range_view(
 fn AnchorRangeContent(
     kind: GraphViewportEdgeKind,
     previous: Vec<AnchorRangeEdge>,
-    nodes: Vec<AnchorRangeNode>,
+    paths: Vec<AnchorRangePath>,
     next: Vec<AnchorRangeEdge>,
 ) -> impl IntoView {
-    let detail_count = nodes.len().saturating_sub(2);
-    let last_index = nodes.len().saturating_sub(1);
+    let detail_count = paths
+        .iter()
+        .flat_map(|path| {
+            path.nodes
+                .iter()
+                .skip(1)
+                .take(path.nodes.len().saturating_sub(2))
+        })
+        .map(|node| &node.id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let path_count = paths.len();
     let mut items = previous
         .into_iter()
         .map(|edge| {
             view! { <AnchorRangeNavigation label="Previous relationship" edge/> }.into_any()
         })
         .collect::<Vec<_>>();
-    for (index, node) in nodes.into_iter().enumerate() {
-        if let Some(kind) = node.incoming_edge {
-            items.push(view! { <AnchorRangeConnector kind/> }.into_any());
+    items.push(
+        view! {
+            <li class="anchor-range-paths">
+                {paths
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        view! { <AnchorRangePathLane index path_count path/> }
+                    })
+                    .collect_view()}
+            </li>
         }
-        items.push(view! { <AnchorRangeNodeCard index last_index node/> }.into_any());
-    }
+        .into_any(),
+    );
     items.extend(
         next.into_iter().map(|edge| {
             view! { <AnchorRangeNavigation label="Next relationship" edge/> }.into_any()
@@ -384,11 +402,38 @@ fn AnchorRangeContent(
         <div class="anchor-range-summary">
             <span>{anchor_range_kind_label(kind)}</span>
             <strong>{format!(
-                "{detail_count} detail node{}",
+                "{detail_count} detail node{} across {path_count} relationship path{}",
                 if detail_count == 1 { "" } else { "s" },
+                if path_count == 1 { "" } else { "s" },
             )}</strong>
         </div>
         <ol class="anchor-range-track">{items}</ol>
+    }
+}
+
+#[component]
+fn AnchorRangePathLane(index: usize, path_count: usize, path: AnchorRangePath) -> impl IntoView {
+    let last_index = path.nodes.len().saturating_sub(1);
+    let kind = path.nodes.last().and_then(|node| node.incoming_edge);
+    let mut items = Vec::new();
+    for (index, node) in path.nodes.into_iter().enumerate() {
+        if let Some(kind) = node.incoming_edge {
+            items.push(view! { <AnchorRangeConnector kind/> }.into_any());
+        }
+        items.push(view! { <AnchorRangeNodeCard index last_index node/> }.into_any());
+    }
+    view! {
+        <div class="anchor-range-path">
+            {(path_count > 1).then(|| {
+                view! {
+                    <p class="anchor-range-path-label">
+                        {format!("Relationship path {}", index + 1)}
+                        {kind.map(|kind| format!(" · {}", anchor_range_kind_label(kind)))}
+                    </p>
+                }
+            })}
+            <ol class="anchor-range-path-track">{items}</ol>
+        </div>
     }
 }
 
@@ -1251,15 +1296,32 @@ mod tests {
                     source: "previous".to_owned(),
                     target: "source".to_owned(),
                 }]
-                nodes=vec![
-                    node("source", "prompt"),
-                    AnchorRangeNode {
-                        incoming_edge: Some(GraphViewportEdgeKind::Primary),
-                        ..node("detail", "text")
+                paths=vec![
+                    AnchorRangePath {
+                        nodes: vec![
+                            node("source", "prompt"),
+                            AnchorRangeNode {
+                                incoming_edge: Some(GraphViewportEdgeKind::Primary),
+                                ..node("detail", "text")
+                            },
+                            AnchorRangeNode {
+                                incoming_edge: Some(GraphViewportEdgeKind::Merge),
+                                ..node("target", "prompt")
+                            },
+                        ],
                     },
-                    AnchorRangeNode {
-                        incoming_edge: Some(GraphViewportEdgeKind::Merge),
-                        ..node("target", "prompt")
+                    AnchorRangePath {
+                        nodes: vec![
+                            node("source", "prompt"),
+                            AnchorRangeNode {
+                                incoming_edge: Some(GraphViewportEdgeKind::Primary),
+                                ..node("second-detail", "text")
+                            },
+                            AnchorRangeNode {
+                                incoming_edge: Some(GraphViewportEdgeKind::Shadow),
+                                ..node("target", "prompt")
+                            },
+                        ],
                     },
                 ]
                 next=vec![AnchorRangeEdge {
@@ -1271,7 +1333,9 @@ mod tests {
         }
         .to_html();
 
-        assert!(range.contains("1 detail node"));
+        assert!(range.contains("2 detail nodes across 2 relationship paths"));
+        assert!(range.contains("Relationship path 1"));
+        assert!(range.contains("Relationship path 2"));
         assert!(range.contains("Source anchor"));
         assert!(range.contains("Detail node"));
         assert!(range.contains("Target anchor"));
@@ -1281,7 +1345,7 @@ mod tests {
         assert!(range.contains("data-edge-kind=\"shadow_parent\""));
         assert!(range.contains("Primary parent"));
         assert!(range.contains("Merge parent"));
-        assert_eq!(range.matches("href=\"#detail-").count(), 3);
+        assert_eq!(range.matches("href=\"#detail-").count(), 6);
     }
 
     #[test]

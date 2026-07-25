@@ -31,7 +31,7 @@ use super::publisher::ConsolePublisher;
 use super::render::render_index_page;
 use crate::Result;
 use crate::api::{
-    AnchorRangeEdge, AnchorRangeNode, AnchorRangeResponse, GraphViewportEdge,
+    AnchorRangeEdge, AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdge,
     GraphViewportEdgeKind, NodeDetailResponse, Point as ApiPoint, ProviderContextItem,
     ProviderContextNode, ProviderContextResponse,
 };
@@ -476,94 +476,79 @@ where
         return Ok(AnchorRangeResponse::Missing);
     }
 
-    let Some(nodes) = anchor_range_nodes(state, source_id, target_id, kind).await? else {
+    let Some(paths) = anchor_range_paths(state, source_id, target_id, kind).await? else {
         return Ok(AnchorRangeResponse::Missing);
     };
     let (previous, next) = adjacent_anchor_edges(edges, source_id, target_id);
     Ok(AnchorRangeResponse::Found {
         kind,
         previous,
-        nodes,
+        paths,
         next,
     })
 }
 
-async fn anchor_range_nodes<S>(
+async fn anchor_range_paths<S>(
     state: &AppState<S>,
     source_id: &str,
     target_id: &str,
-    kind: GraphViewportEdgeKind,
-) -> Result<Option<Vec<AnchorRangeNode>>>
+    displayed_kind: GraphViewportEdgeKind,
+) -> Result<Option<Vec<AnchorRangePath>>>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let nodes = match kind {
-        GraphViewportEdgeKind::Primary => {
-            let Some(nodes) = load_primary_path(state, source_id, target_id).await? else {
-                return Ok(None);
-            };
-            if nodes.len() < 2
-                || nodes
-                    .last()
-                    .is_none_or(|node| node.kind.anchor_payload_kind().is_none())
-                || nodes[1..nodes.len() - 1]
-                    .iter()
-                    .any(|node| node.kind.anchor_payload_kind().is_some())
-            {
-                return Ok(None);
-            }
-            nodes
-                .into_iter()
-                .enumerate()
-                .map(|(index, node)| {
-                    anchor_range_node(node, (index > 0).then_some(GraphViewportEdgeKind::Primary))
-                })
-                .collect()
-        }
-        GraphViewportEdgeKind::Merge | GraphViewportEdgeKind::Shadow => {
-            let target = match state.store.get_node(target_id).await {
-                Ok(node) => node,
-                Err(error) if is_missing_node(&error) => return Ok(None),
-                Err(source) => return Err(source).context(StoreSnafu),
-            };
-            let Kind::Anchor(anchor) = &target.kind else {
-                return Ok(None);
-            };
-            let is_shadow = kind == GraphViewportEdgeKind::Shadow;
-            let mut matching_path = None;
-            for parent in anchor
-                .merge_parents()
-                .iter()
-                .filter(|parent| parent.is_shadow() == is_shadow)
-            {
-                let Some(nodes) = load_primary_path(state, source_id, parent.node_id()).await?
-                else {
-                    continue;
-                };
-                if nodes[1..]
-                    .iter()
-                    .any(|node| node.kind.anchor_payload_kind().is_some())
-                {
-                    continue;
-                }
-                matching_path = Some(nodes);
-                break;
-            }
-            let Some(nodes) = matching_path else {
-                return Ok(None);
-            };
-            let mut range = nodes
-                .into_iter()
-                .enumerate()
-                .map(|(index, node)| {
-                    anchor_range_node(node, (index > 0).then_some(GraphViewportEdgeKind::Primary))
-                })
-                .collect::<Vec<_>>();
-            range.push(anchor_range_node(target, Some(kind)));
-            range
-        }
+    let target = match state.store.get_node(target_id).await {
+        Ok(node) => node,
+        Err(error) if is_missing_node(&error) => return Ok(None),
+        Err(source) => return Err(source).context(StoreSnafu),
     };
-    Ok(Some(nodes))
+    let Kind::Anchor(anchor) = &target.kind else {
+        return Ok(None);
+    };
+    let mut parents = Vec::with_capacity(anchor.merge_parents().len() + 1);
+    if !target.parent.is_empty() {
+        parents.push((GraphViewportEdgeKind::Primary, target.parent.clone()));
+    }
+    parents.extend(anchor.merge_parents().iter().map(|parent| {
+        (
+            if parent.is_shadow() {
+                GraphViewportEdgeKind::Shadow
+            } else {
+                GraphViewportEdgeKind::Merge
+            },
+            parent.node_id().to_owned(),
+        )
+    }));
+
+    let mut paths = Vec::new();
+    for (kind, parent_id) in parents {
+        let Some(nodes) = load_primary_path(state, source_id, &parent_id).await? else {
+            continue;
+        };
+        if nodes[1..]
+            .iter()
+            .any(|node| node.kind.anchor_payload_kind().is_some())
+        {
+            continue;
+        }
+        let mut nodes = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| {
+                anchor_range_node(node, (index > 0).then_some(GraphViewportEdgeKind::Primary))
+            })
+            .collect::<Vec<_>>();
+        nodes.push(anchor_range_node(target.clone(), Some(kind)));
+        paths.push(AnchorRangePath { nodes });
+    }
+    let first_kind = paths
+        .first()
+        .and_then(|path| path.nodes.last())
+        .and_then(|node| node.incoming_edge);
+    if first_kind != Some(displayed_kind) {
+        return Ok(None);
+    }
+    Ok(Some(paths))
 }
 
 async fn load_primary_path<S>(
@@ -1141,13 +1126,25 @@ mod tests {
             })
             .await
             .unwrap();
+        let second_merge_detail = store
+            .append(NewNode {
+                parent: source_anchor.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("second merge detail".to_owned()),
+            })
+            .await
+            .unwrap();
         let next_anchor = store
             .append(NewNode {
                 parent: target_anchor.clone(),
                 role: Role::User,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
-                    vec![MergeParent::merge(detail.clone())],
+                    vec![
+                        MergeParent::merge(detail.clone()),
+                        MergeParent::merge(second_merge_detail.clone()),
+                    ],
                     PromptAnchor {
                         prompt: "next".to_owned(),
                         attachments: Vec::new(),
@@ -1194,11 +1191,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let AnchorRangeResponse::Found { nodes, next, .. } = primary else {
+        let AnchorRangeResponse::Found { paths, next, .. } = primary else {
             panic!("primary anchor range should exist");
         };
+        assert_eq!(paths.len(), 1);
         assert_eq!(
-            nodes
+            paths[0]
+                .nodes
                 .iter()
                 .map(|node| node.id.as_str())
                 .collect::<Vec<_>>(),
@@ -1218,19 +1217,42 @@ mod tests {
         )
         .await
         .unwrap();
-        let AnchorRangeResponse::Found { kind, nodes, .. } = merge else {
+        let AnchorRangeResponse::Found { kind, paths, .. } = merge else {
             panic!("merge anchor relationship should exist");
         };
         assert_eq!(kind, GraphViewportEdgeKind::Merge);
+        assert_eq!(paths.len(), 2);
         assert_eq!(
-            nodes
+            paths[0]
+                .nodes
                 .iter()
                 .map(|node| node.id.as_str())
                 .collect::<Vec<_>>(),
             [&source_anchor, &detail, &next_anchor]
         );
         assert_eq!(
-            nodes
+            paths[0]
+                .nodes
+                .iter()
+                .map(|node| node.incoming_edge)
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some(GraphViewportEdgeKind::Primary),
+                Some(GraphViewportEdgeKind::Merge),
+            ]
+        );
+        assert_eq!(
+            paths[1]
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            [&source_anchor, &second_merge_detail, &next_anchor]
+        );
+        assert_eq!(
+            paths[1]
+                .nodes
                 .iter()
                 .map(|node| node.incoming_edge)
                 .collect::<Vec<_>>(),
@@ -1249,19 +1271,22 @@ mod tests {
         )
         .await
         .unwrap();
-        let AnchorRangeResponse::Found { kind, nodes, .. } = shadow else {
+        let AnchorRangeResponse::Found { kind, paths, .. } = shadow else {
             panic!("shadow anchor relationship should exist");
         };
         assert_eq!(kind, GraphViewportEdgeKind::Shadow);
+        assert_eq!(paths.len(), 1);
         assert_eq!(
-            nodes
+            paths[0]
+                .nodes
                 .iter()
                 .map(|node| node.id.as_str())
                 .collect::<Vec<_>>(),
             [&source_anchor, &shadow_detail, &shadow_target]
         );
         assert_eq!(
-            nodes
+            paths[0]
+                .nodes
                 .iter()
                 .map(|node| node.incoming_edge)
                 .collect::<Vec<_>>(),
