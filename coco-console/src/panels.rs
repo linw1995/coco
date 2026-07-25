@@ -101,16 +101,10 @@ fn NodeDetailPanelBody() -> impl IntoView {
         }
     });
     Effect::new(move || {
-        let Some(target) = selected_target.get() else {
-            return;
-        };
-        let Some(loaded) = detail.get().flatten() else {
-            return;
-        };
-        if loaded.request == target
-            && matches!(&loaded.response, Ok(NodeDetailResponse::Found { .. }))
-        {
-            reveal_node_detail_on_mobile(&target);
+        let current = selected_target.get();
+        let loaded = detail.get().flatten();
+        if let Some(target) = loaded_node_detail_target(current.as_deref(), loaded.as_ref()) {
+            reveal_node_detail_on_mobile(target);
         }
     });
 
@@ -191,6 +185,16 @@ fn subscribe_to_panel_selection(_selection: RwSignal<PanelSelection>) {}
 #[cfg(target_arch = "wasm32")]
 fn current_panel_selection() -> PanelSelection {
     PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
+}
+
+fn loaded_node_detail_target<'a>(
+    current: Option<&'a str>,
+    loaded: Option<&LoadedPanel<String, NodeDetailResponse>>,
+) -> Option<&'a str> {
+    let current = current?;
+    let loaded = loaded?;
+    (loaded.request == current && matches!(&loaded.response, Ok(NodeDetailResponse::Found { .. })))
+        .then_some(current)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -930,6 +934,37 @@ mod tests {
     }
 
     #[test]
+    fn loaded_node_detail_target_requires_current_found_response() {
+        let found = LoadedPanel {
+            request: "detail-node".to_owned(),
+            response: Ok(NodeDetailResponse::Found {
+                node: Box::new(test_node(Kind::Text("response".to_owned()))),
+            }),
+        };
+        let missing = LoadedPanel {
+            request: "detail-node".to_owned(),
+            response: Ok(NodeDetailResponse::Missing {
+                target: "detail-node".to_owned(),
+            }),
+        };
+
+        assert_eq!(
+            loaded_node_detail_target(Some("detail-node"), Some(&found)),
+            Some("detail-node")
+        );
+        assert_eq!(
+            loaded_node_detail_target(Some("detail-other"), Some(&found)),
+            None
+        );
+        assert_eq!(
+            loaded_node_detail_target(Some("detail-node"), Some(&missing)),
+            None
+        );
+        assert_eq!(loaded_node_detail_target(None, Some(&found)), None);
+        assert_eq!(loaded_node_detail_target(Some("detail-node"), None), None);
+    }
+
+    #[test]
     fn panel_islands_render_independent_server_fallbacks() {
         let node = view! { <NodeDetailPanel/> }.to_html();
         let provider = view! { <ProviderContextPanel graph_mode="all".to_owned()/> }.to_html();
@@ -1175,6 +1210,44 @@ mod wasm_tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn graph_items_mobile_node_detail_reveal_scrolls_target_into_view() {
+        let window = web_sys::window().expect_throw("window should be available");
+        let document = window
+            .document()
+            .expect_throw("document should be available");
+        let root = document
+            .create_element("div")
+            .expect_throw("test root should be created");
+        root.set_attribute("style", "height: 2000px; padding-top: 1200px")
+            .expect_throw("test root should be styled");
+        let detail = document
+            .create_element("section")
+            .expect_throw("detail should be created");
+        detail.set_id("detail-mobile");
+        root.append_child(&detail)
+            .expect_throw("detail should be mounted");
+        document
+            .body()
+            .expect_throw("document body should be available")
+            .append_child(&root)
+            .expect_throw("test root should be mounted");
+        window.scroll_to_with_x_and_y(0.0, 0.0);
+
+        reveal_node_detail_on_mobile("detail-mobile");
+        next_animation_frame().await;
+        next_animation_frame().await;
+
+        assert!(
+            window
+                .scroll_y()
+                .expect_throw("scroll position should exist")
+                > 0.0
+        );
+        root.remove();
+        window.scroll_to_with_x_and_y(0.0, 0.0);
+    }
 
     #[wasm_bindgen_test]
     async fn graph_items_panel_selection_signals_read_initial_hash_and_track_changes_independently()

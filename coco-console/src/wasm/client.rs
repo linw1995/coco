@@ -2415,6 +2415,11 @@ mod tests {
             !update_detail_hash(&window, "#detail-aaaaaaaa")
                 .expect_throw("unchanged selection should be detected")
         );
+        select_detail_link(fixture.graph.clone(), "#detail-aaaaaaaa".to_owned());
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-aaaaaaaa"
+        );
         assert!(
             update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-context")
                 .expect_throw("provider context hash should be set")
