@@ -152,13 +152,14 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
 }
 
 fn use_panel_selection() -> RwSignal<PanelSelection> {
-    let selection = RwSignal::new(current_panel_selection());
+    let selection = RwSignal::new(PanelSelection::default());
     Effect::new(move || subscribe_to_panel_selection(selection));
     selection
 }
 
 #[cfg(target_arch = "wasm32")]
 fn subscribe_to_panel_selection(selection: RwSignal<PanelSelection>) {
+    request_animation_frame(move || selection.set(current_panel_selection()));
     let listener = window_event_listener(ev::hashchange, move |_| {
         selection.set(current_panel_selection());
     });
@@ -171,11 +172,6 @@ fn subscribe_to_panel_selection(_selection: RwSignal<PanelSelection>) {}
 #[cfg(target_arch = "wasm32")]
 fn current_panel_selection() -> PanelSelection {
     PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn current_panel_selection() -> PanelSelection {
-    PanelSelection::default()
 }
 
 fn node_detail_view(
@@ -570,13 +566,21 @@ mod wasm_tests {
             .expect_throw("initial hash should be set");
         let node_selection = use_panel_selection();
         let context_selection = use_panel_selection();
+        let loaded_selection = LocalResource::new(move || {
+            let selection = node_selection.get();
+            async move { selection }
+        });
+        assert_eq!(node_selection.get_untracked(), PanelSelection::default());
+        assert_eq!(context_selection.get_untracked(), PanelSelection::default());
+        next_animation_frame().await;
+        next_task().await;
         let expected_initial = PanelSelection {
             target: Some("detail-node".to_owned()),
             context: None,
         };
         assert_eq!(node_selection.get_untracked(), expected_initial);
         assert_eq!(context_selection.get_untracked(), expected_initial);
-        next_task().await;
+        assert_eq!(loaded_selection.await, expected_initial);
 
         window
             .location()
@@ -604,5 +608,18 @@ mod wasm_tests {
         JsFuture::from(Promise::resolve(&JsValue::NULL))
             .await
             .expect_throw("task should resolve");
+    }
+
+    async fn next_animation_frame() {
+        let promise = Promise::new(&mut |resolve, _| {
+            request_animation_frame(move || {
+                resolve
+                    .call0(&JsValue::UNDEFINED)
+                    .expect_throw("animation frame promise should resolve");
+            });
+        });
+        JsFuture::from(promise)
+            .await
+            .expect_throw("animation frame should run");
     }
 }
