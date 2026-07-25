@@ -31,7 +31,7 @@ use super::publisher::ConsolePublisher;
 use super::render::render_index_page;
 use crate::Result;
 use crate::api::{
-    NodeDetailResponse, PanelNode, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
+    NodeDetailResponse, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
     ProviderContextResponse,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
@@ -420,7 +420,7 @@ where
     };
     match state.store.get_node(node_id).await {
         Ok(node) => Ok(NodeDetailResponse::Found {
-            node: panel_node(NodeView::from(&node)),
+            node: Box::new(node),
         }),
         Err(error) if is_missing_node(&error) => Ok(NodeDetailResponse::Missing {
             target: target.to_owned(),
@@ -502,18 +502,6 @@ where
         })
         .collect();
     Ok(ProviderContextResponse::Found { items })
-}
-
-fn panel_node(node: NodeView) -> PanelNode {
-    PanelNode {
-        id: node.id,
-        short_id: node.short_id,
-        kind: node.kind,
-        role: node.role,
-        created_at: node.created_at,
-        content: node.content,
-        summary: node.summary,
-    }
 }
 
 fn provider_context_node(node: NodeView) -> ProviderContextNode {
@@ -878,7 +866,7 @@ mod tests {
         let NodeDetailResponse::Found { node } = detail else {
             panic!("node detail should be found");
         };
-        assert_eq!(node.content, "direct detail");
+        assert_eq!(node.kind, Kind::Text("direct detail".to_owned()));
         assert_eq!(node.id, node_id);
 
         let request = Request::builder()

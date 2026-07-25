@@ -545,6 +545,7 @@ dependencies = [
  "async-trait",
  "axum",
  "coco-mem",
+ "coco-types",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -611,6 +612,7 @@ name = "coco-mem"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "coco-types",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -619,11 +621,20 @@ dependencies = [
  "nanoid 0.5.0",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "snafu",
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "coco-types"
+version = "0.1.0"
+dependencies = [
+ "jiff",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

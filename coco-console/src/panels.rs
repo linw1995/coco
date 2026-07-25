@@ -1,7 +1,11 @@
+use coco_types::{
+    AnchorPayload, Kind, Node, PromptAttachment, SessionAnchor, SessionAnchorPatch,
+    SkillInvocationMode, ToolResult, ToolUse,
+};
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
 
-use crate::api::{NodeDetailResponse, PanelNode, ProviderContextItem, ProviderContextResponse};
+use crate::api::{NodeDetailResponse, ProviderContextItem, ProviderContextResponse};
 
 #[cfg(target_arch = "wasm32")]
 use leptos::{
@@ -224,26 +228,443 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         NodeDetailResponse::Missing { target } => {
             view! { <NodeDetailMissing target=target/> }.into_any()
         }
-        NodeDetailResponse::Found { node } => view! { <NodeDetail node=node/> }.into_any(),
+        NodeDetailResponse::Found { node } => view! { <NodeDetail node=*node/> }.into_any(),
     }
 }
 
 #[component]
-fn NodeDetail(node: PanelNode) -> impl IntoView {
+fn NodeDetail(node: Node) -> impl IntoView {
     let target = format!("{NODE_TARGET_PREFIX}{}", node.id);
+    let kind = node_kind_name(&node.kind);
+    let kind_class = format!("node-details node-detail kind-{kind}");
+    let title = humanize_kind(kind);
+    let role = format!("{:?}", node.role);
+    let short_id = shorten_id(&node.id);
+    let full_id = node.id;
+    let parent = (!node.parent.is_empty()).then_some(node.parent);
+    let merge_parents = match &node.kind {
+        Kind::Anchor(anchor) => anchor
+            .merge_parents()
+            .iter()
+            .map(|parent| {
+                (
+                    if parent.is_shadow() {
+                        "Shadow"
+                    } else {
+                        "Merge"
+                    },
+                    parent.node_id().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        Kind::ToolUse(_) | Kind::ToolResult(_) | Kind::Text(_) | Kind::Failure(_) => Vec::new(),
+    };
     view! {
-        <section id=target class="node-details node-detail">
-            <h2>"Node"</h2>
-            <dl class="detail-list">
-                <div><dt>"Id"</dt><dd>{node.id}</dd></div>
-                <div><dt>"Kind"</dt><dd>{node.kind}</dd></div>
-                <div><dt>"Role"</dt><dd>{node.role}</dd></div>
-                <div><dt>"Created"</dt><dd>{node.created_at}</dd></div>
-                <div><dt>"Labels"</dt><dd>"None"</dd></div>
-                <div><dt>"Content"</dt><dd>{node.content}</dd></div>
+        <section id=target class=kind_class>
+            <header class="node-detail-header">
+                <div>
+                    <p class="node-detail-eyebrow">"Node detail"</p>
+                    <h2>{title}</h2>
+                </div>
+                <span class="node-detail-role">{role}</span>
+            </header>
+            <dl class="node-detail-meta">
+                <div>
+                    <dt>"Id"</dt>
+                    <dd><code title=full_id>{short_id}</code></dd>
+                </div>
+                <div><dt>"Created"</dt><dd>{node.created_at.to_string()}</dd></div>
+                {parent.map(|parent| view! {
+                    <div class="node-detail-meta-wide">
+                        <dt>"Parent"</dt>
+                        <dd><code>{parent}</code></dd>
+                    </div>
+                })}
+                {merge_parents.into_iter().map(|(kind, node_id)| view! {
+                    <div class="node-detail-meta-wide">
+                        <dt>{format!("{kind} parent")}</dt>
+                        <dd><code>{node_id}</code></dd>
+                    </div>
+                }).collect::<Vec<_>>()}
             </dl>
+            <NodeDetailBody kind=node.kind/>
         </section>
     }
+}
+
+#[component]
+fn NodeDetailBody(kind: Kind) -> AnyView {
+    match kind {
+        Kind::Anchor(anchor) => match anchor.payload {
+            AnchorPayload::Session(session) => {
+                let SessionAnchor {
+                    role,
+                    provider_profile,
+                    provider,
+                    model,
+                    tools,
+                    system_prompt,
+                    prompt,
+                    temperature,
+                    max_tokens,
+                    additional_params,
+                    enable_coco_shim,
+                    active_skill,
+                } = *session;
+                let session_role = role.as_str();
+                let tools = tools.into_iter().map(|tool| tool.name).collect();
+                let provider = provider.unwrap_or_else(|| "Profile default".to_owned());
+                let provider_profile = provider_profile.unwrap_or_else(|| "Default".to_owned());
+                let temperature =
+                    temperature.map_or_else(|| "Default".to_owned(), |value| value.to_string());
+                let max_tokens =
+                    max_tokens.map_or_else(|| "Default".to_owned(), |value| value.to_string());
+                let additional_params = additional_params.map(|value| pretty_json(&value));
+                view! {
+                    <div class="node-detail-body session-detail">
+                        <dl class="node-detail-properties">
+                            <div><dt>"Session role"</dt><dd>{humanize_kind(session_role)}</dd></div>
+                            <div><dt>"Model"</dt><dd>{model}</dd></div>
+                            <div><dt>"Provider"</dt><dd>{provider}</dd></div>
+                            <div><dt>"Profile"</dt><dd>{provider_profile}</dd></div>
+                            <div><dt>"Temperature"</dt><dd>{temperature}</dd></div>
+                            <div><dt>"Max tokens"</dt><dd>{max_tokens}</dd></div>
+                            <div>
+                                <dt>"CoCo shim"</dt>
+                                <dd>{if enable_coco_shim { "Enabled" } else { "Disabled" }}</dd>
+                            </div>
+                        </dl>
+                        <DetailTags label="Tools" values=tools empty="None configured"/>
+                        {active_skill.map(|skill| view! {
+                            <section class="node-detail-callout">
+                                <span>"Active skill"</span>
+                                <strong>{skill.name}</strong>
+                                {skill.handoff.map(|handoff| view! { <p>{handoff}</p> })}
+                            </section>
+                        })}
+                        <DetailTextBlock label="Prompt" content=prompt/>
+                        <DetailTextBlock label="System prompt" content=system_prompt/>
+                        {additional_params.map(|params| view! {
+                            <DetailCodeBlock label="Additional params" content=params/>
+                        })}
+                    </div>
+                }
+                .into_any()
+            }
+            AnchorPayload::SessionPatch(patch) => {
+                let fields = session_patch_fields(patch);
+                let content = if fields.is_empty() {
+                    view! { <p class="node-detail-empty">"No configuration changes."</p> }
+                        .into_any()
+                } else {
+                    view! {
+                        <dl class="node-detail-properties patch-properties">
+                            {fields.into_iter().map(|(name, value)| view! {
+                                <div><dt>{name}</dt><dd>{value}</dd></div>
+                            }).collect::<Vec<_>>()}
+                        </dl>
+                    }
+                    .into_any()
+                };
+                view! {
+                    <div class="node-detail-body">
+                        <section class="node-detail-section">
+                            <h3>"Configuration changes"</h3>
+                            {content}
+                        </section>
+                    </div>
+                }
+                .into_any()
+            }
+            AnchorPayload::Prompt(prompt) => view! {
+                <div class="node-detail-body">
+                    <DetailTextBlock label="Prompt" content=prompt.prompt/>
+                    <PromptAttachments attachments=prompt.attachments/>
+                </div>
+            }
+            .into_any(),
+            AnchorPayload::SkillInvocation(invocation) => {
+                let (mode, prompt) = match invocation.mode {
+                    SkillInvocationMode::InheritContext => ("Inherit context", None),
+                    SkillInvocationMode::Handoff { prompt } => ("Handoff", Some(prompt)),
+                };
+                view! {
+                    <div class="node-detail-body">
+                        <dl class="node-detail-properties">
+                            <div><dt>"Skill"</dt><dd>{invocation.skill_name}</dd></div>
+                            <div><dt>"Mode"</dt><dd>{mode}</dd></div>
+                        </dl>
+                        {prompt.map(|prompt| view! {
+                            <DetailTextBlock label="Handoff prompt" content=prompt/>
+                        })}
+                    </div>
+                }
+                .into_any()
+            }
+            AnchorPayload::SkillResult(result) => view! {
+                <div class="node-detail-body">
+                    <dl class="node-detail-properties">
+                        <div><dt>"Skill"</dt><dd>{result.skill_name}</dd></div>
+                    </dl>
+                    <DetailTextBlock label="Output" content=result.output/>
+                </div>
+            }
+            .into_any(),
+        },
+        Kind::ToolUse(items) => view! {
+            <div class="node-detail-body node-detail-items">
+                {items.into_iter().map(|item| view! { <ToolUseDetail item=item/> }).collect::<Vec<_>>()}
+            </div>
+        }
+        .into_any(),
+        Kind::ToolResult(items) => view! {
+            <div class="node-detail-body node-detail-items">
+                {items.into_iter().map(|item| view! { <ToolResultDetail item=item/> }).collect::<Vec<_>>()}
+            </div>
+        }
+        .into_any(),
+        Kind::Text(text) => view! {
+            <div class="node-detail-body">
+                <DetailTextBlock label="Text" content=text/>
+            </div>
+        }
+        .into_any(),
+        Kind::Failure(message) => view! {
+            <div class="node-detail-body">
+                <section class="node-detail-section node-detail-failure">
+                    <h3>"Failure"</h3>
+                    <pre>{message}</pre>
+                </section>
+            </div>
+        }
+        .into_any(),
+    }
+}
+
+fn session_patch_fields(patch: SessionAnchorPatch) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    if let Some(role) = patch.role {
+        push_patch_field(&mut fields, "Role", role.as_str());
+    }
+    if let Some(provider_profile) = patch.provider_profile {
+        push_patch_field(
+            &mut fields,
+            "Provider profile",
+            provider_profile.unwrap_or_else(|| "None".to_owned()),
+        );
+    }
+    if let Some(provider) = patch.provider {
+        push_patch_field(
+            &mut fields,
+            "Provider",
+            provider.unwrap_or_else(|| "None".to_owned()),
+        );
+    }
+    if let Some(model) = patch.model {
+        push_patch_field(&mut fields, "Model", model);
+    }
+    if let Some(tools) = patch.tools {
+        push_patch_field(
+            &mut fields,
+            "Tools",
+            if tools.is_empty() {
+                "None".to_owned()
+            } else {
+                tools
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+    }
+    if let Some(system_prompt) = patch.system_prompt {
+        push_patch_field(&mut fields, "System prompt", system_prompt);
+    }
+    if let Some(temperature) = patch.temperature {
+        push_patch_field(
+            &mut fields,
+            "Temperature",
+            temperature.map_or_else(|| "None".to_owned(), |value| value.to_string()),
+        );
+    }
+    if let Some(max_tokens) = patch.max_tokens {
+        push_patch_field(
+            &mut fields,
+            "Max tokens",
+            max_tokens.map_or_else(|| "None".to_owned(), |value| value.to_string()),
+        );
+    }
+    if let Some(additional_params) = patch.additional_params {
+        push_patch_field(
+            &mut fields,
+            "Additional params",
+            additional_params.map_or_else(|| "None".to_owned(), |value| pretty_json(&value)),
+        );
+    }
+    if let Some(enable_coco_shim) = patch.enable_coco_shim {
+        push_patch_field(
+            &mut fields,
+            "CoCo shim",
+            if enable_coco_shim {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        );
+    }
+    fields
+}
+
+fn push_patch_field(
+    fields: &mut Vec<(String, String)>,
+    name: impl Into<String>,
+    value: impl Into<String>,
+) {
+    fields.push((name.into(), value.into()));
+}
+
+fn node_kind_name(kind: &Kind) -> &'static str {
+    kind.anchor_payload_kind()
+        .map(|kind| kind.as_str())
+        .unwrap_or_else(|| kind.tag().as_str())
+}
+
+fn shorten_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn pretty_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).expect("JSON value should serialize")
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[component]
+fn DetailTags(label: &'static str, values: Vec<String>, empty: &'static str) -> impl IntoView {
+    view! {
+        <section class="node-detail-section">
+            <h3>{label}</h3>
+            {if values.is_empty() {
+                view! { <p class="node-detail-empty">{empty}</p> }.into_any()
+            } else {
+                view! {
+                    <ul class="node-detail-tags">
+                        {values.into_iter().map(|value| view! { <li>{value}</li> }).collect::<Vec<_>>()}
+                    </ul>
+                }
+                .into_any()
+            }}
+        </section>
+    }
+}
+
+#[component]
+fn DetailTextBlock(label: &'static str, content: String) -> impl IntoView {
+    view! {
+        <section class="node-detail-section">
+            <h3>{label}</h3>
+            <pre>{if content.is_empty() { "Empty".to_owned() } else { content }}</pre>
+        </section>
+    }
+}
+
+#[component]
+fn DetailCodeBlock(label: &'static str, content: String) -> impl IntoView {
+    view! {
+        <section class="node-detail-section">
+            <h3>{label}</h3>
+            <pre class="node-detail-code">{content}</pre>
+        </section>
+    }
+}
+
+#[component]
+fn ToolUseDetail(item: ToolUse) -> impl IntoView {
+    let input = pretty_json(&item.input);
+    view! {
+        <article class="node-detail-item">
+            <header>
+                <strong>{item.name}</strong>
+                <code>{item.id}</code>
+            </header>
+            <DetailCodeBlock label="Input" content=input/>
+        </article>
+    }
+}
+
+#[component]
+fn ToolResultDetail(item: ToolResult) -> impl IntoView {
+    view! {
+        <article class="node-detail-item">
+            <header>
+                <strong>"Tool result"</strong>
+                <code>{item.id}</code>
+            </header>
+            <DetailTextBlock label="Output" content=item.output/>
+        </article>
+    }
+}
+
+#[component]
+fn PromptAttachments(attachments: Vec<PromptAttachment>) -> impl IntoView {
+    if attachments.is_empty() {
+        None
+    } else {
+        Some(view! {
+            <section class="node-detail-section">
+                <h3>"Attachments"</h3>
+                <ul class="node-detail-attachments">
+                    {attachments.into_iter().map(|attachment| match attachment {
+                        PromptAttachment::Image(image) => {
+                            let dimensions = match (image.width, image.height) {
+                                (Some(width), Some(height)) => Some(format!("{width} × {height}")),
+                                _ => None,
+                            };
+                            let file_size = image.file_size.map(format_file_size);
+                            view! {
+                                <li>
+                                    <strong>"Image"</strong>
+                                    <code>{image.id}</code>
+                                    <span>
+                                        {[
+                                            image.media_type,
+                                            dimensions,
+                                            file_size,
+                                        ].into_iter().flatten().collect::<Vec<_>>().join(" · ")}
+                                    </span>
+                                </li>
+                            }
+                        }
+                    }).collect::<Vec<_>>()}
+                </ul>
+            </section>
+        })
+    }
+}
+
+fn humanize_kind(kind: &str) -> String {
+    kind.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
 }
 
 #[component]
@@ -438,6 +859,19 @@ fn provider_context_target(query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coco_types::{Anchor, SessionRole, Tool};
+
+    fn test_node(kind: Kind) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "id": "node-1",
+            "parent": "parent-node",
+            "created_at": "2026-07-25T00:00:00Z",
+            "role": "User",
+            "metadata": null,
+            "kind": kind,
+        }))
+        .expect("test node should deserialize")
+    }
 
     #[test]
     fn selection_parses_node_and_provider_context_targets() {
@@ -509,15 +943,7 @@ mod tests {
     fn panel_components_render_typed_success_and_error_states() {
         let node = view! {
             <NodeDetailContent response=NodeDetailResponse::Found {
-                node: PanelNode {
-                    id: "node-1".to_owned(),
-                    short_id: "node-1".to_owned(),
-                    kind: "text".to_owned(),
-                    role: "User".to_owned(),
-                    created_at: "now".to_owned(),
-                    content: "<script>alert(1)</script>".to_owned(),
-                    summary: "summary".to_owned(),
-                },
+                node: Box::new(test_node(Kind::Text("<script>alert(1)</script>".to_owned()))),
             }/>
         }
         .to_html();
@@ -538,6 +964,63 @@ mod tests {
         assert!(node_error.contains("node failed"));
         assert!(provider_error.contains("Failed to load provider context."));
         assert!(provider_error.contains("provider failed"));
+    }
+
+    #[test]
+    fn node_detail_bodies_render_kind_specific_fields() {
+        let session = view! {
+            <NodeDetailBody kind=Kind::Anchor(Anchor::session(
+                Vec::new(),
+                SessionAnchor {
+                    role: SessionRole::Runner,
+                    provider_profile: Some("default".to_owned()),
+                    provider: Some("openai".to_owned()),
+                    model: "gpt-test".to_owned(),
+                    tools: vec![Tool {
+                        name: "exec_command".to_owned(),
+                        description: "Run a command".to_owned(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    }],
+                    system_prompt: "System instructions".to_owned(),
+                    prompt: "User prompt".to_owned(),
+                    temperature: Some(0.7),
+                    max_tokens: Some(1024),
+                    additional_params: Some(serde_json::json!({"seed": 7})),
+                    enable_coco_shim: true,
+                    active_skill: None,
+                },
+            ))/>
+        }
+        .to_html();
+        let tool_use = view! {
+            <NodeDetailBody kind=Kind::tool_uses(vec![
+                ToolUse {
+                    id: "toolu-1".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "true"}),
+                },
+            ])/>
+        }
+        .to_html();
+        let failure = view! {
+            <NodeDetailBody kind=Kind::Failure("backend unavailable".to_owned())/>
+        }
+        .to_html();
+
+        for expected in [
+            "Session role",
+            "gpt-test",
+            "exec_command",
+            "System instructions",
+            "Additional params",
+        ] {
+            assert!(session.contains(expected));
+        }
+        for expected in ["exec_command", "toolu-1", "cmd", "true"] {
+            assert!(tool_use.contains(expected));
+        }
+        assert!(failure.contains("node-detail-failure"));
+        assert!(failure.contains("backend unavailable"));
     }
 }
 

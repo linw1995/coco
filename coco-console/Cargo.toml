@@ -8,6 +8,9 @@ version.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+# Shared domain types.
+coco-types = { path = "../coco-types" }
+
 # Serialization shared by host and wasm builds.
 serde.workspace = true
 serde_json.workspace = true
