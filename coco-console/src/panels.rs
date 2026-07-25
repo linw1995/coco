@@ -236,7 +236,7 @@ fn use_panel_selection() -> RwSignal<PanelSelection> {
 
 #[cfg(target_arch = "wasm32")]
 fn subscribe_to_anchor_range(selection: RwSignal<Option<AnchorRangeRequest>>) {
-    let listener = window_event_listener(ev::click, move |event| {
+    let click_listener = window_event_listener(ev::click, move |event| {
         let Some(request) = anchor_range_request_from_event(&event) else {
             return;
         };
@@ -244,7 +244,18 @@ fn subscribe_to_anchor_range(selection: RwSignal<Option<AnchorRangeRequest>>) {
         event.stop_propagation();
         selection.set(Some(request));
     });
-    on_cleanup(move || listener.remove());
+    let keyboard_listener = window_event_listener(ev::keydown, move |event| {
+        let Some(request) = anchor_range_request_from_key_event(&event) else {
+            return;
+        };
+        event.prevent_default();
+        event.stop_propagation();
+        selection.set(Some(request));
+    });
+    on_cleanup(move || {
+        click_listener.remove();
+        keyboard_listener.remove();
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -259,7 +270,28 @@ fn anchor_range_request_from_event(event: &web_sys::MouseEvent) -> Option<Anchor
 }
 
 #[cfg(target_arch = "wasm32")]
+fn anchor_range_request_from_key_event(
+    event: &web_sys::KeyboardEvent,
+) -> Option<AnchorRangeRequest> {
+    if !matches!(event.key().as_str(), "Enter" | " ") || anchor_range_key_has_modifier(event) {
+        return None;
+    }
+    anchor_range_request_from_target(event.target()?)
+}
+
+#[cfg(target_arch = "wasm32")]
 fn anchor_range_event_has_modifier(event: &web_sys::MouseEvent) -> bool {
+    [
+        event.alt_key(),
+        event.ctrl_key(),
+        event.meta_key(),
+        event.shift_key(),
+    ]
+    .contains(&true)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn anchor_range_key_has_modifier(event: &web_sys::KeyboardEvent) -> bool {
     [
         event.alt_key(),
         event.ctrl_key(),
@@ -1519,7 +1551,7 @@ mod wasm_tests {
     use wasm_bindgen::{JsValue, UnwrapThrowExt};
     use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-    use web_sys::{Element, MouseEvent, MouseEventInit};
+    use web_sys::{Element, KeyboardEvent, KeyboardEventInit, MouseEvent, MouseEventInit};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -1562,6 +1594,12 @@ mod wasm_tests {
         modified_click.set_ctrl_key(true);
         assert!(request_from_dispatched_click(&child, &modified_click).is_none());
 
+        let request = request_from_dispatched_key(&child, "Enter")
+            .expect("Enter should select an anchor range");
+        assert_eq!(request.kind, GraphViewportEdgeKind::Merge);
+        assert!(request_from_dispatched_key(&child, " ").is_some());
+        assert!(request_from_dispatched_key(&child, "Escape").is_none());
+
         fixture.remove();
     }
 
@@ -1575,6 +1613,17 @@ mod wasm_tests {
             .dispatch_event(&event)
             .expect_throw("click event should dispatch");
         anchor_range_request_from_event(&event)
+    }
+
+    fn request_from_dispatched_key(target: &Element, key: &str) -> Option<AnchorRangeRequest> {
+        let init = KeyboardEventInit::new();
+        init.set_key(key);
+        let event = KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
+            .expect_throw("keyboard event should be created");
+        target
+            .dispatch_event(&event)
+            .expect_throw("keyboard event should dispatch");
+        anchor_range_request_from_key_event(&event)
     }
 
     #[wasm_bindgen_test]

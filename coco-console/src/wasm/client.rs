@@ -569,6 +569,9 @@ impl VirtualGraph {
                 ("data-edge-kind", edge.kind.key_part().to_owned()),
                 ("data-source-id", edge.source_id.clone()),
                 ("data-target-id", edge.target_id.clone()),
+                ("tabindex", "0".to_owned()),
+                ("role", "button".to_owned()),
+                ("aria-label", edge_hit_target_label(edge)),
             ],
         )?;
         if element.parent_element().is_none() {
@@ -1007,6 +1010,18 @@ fn edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
         GraphViewportEdgeKind::Merge => ("edge merge-parent", "url(#merge-arrowhead)"),
         GraphViewportEdgeKind::Shadow => ("edge shadow-parent", "url(#shadow-arrowhead)"),
     }
+}
+
+fn edge_hit_target_label(edge: &GraphViewportEdge) -> String {
+    let kind = match edge.kind {
+        GraphViewportEdgeKind::Primary => "primary parent",
+        GraphViewportEdgeKind::Merge => "merge parent",
+        GraphViewportEdgeKind::Shadow => "shadow parent",
+    };
+    format!(
+        "Expand {kind} relationship from {} to {}",
+        edge.source_id, edge.target_id
+    )
 }
 
 fn edge_hit_target_id(key: &str) -> String {
@@ -2716,7 +2731,22 @@ mod tests {
         let edge_before = document
             .get_element_by_id(&render_element_id(edge_key))
             .expect_throw("edge should be rendered");
+        let edge_hit_target = document
+            .get_element_by_id(&edge_hit_target_id(edge_key))
+            .expect_throw("edge hit target should be rendered");
         assert!(node_before.class_list().contains("node-link-selected"));
+        assert_eq!(
+            edge_hit_target.get_attribute("tabindex").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            edge_hit_target.get_attribute("role").as_deref(),
+            Some("button")
+        );
+        assert_eq!(
+            edge_hit_target.get_attribute("aria-label").as_deref(),
+            Some("Expand primary parent relationship from aaaaaaaa to bbbbbbbb")
+        );
 
         {
             let mut graph = fixture.graph.borrow_mut();
