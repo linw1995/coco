@@ -14,6 +14,8 @@ use leptos::{
 };
 const NODE_TARGET_PREFIX: &str = "detail-";
 #[cfg(target_arch = "wasm32")]
+const MOBILE_VIEWPORT_MAX_WIDTH: i32 = 860;
+#[cfg(target_arch = "wasm32")]
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -98,6 +100,19 @@ fn NodeDetailPanelBody() -> impl IntoView {
             })
         }
     });
+    Effect::new(move || {
+        let Some(target) = selected_target.get() else {
+            return;
+        };
+        let Some(loaded) = detail.get().flatten() else {
+            return;
+        };
+        if loaded.request == target
+            && matches!(&loaded.response, Ok(NodeDetailResponse::Found { .. }))
+        {
+            reveal_node_detail_on_mobile(&target);
+        }
+    });
 
     view! {
         <div class="panel-content">
@@ -177,6 +192,28 @@ fn subscribe_to_panel_selection(_selection: RwSignal<PanelSelection>) {}
 fn current_panel_selection() -> PanelSelection {
     PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
 }
+
+#[cfg(target_arch = "wasm32")]
+fn reveal_node_detail_on_mobile(target: &str) {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    if document
+        .document_element()
+        .is_none_or(|root| root.client_width() > MOBILE_VIEWPORT_MAX_WIDTH)
+    {
+        return;
+    }
+    let target = target.to_owned();
+    request_animation_frame(move || {
+        if let Some(detail) = document.get_element_by_id(&target) {
+            detail.scroll_into_view();
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reveal_node_detail_on_mobile(_target: &str) {}
 
 fn node_detail_view(
     current: Option<String>,
