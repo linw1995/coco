@@ -202,10 +202,15 @@ pub fn reveal_node_detail_on_mobile(target: &str) {
     let Some(document) = web_sys::window().and_then(|window| window.document()) else {
         return;
     };
-    if document
-        .document_element()
-        .is_none_or(|root| root.client_width() > MOBILE_VIEWPORT_MAX_WIDTH)
-    {
+    let Some(viewport_width) = document.document_element().map(|root| root.client_width()) else {
+        return;
+    };
+    reveal_node_detail(document, target, viewport_width);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn reveal_node_detail(document: web_sys::Document, target: &str, viewport_width: i32) {
+    if viewport_width > MOBILE_VIEWPORT_MAX_WIDTH {
         return;
     }
     let target = target.to_owned();
@@ -1243,7 +1248,7 @@ mod wasm_tests {
             .append_child(&root)
             .expect_throw("test root should be mounted");
 
-        reveal_node_detail_on_mobile("detail-mobile");
+        reveal_node_detail(document, "detail-mobile", MOBILE_VIEWPORT_MAX_WIDTH);
         next_animation_frame().await;
 
         assert!(scroll_invoked.get());
