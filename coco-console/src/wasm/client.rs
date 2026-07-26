@@ -30,7 +30,7 @@ use crate::viewport::{
 
 use super::anchor_range::{
     AnchorRangeLayout, AnchorRangeLayoutEdge, AnchorRangeTransform, anchor_range_extra_width,
-    layout_anchor_range, transform_graph_route,
+    layout_anchor_range, route_anchor_range_edge, transform_graph_route,
 };
 
 const ROOT_ID: &str = "console-root";
@@ -1516,20 +1516,7 @@ fn graph_edge_key(kind: GraphViewportEdgeKind, source_id: &str, target_id: &str)
 }
 
 fn anchor_range_edge_path(edge: AnchorRangeLayoutEdge) -> String {
-    let horizontal = edge.target.x.saturating_sub(edge.source.x);
-    let control = horizontal / 2;
-    bezier_path(GraphBezierRoute {
-        source: edge.source,
-        control_1: Point {
-            x: edge.source.x.saturating_add(control),
-            y: edge.source.y,
-        },
-        control_2: Point {
-            x: edge.target.x.saturating_sub(control),
-            y: edge.target.y,
-        },
-        target: edge.target,
-    })
+    bezier_path(route_anchor_range_edge(edge, NODE_RADIUS))
 }
 
 fn edge_kind_label(kind: GraphViewportEdgeKind) -> &'static str {
@@ -3312,6 +3299,14 @@ mod tests {
         let expected_path = "M 120 80 C 150 80, 280 80, 300 80";
         assert_eq!(edge.get_attribute("d").as_deref(), Some(expected_path));
         assert_eq!(trigger.get_attribute("d").as_deref(), Some(expected_path));
+        let expanded_edge = document
+            .query_selector(".anchor-range-path-edge")
+            .expect_throw("expanded edge query should succeed")
+            .expect_throw("expanded edge should exist");
+        assert_eq!(
+            expanded_edge.get_attribute("d").as_deref(),
+            Some("M 118 80 C 156 80, 156 80, 194 80")
+        );
 
         let context_point = document
             .create_element("span")

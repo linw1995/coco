@@ -102,6 +102,43 @@ pub fn transform_graph_route(
     }
 }
 
+pub fn route_anchor_range_edge(edge: AnchorRangeLayoutEdge, node_radius: f64) -> GraphBezierRoute {
+    let delta_x = f64::from(edge.target.x.saturating_sub(edge.source.x));
+    let delta_y = f64::from(edge.target.y.saturating_sub(edge.source.y));
+    let distance = delta_x.hypot(delta_y);
+    let (source, target) = if distance > 0.0 {
+        let offset_x = delta_x * node_radius / distance;
+        let offset_y = delta_y * node_radius / distance;
+        (
+            Point {
+                x: rounded_i32(f64::from(edge.source.x) + offset_x),
+                y: rounded_i32(f64::from(edge.source.y) + offset_y),
+            },
+            Point {
+                x: rounded_i32(f64::from(edge.target.x) - offset_x),
+                y: rounded_i32(f64::from(edge.target.y) - offset_y),
+            },
+        )
+    } else {
+        (edge.source, edge.target)
+    };
+    let horizontal = target.x.saturating_sub(source.x);
+    let control = horizontal / 2;
+
+    GraphBezierRoute {
+        source,
+        control_1: Point {
+            x: source.x.saturating_add(control),
+            y: source.y,
+        },
+        control_2: Point {
+            x: target.x.saturating_sub(control),
+            y: target.y,
+        },
+        target,
+    }
+}
+
 pub fn anchor_range_extra_width(paths: &[AnchorRangePath]) -> i32 {
     let detail_columns = paths
         .iter()
@@ -225,6 +262,12 @@ fn interpolate(start: i32, end: i32, numerator: i64, denominator: i64) -> i32 {
     i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
 }
 
+fn rounded_i32(value: f64) -> i32 {
+    value
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +373,42 @@ mod tests {
                 target: Point { x: 300, y: 80 },
             }
         );
+    }
+
+    #[test]
+    fn anchor_range_route_meets_horizontal_node_boundaries() {
+        let route = route_anchor_range_edge(
+            AnchorRangeLayoutEdge {
+                kind: GraphViewportEdgeKind::Primary,
+                source: Point { x: 100, y: 80 },
+                target: Point { x: 212, y: 80 },
+            },
+            18.0,
+        );
+
+        assert_eq!(
+            route,
+            GraphBezierRoute {
+                source: Point { x: 118, y: 80 },
+                control_1: Point { x: 156, y: 80 },
+                control_2: Point { x: 156, y: 80 },
+                target: Point { x: 194, y: 80 },
+            }
+        );
+    }
+
+    #[test]
+    fn anchor_range_route_meets_diagonal_node_boundaries() {
+        let route = route_anchor_range_edge(
+            AnchorRangeLayoutEdge {
+                kind: GraphViewportEdgeKind::Merge,
+                source: Point { x: 100, y: 100 },
+                target: Point { x: 212, y: 172 },
+            },
+            18.0,
+        );
+
+        assert_eq!(route.source, Point { x: 115, y: 110 });
+        assert_eq!(route.target, Point { x: 197, y: 162 });
     }
 }
