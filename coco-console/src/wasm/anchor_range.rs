@@ -1,4 +1,6 @@
-use crate::api::{AnchorRangeNode, AnchorRangePath, GraphViewportEdgeKind, Point};
+use crate::api::{
+    AnchorRangeNode, AnchorRangePath, GraphBezierRoute, GraphViewportEdgeKind, Point,
+};
 
 pub const DETAIL_RANK_STEP: i32 = 112;
 const LANE_ROW_STEP: i32 = 72;
@@ -72,6 +74,31 @@ impl AnchorRangeTransform {
             return x - f64::from(self.extra_width);
         }
         source_x + (x - source_x) * (target_x - source_x) / (expanded_target_x - source_x)
+    }
+}
+
+pub fn transform_graph_route(
+    route: GraphBezierRoute,
+    source_node_x: Option<i32>,
+    target_node_x: Option<i32>,
+    transform: AnchorRangeTransform,
+) -> GraphBezierRoute {
+    let endpoint_delta = |node_x: Option<i32>, endpoint_x: i32| {
+        let anchor_x = node_x.unwrap_or(endpoint_x);
+        transform.transform_x(anchor_x).saturating_sub(anchor_x)
+    };
+    let source_delta = endpoint_delta(source_node_x, route.source.x);
+    let target_delta = endpoint_delta(target_node_x, route.target.x);
+    let translate = |point: Point, delta: i32| Point {
+        x: point.x.saturating_add(delta),
+        y: point.y,
+    };
+
+    GraphBezierRoute {
+        source: translate(route.source, source_delta),
+        control_1: translate(route.control_1, source_delta),
+        control_2: translate(route.control_2, target_delta),
+        target: translate(route.target, target_delta),
     }
 }
 
@@ -278,5 +305,30 @@ mod tests {
         }
         assert_eq!(transform.transform_x(212), 436);
         assert_eq!(transform.transform_x(500), 724);
+    }
+
+    #[test]
+    fn graph_route_preserves_endpoint_and_tangent_offsets() {
+        let transform = AnchorRangeTransform {
+            source_x: 100,
+            target_x: 212,
+            extra_width: 112,
+        };
+        let route = GraphBezierRoute {
+            source: Point { x: 120, y: 80 },
+            control_1: Point { x: 150, y: 80 },
+            control_2: Point { x: 168, y: 80 },
+            target: Point { x: 188, y: 80 },
+        };
+
+        assert_eq!(
+            transform_graph_route(route, Some(100), Some(212), transform),
+            GraphBezierRoute {
+                source: Point { x: 120, y: 80 },
+                control_1: Point { x: 150, y: 80 },
+                control_2: Point { x: 280, y: 80 },
+                target: Point { x: 300, y: 80 },
+            }
+        );
     }
 }

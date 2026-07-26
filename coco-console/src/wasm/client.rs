@@ -30,7 +30,7 @@ use crate::viewport::{
 
 use super::anchor_range::{
     AnchorRangeLayout, AnchorRangeLayoutEdge, AnchorRangeTransform, anchor_range_extra_width,
-    layout_anchor_range,
+    layout_anchor_range, transform_graph_route,
 };
 
 const ROOT_ID: &str = "console-root";
@@ -728,6 +728,7 @@ impl VirtualGraph {
         let nodes = self
             .node_group
             .query_selector_all(".node-link[data-base-node-x][data-node-y]")?;
+        let mut rendered_node_x = BTreeMap::new();
         for index in 0..nodes.length() {
             let Some(node) = nodes.item(index) else {
                 continue;
@@ -741,6 +742,9 @@ impl VirtualGraph {
             let Some(y) = graph_item_i32(&node, "data-node-y") else {
                 continue;
             };
+            if let Some(node_id) = node.get_attribute("data-node-id") {
+                rendered_node_x.insert(node_id, base_x);
+            }
             let x = transform.map_or(base_x, |transform| transform.transform_x(base_x));
             node.set_attribute("data-node-x", &x.to_string())?;
             if let Some(group) = node.query_selector(".node")? {
@@ -761,8 +765,17 @@ impl VirtualGraph {
             let Some(route) = graph_edge_route_from_attributes(&edge) else {
                 continue;
             };
-            let route =
-                transform.map_or(route, |transform| transform_graph_route(route, transform));
+            let route = if let Some(transform) = transform {
+                let source_node_x = edge
+                    .get_attribute("data-source-id")
+                    .and_then(|source_id| rendered_node_x.get(&source_id).copied());
+                let target_node_x = edge
+                    .get_attribute("data-target-id")
+                    .and_then(|target_id| rendered_node_x.get(&target_id).copied());
+                transform_graph_route(route, source_node_x, target_node_x, transform)
+            } else {
+                route
+            };
             let path = bezier_path(route);
             edge.set_attribute("d", &path)?;
             if let Some(key) = edge.get_attribute("data-render-key")
@@ -969,6 +982,8 @@ impl VirtualGraph {
                 ("data-target-x", edge.route.target.x.to_string()),
                 ("data-target-y", edge.route.target.y.to_string()),
                 ("data-edge-kind", edge.kind.key_part().to_owned()),
+                ("data-source-id", edge.source_id.clone()),
+                ("data-target-id", edge.target_id.clone()),
             ],
         )?;
         if element.parent_element().is_none() {
@@ -2081,22 +2096,6 @@ fn graph_edge_route_from_attributes(element: &Element) -> Option<GraphBezierRout
             y: graph_item_i32(element, "data-target-y")?,
         },
     })
-}
-
-fn transform_graph_route(
-    route: GraphBezierRoute,
-    transform: AnchorRangeTransform,
-) -> GraphBezierRoute {
-    let transform_point = |point: Point| Point {
-        x: transform.transform_x(point.x),
-        y: point.y,
-    };
-    GraphBezierRoute {
-        source: transform_point(route.source),
-        control_1: transform_point(route.control_1),
-        control_2: transform_point(route.control_2),
-        target: transform_point(route.target),
-    }
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -3262,6 +3261,13 @@ mod tests {
             trigger.get_attribute("aria-pressed").as_deref(),
             Some("true")
         );
+        let edge = document
+            .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"target\"]")
+            .expect_throw("edge query should succeed")
+            .expect_throw("expanded edge should exist");
+        let expected_path = "M 120 80 C 150 80, 280 80, 300 80";
+        assert_eq!(edge.get_attribute("d").as_deref(), Some(expected_path));
+        assert_eq!(trigger.get_attribute("d").as_deref(), Some(expected_path));
 
         let context_point = document
             .create_element("span")
