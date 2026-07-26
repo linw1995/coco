@@ -2269,6 +2269,11 @@ fn render_anchor_range(
     selection: AnchorRangeSelection,
     paths: Vec<crate::api::AnchorRangePath>,
 ) -> Option<Point> {
+    if anchor_range_extra_width(&paths) == 0 {
+        let _ = graph.collapse_anchor_range();
+        graph.show_status("No detail nodes exist between the selected anchors.");
+        return None;
+    }
     match graph.expand_anchor_range(selection, paths) {
         Ok(focus) => {
             graph.hide_status();
@@ -2783,7 +2788,14 @@ fn select_time_scale_tick(graph: &mut VirtualGraph, tick: &TimeScaleTick) {
     if let Err(error) = graph.set_auto_follow(false) {
         web_sys::console::error_1(&error);
     }
-    center_viewport_on_graph_point(graph, tick.point);
+    let point = graph
+        .anchor_range
+        .as_ref()
+        .map_or(tick.point, |expansion| Point {
+            x: expansion.transform.transform_x(tick.point.x),
+            ..tick.point
+        });
+    center_viewport_on_graph_point(graph, point);
     if let Err(error) = graph.window.location().set_hash(&tick.node_target) {
         web_sys::console::error_1(&error);
     }
@@ -3275,6 +3287,12 @@ mod tests {
 
         {
             let mut graph = fixture.graph.borrow_mut();
+            graph.viewport.width = 100.0;
+            let ticks =
+                time_scale_ticks(&graph.time_scale).expect_throw("time scale ticks should load");
+            select_time_scale_tick(&mut graph, &ticks[1]);
+            assert_eq!(graph.viewport.x, 294.0);
+
             graph.viewport.x = 324.0;
             graph.viewport.width = 100.0;
             graph.rendered_viewport = graph.viewport;
@@ -3296,6 +3314,41 @@ mod tests {
                 .query_selector(".graph-anchor-range .anchor-range-node-link")
                 .expect_throw("collapsed range query should succeed")
                 .is_none()
+        );
+
+        {
+            let selection = AnchorRangeSelection {
+                source: "source".to_owned(),
+                target: "target".to_owned(),
+                kind: GraphViewportEdgeKind::Primary,
+            };
+            let mut graph = fixture.graph.borrow_mut();
+            graph.anchor_range_selection = Some(selection.clone());
+            assert!(
+                apply_anchor_range_response(
+                    &mut graph,
+                    selection,
+                    Ok(AnchorRangeResponse::Found {
+                        paths: vec![crate::api::AnchorRangePath {
+                            nodes: vec![
+                                anchor_range_node("source", None),
+                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary),),
+                            ],
+                        }],
+                    }),
+                )
+                .is_none()
+            );
+            assert!(graph.anchor_range_selection.is_none());
+            assert!(graph.anchor_range.is_none());
+        }
+        assert_eq!(
+            document
+                .query_selector(".graph-status")
+                .expect_throw("graph status query should succeed")
+                .and_then(|status| status.text_content())
+                .as_deref(),
+            Some("No detail nodes exist between the selected anchors.")
         );
     }
 
