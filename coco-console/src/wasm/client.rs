@@ -481,11 +481,9 @@ impl VirtualGraph {
         else {
             return viewport;
         };
-        let left = transform.inverse_x(viewport.x);
-        let right = transform.inverse_x(viewport.x + viewport.width);
+        let center = transform.inverse_x(viewport.x + viewport.width / 2.0);
         ViewportState {
-            x: left,
-            width: (right - left).max(1.0),
+            x: (center - viewport.width / 2.0).max(0.0),
             ..viewport
         }
     }
@@ -498,11 +496,10 @@ impl VirtualGraph {
         else {
             return viewport;
         };
-        let left = f64::from(transform.transform_x(rounded_i32(viewport.x)));
-        let right = f64::from(transform.transform_x(rounded_i32(viewport.x + viewport.width)));
+        let center =
+            f64::from(transform.transform_x(rounded_i32(viewport.x + viewport.width / 2.0)));
         ViewportState {
-            x: left,
-            width: (right - left).max(1.0),
+            x: (center - viewport.width / 2.0).max(0.0),
             ..viewport
         }
     }
@@ -3354,8 +3351,17 @@ mod tests {
             graph.persist_viewport();
             assert_eq!(
                 ViewportState::load(&graph.window).map(|viewport| (viewport.x, viewport.width)),
-                Some((212.0, 70.0))
+                Some((182.0, 100.0))
             );
+
+            let inserted_viewport = ViewportState {
+                x: 230.0,
+                width: 40.0,
+                ..graph.viewport
+            };
+            let base_viewport = graph.base_viewport(inserted_viewport);
+            assert_eq!(base_viewport.x, 192.0);
+            assert_eq!(base_viewport.width, 40.0);
 
             graph.viewport.x = 324.0;
             graph.viewport.width = 100.0;
