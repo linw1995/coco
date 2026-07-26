@@ -2659,11 +2659,29 @@ async fn writable_open_migrates_known_persisted_builtin_revision() {
         .copied()
         .unwrap();
     let previous_revision = migration.source_revision_ids().last().copied().unwrap();
+    let earlier_revision = migration
+        .source_revision_ids()
+        .iter()
+        .rev()
+        .nth(1)
+        .copied()
+        .unwrap();
     let mut connection = store.connect().await.unwrap();
     diesel::update(
         skill_versions::table
             .filter(skill_versions::role.eq(SessionRole::Runner.as_str()))
-            .filter(skill_versions::skill_name.eq("telegram")),
+            .filter(skill_versions::skill_name.eq("telegram"))
+            .filter(skill_versions::version.eq(current.current_version.to_string())),
+    )
+    .set(skill_versions::id.eq(earlier_revision))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    diesel::update(
+        skill_versions::table
+            .filter(skill_versions::role.eq(SessionRole::Runner.as_str()))
+            .filter(skill_versions::skill_name.eq("telegram"))
+            .filter(skill_versions::version.eq(materialized.current_version.to_string())),
     )
     .set(skill_versions::id.eq(previous_revision))
     .execute(&mut connection)
@@ -2734,11 +2752,29 @@ async fn writable_open_preserves_rolled_back_builtin_revision() {
         .copied()
         .unwrap();
     let previous_revision = migration.source_revision_ids().last().copied().unwrap();
+    let earlier_revision = migration
+        .source_revision_ids()
+        .iter()
+        .rev()
+        .nth(1)
+        .copied()
+        .unwrap();
     let mut connection = store.connect().await.unwrap();
     diesel::update(
         skill_versions::table
             .filter(skill_versions::role.eq(SessionRole::Runner.as_str()))
-            .filter(skill_versions::skill_name.eq("telegram")),
+            .filter(skill_versions::skill_name.eq("telegram"))
+            .filter(skill_versions::version.eq(current.current_version.to_string())),
+    )
+    .set(skill_versions::id.eq(earlier_revision))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    diesel::update(
+        skill_versions::table
+            .filter(skill_versions::role.eq(SessionRole::Runner.as_str()))
+            .filter(skill_versions::skill_name.eq("telegram"))
+            .filter(skill_versions::version.eq(materialized.current_version.to_string())),
     )
     .set(skill_versions::id.eq(previous_revision))
     .execute(&mut connection)
@@ -2776,6 +2812,68 @@ async fn writable_open_preserves_rolled_back_builtin_revision() {
         .await
         .unwrap();
     assert_eq!(preserved.current_version, 4);
+    assert_eq!(preserved.current().unwrap().id, previous_revision);
+}
+
+#[tokio::test]
+async fn writable_open_preserves_pre_upgrade_builtin_rollback() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let original = store
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
+    let modified = store
+        .update_skill(
+            SessionRole::Runner,
+            "telegram",
+            &SkillUpdatePatch {
+                body: Some("user-modified body".to_owned()),
+                ..SkillUpdatePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let migration = crate::builtin_skill_migrations::BUILTIN_SKILL_MIGRATIONS
+        .iter()
+        .find(|migration| migration.role == SessionRole::Runner && migration.name == "telegram")
+        .copied()
+        .unwrap();
+    let previous_revision = migration.source_revision_ids().last().copied().unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(
+        skill_versions::table
+            .filter(skill_versions::role.eq(SessionRole::Runner.as_str()))
+            .filter(skill_versions::skill_name.eq("telegram"))
+            .filter(skill_versions::version.eq(original.current_version.to_string())),
+    )
+    .set(skill_versions::id.eq(previous_revision))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    drop(connection);
+
+    let rolled_back = store
+        .rollback_skill(SessionRole::Runner, "telegram", original.current_version)
+        .await
+        .unwrap();
+    assert_eq!(rolled_back.current_version, modified.current_version + 1);
+    assert_eq!(rolled_back.current().unwrap().id, previous_revision);
+    assert!(
+        rolled_back
+            .versions
+            .values()
+            .all(|version| version.id != migration.target_revision_id())
+    );
+    drop(store);
+
+    let reopened = SqliteStore::open(&path).await.unwrap();
+    let preserved = reopened
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
+    assert_eq!(preserved.current_version, rolled_back.current_version);
     assert_eq!(preserved.current().unwrap().id, previous_revision);
 }
 
