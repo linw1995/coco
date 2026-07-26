@@ -62,7 +62,7 @@ async fn load_node_detail(target: String) -> Result<NodeDetailResponse, ServerFn
 }
 
 #[server(prefix = "/api/panels", endpoint = "anchor-range", input = GetUrl)]
-pub(crate) async fn load_anchor_range(
+pub async fn load_anchor_range(
     source: String,
     target: String,
     kind: GraphViewportEdgeKind,

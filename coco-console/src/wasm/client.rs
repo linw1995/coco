@@ -382,13 +382,14 @@ impl VirtualGraph {
         let Some(storage) = session_storage(&self.window) else {
             return;
         };
+        let viewport = self.base_viewport(self.viewport);
         let value = format!(
             "{},{},{},{},{}",
-            rounded_i32(self.viewport.x),
-            rounded_i32(self.viewport.y),
-            rounded_i32(self.viewport.width),
-            rounded_i32(self.viewport.height),
-            self.viewport.overscan
+            rounded_i32(viewport.x),
+            rounded_i32(viewport.y),
+            rounded_i32(viewport.width),
+            rounded_i32(viewport.height),
+            viewport.overscan
         );
         let _ = storage.set_item(VIEWPORT_KEY, &value);
     }
@@ -2274,10 +2275,23 @@ fn render_anchor_range(
         graph.show_status("No detail nodes exist between the selected anchors.");
         return None;
     }
+    render_anchor_range_paths(graph, selection, paths)
+}
+
+fn render_anchor_range_paths(
+    graph: &mut VirtualGraph,
+    selection: AnchorRangeSelection,
+    paths: Vec<crate::api::AnchorRangePath>,
+) -> Option<Point> {
     match graph.expand_anchor_range(selection, paths) {
-        Ok(focus) => {
+        Ok(Some(focus)) => {
             graph.hide_status();
-            focus
+            Some(focus)
+        }
+        Ok(None) => {
+            let _ = graph.collapse_anchor_range();
+            graph.show_status("Anchor endpoints are outside the rendered graph.");
+            None
         }
         Err(error) => {
             web_sys::console::error_1(&error);
@@ -3292,6 +3306,11 @@ mod tests {
                 time_scale_ticks(&graph.time_scale).expect_throw("time scale ticks should load");
             select_time_scale_tick(&mut graph, &ticks[1]);
             assert_eq!(graph.viewport.x, 294.0);
+            graph.persist_viewport();
+            assert_eq!(
+                ViewportState::load(&graph.window).map(|viewport| (viewport.x, viewport.width)),
+                Some((197.0, 85.0))
+            );
 
             graph.viewport.x = 324.0;
             graph.viewport.width = 100.0;
@@ -3332,7 +3351,7 @@ mod tests {
                         paths: vec![crate::api::AnchorRangePath {
                             nodes: vec![
                                 anchor_range_node("source", None),
-                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary),),
+                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
                             ],
                         }],
                     }),
@@ -3349,6 +3368,42 @@ mod tests {
                 .and_then(|status| status.text_content())
                 .as_deref(),
             Some("No detail nodes exist between the selected anchors.")
+        );
+
+        {
+            let selection = AnchorRangeSelection {
+                source: "missing-source".to_owned(),
+                target: "target".to_owned(),
+                kind: GraphViewportEdgeKind::Primary,
+            };
+            let mut graph = fixture.graph.borrow_mut();
+            graph.anchor_range_selection = Some(selection.clone());
+            assert!(
+                apply_anchor_range_response(
+                    &mut graph,
+                    selection,
+                    Ok(AnchorRangeResponse::Found {
+                        paths: vec![crate::api::AnchorRangePath {
+                            nodes: vec![
+                                anchor_range_node("missing-source", None),
+                                anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                            ],
+                        }],
+                    }),
+                )
+                .is_none()
+            );
+            assert!(graph.anchor_range_selection.is_none());
+            assert!(graph.anchor_range.is_none());
+        }
+        assert_eq!(
+            document
+                .query_selector(".graph-status")
+                .expect_throw("graph status query should succeed")
+                .and_then(|status| status.text_content())
+                .as_deref(),
+            Some("Anchor endpoints are outside the rendered graph.")
         );
     }
 
