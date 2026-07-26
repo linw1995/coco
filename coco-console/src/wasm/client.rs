@@ -828,13 +828,21 @@ impl VirtualGraph {
             let Some(route) = graph_edge_route_from_attributes(&edge) else {
                 continue;
             };
+            let source_node_x = retained_edge_node_x(
+                &edge,
+                "data-source-id",
+                "data-source-node-id",
+                "data-source-node-x",
+                &rendered_node_x,
+            )?;
+            let target_node_x = retained_edge_node_x(
+                &edge,
+                "data-target-id",
+                "data-target-node-id",
+                "data-target-node-x",
+                &rendered_node_x,
+            )?;
             let route = if let Some(transform) = transform {
-                let source_node_x = edge
-                    .get_attribute("data-source-id")
-                    .and_then(|source_id| rendered_node_x.get(&source_id).copied());
-                let target_node_x = edge
-                    .get_attribute("data-target-id")
-                    .and_then(|target_id| rendered_node_x.get(&target_id).copied());
                 transform_graph_route(route, source_node_x, target_node_x, transform)
             } else {
                 route
@@ -2146,6 +2154,27 @@ fn graph_edge_route_from_attributes(element: &Element) -> Option<GraphBezierRout
             y: graph_item_i32(element, "data-target-y")?,
         },
     })
+}
+
+fn retained_edge_node_x(
+    edge: &Element,
+    endpoint_id_attr: &str,
+    cached_id_attr: &str,
+    cached_x_attr: &str,
+    rendered_node_x: &BTreeMap<String, i32>,
+) -> Result<Option<i32>, JsValue> {
+    let Some(endpoint_id) = edge.get_attribute(endpoint_id_attr) else {
+        return Ok(None);
+    };
+    if let Some(x) = rendered_node_x.get(&endpoint_id).copied() {
+        edge.set_attribute(cached_id_attr, &endpoint_id)?;
+        edge.set_attribute(cached_x_attr, &x.to_string())?;
+        return Ok(Some(x));
+    }
+    if edge.get_attribute(cached_id_attr).as_deref() != Some(endpoint_id.as_str()) {
+        return Ok(None);
+    }
+    Ok(graph_item_i32(edge, cached_x_attr))
 }
 
 fn remap_expanded_viewport(
@@ -3612,6 +3641,8 @@ mod tests {
         let fixture = GraphFixture::new();
         let initial_route = route((120, 80), (150, 80), (168, 80), (188, 80));
         let updated_route = route((140, 100), (170, 100), (216, 140), (236, 140));
+        let initial_adjacent_route = route((120, 80), (150, 80), (168, 200), (188, 200));
+        let updated_adjacent_route = route((140, 100), (170, 100), (216, 220), (236, 220));
         let selection = AnchorRangeSelection {
             source: "source".to_owned(),
             target: "target".to_owned(),
@@ -3627,13 +3658,25 @@ mod tests {
                         height: 280,
                     },
                     viewport: viewport(),
-                    nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
-                    edges: vec![graph_edge(
-                        GraphViewportEdgeKind::Primary,
-                        "source",
-                        "target",
-                        initial_route,
-                    )],
+                    nodes: vec![
+                        graph_node("source", 100, 80),
+                        graph_node("target", 212, 80),
+                        graph_node("adjacent", 212, 200),
+                    ],
+                    edges: vec![
+                        graph_edge(
+                            GraphViewportEdgeKind::Primary,
+                            "source",
+                            "target",
+                            initial_route,
+                        ),
+                        graph_edge(
+                            GraphViewportEdgeKind::Shadow,
+                            "source",
+                            "adjacent",
+                            initial_adjacent_route,
+                        ),
+                    ],
                 })
                 .expect_throw("initial anchor graph should render");
             graph
@@ -3663,13 +3706,22 @@ mod tests {
                         nodes: vec![
                             graph_node("source", 120, 100),
                             graph_node("target", 260, 140),
+                            graph_node("adjacent", 260, 220),
                         ],
-                        edges: vec![graph_edge(
-                            GraphViewportEdgeKind::Primary,
-                            "source",
-                            "target",
-                            updated_route,
-                        )],
+                        edges: vec![
+                            graph_edge(
+                                GraphViewportEdgeKind::Primary,
+                                "source",
+                                "target",
+                                updated_route,
+                            ),
+                            graph_edge(
+                                GraphViewportEdgeKind::Shadow,
+                                "source",
+                                "adjacent",
+                                updated_adjacent_route,
+                            ),
+                        ],
                     },
                     removed: Vec::new(),
                 })
@@ -3699,6 +3751,14 @@ mod tests {
             edge.get_attribute("d").as_deref(),
             Some("M 140 100 C 170 100, 328 140, 348 140")
         );
+        let adjacent_edge = document
+            .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"adjacent\"]")
+            .expect_throw("adjacent edge query should succeed")
+            .expect_throw("reflowed adjacent edge should exist");
+        assert_eq!(
+            adjacent_edge.get_attribute("d").as_deref(),
+            Some("M 140 100 C 170 100, 328 220, 348 220")
+        );
         {
             let graph = fixture.graph.borrow();
             assert_eq!(
@@ -3724,18 +3784,30 @@ mod tests {
                     viewport: viewport(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
-                    removed: vec![GraphViewportRemovedItem {
-                        kind: crate::api::GraphViewportItemKind::Node,
-                        key: "node:target".to_owned(),
-                    }],
+                    removed: vec![
+                        GraphViewportRemovedItem {
+                            kind: crate::api::GraphViewportItemKind::Node,
+                            key: "node:target".to_owned(),
+                        },
+                        GraphViewportRemovedItem {
+                            kind: crate::api::GraphViewportItemKind::Node,
+                            key: "node:adjacent".to_owned(),
+                        },
+                    ],
                 })
-                .expect_throw("virtualized target should preserve the open range");
+                .expect_throw("virtualized endpoints should preserve the open range");
             assert!(graph.anchor_range.is_some());
         }
         assert!(
             document
                 .query_selector(".node-link[data-node-id=\"target\"]")
                 .expect_throw("virtualized target query should succeed")
+                .is_none()
+        );
+        assert!(
+            document
+                .query_selector(".node-link[data-node-id=\"adjacent\"]")
+                .expect_throw("virtualized adjacent node query should succeed")
                 .is_none()
         );
         assert!(
@@ -3747,6 +3819,10 @@ mod tests {
         assert_eq!(
             edge.get_attribute("d").as_deref(),
             Some("M 140 100 C 170 100, 328 140, 348 140")
+        );
+        assert_eq!(
+            adjacent_edge.get_attribute("d").as_deref(),
+            Some("M 140 100 C 170 100, 328 220, 348 220")
         );
 
         {
@@ -3761,7 +3837,10 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     added: GraphViewportItems {
-                        nodes: vec![graph_node("target", 280, 160)],
+                        nodes: vec![
+                            graph_node("target", 280, 160),
+                            graph_node("adjacent", 280, 220),
+                        ],
                         edges: Vec::new(),
                     },
                     updated: GraphViewportItems::default(),
