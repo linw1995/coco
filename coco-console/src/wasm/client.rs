@@ -16,9 +16,9 @@ use super::refresh::{
     pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
 use crate::api::{
-    AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse,
-    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItems, GraphViewportNode,
-    GraphViewportRemovedItem, GraphViewportResponse, Point,
+    AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphViewport,
+    GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItems,
+    GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
 use crate::panels::{
     PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, load_anchor_range,
@@ -93,6 +93,7 @@ struct AnchorRangeSelection {
 
 struct ExpandedAnchorRange {
     selection: AnchorRangeSelection,
+    paths: Vec<AnchorRangePath>,
     layout: AnchorRangeLayout,
     transform: AnchorRangeTransform,
 }
@@ -407,6 +408,7 @@ impl VirtualGraph {
         self.rendered = RenderedKeys::new();
         self.apply_response_viewport(version, canvas, viewport)?;
         self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
+        self.refresh_anchor_range_geometry()?;
         self.sync_anchor_range()?;
         self.sync_svg_viewport();
         self.sync_selected_graph_node();
@@ -427,6 +429,7 @@ impl VirtualGraph {
         self.apply_response_viewport(version, canvas, viewport)?;
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
+        self.refresh_anchor_range_geometry()?;
         self.sync_anchor_range()?;
         self.sync_svg_viewport();
         self.sync_selected_graph_node();
@@ -598,7 +601,7 @@ impl VirtualGraph {
     fn expand_anchor_range(
         &mut self,
         selection: AnchorRangeSelection,
-        paths: Vec<crate::api::AnchorRangePath>,
+        paths: Vec<AnchorRangePath>,
     ) -> Result<Option<Point>, JsValue> {
         let Some(source) = self.rendered_node_point(&selection.source)? else {
             return Ok(None);
@@ -615,7 +618,7 @@ impl VirtualGraph {
             x: transform.transform_x(target.x),
             y: target.y,
         };
-        let layout = layout_anchor_range(source, target, paths);
+        let layout = layout_anchor_range(source, target, paths.clone());
         let focus = Point {
             x: layout.bounds.left.saturating_add(layout.bounds.right) / 2,
             y: layout.bounds.top.saturating_add(layout.bounds.bottom) / 2,
@@ -623,6 +626,7 @@ impl VirtualGraph {
         self.anchor_range_selection = Some(selection.clone());
         self.anchor_range = Some(ExpandedAnchorRange {
             selection,
+            paths,
             layout,
             transform,
         });
@@ -632,6 +636,46 @@ impl VirtualGraph {
         self.sync_anchor_range()?;
         self.apply_canvas()?;
         Ok(Some(focus))
+    }
+
+    fn refresh_anchor_range_geometry(&mut self) -> Result<(), JsValue> {
+        let Some((selection, paths)) = self
+            .anchor_range
+            .as_ref()
+            .map(|expansion| (expansion.selection.clone(), expansion.paths.clone()))
+        else {
+            return Ok(());
+        };
+        let base_viewport = self.base_viewport(self.viewport);
+        let base_rendered_viewport = self.base_viewport(self.rendered_viewport);
+        let Some(source) = self.rendered_node_point(&selection.source)? else {
+            return self.collapse_anchor_range();
+        };
+        let Some(target) = self.rendered_node_point(&selection.target)? else {
+            return self.collapse_anchor_range();
+        };
+        let transform = AnchorRangeTransform {
+            source_x: source.x,
+            target_x: target.x,
+            extra_width: anchor_range_extra_width(&paths),
+        };
+        let expanded_target = Point {
+            x: transform.transform_x(target.x),
+            y: target.y,
+        };
+        self.anchor_range = Some(ExpandedAnchorRange {
+            selection,
+            layout: layout_anchor_range(source, expanded_target, paths.clone()),
+            paths,
+            transform,
+        });
+        self.viewport = self.expanded_viewport(base_viewport);
+        self.rendered_viewport = self.expanded_viewport(base_rendered_viewport);
+        if let Some(base) = self.base_canvas {
+            self.canvas = Some(self.expanded_canvas(base));
+        }
+        self.clamp_viewport();
+        self.apply_canvas()
     }
 
     fn collapse_anchor_range(&mut self) -> Result<(), JsValue> {
@@ -3410,6 +3454,109 @@ mod tests {
                 .and_then(|status| status.text_content())
                 .as_deref(),
             Some("Anchor endpoints are outside the rendered graph.")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_reflow_open_anchor_range_with_current_endpoints() {
+        let fixture = GraphFixture::new();
+        let initial_route = route((120, 80), (150, 80), (168, 80), (188, 80));
+        let updated_route = route((140, 100), (170, 100), (216, 140), (236, 140));
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .apply_full(GraphViewportResponse {
+                    version: 1,
+                    canvas: GraphCanvas {
+                        width: 480,
+                        height: 280,
+                    },
+                    viewport: viewport(),
+                    nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
+                    edges: vec![graph_edge(
+                        GraphViewportEdgeKind::Primary,
+                        "source",
+                        "target",
+                        initial_route,
+                    )],
+                })
+                .expect_throw("initial anchor graph should render");
+            graph
+                .expand_anchor_range(
+                    selection,
+                    vec![AnchorRangePath {
+                        nodes: vec![
+                            anchor_range_node("source", None),
+                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                            anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                        ],
+                    }],
+                )
+                .expect_throw("anchor details should expand")
+                .expect_throw("anchor endpoints should be rendered");
+            graph
+                .apply_diff(GraphViewportDiffResponse {
+                    version: 2,
+                    canvas: GraphCanvas {
+                        width: 480,
+                        height: 280,
+                    },
+                    previous_viewport: viewport(),
+                    viewport: viewport(),
+                    added: GraphViewportItems::default(),
+                    updated: GraphViewportItems {
+                        nodes: vec![
+                            graph_node("source", 120, 100),
+                            graph_node("target", 260, 140),
+                        ],
+                        edges: vec![graph_edge(
+                            GraphViewportEdgeKind::Primary,
+                            "source",
+                            "target",
+                            updated_route,
+                        )],
+                    },
+                    removed: Vec::new(),
+                })
+                .expect_throw("anchor graph reflow should render");
+        }
+
+        let document = fixture.graph.borrow().document.clone();
+        let detail = document
+            .query_selector(".anchor-range-node-link[data-node-id=\"detail\"] .node")
+            .expect_throw("detail node query should succeed")
+            .expect_throw("detail node should remain expanded");
+        assert_eq!(
+            detail.get_attribute("transform").as_deref(),
+            Some("translate(246 120)")
+        );
+        let frame = document
+            .query_selector(".anchor-range-frame")
+            .expect_throw("range frame query should succeed")
+            .expect_throw("range frame should remain rendered");
+        assert_eq!(frame.get_attribute("x").as_deref(), Some("194"));
+        assert_eq!(frame.get_attribute("y").as_deref(), Some("68"));
+        let edge = document
+            .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"target\"]")
+            .expect_throw("edge query should succeed")
+            .expect_throw("reflowed edge should exist");
+        assert_eq!(
+            edge.get_attribute("d").as_deref(),
+            Some("M 140 100 C 170 100, 328 140, 348 140")
+        );
+        let expansion = fixture.graph.borrow();
+        assert_eq!(
+            expansion.anchor_range.as_ref().map(|range| range.transform),
+            Some(AnchorRangeTransform {
+                source_x: 120,
+                target_x: 260,
+                extra_width: 112,
+            })
         );
     }
 
