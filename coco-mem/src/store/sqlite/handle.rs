@@ -19,6 +19,7 @@ use super::node::{
     load_nodes_by_exact_ids, load_root_id, node_count, node_cursor_matches,
     persist_node_without_transaction,
 };
+use super::skill::migrate_builtin_skills;
 use super::{
     AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchPage,
     GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor,
@@ -84,6 +85,7 @@ impl SqliteStore {
             .initialized_root_id(|| store.initialize_writable())
             .await?;
         store.root_id = root_id;
+        store.migrate_builtin_skills().await?;
         Ok(store)
     }
 
@@ -179,6 +181,18 @@ impl SqliteStore {
         ensure_existing_database_file(&store.database_path)?;
         let mut connection = store.connect().await?;
         migration::requires_migration(&mut connection, &store.database_path).await
+    }
+
+    async fn migrate_builtin_skills(&self) -> Result<()> {
+        let mut connection = self.connect().await?;
+        connection
+            .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+                migrate_builtin_skills(connection, &self.database_path)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)
+            })
+            .await
+            .map_err(|error| error.into_store_error(&self.database_path))
     }
 
     pub(super) fn ensure_writable(&self) -> Result<()> {

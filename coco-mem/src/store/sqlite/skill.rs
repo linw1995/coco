@@ -9,6 +9,9 @@ use snafu::prelude::*;
 
 use super::codec::{parse_session_role, parse_u64_column};
 use super::{AsyncSqliteConnection, SqliteStore, SqliteTransactionError};
+use crate::builtin_skill_migrations::{
+    BUILTIN_SKILL_MIGRATIONS, BuiltinSkillMigrationAction, migrate_builtin_skill,
+};
 use crate::error::{
     CorruptedStoreSnafu, InvalidSkillNameSnafu, QuerySqliteStoreSnafu, SkillAlreadyExistsSnafu,
     SkillNotFoundSnafu, SkillUpdateEmptySnafu, SkillVersionNotFoundSnafu, StoreError,
@@ -60,6 +63,77 @@ async fn load_skill_groups(
             .insert(record.name.clone(), record);
     }
     Ok(groups)
+}
+
+pub async fn migrate_builtin_skills(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<()> {
+    let defaults = default_skill_groups();
+    for migration in BUILTIN_SKILL_MIGRATIONS {
+        let Some((role, mut record)) =
+            query_skill_records(connection, path, Some(migration.role), Some(migration.name))
+                .await?
+                .pop()
+        else {
+            continue;
+        };
+        let Some(target) = defaults
+            .for_role(migration.role)
+            .get(migration.name)
+            .and_then(SkillRecord::current)
+        else {
+            continue;
+        };
+        let from_version = record.current_version;
+        let from_revision = record
+            .current()
+            .map(|version| version.id.clone())
+            .unwrap_or_default();
+        match migrate_builtin_skill(*migration, &mut record, target) {
+            BuiltinSkillMigrationAction::Updated => {
+                tracing::info!(
+                    role = role.as_str(),
+                    skill = record.name,
+                    from_version,
+                    from_revision,
+                    to_version = record.current_version,
+                    to_revision = target.id,
+                    "updating persisted builtin skill"
+                );
+                persist_skill(connection, path, role, &record).await?;
+            }
+            BuiltinSkillMigrationAction::SkipUserModified => {
+                tracing::debug!(
+                    role = role.as_str(),
+                    skill = record.name,
+                    current_version = record.current_version,
+                    current_revision = from_revision,
+                    "skipping user-modified builtin skill"
+                );
+            }
+            BuiltinSkillMigrationAction::SkipRolledBack => {
+                tracing::debug!(
+                    role = role.as_str(),
+                    skill = record.name,
+                    current_version = record.current_version,
+                    current_revision = from_revision,
+                    "preserving rolled-back builtin skill"
+                );
+            }
+            BuiltinSkillMigrationAction::TargetMismatch => {
+                tracing::warn!(
+                    role = role.as_str(),
+                    skill = record.name,
+                    expected_revision = migration.target_revision_id(),
+                    actual_revision = target.id,
+                    "builtin skill migration target does not match compiled default"
+                );
+            }
+            BuiltinSkillMigrationAction::Unchanged => {}
+        }
+    }
+    Ok(())
 }
 
 async fn query_skill_records(

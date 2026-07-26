@@ -1,5 +1,6 @@
 // CoCo Memory Implementation
 
+mod builtin_skill_migrations;
 mod default_skills;
 mod error;
 mod schema;
