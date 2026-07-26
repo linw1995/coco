@@ -42,6 +42,8 @@ fn main() {
 fn run() -> BuildResult<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/panels.rs");
+    println!("cargo:rerun-if-changed=src/api.rs");
+    println!("cargo:rerun-if-changed=src/wasm/anchor_range.rs");
     println!("cargo:rerun-if-changed=src/wasm/client.rs");
     println!("cargo:rerun-if-changed=src/wasm/viewport.rs");
     println!("cargo:rerun-if-changed=web-graph-migrations");

@@ -31,9 +31,9 @@ use super::publisher::ConsolePublisher;
 use super::render::render_index_page;
 use crate::Result;
 use crate::api::{
-    AnchorRangeEdge, AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdge,
-    GraphViewportEdgeKind, NodeDetailResponse, Point as ApiPoint, ProviderContextItem,
-    ProviderContextNode, ProviderContextResponse,
+    AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdgeKind,
+    NodeDetailResponse, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
+    ProviderContextResponse,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
@@ -479,13 +479,7 @@ where
     let Some(paths) = anchor_range_paths(state, source_id, target_id, kind).await? else {
         return Ok(AnchorRangeResponse::Missing);
     };
-    let (previous, next) = adjacent_anchor_edges(edges, source_id, target_id);
-    Ok(AnchorRangeResponse::Found {
-        kind,
-        previous,
-        paths,
-        next,
-    })
+    Ok(AnchorRangeResponse::Found { paths })
 }
 
 async fn anchor_range_paths<S>(
@@ -579,39 +573,6 @@ where
         return Ok(None);
     }
     Ok(Some(nodes))
-}
-
-fn adjacent_anchor_edges(
-    edges: Vec<GraphViewportEdge>,
-    source_id: &str,
-    target_id: &str,
-) -> (Vec<AnchorRangeEdge>, Vec<AnchorRangeEdge>) {
-    let mut previous = Vec::new();
-    let mut next = Vec::new();
-    for edge in edges {
-        let edge = AnchorRangeEdge {
-            kind: edge.kind,
-            source: edge.source_id,
-            target: edge.target_id,
-        };
-        if edge.target == source_id {
-            previous.push(edge);
-        } else if edge.source == target_id {
-            next.push(edge);
-        }
-    }
-    let sort_edges = |edges: &mut Vec<AnchorRangeEdge>| {
-        edges.sort_by(|left, right| {
-            (left.kind.key_part(), &left.source, &left.target).cmp(&(
-                right.kind.key_part(),
-                &right.source,
-                &right.target,
-            ))
-        });
-    };
-    sort_edges(&mut previous);
-    sort_edges(&mut next);
-    (previous, next)
 }
 
 fn anchor_range_node(
@@ -1191,7 +1152,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let AnchorRangeResponse::Found { paths, next, .. } = primary else {
+        let AnchorRangeResponse::Found { paths } = primary else {
             panic!("primary anchor range should exist");
         };
         assert_eq!(paths.len(), 1);
@@ -1203,12 +1164,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [&source_anchor, &detail, &target_anchor]
         );
-        assert!(next.iter().any(|edge| {
-            edge.kind == GraphViewportEdgeKind::Primary
-                && edge.source == target_anchor
-                && edge.target == next_anchor
-        }));
-
         let merge = load_anchor_range(
             &state,
             &source_anchor,
@@ -1217,10 +1172,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let AnchorRangeResponse::Found { kind, paths, .. } = merge else {
+        let AnchorRangeResponse::Found { paths } = merge else {
             panic!("merge anchor relationship should exist");
         };
-        assert_eq!(kind, GraphViewportEdgeKind::Merge);
         assert_eq!(paths.len(), 2);
         assert_eq!(
             paths[0]
@@ -1271,10 +1225,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let AnchorRangeResponse::Found { kind, paths, .. } = shadow else {
+        let AnchorRangeResponse::Found { paths } = shadow else {
             panic!("shadow anchor relationship should exist");
         };
-        assert_eq!(kind, GraphViewportEdgeKind::Shadow);
         assert_eq!(paths.len(), 1);
         assert_eq!(
             paths[0]
