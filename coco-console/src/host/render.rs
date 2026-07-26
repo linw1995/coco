@@ -2,9 +2,7 @@ use askama::Template;
 use leptos::{html::HtmlElement, prelude::*};
 
 use crate::host::web_graph_view::ViewMode;
-use crate::panels::{
-    AnchorRangeExpansion, NODE_DETAIL_PANEL_ID, NodeDetailPanel, ProviderContextPanel,
-};
+use crate::panels::{NODE_DETAIL_PANEL_ID, NodeDetailPanel, ProviderContextPanel};
 
 use super::CLIENT_ASSET_VERSION;
 
@@ -52,8 +50,6 @@ fn render_root(mode: ViewMode, revision: u64) -> AnyView {
         .expect("graph shell template should render");
     let provider_context_panel = view! { <ProviderContextPanel graph_mode=graph_mode/> }.into_any();
     let node_detail_panel = view! { <NodeDetailPanel/> }.into_any();
-    let anchor_range = view! { <AnchorRangeExpansion/> }.into_any();
-
     view! {
         <main
             id="console-root"
@@ -74,7 +70,6 @@ fn render_root(mode: ViewMode, revision: u64) -> AnyView {
             <section class="content">
                 <div class="graph-shell">
                     <div class="graph-surface" inner_html=graph_shell></div>
-                    {anchor_range}
                     {render_empty_time_scale()}
                 </div>
                 <section class="provider-context-panel">
@@ -155,8 +150,8 @@ mod tests {
         assert!(graph_loader < island_loader);
         assert!(!page.contains("<!--bo-"));
         assert!(!page.contains("<!--bc-"));
-        assert_eq!(page.matches("<leptos-island").count(), 3);
-        assert!(page.contains("anchor-range"));
+        assert_eq!(page.matches("<leptos-island").count(), 2);
+        assert!(page.contains("graph-anchor-range"));
         assert_eq!(
             page.matches("Select a node to inspect its content.")
                 .count(),

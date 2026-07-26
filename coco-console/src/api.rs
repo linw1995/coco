@@ -31,22 +31,10 @@ pub struct AnchorRangePath {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct AnchorRangeEdge {
-    pub kind: GraphViewportEdgeKind,
-    pub source: String,
-    pub target: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AnchorRangeResponse {
     Missing,
-    Found {
-        kind: GraphViewportEdgeKind,
-        previous: Vec<AnchorRangeEdge>,
-        paths: Vec<AnchorRangePath>,
-        next: Vec<AnchorRangeEdge>,
-    },
+    Found { paths: Vec<AnchorRangePath> },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

@@ -33,6 +33,7 @@ mod host {
 // Host tests compile viewport so its pure geometry logic stays covered without a wasm test runner.
 #[cfg(any(target_arch = "wasm32", test))]
 mod wasm {
+    pub mod anchor_range;
     #[cfg(target_arch = "wasm32")]
     pub mod client;
     pub mod refresh;
