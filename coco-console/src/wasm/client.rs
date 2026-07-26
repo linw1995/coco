@@ -444,7 +444,10 @@ impl VirtualGraph {
         viewport: GraphViewport,
     ) -> Result<(), JsValue> {
         let desired_viewport = self.viewport;
-        let response_viewport = self.expanded_viewport(ViewportState::from(viewport));
+        let base_response_viewport = ViewportState::from(viewport);
+        let response_matches_desired =
+            same_viewport(self.base_viewport(desired_viewport), base_response_viewport);
+        let response_viewport = self.expanded_viewport(base_response_viewport);
         self.version = version;
         self.base_canvas = Some(canvas);
         self.canvas = Some(self.expanded_canvas(canvas));
@@ -455,7 +458,11 @@ impl VirtualGraph {
             self.set_viewport(response_viewport);
         }
         self.fit_short_canvas_once();
-        self.rendered_viewport = response_viewport;
+        self.rendered_viewport = if response_matches_desired {
+            desired_viewport
+        } else {
+            response_viewport
+        };
         self.set_root_version();
         self.apply_canvas()
     }
@@ -636,15 +643,19 @@ impl VirtualGraph {
     }
 
     fn refresh_anchor_range_geometry(&mut self) -> Result<(), JsValue> {
-        let Some((selection, paths)) = self
-            .anchor_range
-            .as_ref()
-            .map(|expansion| (expansion.selection.clone(), expansion.paths.clone()))
+        let Some((selection, paths, previous_transform)) =
+            self.anchor_range.as_ref().map(|expansion| {
+                (
+                    expansion.selection.clone(),
+                    expansion.paths.clone(),
+                    expansion.transform,
+                )
+            })
         else {
             return Ok(());
         };
-        let base_viewport = self.base_viewport(self.viewport);
-        let base_rendered_viewport = self.base_viewport(self.rendered_viewport);
+        let viewport = self.viewport;
+        let rendered_viewport = self.rendered_viewport;
         let Some(source) = self.rendered_node_point(&selection.source)? else {
             return self.collapse_anchor_range();
         };
@@ -666,8 +677,9 @@ impl VirtualGraph {
             paths,
             transform,
         });
-        self.viewport = self.expanded_viewport(base_viewport);
-        self.rendered_viewport = self.expanded_viewport(base_rendered_viewport);
+        self.viewport = remap_expanded_viewport(viewport, previous_transform, transform);
+        self.rendered_viewport =
+            remap_expanded_viewport(rendered_viewport, previous_transform, transform);
         if let Some(base) = self.base_canvas {
             self.canvas = Some(self.expanded_canvas(base));
         }
@@ -2126,6 +2138,26 @@ fn graph_edge_route_from_attributes(element: &Element) -> Option<GraphBezierRout
     })
 }
 
+fn remap_expanded_viewport(
+    viewport: ViewportState,
+    previous: AnchorRangeTransform,
+    current: AnchorRangeTransform,
+) -> ViewportState {
+    let center = viewport.x + viewport.width / 2.0;
+    let previous_target = f64::from(previous.target_x);
+    let previous_expanded_target = previous_target + f64::from(previous.extra_width);
+    let current_center = if center >= previous_target && center < previous_expanded_target {
+        let inserted_offset = (center - previous_target).min(f64::from(current.extra_width));
+        f64::from(current.target_x) + inserted_offset
+    } else {
+        f64::from(current.transform_x(rounded_i32(previous.inverse_x(center))))
+    };
+    ViewportState {
+        x: (current_center - viewport.width / 2.0).max(0.0),
+        ..viewport
+    }
+}
+
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let installers: [GraphListenerInstaller; 10] = [
         install_anchor_range_listener,
@@ -3362,6 +3394,41 @@ mod tests {
             let base_viewport = graph.base_viewport(inserted_viewport);
             assert_eq!(base_viewport.x, 192.0);
             assert_eq!(base_viewport.width, 40.0);
+            graph.auto_follow = false;
+            graph.auto_fit_short_canvas = false;
+            graph.viewport = inserted_viewport;
+            graph.rendered_viewport = inserted_viewport;
+            graph.patch_in_flight = true;
+            graph
+                .apply_diff(GraphViewportDiffResponse {
+                    version: 1,
+                    canvas: GraphCanvas {
+                        width: 480,
+                        height: 280,
+                    },
+                    previous_viewport: GraphViewport {
+                        x: 192,
+                        y: rounded_i32(inserted_viewport.y),
+                        width: 40,
+                        height: rounded_i32(inserted_viewport.height),
+                        overscan: inserted_viewport.overscan,
+                    },
+                    viewport: GraphViewport {
+                        x: 192,
+                        y: rounded_i32(inserted_viewport.y),
+                        width: 40,
+                        height: rounded_i32(inserted_viewport.height),
+                        overscan: inserted_viewport.overscan,
+                    },
+                    added: GraphViewportItems::default(),
+                    updated: GraphViewportItems::default(),
+                    removed: Vec::new(),
+                })
+                .expect_throw("equivalent base viewport response should render");
+            assert_eq!(graph.viewport.x, 230.0);
+            assert_eq!(graph.viewport.width, 40.0);
+            assert!(same_viewport(graph.rendered_viewport, graph.viewport));
+            assert!(!finish_applied_viewport_patch(&mut graph));
 
             graph.viewport.x = 324.0;
             graph.viewport.width = 100.0;
