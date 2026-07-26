@@ -113,6 +113,15 @@ pub(super) async fn migrate_builtin_skills(
                     "skipping user-modified builtin skill"
                 );
             }
+            BuiltinSkillMigrationAction::SkipRolledBack => {
+                tracing::debug!(
+                    role = role.as_str(),
+                    skill = record.name,
+                    current_version = record.current_version,
+                    current_revision = from_revision,
+                    "preserving rolled-back builtin skill"
+                );
+            }
             BuiltinSkillMigrationAction::TargetMismatch => {
                 tracing::warn!(
                     role = role.as_str(),

@@ -11,6 +11,7 @@ pub(crate) struct BuiltinSkillMigration {
 pub(crate) enum BuiltinSkillMigrationAction {
     Updated,
     Unchanged,
+    SkipRolledBack,
     SkipUserModified,
     TargetMismatch,
 }
@@ -126,6 +127,13 @@ pub(crate) fn migrate_builtin_skill(
     };
     if current.id == target.id {
         return BuiltinSkillMigrationAction::Unchanged;
+    }
+    if record
+        .versions
+        .values()
+        .any(|version| version.id == target.id)
+    {
+        return BuiltinSkillMigrationAction::SkipRolledBack;
     }
     if !migration
         .source_revision_ids()
@@ -263,5 +271,39 @@ mod tests {
         );
         assert_eq!(record.current_version, 1);
         assert_eq!(record.current().unwrap().id, "user-modified");
+    }
+
+    #[test]
+    fn rolled_back_builtin_revision_is_preserved() {
+        let defaults = default_skill_groups();
+        let migration = BUILTIN_SKILL_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name == "telegram")
+            .copied()
+            .unwrap();
+        let target = defaults
+            .for_role(migration.role)
+            .get(migration.name)
+            .and_then(SkillRecord::current)
+            .unwrap();
+        let mut record = defaults
+            .for_role(migration.role)
+            .get(migration.name)
+            .cloned()
+            .unwrap();
+        let source_revision = migration.source_revision_ids().last().unwrap();
+        record.versions.get_mut(&1).unwrap().id = source_revision.to_string();
+        assert_eq!(
+            migrate_builtin_skill(migration, &mut record, target),
+            BuiltinSkillMigrationAction::Updated
+        );
+        record.rollback(1).unwrap();
+
+        assert_eq!(
+            migrate_builtin_skill(migration, &mut record, target),
+            BuiltinSkillMigrationAction::SkipRolledBack
+        );
+        assert_eq!(record.current_version, 3);
+        assert_eq!(record.current().unwrap().id, *source_revision);
     }
 }
