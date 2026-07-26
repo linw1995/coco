@@ -1112,8 +1112,27 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 
 
 @media (max-width: 860px) {
+  body {
+    min-height: 100svh;
+    overflow: auto;
+  }
+
+  .shell {
+    height: auto;
+    min-height: 100svh;
+  }
+
   .content {
     grid-template-columns: 1fr;
+    overflow: visible;
+  }
+
+  .graph-shell {
+    height: clamp(20rem, 58svh, 36rem);
+  }
+
+  .graph-wrap {
+    touch-action: pan-y;
   }
 
   .provider-context-panel,
@@ -1121,5 +1140,42 @@ leptos-island:has(> .panel-content) > .provider-context-default {
     border-left: 0;
     border-top: 1px solid rgba(255, 255, 255, 0.08);
     height: auto;
+    overflow: visible;
+  }
+
+  .provider-context-section {
+    height: auto;
+    max-height: min(42svh, 22rem);
+  }
+
+  .node-details {
+    height: auto;
+    overflow: visible;
+    scroll-margin-block-start: 1rem;
+  }
+
+  .side {
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+  }
+}
+
+@media (max-width: 520px) {
+  .topbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topbar-actions {
+    justify-content: space-between;
+  }
+
+  .node-detail-meta,
+  .node-detail-properties {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .node-detail-meta > div,
+  .node-detail-properties > div {
+    padding-right: 0;
   }
 }

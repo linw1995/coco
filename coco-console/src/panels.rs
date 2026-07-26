@@ -11,16 +11,13 @@ use crate::api::{
 };
 
 #[cfg(target_arch = "wasm32")]
-use leptos::{
-    ev,
-    leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
-};
+mod client;
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
-const NODE_TARGET_PREFIX: &str = "detail-";
+pub use client::{PROVIDER_CONTEXT_RENDERED_EVENT, reveal_node_detail_on_mobile};
+
 const ANCHOR_RANGE_ID: &str = "anchor-range";
-#[cfg(target_arch = "wasm32")]
-pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
+const NODE_TARGET_PREFIX: &str = "detail-";
+pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PanelSelection {
@@ -124,6 +121,14 @@ fn NodeDetailPanelBody() -> impl IntoView {
             })
         }
     });
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(move || {
+        let current = selected_target.get();
+        let loaded = detail.get().flatten();
+        if current_node_detail_is_loaded(current.as_deref(), loaded.as_ref()) {
+            reveal_node_detail_on_mobile();
+        }
+    });
 
     view! {
         <div class="panel-content">
@@ -164,13 +169,14 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
             Some(LoadedPanel { request, response })
         }
     });
+    #[cfg(target_arch = "wasm32")]
     Effect::new(move || {
         let current = selected_context.get();
         let loaded = provider_context.get().flatten();
         if loaded.is_some_and(|loaded| {
             Some(&loaded.request) == current.as_ref() && loaded.response.is_ok()
         }) {
-            notify_provider_context_rendered();
+            client::notify_provider_context_rendered();
         }
     });
 
@@ -189,7 +195,8 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
 #[component]
 fn AnchorRangeExpansionBody() -> impl IntoView {
     let selection = RwSignal::new(None::<AnchorRangeRequest>);
-    Effect::new(move || subscribe_to_anchor_range(selection));
+    #[cfg(target_arch = "wasm32")]
+    client::subscribe_to_anchor_range(selection);
     let range = LocalResource::new(move || {
         let request = selection.get();
         async move {
@@ -230,114 +237,19 @@ fn AnchorRangeExpansionBody() -> impl IntoView {
 
 fn use_panel_selection() -> RwSignal<PanelSelection> {
     let selection = RwSignal::new(PanelSelection::default());
-    Effect::new(move || subscribe_to_panel_selection(selection));
+    #[cfg(target_arch = "wasm32")]
+    client::subscribe_to_panel_selection(selection);
     selection
 }
 
-#[cfg(target_arch = "wasm32")]
-fn subscribe_to_anchor_range(selection: RwSignal<Option<AnchorRangeRequest>>) {
-    let click_listener = window_event_listener(ev::click, move |event| {
-        let Some(request) = anchor_range_request_from_event(&event) else {
-            return;
-        };
-        event.prevent_default();
-        event.stop_propagation();
-        selection.set(Some(request));
-    });
-    let keyboard_listener = window_event_listener(ev::keydown, move |event| {
-        let Some(request) = anchor_range_request_from_key_event(&event) else {
-            return;
-        };
-        event.prevent_default();
-        event.stop_propagation();
-        selection.set(Some(request));
-    });
-    on_cleanup(move || {
-        click_listener.remove();
-        keyboard_listener.remove();
-    });
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn subscribe_to_anchor_range(_selection: RwSignal<Option<AnchorRangeRequest>>) {}
-
-#[cfg(target_arch = "wasm32")]
-fn anchor_range_request_from_event(event: &web_sys::MouseEvent) -> Option<AnchorRangeRequest> {
-    if event.button() != 0 || anchor_range_event_has_modifier(event) {
-        return None;
-    }
-    anchor_range_request_from_target(event.target()?)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn anchor_range_request_from_key_event(
-    event: &web_sys::KeyboardEvent,
-) -> Option<AnchorRangeRequest> {
-    if !matches!(event.key().as_str(), "Enter" | " ") || anchor_range_key_has_modifier(event) {
-        return None;
-    }
-    anchor_range_request_from_target(event.target()?)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn anchor_range_event_has_modifier(event: &web_sys::MouseEvent) -> bool {
-    [
-        event.alt_key(),
-        event.ctrl_key(),
-        event.meta_key(),
-        event.shift_key(),
-    ]
-    .contains(&true)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn anchor_range_key_has_modifier(event: &web_sys::KeyboardEvent) -> bool {
-    [
-        event.alt_key(),
-        event.ctrl_key(),
-        event.meta_key(),
-        event.shift_key(),
-    ]
-    .contains(&true)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn anchor_range_request_from_target(target: web_sys::EventTarget) -> Option<AnchorRangeRequest> {
-    let trigger = target
-        .dyn_into::<web_sys::Element>()
-        .ok()?
-        .closest("[data-anchor-range=\"true\"][data-edge-kind][data-source-id][data-target-id]")
-        .ok()
-        .flatten()?;
-    anchor_range_request_from_trigger(&trigger)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn anchor_range_request_from_trigger(trigger: &web_sys::Element) -> Option<AnchorRangeRequest> {
-    Some(AnchorRangeRequest {
-        source: trigger.get_attribute("data-source-id")?,
-        target: trigger.get_attribute("data-target-id")?,
-        kind: trigger
-            .get_attribute("data-edge-kind")
-            .and_then(|kind| GraphViewportEdgeKind::from_key_part(&kind))?,
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn subscribe_to_panel_selection(selection: RwSignal<PanelSelection>) {
-    request_animation_frame(move || selection.set(current_panel_selection()));
-    let listener = window_event_listener(ev::hashchange, move |_| {
-        selection.set(current_panel_selection());
-    });
-    on_cleanup(move || listener.remove());
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn subscribe_to_panel_selection(_selection: RwSignal<PanelSelection>) {}
-
-#[cfg(target_arch = "wasm32")]
-fn current_panel_selection() -> PanelSelection {
-    PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
+#[cfg(any(target_arch = "wasm32", test))]
+fn current_node_detail_is_loaded(
+    current: Option<&str>,
+    loaded: Option<&LoadedPanel<String, NodeDetailResponse>>,
+) -> bool {
+    current
+        .zip(loaded)
+        .is_some_and(|(current, loaded)| loaded.request == current)
 }
 
 fn node_detail_view(
@@ -546,21 +458,6 @@ fn provider_context_view(
         _ => view! { <ProviderContextLoading/> }.into_any(),
     }
 }
-
-#[cfg(target_arch = "wasm32")]
-fn notify_provider_context_rendered() {
-    request_animation_frame(|| {
-        let Ok(event) = web_sys::Event::new(PROVIDER_CONTEXT_RENDERED_EVENT) else {
-            return;
-        };
-        if let Some(window) = web_sys::window() {
-            let _ = window.dispatch_event(&event);
-        }
-    });
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn notify_provider_context_rendered() {}
 
 #[component]
 fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
@@ -1234,6 +1131,45 @@ mod tests {
     }
 
     #[test]
+    fn current_node_detail_is_loaded_accepts_every_current_response() {
+        let found = LoadedPanel {
+            request: "detail-node".to_owned(),
+            response: Ok(NodeDetailResponse::Found {
+                node: Box::new(test_node(Kind::Text("response".to_owned()))),
+            }),
+        };
+        let missing = LoadedPanel {
+            request: "detail-node".to_owned(),
+            response: Ok(NodeDetailResponse::Missing {
+                target: "detail-node".to_owned(),
+            }),
+        };
+        let failed = LoadedPanel {
+            request: "detail-node".to_owned(),
+            response: Err("backend unavailable".to_owned()),
+        };
+
+        assert!(current_node_detail_is_loaded(
+            Some("detail-node"),
+            Some(&found)
+        ));
+        assert!(current_node_detail_is_loaded(
+            Some("detail-node"),
+            Some(&missing)
+        ));
+        assert!(current_node_detail_is_loaded(
+            Some("detail-node"),
+            Some(&failed)
+        ));
+        assert!(!current_node_detail_is_loaded(
+            Some("detail-other"),
+            Some(&found)
+        ));
+        assert!(!current_node_detail_is_loaded(None, Some(&found)));
+        assert!(!current_node_detail_is_loaded(Some("detail-node"), None));
+    }
+
+    #[test]
     fn panel_islands_render_independent_server_fallbacks() {
         let node = view! { <NodeDetailPanel/> }.to_html();
         let provider = view! { <ProviderContextPanel graph_mode="all".to_owned()/> }.to_html();
@@ -1548,83 +1484,12 @@ mod wasm_tests {
 
     use any_spawner::Executor;
     use js_sys::Promise;
+    use leptos::leptos_dom::helpers::request_animation_frame;
     use wasm_bindgen::{JsValue, UnwrapThrowExt};
     use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-    use web_sys::{Element, KeyboardEvent, KeyboardEventInit, MouseEvent, MouseEventInit};
 
     wasm_bindgen_test_configure!(run_in_browser);
-
-    #[wasm_bindgen_test]
-    fn graph_items_anchor_range_request_reads_edge_trigger() {
-        let document = web_sys::window()
-            .expect_throw("window should be available")
-            .document()
-            .expect_throw("document should be available");
-        let fixture = document
-            .create_element("div")
-            .expect_throw("fixture should be created");
-        fixture.set_inner_html(
-            r#"
-            <button data-anchor-range="true"
-                    data-edge-kind="merge_parent"
-                    data-source-id="source"
-                    data-target-id="target">
-              <span></span>
-            </button>
-            "#,
-        );
-        document
-            .body()
-            .expect_throw("document body should be available")
-            .append_child(&fixture)
-            .expect_throw("fixture should be mounted");
-        let child = fixture
-            .query_selector("span")
-            .expect_throw("child query should succeed")
-            .expect_throw("child should exist");
-
-        let request = request_from_dispatched_click(&child, &MouseEventInit::new())
-            .expect("plain click should select an anchor range");
-        assert_eq!(request.source, "source");
-        assert_eq!(request.target, "target");
-        assert_eq!(request.kind, GraphViewportEdgeKind::Merge);
-
-        let modified_click = MouseEventInit::new();
-        modified_click.set_ctrl_key(true);
-        assert!(request_from_dispatched_click(&child, &modified_click).is_none());
-
-        let request = request_from_dispatched_key(&child, "Enter")
-            .expect("Enter should select an anchor range");
-        assert_eq!(request.kind, GraphViewportEdgeKind::Merge);
-        assert!(request_from_dispatched_key(&child, " ").is_some());
-        assert!(request_from_dispatched_key(&child, "Escape").is_none());
-
-        fixture.remove();
-    }
-
-    fn request_from_dispatched_click(
-        target: &Element,
-        init: &MouseEventInit,
-    ) -> Option<AnchorRangeRequest> {
-        let event = MouseEvent::new_with_mouse_event_init_dict("click", init)
-            .expect_throw("click event should be created");
-        target
-            .dispatch_event(&event)
-            .expect_throw("click event should dispatch");
-        anchor_range_request_from_event(&event)
-    }
-
-    fn request_from_dispatched_key(target: &Element, key: &str) -> Option<AnchorRangeRequest> {
-        let init = KeyboardEventInit::new();
-        init.set_key(key);
-        let event = KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
-            .expect_throw("keyboard event should be created");
-        target
-            .dispatch_event(&event)
-            .expect_throw("keyboard event should dispatch");
-        anchor_range_request_from_key_event(&event)
-    }
 
     #[wasm_bindgen_test]
     async fn graph_items_panel_selection_signals_read_initial_hash_and_track_changes_independently()

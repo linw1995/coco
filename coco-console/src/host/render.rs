@@ -2,7 +2,9 @@ use askama::Template;
 use leptos::{html::HtmlElement, prelude::*};
 
 use crate::host::web_graph_view::ViewMode;
-use crate::panels::{AnchorRangeExpansion, NodeDetailPanel, ProviderContextPanel};
+use crate::panels::{
+    AnchorRangeExpansion, NODE_DETAIL_PANEL_ID, NodeDetailPanel, ProviderContextPanel,
+};
 
 use super::CLIENT_ASSET_VERSION;
 
@@ -81,7 +83,7 @@ fn render_root(mode: ViewMode, revision: u64) -> AnyView {
                     </div>
                 </section>
                 <aside class="side">
-                    <div class="node-detail-slot">{node_detail_panel}</div>
+                    <div id=NODE_DETAIL_PANEL_ID class="node-detail-slot">{node_detail_panel}</div>
                 </aside>
             </section>
         </main>
