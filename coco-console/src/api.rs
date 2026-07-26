@@ -16,6 +16,40 @@ pub enum NodeDetailResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AnchorRangeNode {
+    pub id: String,
+    pub short_id: String,
+    pub kind: String,
+    pub role: String,
+    pub summary: String,
+    pub incoming_edge: Option<GraphViewportEdgeKind>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AnchorRangePath {
+    pub nodes: Vec<AnchorRangeNode>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AnchorRangeEdge {
+    pub kind: GraphViewportEdgeKind,
+    pub source: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AnchorRangeResponse {
+    Missing,
+    Found {
+        kind: GraphViewportEdgeKind,
+        previous: Vec<AnchorRangeEdge>,
+        paths: Vec<AnchorRangePath>,
+        next: Vec<AnchorRangeEdge>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderContextItem {
     pub context_target: String,
     pub node: ProviderContextNode,
@@ -130,6 +164,16 @@ impl GraphViewportEdgeKind {
             Self::Primary => "primary_parent",
             Self::Merge => "merge_parent",
             Self::Shadow => "shadow_parent",
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_key_part(value: &str) -> Option<Self> {
+        match value {
+            "primary_parent" => Some(Self::Primary),
+            "merge_parent" => Some(Self::Merge),
+            "shadow_parent" => Some(Self::Shadow),
+            _ => None,
         }
     }
 }

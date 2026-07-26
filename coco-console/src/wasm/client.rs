@@ -8,7 +8,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AbortController, AbortSignal, Document, Element, EventSource, KeyboardEvent, MessageEvent,
-    MouseEvent, RequestInit, Response, WheelEvent, Window,
+    MouseEvent, RequestInit, ResizeObserver, Response, WheelEvent, Window,
 };
 
 use super::refresh::{
@@ -223,6 +223,7 @@ struct VirtualGraph {
     version_refresh_scheduled: bool,
     version_refresh_abort: Option<AbortController>,
     events: Option<EventSource>,
+    resize_observer: Option<ResizeObserver>,
 }
 
 impl VirtualGraph {
@@ -265,6 +266,7 @@ impl VirtualGraph {
             version_refresh_scheduled: false,
             version_refresh_abort: None,
             events: None,
+            resize_observer: None,
         };
         graph.apply_follow_toggle_state()?;
         Ok(graph)
@@ -542,9 +544,40 @@ impl VirtualGraph {
         if element.parent_element().is_none() {
             self.edge_group.append_child(&element)?;
         }
+        self.upsert_edge_hit_target(&edge)?;
         self.rendered
             .edges
             .insert(edge.key.clone(), edge.fingerprint());
+        Ok(())
+    }
+
+    fn upsert_edge_hit_target(&self, edge: &GraphViewportEdge) -> Result<(), JsValue> {
+        if self.graph_mode != "anchors" {
+            return Ok(());
+        }
+        let id = edge_hit_target_id(&edge.key);
+        let element = self
+            .document
+            .get_element_by_id(&id)
+            .map_or_else(|| svg_element(&self.document, "path"), Ok)?;
+        set_attributes(
+            &element,
+            [
+                ("id", id),
+                ("class", "edge-hit-target".to_owned()),
+                ("d", bezier_path(edge.route)),
+                ("data-anchor-range", "true".to_owned()),
+                ("data-edge-kind", edge.kind.key_part().to_owned()),
+                ("data-source-id", edge.source_id.clone()),
+                ("data-target-id", edge.target_id.clone()),
+                ("tabindex", "0".to_owned()),
+                ("role", "button".to_owned()),
+                ("aria-label", edge_hit_target_label(edge)),
+            ],
+        )?;
+        if element.parent_element().is_none() {
+            self.edge_group.append_child(&element)?;
+        }
         Ok(())
     }
 
@@ -714,6 +747,9 @@ impl VirtualGraph {
 
     fn remove_key(&mut self, key: &str) {
         if let Some(element) = self.document.get_element_by_id(&render_element_id(key)) {
+            element.remove();
+        }
+        if let Some(element) = self.document.get_element_by_id(&edge_hit_target_id(key)) {
             element.remove();
         }
         self.rendered.nodes.remove(key);
@@ -975,6 +1011,22 @@ fn edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
         GraphViewportEdgeKind::Merge => ("edge merge-parent", "url(#merge-arrowhead)"),
         GraphViewportEdgeKind::Shadow => ("edge shadow-parent", "url(#shadow-arrowhead)"),
     }
+}
+
+fn edge_hit_target_label(edge: &GraphViewportEdge) -> String {
+    let kind = match edge.kind {
+        GraphViewportEdgeKind::Primary => "primary parent",
+        GraphViewportEdgeKind::Merge => "merge parent",
+        GraphViewportEdgeKind::Shadow => "shadow parent",
+    };
+    format!(
+        "Expand {kind} relationship from {} to {}",
+        edge.source_id, edge.target_id
+    )
+}
+
+fn edge_hit_target_id(key: &str) -> String {
+    format!("{}-hit", render_element_id(key))
 }
 
 fn apply_graph_viewport_metadata(
@@ -1551,7 +1603,7 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
         install_follow_toggle_listener,
         install_mouse_pan_listener,
         install_wheel_listener,
-        install_resize_listener,
+        install_resize_observer,
         install_time_scale_listener,
         install_time_scale_keyboard_listener,
         install_hashchange_node_selection_listener,
@@ -1702,16 +1754,17 @@ fn install_wheel_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValu
     Ok(())
 }
 
-fn install_resize_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+fn install_resize_observer(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let graph_wrap = graph.borrow().graph_wrap.clone();
     let resize_graph = graph.clone();
-    let resize_window = graph.borrow().window.clone();
     let resize_closure = Closure::<dyn FnMut()>::new(move || {
         update_viewport(resize_graph.clone(), |graph| {
             graph.resize_viewport();
         });
     });
-    resize_window
-        .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
+    let resize_observer = ResizeObserver::new(resize_closure.as_ref().unchecked_ref())?;
+    resize_observer.observe(&graph_wrap);
+    graph.borrow_mut().resize_observer = Some(resize_observer);
     resize_closure.forget();
     Ok(())
 }
@@ -2716,7 +2769,22 @@ mod tests {
         let edge_before = document
             .get_element_by_id(&render_element_id(edge_key))
             .expect_throw("edge should be rendered");
+        let edge_hit_target = document
+            .get_element_by_id(&edge_hit_target_id(edge_key))
+            .expect_throw("edge hit target should be rendered");
         assert!(node_before.class_list().contains("node-link-selected"));
+        assert_eq!(
+            edge_hit_target.get_attribute("tabindex").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            edge_hit_target.get_attribute("role").as_deref(),
+            Some("button")
+        );
+        assert_eq!(
+            edge_hit_target.get_attribute("aria-label").as_deref(),
+            Some("Expand primary parent relationship from aaaaaaaa to bbbbbbbb")
+        );
 
         {
             let mut graph = fixture.graph.borrow_mut();
