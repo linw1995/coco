@@ -416,22 +416,29 @@ fn AnchorRangeConnector(kind: GraphViewportEdgeKind) -> impl IntoView {
 
 #[component]
 fn AnchorRangeNavigation(label: &'static str, edge: AnchorRangeEdge) -> impl IntoView {
-    let source = shorten_id(&edge.source);
-    let target = shorten_id(&edge.target);
+    let source_id = edge.source;
+    let target_id = edge.target;
+    let source = shorten_id(&source_id);
+    let target = shorten_id(&target_id);
+    let kind = edge.kind;
+    let accessible_label = format!(
+        "{label}: {} from {source} to {target}",
+        anchor_range_kind_label(kind)
+    );
     view! {
         <li class="anchor-range-edge anchor-range-navigation">
             <button
                 type="button"
                 data-anchor-range="true"
-                data-edge-kind=edge.kind.key_part()
-                data-source-id=edge.source
-                data-target-id=edge.target
-                aria-label=label
+                data-edge-kind=kind.key_part()
+                data-source-id=source_id
+                data-target-id=target_id
+                aria-label=accessible_label
             >
                 <span></span>
                 <small>{label}</small>
                 <code>{source}" → "{target}</code>
-                <em>{anchor_range_kind_label(edge.kind)}</em>
+                <em>{anchor_range_kind_label(kind)}</em>
             </button>
         </li>
     }
@@ -1309,6 +1316,12 @@ mod tests {
         assert!(range.contains("Target anchor"));
         assert!(range.contains("Previous relationship"));
         assert!(range.contains("Next relationship"));
+        assert!(range.contains(
+            "aria-label=\"Previous relationship: Merge parent from previous to source\""
+        ));
+        assert!(
+            range.contains("aria-label=\"Next relationship: Shadow parent from target to next\"")
+        );
         assert!(range.contains("data-edge-kind=\"merge_parent\""));
         assert!(range.contains("data-edge-kind=\"shadow_parent\""));
         assert!(range.contains("Primary parent"));
