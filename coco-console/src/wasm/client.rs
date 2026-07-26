@@ -3392,13 +3392,25 @@ mod tests {
                 x: 230.0,
                 width: 40.0,
                 ..graph.viewport
-            };
+            }
+            .with_render_overscan();
             graph.clamp_viewport();
             let inserted_viewport = graph.viewport;
             graph.rendered_viewport = inserted_viewport;
             let base_viewport = graph.base_viewport(inserted_viewport);
             assert_eq!(base_viewport.x, 192.0);
             assert_eq!(base_viewport.width, 40.0);
+            let response_viewport = GraphViewport {
+                x: 192,
+                y: rounded_i32(inserted_viewport.y),
+                width: 40,
+                height: rounded_i32(inserted_viewport.height),
+                overscan: inserted_viewport.overscan,
+            };
+            assert!(same_viewport(
+                base_viewport,
+                ViewportState::from(response_viewport)
+            ));
             graph.patch_in_flight = true;
             graph
                 .apply_diff(GraphViewportDiffResponse {
@@ -3407,20 +3419,8 @@ mod tests {
                         width: 480,
                         height: 280,
                     },
-                    previous_viewport: GraphViewport {
-                        x: 192,
-                        y: rounded_i32(inserted_viewport.y),
-                        width: 40,
-                        height: rounded_i32(inserted_viewport.height),
-                        overscan: inserted_viewport.overscan,
-                    },
-                    viewport: GraphViewport {
-                        x: 192,
-                        y: rounded_i32(inserted_viewport.y),
-                        width: 40,
-                        height: rounded_i32(inserted_viewport.height),
-                        overscan: inserted_viewport.overscan,
-                    },
+                    previous_viewport: response_viewport,
+                    viewport: response_viewport,
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
                     removed: Vec::new(),
