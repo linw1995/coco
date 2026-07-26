@@ -1,14 +1,14 @@
 use coco_types::{SessionRole, SkillRecord, SkillUpdatePatch, SkillVersion};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BuiltinSkillMigration {
+pub struct BuiltinSkillMigration {
     pub role: SessionRole,
     pub name: &'static str,
     revision_ids: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuiltinSkillMigrationAction {
+pub enum BuiltinSkillMigrationAction {
     Updated,
     Unchanged,
     SkipRolledBack,
@@ -30,7 +30,7 @@ impl BuiltinSkillMigration {
     }
 }
 
-pub(crate) const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
+pub const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     BuiltinSkillMigration {
         role: SessionRole::Orchestrator,
         name: "coco-orchestrator",
@@ -114,7 +114,7 @@ pub(crate) const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
     },
 ];
 
-pub(crate) fn migrate_builtin_skill(
+pub fn migrate_builtin_skill(
     migration: BuiltinSkillMigration,
     record: &mut SkillRecord,
     target: &SkillVersion,
