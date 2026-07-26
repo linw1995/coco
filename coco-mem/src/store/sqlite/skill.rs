@@ -65,23 +65,22 @@ async fn load_skill_groups(
     Ok(groups)
 }
 
-pub(super) async fn migrate_builtin_skills(
+pub async fn migrate_builtin_skills(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
 ) -> Result<()> {
     let defaults = default_skill_groups();
-    let persisted = query_skill_records(connection, path, None, None).await?;
-    for (role, mut record) in persisted {
-        let Some(migration) = BUILTIN_SKILL_MIGRATIONS
-            .iter()
-            .find(|migration| migration.role == role && migration.name == record.name)
-            .copied()
+    for migration in BUILTIN_SKILL_MIGRATIONS {
+        let Some((role, mut record)) =
+            query_skill_records(connection, path, Some(migration.role), Some(migration.name))
+                .await?
+                .pop()
         else {
             continue;
         };
         let Some(target) = defaults
-            .for_role(role)
-            .get(&record.name)
+            .for_role(migration.role)
+            .get(migration.name)
             .and_then(SkillRecord::current)
         else {
             continue;
@@ -91,7 +90,7 @@ pub(super) async fn migrate_builtin_skills(
             .current()
             .map(|version| version.id.clone())
             .unwrap_or_default();
-        match migrate_builtin_skill(migration, &mut record, target) {
+        match migrate_builtin_skill(*migration, &mut record, target) {
             BuiltinSkillMigrationAction::Updated => {
                 tracing::info!(
                     role = role.as_str(),

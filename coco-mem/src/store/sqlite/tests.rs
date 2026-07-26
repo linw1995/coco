@@ -2898,3 +2898,43 @@ async fn writable_open_preserves_user_modified_builtin_revision() {
     assert_eq!(preserved.current().unwrap().id, user_revision);
     assert_eq!(preserved.current().unwrap().body, "user-modified body");
 }
+
+#[tokio::test]
+async fn writable_open_ignores_unrelated_corrupted_skill_history() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    store
+        .add_skill(
+            SessionRole::Runner,
+            "custom-runner",
+            SkillVersionSpec {
+                description: "custom".to_owned(),
+                body: "run".to_owned(),
+                scripts: vec![],
+                enable_coco_shim: false,
+            },
+        )
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(
+        skill_versions::table
+            .filter(skill_versions::role.eq(SessionRole::Runner.as_str()))
+            .filter(skill_versions::skill_name.eq("custom-runner")),
+    )
+    .set(skill_versions::created_at.eq("invalid"))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    drop(connection);
+    drop(store);
+
+    let reopened = SqliteStore::open(&path).await.unwrap();
+    assert!(
+        reopened
+            .get_skill(SessionRole::Runner, "telegram")
+            .await
+            .is_ok()
+    );
+}
