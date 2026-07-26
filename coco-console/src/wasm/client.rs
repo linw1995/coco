@@ -3386,18 +3386,19 @@ mod tests {
                 Some((182.0, 100.0))
             );
 
-            let inserted_viewport = ViewportState {
+            graph.auto_follow = false;
+            graph.auto_fit_short_canvas = false;
+            graph.viewport = ViewportState {
                 x: 230.0,
                 width: 40.0,
                 ..graph.viewport
             };
+            graph.clamp_viewport();
+            let inserted_viewport = graph.viewport;
+            graph.rendered_viewport = inserted_viewport;
             let base_viewport = graph.base_viewport(inserted_viewport);
             assert_eq!(base_viewport.x, 192.0);
             assert_eq!(base_viewport.width, 40.0);
-            graph.auto_follow = false;
-            graph.auto_fit_short_canvas = false;
-            graph.viewport = inserted_viewport;
-            graph.rendered_viewport = inserted_viewport;
             graph.patch_in_flight = true;
             graph
                 .apply_diff(GraphViewportDiffResponse {
