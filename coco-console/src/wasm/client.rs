@@ -2229,48 +2229,67 @@ async fn load_and_expand_anchor_range(
         selection.target.clone(),
         selection.kind,
     )
-    .await;
+    .await
+    .map_err(|error| error.to_string());
     let focus = {
         let mut graph = graph.borrow_mut();
         if graph.anchor_range_selection.as_ref() != Some(&selection) {
             return;
         }
-        match response {
-            Ok(AnchorRangeResponse::Found { paths }) => {
-                match graph.expand_anchor_range(selection, paths) {
-                    Ok(focus) => {
-                        graph.hide_status();
-                        focus
-                    }
-                    Err(error) => {
-                        web_sys::console::error_1(&error);
-                        graph.show_status("Failed to render anchor details.");
-                        None
-                    }
-                }
-            }
-            Ok(AnchorRangeResponse::Missing) => {
-                let _ = graph.collapse_anchor_range();
-                graph.show_status("The selected anchor relationship is no longer available.");
-                None
-            }
-            Err(error) => {
-                let _ = graph.collapse_anchor_range();
-                graph.show_status(&format!("Failed to load anchor details: {error}"));
-                None
-            }
-        }
+        apply_anchor_range_response(&mut graph, selection, response)
     };
     if let Some(focus) = focus {
-        update_viewport(graph, |graph| {
-            if graph.auto_follow
-                && let Err(error) = graph.set_auto_follow(false)
-            {
-                web_sys::console::error_1(&error);
-            }
-            center_viewport_on_graph_point(graph, focus);
-        });
+        focus_anchor_range(graph, focus);
     }
+}
+
+fn apply_anchor_range_response(
+    graph: &mut VirtualGraph,
+    selection: AnchorRangeSelection,
+    response: Result<AnchorRangeResponse, String>,
+) -> Option<Point> {
+    match response {
+        Ok(AnchorRangeResponse::Found { paths }) => render_anchor_range(graph, selection, paths),
+        Ok(AnchorRangeResponse::Missing) => {
+            let _ = graph.collapse_anchor_range();
+            graph.show_status("The selected anchor relationship is no longer available.");
+            None
+        }
+        Err(error) => {
+            let _ = graph.collapse_anchor_range();
+            graph.show_status(&format!("Failed to load anchor details: {error}"));
+            None
+        }
+    }
+}
+
+fn render_anchor_range(
+    graph: &mut VirtualGraph,
+    selection: AnchorRangeSelection,
+    paths: Vec<crate::api::AnchorRangePath>,
+) -> Option<Point> {
+    match graph.expand_anchor_range(selection, paths) {
+        Ok(focus) => {
+            graph.hide_status();
+            focus
+        }
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            graph.show_status("Failed to render anchor details.");
+            None
+        }
+    }
+}
+
+fn focus_anchor_range(graph: Rc<RefCell<VirtualGraph>>, focus: Point) {
+    update_viewport(graph, |graph| {
+        if graph.auto_follow
+            && let Err(error) = graph.set_auto_follow(false)
+        {
+            web_sys::console::error_1(&error);
+        }
+        center_viewport_on_graph_point(graph, focus);
+    });
 }
 
 fn collapse_anchor_range(graph: Rc<RefCell<VirtualGraph>>) {
@@ -3167,18 +3186,23 @@ mod tests {
                     false,
                 )
                 .expect_throw("anchor graph items should render");
-            graph
-                .expand_anchor_range(
+            graph.anchor_range_selection = Some(selection.clone());
+            assert!(
+                apply_anchor_range_response(
+                    &mut graph,
                     selection,
-                    vec![crate::api::AnchorRangePath {
-                        nodes: vec![
-                            anchor_range_node("source", None),
-                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
-                            anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                        ],
-                    }],
+                    Ok(AnchorRangeResponse::Found {
+                        paths: vec![crate::api::AnchorRangePath {
+                            nodes: vec![
+                                anchor_range_node("source", None),
+                                anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                            ],
+                        }],
+                    }),
                 )
-                .expect_throw("anchor details should expand");
+                .is_some()
+            );
         }
 
         let document = fixture.graph.borrow().document.clone();
