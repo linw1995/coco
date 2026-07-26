@@ -2633,7 +2633,7 @@ async fn updating_builtin_skill_materializes_existing_history() {
 }
 
 #[tokio::test]
-async fn writable_open_migrates_known_persisted_builtin_revision() {
+async fn writable_open_migrates_no_op_updated_builtin_revision() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
     let store = SqliteStore::open(&path).await.unwrap();
@@ -2659,13 +2659,6 @@ async fn writable_open_migrates_known_persisted_builtin_revision() {
         .copied()
         .unwrap();
     let previous_revision = migration.source_revision_ids().last().copied().unwrap();
-    let earlier_revision = migration
-        .source_revision_ids()
-        .iter()
-        .rev()
-        .nth(1)
-        .copied()
-        .unwrap();
     let mut connection = store.connect().await.unwrap();
     diesel::update(
         skill_versions::table
@@ -2673,7 +2666,7 @@ async fn writable_open_migrates_known_persisted_builtin_revision() {
             .filter(skill_versions::skill_name.eq("telegram"))
             .filter(skill_versions::version.eq(current.current_version.to_string())),
     )
-    .set(skill_versions::id.eq(earlier_revision))
+    .set(skill_versions::id.eq(previous_revision))
     .execute(&mut connection)
     .await
     .unwrap();

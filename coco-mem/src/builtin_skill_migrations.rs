@@ -138,12 +138,25 @@ pub(crate) fn migrate_builtin_skill(
         .versions
         .values()
         .any(|version| version.id == target.id);
-    let current_revision_count = record
+    let mut saw_current_revision = false;
+    let mut saw_intervening_revision = false;
+    let source_was_restored = record
         .versions
-        .values()
-        .filter(|version| version.id == current.id)
-        .count();
-    if target_was_applied || current_revision_count > 1 {
+        .range(..record.current_version)
+        .map(|(_, version)| version)
+        .any(|version| {
+            if version.id == current.id {
+                if saw_intervening_revision {
+                    return true;
+                }
+                saw_current_revision = true;
+            } else if saw_current_revision {
+                saw_intervening_revision = true;
+            }
+            false
+        })
+        || (saw_current_revision && saw_intervening_revision);
+    if target_was_applied || source_was_restored {
         return BuiltinSkillMigrationAction::SkipRolledBack;
     }
 
@@ -352,5 +365,42 @@ mod tests {
                 .values()
                 .all(|version| version.id != target.id)
         );
+    }
+
+    #[test]
+    fn no_op_update_does_not_block_builtin_migration() {
+        let defaults = default_skill_groups();
+        let migration = BUILTIN_SKILL_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name == "telegram")
+            .copied()
+            .unwrap();
+        let target = defaults
+            .for_role(migration.role)
+            .get(migration.name)
+            .and_then(SkillRecord::current)
+            .unwrap();
+        let mut record = defaults
+            .for_role(migration.role)
+            .get(migration.name)
+            .cloned()
+            .unwrap();
+        let source_revision = migration.source_revision_ids().last().unwrap();
+        record.versions.get_mut(&1).unwrap().id = source_revision.to_string();
+        record
+            .update(&SkillUpdatePatch {
+                description: Some(record.current().unwrap().description.clone()),
+                ..SkillUpdatePatch::default()
+            })
+            .unwrap();
+        record.current_version = 2;
+        record.versions.get_mut(&2).unwrap().id = source_revision.to_string();
+
+        assert_eq!(
+            migrate_builtin_skill(migration, &mut record, target),
+            BuiltinSkillMigrationAction::Updated
+        );
+        assert_eq!(record.current_version, 3);
+        assert_eq!(record.current().unwrap().id, target.id);
     }
 }
