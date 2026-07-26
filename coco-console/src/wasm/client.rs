@@ -634,12 +634,18 @@ impl VirtualGraph {
     }
 
     fn collapse_anchor_range(&mut self) -> Result<(), JsValue> {
+        let viewport = self.base_viewport(self.viewport);
+        let rendered_viewport = self.base_viewport(self.rendered_viewport);
         self.anchor_range_selection = None;
         self.anchor_range = None;
+        self.viewport = viewport;
+        self.rendered_viewport = rendered_viewport;
         self.canvas = self.base_canvas;
         self.sync_anchor_range()?;
         self.clamp_viewport();
-        self.apply_canvas()
+        self.apply_canvas()?;
+        self.persist_viewport();
+        Ok(())
     }
 
     fn rendered_node_point(&self, node_id: &str) -> Result<Option<Point>, JsValue> {
@@ -2205,18 +2211,13 @@ fn toggle_anchor_range(graph: Rc<RefCell<VirtualGraph>>, selection: AnchorRangeS
         collapse_anchor_range(graph);
         return;
     }
-    {
-        let mut graph = graph.borrow_mut();
-        graph.anchor_range_selection = Some(selection.clone());
-        graph.anchor_range = None;
-        if let Some(base) = graph.base_canvas {
-            graph.canvas = Some(base);
-        }
-        if let Err(error) = graph.sync_anchor_range() {
+    update_viewport(graph.clone(), |graph| {
+        if let Err(error) = graph.collapse_anchor_range() {
             web_sys::console::error_1(&error);
         }
+        graph.anchor_range_selection = Some(selection.clone());
         graph.show_status("Loading anchor details...");
-    }
+    });
     spawn_local(load_and_expand_anchor_range(graph, selection));
 }
 
@@ -2293,10 +2294,11 @@ fn focus_anchor_range(graph: Rc<RefCell<VirtualGraph>>, focus: Point) {
 }
 
 fn collapse_anchor_range(graph: Rc<RefCell<VirtualGraph>>) {
-    let mut graph = graph.borrow_mut();
-    if let Err(error) = graph.collapse_anchor_range() {
-        web_sys::console::error_1(&error);
-    }
+    update_viewport(graph, |graph| {
+        if let Err(error) = graph.collapse_anchor_range() {
+            web_sys::console::error_1(&error);
+        }
+    });
 }
 
 fn install_mouse_pan_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -2606,7 +2608,11 @@ fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
     let point = {
         let graph = graph.borrow();
         graph.sync_selected_graph_node();
-        match selected_graph_focus_point(&graph.window, &graph.document) {
+        let transform = graph
+            .anchor_range
+            .as_ref()
+            .map(|expansion| expansion.transform);
+        match selected_graph_focus_point(&graph.window, &graph.document, transform) {
             Ok(point) => point,
             Err(error) => {
                 web_sys::console::error_1(&error);
@@ -2644,12 +2650,14 @@ fn sync_selected_graph_node(window: &Window, document: &Document) -> Result<(), 
 fn selected_graph_focus_point(
     window: &Window,
     document: &Document,
+    transform: Option<AnchorRangeTransform>,
 ) -> Result<Option<Point>, JsValue> {
     let Some(target) = selected_node_target(window) else {
         return Ok(None);
     };
     if let Some(point) = graph_focus_point_from_provider_context(document, &target)? {
-        return Ok(Some(point));
+        let x = transform.map_or(point.x, |transform| transform.transform_x(point.x));
+        return Ok(Some(Point { x, ..point }));
     }
     graph_focus_point_from_rendered_node(document, &target)
 }
@@ -3229,11 +3237,60 @@ mod tests {
             Some("true")
         );
 
+        let context_point = document
+            .create_element("span")
+            .expect_throw("provider context point should be created");
+        context_point.set_class_name("provider-context-node-graph-point");
+        context_point
+            .set_attribute("data-node-target", "detail-provider")
+            .expect_throw("provider context target should be set");
+        context_point
+            .set_attribute("data-node-x", "212")
+            .expect_throw("provider context x should be set");
+        context_point
+            .set_attribute("data-node-y", "80")
+            .expect_throw("provider context y should be set");
+        fixture
+            .root
+            .append_child(&context_point)
+            .expect_throw("provider context point should be mounted");
         fixture
             .graph
-            .borrow_mut()
-            .collapse_anchor_range()
-            .expect_throw("anchor details should collapse");
+            .borrow()
+            .window
+            .location()
+            .set_hash("#detail-provider")
+            .expect_throw("provider context target should be selected");
+        let transform = fixture
+            .graph
+            .borrow()
+            .anchor_range
+            .as_ref()
+            .map(|expansion| expansion.transform);
+        assert_eq!(
+            selected_graph_focus_point(&fixture.graph.borrow().window, &document, transform,)
+                .expect_throw("provider context focus should resolve"),
+            Some(Point { x: 324, y: 80 })
+        );
+
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph.viewport.x = 324.0;
+            graph.viewport.width = 100.0;
+            graph.rendered_viewport = graph.viewport;
+            graph
+                .collapse_anchor_range()
+                .expect_throw("anchor details should collapse");
+            assert_eq!(graph.viewport.x, 212.0);
+            assert_eq!(graph.viewport.width, 100.0);
+            assert_eq!(graph.rendered_viewport.x, graph.viewport.x);
+            assert_eq!(graph.rendered_viewport.width, graph.viewport.width);
+        }
+        assert_eq!(
+            ViewportState::load(&fixture.graph.borrow().window)
+                .map(|viewport| (viewport.x, viewport.width)),
+            Some((212.0, 100.0))
+        );
         assert!(
             document
                 .query_selector(".graph-anchor-range .anchor-range-node-link")
