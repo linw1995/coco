@@ -2631,3 +2631,109 @@ async fn updating_builtin_skill_materializes_existing_history() {
         original.current().unwrap().scripts
     );
 }
+
+#[tokio::test]
+async fn writable_open_migrates_known_persisted_builtin_revision() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let current = store
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
+    let current_revision = current.current().unwrap().id.clone();
+    let materialized = store
+        .update_skill(
+            SessionRole::Runner,
+            "telegram",
+            &SkillUpdatePatch {
+                description: Some(current.current().unwrap().description.clone()),
+                ..SkillUpdatePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let migration = crate::builtin_skill_migrations::BUILTIN_SKILL_MIGRATIONS
+        .iter()
+        .find(|migration| migration.role == SessionRole::Runner && migration.name == "telegram")
+        .copied()
+        .unwrap();
+    let previous_revision = migration.source_revision_ids().last().copied().unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(
+        skill_versions::table
+            .filter(skill_versions::role.eq(SessionRole::Runner.as_str()))
+            .filter(skill_versions::skill_name.eq("telegram"))
+            .filter(skill_versions::version.eq(materialized.current_version.to_string())),
+    )
+    .set(skill_versions::id.eq(previous_revision))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    drop(connection);
+    drop(store);
+
+    let read_only = SqliteStore::open_read_only(&path).await.unwrap();
+    let before = read_only
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
+    assert_eq!(before.current_version, 2);
+    assert_eq!(before.current().unwrap().id, previous_revision);
+
+    let writable = SqliteStore::open(&path).await.unwrap();
+    let migrated = writable
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
+    assert_eq!(migrated.current_version, 3);
+    assert_eq!(migrated.current().unwrap().id, current_revision);
+    assert!(
+        migrated
+            .current()
+            .unwrap()
+            .scripts
+            .iter()
+            .all(|script| script.content.contains("TELEGRAM_BASE_URL"))
+    );
+
+    drop(writable);
+    let reopened = SqliteStore::open(&path).await.unwrap();
+    assert_eq!(
+        reopened
+            .get_skill(SessionRole::Runner, "telegram")
+            .await
+            .unwrap()
+            .current_version,
+        3
+    );
+}
+
+#[tokio::test]
+async fn writable_open_preserves_user_modified_builtin_revision() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let updated = store
+        .update_skill(
+            SessionRole::Runner,
+            "telegram",
+            &SkillUpdatePatch {
+                body: Some("user-modified body".to_owned()),
+                ..SkillUpdatePatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let user_revision = updated.current().unwrap().id.clone();
+    drop(store);
+
+    let reopened = SqliteStore::open(&path).await.unwrap();
+    let preserved = reopened
+        .get_skill(SessionRole::Runner, "telegram")
+        .await
+        .unwrap();
+    assert_eq!(preserved.current_version, 2);
+    assert_eq!(preserved.current().unwrap().id, user_revision);
+    assert_eq!(preserved.current().unwrap().body, "user-modified body");
+}
