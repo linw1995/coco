@@ -782,14 +782,16 @@ impl VirtualGraph {
     }
 
     fn apply_anchor_range_graph_transform(&self) -> Result<(), JsValue> {
-        let transform = self
-            .anchor_range
-            .as_ref()
-            .map(|expansion| expansion.transform);
+        let expansion = self.anchor_range.as_ref();
+        let transform = expansion.map(|expansion| expansion.transform);
         let nodes = self
             .node_group
             .query_selector_all(".node-link[data-base-node-x][data-node-y]")?;
         let mut rendered_node_x = BTreeMap::new();
+        if let Some(expansion) = expansion {
+            rendered_node_x.insert(expansion.selection.source.clone(), expansion.source.x);
+            rendered_node_x.insert(expansion.selection.target.clone(), expansion.target.x);
+        }
         for index in 0..nodes.length() {
             let Some(node) = nodes.item(index) else {
                 continue;
@@ -3724,16 +3726,16 @@ mod tests {
                     updated: GraphViewportItems::default(),
                     removed: vec![GraphViewportRemovedItem {
                         kind: crate::api::GraphViewportItemKind::Node,
-                        key: "node:source".to_owned(),
+                        key: "node:target".to_owned(),
                     }],
                 })
-                .expect_throw("virtualized source should preserve the open range");
+                .expect_throw("virtualized target should preserve the open range");
             assert!(graph.anchor_range.is_some());
         }
         assert!(
             document
-                .query_selector(".node-link[data-node-id=\"source\"]")
-                .expect_throw("virtualized source query should succeed")
+                .query_selector(".node-link[data-node-id=\"target\"]")
+                .expect_throw("virtualized target query should succeed")
                 .is_none()
         );
         assert!(
@@ -3741,6 +3743,10 @@ mod tests {
                 .query_selector(".anchor-range-node-link[data-node-id=\"detail\"]")
                 .expect_throw("cached range detail query should succeed")
                 .is_some()
+        );
+        assert_eq!(
+            edge.get_attribute("d").as_deref(),
+            Some("M 140 100 C 170 100, 328 140, 348 140")
         );
 
         {
@@ -3755,18 +3761,18 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     added: GraphViewportItems {
-                        nodes: vec![graph_node("source", 140, 120)],
+                        nodes: vec![graph_node("target", 280, 160)],
                         edges: Vec::new(),
                     },
                     updated: GraphViewportItems::default(),
                     removed: Vec::new(),
                 })
-                .expect_throw("restored source should refresh the open range");
+                .expect_throw("restored target should refresh the open range");
             assert_eq!(
                 graph.anchor_range.as_ref().map(|range| range.transform),
                 Some(AnchorRangeTransform {
-                    source_x: 140,
-                    target_x: 260,
+                    source_x: 120,
+                    target_x: 280,
                     extra_width: 112,
                 })
             );
