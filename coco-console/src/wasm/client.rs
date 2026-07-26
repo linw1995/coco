@@ -3354,7 +3354,7 @@ mod tests {
             graph.persist_viewport();
             assert_eq!(
                 ViewportState::load(&graph.window).map(|viewport| (viewport.x, viewport.width)),
-                Some((197.0, 85.0))
+                Some((212.0, 70.0))
             );
 
             graph.viewport.x = 324.0;
@@ -3453,6 +3453,77 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_insert_anchor_details_before_target_rank() {
+        let fixture = GraphFixture::new();
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Merge,
+        };
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            let canvas = GraphCanvas {
+                width: 560,
+                height: 280,
+            };
+            graph.base_canvas = Some(canvas);
+            graph.canvas = Some(canvas);
+            graph
+                .upsert_graph_items(
+                    GraphViewportItems {
+                        nodes: vec![
+                            graph_node("source", 100, 80),
+                            graph_node("middle", 212, 80),
+                            graph_node("target", 324, 80),
+                        ],
+                        edges: Vec::new(),
+                    },
+                    false,
+                )
+                .expect_throw("anchor graph nodes should render");
+            graph
+                .expand_anchor_range(
+                    selection,
+                    vec![AnchorRangePath {
+                        nodes: vec![
+                            anchor_range_node("source", None),
+                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Merge)),
+                            anchor_range_node("target", Some(GraphViewportEdgeKind::Merge)),
+                        ],
+                    }],
+                )
+                .expect_throw("merge details should expand")
+                .expect_throw("merge endpoints should be rendered");
+        }
+
+        let document = fixture.graph.borrow().document.clone();
+        let middle = document
+            .query_selector(".node-link[data-node-id=\"middle\"] .node")
+            .expect_throw("middle anchor query should succeed")
+            .expect_throw("middle anchor should remain rendered");
+        assert_eq!(
+            middle.get_attribute("transform").as_deref(),
+            Some("translate(212 80)")
+        );
+        let detail = document
+            .query_selector(".anchor-range-node-link[data-node-id=\"detail\"] .node")
+            .expect_throw("detail node query should succeed")
+            .expect_throw("detail node should render in the inserted rank");
+        assert_eq!(
+            detail.get_attribute("transform").as_deref(),
+            Some("translate(324 80)")
+        );
+        let target = document
+            .query_selector(".node-link[data-node-id=\"target\"] .node")
+            .expect_throw("target anchor query should succeed")
+            .expect_throw("target anchor should remain rendered");
+        assert_eq!(
+            target.get_attribute("transform").as_deref(),
+            Some("translate(436 80)")
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_reflow_open_anchor_range_with_current_endpoints() {
         let fixture = GraphFixture::new();
         let initial_route = route((120, 80), (150, 80), (168, 80), (188, 80));
@@ -3528,13 +3599,13 @@ mod tests {
             .expect_throw("detail node should remain expanded");
         assert_eq!(
             detail.get_attribute("transform").as_deref(),
-            Some("translate(246 120)")
+            Some("translate(260 120)")
         );
         let frame = document
             .query_selector(".anchor-range-frame")
             .expect_throw("range frame query should succeed")
             .expect_throw("range frame should remain rendered");
-        assert_eq!(frame.get_attribute("x").as_deref(), Some("194"));
+        assert_eq!(frame.get_attribute("x").as_deref(), Some("208"));
         assert_eq!(frame.get_attribute("y").as_deref(), Some("68"));
         let edge = document
             .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"target\"]")

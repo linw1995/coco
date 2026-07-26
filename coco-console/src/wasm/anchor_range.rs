@@ -49,31 +49,22 @@ pub struct AnchorRangeTransform {
 
 impl AnchorRangeTransform {
     pub fn transform_x(self, x: i32) -> i32 {
-        if x <= self.source_x || self.extra_width == 0 {
+        if x < self.target_x || self.extra_width == 0 {
             return x;
         }
-        if x >= self.target_x {
-            return x.saturating_add(self.extra_width);
-        }
-        let source_span = i64::from(self.target_x.saturating_sub(self.source_x)).max(1);
-        let expanded_span = source_span.saturating_add(i64::from(self.extra_width));
-        let offset =
-            i64::from(x.saturating_sub(self.source_x)).saturating_mul(expanded_span) / source_span;
-        self.source_x
-            .saturating_add(i32::try_from(offset).unwrap_or(i32::MAX))
+        x.saturating_add(self.extra_width)
     }
 
     pub fn inverse_x(self, x: f64) -> f64 {
-        let source_x = f64::from(self.source_x);
         let target_x = f64::from(self.target_x);
         let expanded_target_x = target_x + f64::from(self.extra_width);
-        if x <= source_x || self.extra_width == 0 {
+        if x < target_x || self.extra_width == 0 {
             return x;
         }
         if x >= expanded_target_x {
             return x - f64::from(self.extra_width);
         }
-        source_x + (x - source_x) * (target_x - source_x) / (expanded_target_x - source_x)
+        target_x
     }
 }
 
@@ -103,8 +94,8 @@ pub fn transform_graph_route(
 }
 
 pub fn route_anchor_range_edge(edge: AnchorRangeLayoutEdge, node_radius: f64) -> GraphBezierRoute {
-    let delta_x = f64::from(edge.target.x.saturating_sub(edge.source.x));
-    let delta_y = f64::from(edge.target.y.saturating_sub(edge.source.y));
+    let delta_x = f64::from(edge.target.x) - f64::from(edge.source.x);
+    let delta_y = f64::from(edge.target.y) - f64::from(edge.source.y);
     let distance = delta_x.hypot(delta_y);
     let (source, target) = if distance > 0.0 {
         let offset_x = delta_x * node_radius / distance;
@@ -155,6 +146,7 @@ pub fn layout_anchor_range(
     target: Point,
     paths: Vec<AnchorRangePath>,
 ) -> AnchorRangeLayout {
+    let inserted_left = target.x.saturating_sub(anchor_range_extra_width(&paths));
     let mut bounds = None;
     let mut detail_ids = std::collections::BTreeSet::new();
     let paths = paths
@@ -180,7 +172,11 @@ pub fn layout_anchor_range(
                 .map(|(index, node)| {
                     let numerator = i64::try_from(index + 1).unwrap_or(i64::MAX);
                     let point = Point {
-                        x: interpolate(source.x, target.x, numerator, denominator),
+                        x: inserted_left.saturating_add(
+                            i32::try_from(index)
+                                .unwrap_or(i32::MAX)
+                                .saturating_mul(DETAIL_RANK_STEP),
+                        ),
                         y: interpolate(source.y, target.y, numerator, denominator)
                             .saturating_add(lane_offset),
                     };
@@ -347,7 +343,33 @@ mod tests {
             );
         }
         assert_eq!(transform.transform_x(212), 436);
+        assert_eq!(transform.transform_x(184), 184);
         assert_eq!(transform.transform_x(500), 724);
+    }
+
+    #[test]
+    fn inserted_detail_rank_does_not_displace_intermediate_anchor() {
+        let paths = vec![AnchorRangePath {
+            nodes: vec![
+                node("source", None),
+                node("detail", Some(GraphViewportEdgeKind::Merge)),
+                node("target", Some(GraphViewportEdgeKind::Merge)),
+            ],
+        }];
+        let transform = AnchorRangeTransform {
+            source_x: 100,
+            target_x: 324,
+            extra_width: DETAIL_RANK_STEP,
+        };
+        let expanded_target = Point {
+            x: transform.transform_x(324),
+            y: 100,
+        };
+        let layout = layout_anchor_range(Point { x: 100, y: 100 }, expanded_target, paths);
+
+        assert_eq!(transform.transform_x(212), 212);
+        assert_eq!(expanded_target.x, 436);
+        assert_eq!(layout.paths[0].nodes[0].point.x, 324);
     }
 
     #[test]
