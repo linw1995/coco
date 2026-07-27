@@ -11,8 +11,22 @@ pub struct Point {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum NodeDetailResponse {
     Default,
-    Missing { target: String },
-    Found { node: Box<Node> },
+    Missing {
+        target: String,
+    },
+    Found {
+        node: Box<Node>,
+        tool_use_input_links: Vec<ToolUseInputLink>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolUseInputLink {
+    pub tool_use_index: usize,
+    pub tool_use_id: String,
+    pub input_pointer: String,
+    pub value: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

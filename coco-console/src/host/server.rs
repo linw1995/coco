@@ -38,7 +38,7 @@ use crate::api::{
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
-    NodeView, ViewMode, node_id_from_target, provider_context_for_node,
+    NodeView, ViewMode, node_id_from_target, provider_context_for_node, tool_use_input_links,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -445,9 +445,22 @@ where
         });
     };
     match state.store.get_node(node_id).await {
-        Ok(node) => Ok(NodeDetailResponse::Found {
-            node: Box::new(node),
-        }),
+        Ok(node) => {
+            let tool_use_input_links = if node
+                .kind
+                .as_tool_uses()
+                .is_some_and(|items| items.iter().any(|item| item.name == "write_stdin"))
+            {
+                let ancestry = state.store.ancestry(&node.id).await.context(StoreSnafu)?;
+                tool_use_input_links(&node, &ancestry)
+            } else {
+                Vec::new()
+            };
+            Ok(NodeDetailResponse::Found {
+                node: Box::new(node),
+                tool_use_input_links,
+            })
+        }
         Err(error) if is_missing_node(&error) => Ok(NodeDetailResponse::Missing {
             target: target.to_owned(),
         }),
@@ -934,7 +947,7 @@ mod tests {
     use axum::body::to_bytes;
     use coco_mem::{
         Anchor, BranchStore, Kind, MergeParent, NewNode, NodeStore, PromptAnchor, Role,
-        SessionAnchor, SessionRole, SqliteStore,
+        SessionAnchor, SessionRole, SqliteStore, ToolResult, ToolUse,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1024,7 +1037,7 @@ mod tests {
         .await;
         let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
         let detail: NodeDetailResponse = serde_json::from_slice(&detail_body).unwrap();
-        let NodeDetailResponse::Found { node } = detail else {
+        let NodeDetailResponse::Found { node, .. } = detail else {
             panic!("node detail should be found");
         };
         assert_eq!(node.kind, Kind::Text("direct detail".to_owned()));
@@ -1040,7 +1053,85 @@ mod tests {
         let detail = panel_server_function(State(state), request).await;
         let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
         let detail: NodeDetailResponse = serde_json::from_slice(&detail_body).unwrap();
-        assert!(matches!(detail, NodeDetailResponse::Found { node } if node.id == node_id));
+        assert!(matches!(detail, NodeDetailResponse::Found { node, .. } if node.id == node_id));
+    }
+
+    #[tokio::test]
+    async fn node_detail_links_write_stdin_session_to_its_exec_command_detail() {
+        let source = SqliteStore::open_temporary().await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(source.clone(), publisher.clone());
+        let exec_id = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "exec-call".to_owned(),
+                    name: "exec_command".to_owned(),
+                    input: serde_json::json!({"cmd": "sleep 10"}),
+                }),
+            })
+            .await
+            .unwrap();
+        let result_id = store
+            .append(NewNode {
+                parent: exec_id.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::tool_result(ToolResult {
+                    id: "exec-call".to_owned(),
+                    output: "Process running\nsession_id: exec-1\nexit_status: running\n"
+                        .to_owned(),
+                }),
+            })
+            .await
+            .unwrap();
+        let write_id = store
+            .append(NewNode {
+                parent: result_id,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: "write-call".to_owned(),
+                    name: "write_stdin".to_owned(),
+                    input: serde_json::json!({"session_id": "exec-1", "chars": ""}),
+                }),
+            })
+            .await
+            .unwrap();
+        let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
+            .await
+            .unwrap();
+        let state = AppState { store, web_graph };
+
+        let detail = load_node_detail(&state, &node_target_id(&write_id))
+            .await
+            .unwrap();
+        let NodeDetailResponse::Found {
+            tool_use_input_links,
+            ..
+        } = detail
+        else {
+            panic!("write_stdin detail should be found");
+        };
+        assert_eq!(
+            tool_use_input_links,
+            [crate::api::ToolUseInputLink {
+                tool_use_index: 0,
+                tool_use_id: "write-call".to_owned(),
+                input_pointer: "/session_id".to_owned(),
+                value: "exec-1".to_owned(),
+                target: node_target_id(&exec_id),
+            }]
+        );
+
+        let linked_detail = load_node_detail(&state, &tool_use_input_links[0].target)
+            .await
+            .unwrap();
+        assert!(
+            matches!(linked_detail, NodeDetailResponse::Found { node, .. } if node.id == exec_id)
+        );
     }
 
     #[tokio::test]

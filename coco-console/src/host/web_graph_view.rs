@@ -10,6 +10,7 @@ use snafu::prelude::*;
 use crate::api::{
     GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind,
     GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse,
+    ToolUseInputLink,
 };
 use crate::host::api::GraphViewportKnownItems;
 use crate::web_graph::{BezierRoute, Point};
@@ -298,6 +299,81 @@ pub fn node_id_from_target(target: &str) -> Option<&str> {
         .filter(|node_id| !node_id.is_empty())
 }
 
+pub fn tool_use_input_links(node: &Node, ancestry: &[Node]) -> Vec<ToolUseInputLink> {
+    let Some(tool_uses) = node.kind.as_tool_uses() else {
+        return Vec::new();
+    };
+
+    tool_uses
+        .iter()
+        .enumerate()
+        .filter(|(_, tool_use)| tool_use.name == "write_stdin")
+        .filter_map(|(tool_use_index, tool_use)| {
+            let session_id = tool_use_session_id(tool_use)?;
+            let exec_command = find_exec_command_tool_use_for_session(ancestry, session_id)?;
+            Some(ToolUseInputLink {
+                tool_use_index,
+                tool_use_id: tool_use.id.clone(),
+                input_pointer: "/session_id".to_owned(),
+                value: session_id.to_owned(),
+                target: node_target_id(&exec_command.id),
+            })
+        })
+        .collect()
+}
+
+fn tool_use_session_id(tool_use: &ToolUse) -> Option<&str> {
+    tool_use
+        .input
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn output_session_id(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("session_id: "))
+}
+
+fn find_tool_use_for_result<'a>(
+    ancestry: &'a [Node],
+    tool_result_id: &str,
+) -> Option<(&'a Node, &'a ToolUse)> {
+    ancestry.iter().find_map(|node| {
+        let tool_uses = node.kind.as_tool_uses()?;
+        tool_uses
+            .iter()
+            .find(|tool_use| tool_use.id == tool_result_id)
+            .map(|tool_use| (node, tool_use))
+    })
+}
+
+fn find_exec_command_tool_use_for_session<'a>(
+    ancestry: &'a [Node],
+    session_id: &str,
+) -> Option<&'a Node> {
+    for node in ancestry {
+        let Some(tool_results) = node.kind.as_tool_results() else {
+            continue;
+        };
+        for tool_result in tool_results {
+            if output_session_id(&tool_result.output) != Some(session_id) {
+                continue;
+            }
+            let Some((tool_use_node, tool_use)) =
+                find_tool_use_for_result(ancestry, &tool_result.id)
+            else {
+                continue;
+            };
+            if tool_use.name == "exec_command" {
+                return Some(tool_use_node);
+            }
+        }
+    }
+
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointPortSlots {
     pub source: usize,
@@ -528,6 +604,33 @@ mod tests {
     use super::*;
     use crate::api::{GraphCanvas, GraphViewport};
 
+    fn test_node(id: &str, kind: Kind) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "parent": "parent-node",
+            "created_at": "2026-07-25T00:00:00Z",
+            "role": "LLM",
+            "metadata": null,
+            "kind": kind,
+        }))
+        .expect("test node should deserialize")
+    }
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> ToolUse {
+        ToolUse {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            input,
+        }
+    }
+
+    fn tool_result(id: &str, output: &str) -> ToolResult {
+        ToolResult {
+            id: id.to_owned(),
+            output: output.to_owned(),
+        }
+    }
+
     fn response(version: u64, nodes: Vec<GraphViewportNode>) -> GraphViewportResponse {
         GraphViewportResponse {
             version,
@@ -606,5 +709,190 @@ mod tests {
         assert_eq!(edge_port_offset(0, 1), 0);
         assert_eq!(edge_port_offset(0, 2), -12);
         assert_eq!(edge_port_offset(1, 2), 12);
+    }
+
+    #[test]
+    fn tool_input_links_identify_the_exact_item_pointer_and_exec_target() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_uses(vec![
+                tool_use(
+                    "other",
+                    "search_skill",
+                    serde_json::json!({"session_id": "exec-1"}),
+                ),
+                tool_use(
+                    "write-1",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "exec-1", "chars": ""}),
+                ),
+            ]),
+        );
+        let result = test_node(
+            "exec-result",
+            Kind::tool_result(tool_result(
+                "exec-call",
+                "Process running\nsession_id: exec-1\nexit_status: running\n",
+            )),
+        );
+        let exec = test_node(
+            "exec-node",
+            Kind::tool_use(tool_use(
+                "exec-call",
+                "exec_command",
+                serde_json::json!({"cmd": "sleep 10"}),
+            )),
+        );
+
+        assert_eq!(
+            tool_use_input_links(&current, &[current.clone(), result, exec]),
+            vec![ToolUseInputLink {
+                tool_use_index: 1,
+                tool_use_id: "write-1".to_owned(),
+                input_pointer: "/session_id".to_owned(),
+                value: "exec-1".to_owned(),
+                target: "detail-exec-node".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_session_ids_link_to_the_nearest_ancestor_exec_command() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_use(tool_use(
+                "write-1",
+                "write_stdin",
+                serde_json::json!({"session_id": "reused-session"}),
+            )),
+        );
+        let recent_result = test_node(
+            "recent-result",
+            Kind::tool_result(tool_result(
+                "recent-exec-call",
+                "session_id: reused-session\nexit_status: running\n",
+            )),
+        );
+        let recent_exec = test_node(
+            "recent-exec-node",
+            Kind::tool_use(tool_use(
+                "recent-exec-call",
+                "exec_command",
+                serde_json::json!({"cmd": "recent"}),
+            )),
+        );
+        let old_result = test_node(
+            "old-result",
+            Kind::tool_result(tool_result(
+                "old-exec-call",
+                "session_id: reused-session\nexit_status: running\n",
+            )),
+        );
+        let old_exec = test_node(
+            "old-exec-node",
+            Kind::tool_use(tool_use(
+                "old-exec-call",
+                "exec_command",
+                serde_json::json!({"cmd": "old"}),
+            )),
+        );
+
+        let links = tool_use_input_links(
+            &current,
+            &[
+                current.clone(),
+                recent_result,
+                recent_exec,
+                old_result,
+                old_exec,
+            ],
+        );
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "detail-recent-exec-node");
+    }
+
+    #[test]
+    fn tool_input_links_skip_missing_non_string_and_unresolved_session_ids() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_uses(vec![
+                tool_use("missing", "write_stdin", serde_json::json!({"chars": ""})),
+                tool_use(
+                    "non-string",
+                    "write_stdin",
+                    serde_json::json!({"session_id": 42}),
+                ),
+                tool_use(
+                    "unresolved",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "unknown"}),
+                ),
+            ]),
+        );
+
+        assert!(tool_use_input_links(&current, std::slice::from_ref(&current)).is_empty());
+    }
+
+    #[test]
+    fn multiple_write_stdin_calls_link_independently_by_item() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_uses(vec![
+                tool_use(
+                    "write-1",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "exec-1"}),
+                ),
+                tool_use(
+                    "write-2",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "exec-2"}),
+                ),
+            ]),
+        );
+        let first_result = test_node(
+            "result-1",
+            Kind::tool_result(tool_result("exec-call-1", "session_id: exec-1\n")),
+        );
+        let first_exec = test_node(
+            "exec-node-1",
+            Kind::tool_use(tool_use(
+                "exec-call-1",
+                "exec_command",
+                serde_json::json!({"cmd": "first"}),
+            )),
+        );
+        let second_result = test_node(
+            "result-2",
+            Kind::tool_result(tool_result("exec-call-2", "session_id: exec-2\n")),
+        );
+        let second_exec = test_node(
+            "exec-node-2",
+            Kind::tool_use(tool_use(
+                "exec-call-2",
+                "exec_command",
+                serde_json::json!({"cmd": "second"}),
+            )),
+        );
+
+        let links = tool_use_input_links(
+            &current,
+            &[
+                current.clone(),
+                second_result,
+                second_exec,
+                first_result,
+                first_exec,
+            ],
+        );
+
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| (link.tool_use_index, link.target.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "detail-exec-node-1"), (1, "detail-exec-node-2")]
+        );
     }
 }

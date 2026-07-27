@@ -231,7 +231,7 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         NodeDetailResponse::Missing { target } => {
             view! { <NodeDetailMissing target=target/> }.into_any()
         }
-        NodeDetailResponse::Found { node } => view! { <NodeDetail node=*node/> }.into_any(),
+        NodeDetailResponse::Found { node, .. } => view! { <NodeDetail node=*node/> }.into_any(),
     }
 }
 
@@ -1210,6 +1210,7 @@ mod tests {
             request: "detail-node".to_owned(),
             response: Ok(NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("response".to_owned()))),
+                tool_use_input_links: Vec::new(),
             }),
         };
         let missing = LoadedPanel {
@@ -1294,6 +1295,7 @@ mod tests {
         let node = view! {
             <NodeDetailContent response=NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("<script>alert(1)</script>".to_owned()))),
+                tool_use_input_links: Vec::new(),
             }/>
         }
         .to_html();
