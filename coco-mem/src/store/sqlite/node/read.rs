@@ -1118,6 +1118,7 @@ pub(crate) const FIND_EXEC_COMMAND_NODE_ID_FOR_SESSION_QUERY: &str = r#"
             ON node_tool_uses.tool_use_id = matching_results.tool_result_id
         JOIN ancestry AS tool_use_ancestry
             ON tool_use_ancestry.node_id = node_tool_uses.node_id
+            AND tool_use_ancestry.depth > matching_results.result_depth
     )
     SELECT tool_use_node_id AS node_id
     FROM ranked_tool_uses

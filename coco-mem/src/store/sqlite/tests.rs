@@ -1788,7 +1788,7 @@ async fn tool_session_lookup_requires_the_tool_use_on_the_same_ancestry() {
 }
 
 #[tokio::test]
-async fn tool_session_lookup_preserves_nearest_tool_use_shadowing() {
+async fn tool_session_lookup_ignores_newer_reuse_of_the_tool_use_id() {
     let store = SqliteStore::open_temporary().await.unwrap();
     let exec_id =
         append_tool_use_node(&store, &store.root_id(), "shared-call", "exec_command").await;
@@ -1798,14 +1798,37 @@ async fn tool_session_lookup_preserves_nearest_tool_use_shadowing() {
         vec![("shared-call", "session_id: active-session\n")],
     )
     .await;
-    let head_id = append_tool_use_node(&store, &result_id, "shared-call", "write_stdin").await;
+    let head_id = append_tool_use_node(&store, &result_id, "shared-call", "exec_command").await;
 
     assert_eq!(
         store
             .find_exec_command_node_id_for_session(&head_id, "active-session")
             .await
             .unwrap(),
-        None
+        Some(exec_id)
+    );
+}
+
+#[tokio::test]
+async fn tool_session_lookup_prefers_the_nearest_preceding_reused_tool_use_id() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let old_exec_id =
+        append_tool_use_node(&store, &store.root_id(), "shared-call", "exec_command").await;
+    let recent_exec_id =
+        append_tool_use_node(&store, &old_exec_id, "shared-call", "exec_command").await;
+    let head_id = append_tool_result_node(
+        &store,
+        &recent_exec_id,
+        vec![("shared-call", "session_id: active-session\n")],
+    )
+    .await;
+
+    assert_eq!(
+        store
+            .find_exec_command_node_id_for_session(&head_id, "active-session")
+            .await
+            .unwrap(),
+        Some(recent_exec_id)
     );
 }
 

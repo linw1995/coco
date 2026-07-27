@@ -77,7 +77,7 @@ pub trait NodeStore {
 /// Tool session lookup API used by interactive clients.
 #[async_trait]
 pub trait ToolSessionStore {
-    /// Finds the nearest `exec_command` node for a session on the primary-parent chain.
+    /// Finds the nearest preceding `exec_command` node for a session on the primary-parent chain.
     ///
     /// Returns `None` when either the head node or a matching session does not exist.
     async fn find_exec_command_node_id_for_session(
