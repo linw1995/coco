@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::api::{
-    GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind,
-    GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse,
-    ToolUseInputLink,
+    GRAPH_SOURCE_PORT_OFFSET_X, GRAPH_TARGET_PORT_OFFSET_X, GraphViewportDiffResponse,
+    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind, GraphViewportItems,
+    GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, ToolUseInputLink,
 };
 use crate::host::api::GraphViewportKnownItems;
 use crate::web_graph::{BezierRoute, Point};
@@ -427,23 +427,15 @@ pub fn route_edge_with_offsets(
     target_center: Point,
     offsets: EndpointPortOffsets,
 ) -> BezierRoute {
-    const SOURCE_PADDING: i32 = 2;
-    const TARGET_PADDING: i32 = 6;
     const CONTROL_RATIO_PERCENT: i32 = 45;
     const MIN_CONTROL_DISTANCE: i32 = 24;
 
     let source = Point {
-        x: source_center
-            .x
-            .saturating_add(GRAPH_NODE_RADIUS)
-            .saturating_add(SOURCE_PADDING),
+        x: source_center.x.saturating_add(GRAPH_SOURCE_PORT_OFFSET_X),
         y: source_center.y.saturating_add(offsets.source),
     };
     let target = Point {
-        x: target_center
-            .x
-            .saturating_sub(GRAPH_NODE_RADIUS)
-            .saturating_sub(TARGET_PADDING),
+        x: target_center.x.saturating_sub(GRAPH_TARGET_PORT_OFFSET_X),
         y: target_center.y.saturating_add(offsets.target),
     };
     let horizontal_distance = target.x.saturating_sub(source.x).max(MIN_CONTROL_DISTANCE);

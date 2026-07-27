@@ -1,6 +1,9 @@
 use coco_types::Node;
 use serde::{Deserialize, Serialize};
 
+pub const GRAPH_SOURCE_PORT_OFFSET_X: i32 = 20;
+pub const GRAPH_TARGET_PORT_OFFSET_X: i32 = 24;
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct Point {
     pub x: i32,
