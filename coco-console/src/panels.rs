@@ -591,16 +591,325 @@ fn DetailCodeBlock(label: &'static str, content: String) -> impl IntoView {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolInputView {
+    List,
+    Raw,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonTokenKind {
+    Plain,
+    Key,
+    String,
+    Number,
+    Boolean,
+    Null,
+}
+
+impl JsonTokenKind {
+    fn class(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Key => Some("json-key"),
+            Self::String => Some("json-string"),
+            Self::Number => Some("json-number"),
+            Self::Boolean => Some("json-boolean"),
+            Self::Null => Some("json-null"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JsonToken {
+    kind: JsonTokenKind,
+    text: String,
+}
+
+impl JsonToken {
+    fn new(kind: JsonTokenKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+        }
+    }
+}
+
+#[component]
+fn ToolInput(input: serde_json::Value) -> impl IntoView {
+    let view = ArcRwSignal::new(ToolInputView::List);
+    let list_class_view = view.clone();
+    let list_pressed_view = view.clone();
+    let list_click_view = view.clone();
+    let raw_class_view = view.clone();
+    let raw_pressed_view = view.clone();
+    let raw_click_view = view.clone();
+    let content_view = view;
+    let list_input = input.clone();
+
+    view! {
+        <section class="node-detail-section tool-input">
+            <div class="tool-input-heading">
+                <h3>"Input"</h3>
+                <div class="tool-input-view-toggle" role="group" aria-label="Input view">
+                    <button
+                        type="button"
+                        class:active=move || list_class_view.get() == ToolInputView::List
+                        aria-pressed=move || {
+                            if list_pressed_view.get() == ToolInputView::List {
+                                "true"
+                            } else {
+                                "false"
+                            }
+                        }
+                        on:click=move |_| list_click_view.set(ToolInputView::List)
+                    >
+                        "List"
+                    </button>
+                    <button
+                        type="button"
+                        class:active=move || raw_class_view.get() == ToolInputView::Raw
+                        aria-pressed=move || {
+                            if raw_pressed_view.get() == ToolInputView::Raw {
+                                "true"
+                            } else {
+                                "false"
+                            }
+                        }
+                        on:click=move |_| raw_click_view.set(ToolInputView::Raw)
+                    >
+                        "Raw JSON"
+                    </button>
+                </div>
+            </div>
+            {move || match content_view.get() {
+                ToolInputView::List => {
+                    view! { <ToolInputList input=list_input.clone()/> }.into_any()
+                }
+                ToolInputView::Raw => {
+                    view! { <ToolInputRaw input=input.clone()/> }.into_any()
+                }
+            }}
+        </section>
+    }
+}
+
+#[component]
+fn ToolInputList(input: serde_json::Value) -> impl IntoView {
+    tool_input_list(&input, "")
+}
+
+fn tool_input_list(value: &serde_json::Value, pointer: &str) -> AnyView {
+    let entries = match value {
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                let pointer = json_pointer_child(pointer, key);
+                tool_input_list_entry(key.clone(), "json-key", value, pointer)
+            })
+            .collect::<Vec<_>>(),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let label = index.to_string();
+                let pointer = json_pointer_child(pointer, &label);
+                tool_input_list_entry(label, "json-index", value, pointer)
+            })
+            .collect::<Vec<_>>(),
+        _ => {
+            return view! {
+                <ul class="tool-input-list tool-input-list-root">
+                    <li class="tool-input-entry tool-input-entry-root">
+                        {tool_input_scalar(value)}
+                    </li>
+                </ul>
+            }
+            .into_any();
+        }
+    };
+
+    if entries.is_empty() {
+        let description = match value {
+            serde_json::Value::Object(_) => "Empty object",
+            serde_json::Value::Array(_) => "Empty array",
+            _ => unreachable!("only containers can produce an empty entry list"),
+        };
+        view! { <p class="tool-input-empty">{description}</p> }.into_any()
+    } else {
+        let class = if pointer.is_empty() {
+            "tool-input-list tool-input-list-root"
+        } else {
+            "tool-input-list"
+        };
+        view! { <ul class=class>{entries}</ul> }.into_any()
+    }
+}
+
+fn tool_input_list_entry(
+    label: String,
+    label_class: &'static str,
+    value: &serde_json::Value,
+    pointer: String,
+) -> AnyView {
+    let summary = match value {
+        serde_json::Value::Object(values) => {
+            Some(format_container_summary("Object", values.len(), "field"))
+        }
+        serde_json::Value::Array(values) => {
+            Some(format_container_summary("Array", values.len(), "item"))
+        }
+        _ => None,
+    };
+    if let Some(summary) = summary {
+        let children = tool_input_list(value, &pointer);
+        view! {
+            <li class="tool-input-entry tool-input-container" data-json-pointer=pointer>
+                <div class="tool-input-entry-heading">
+                    <span class=label_class>{label}</span>
+                    <span class="tool-input-summary">{summary}</span>
+                </div>
+                {children}
+            </li>
+        }
+        .into_any()
+    } else {
+        view! {
+            <li class="tool-input-entry" data-json-pointer=pointer>
+                <span class=label_class>{label}</span>
+                {tool_input_scalar(value)}
+            </li>
+        }
+        .into_any()
+    }
+}
+
+fn tool_input_scalar(value: &serde_json::Value) -> AnyView {
+    let (class, text) = match value {
+        serde_json::Value::String(value) => ("json-string", value.clone()),
+        serde_json::Value::Number(value) => ("json-number", value.to_string()),
+        serde_json::Value::Bool(value) => ("json-boolean", value.to_string()),
+        serde_json::Value::Null => ("json-null", "null".to_owned()),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            unreachable!("containers should render as nested lists")
+        }
+    };
+    view! { <span class=class>{text}</span> }.into_any()
+}
+
+fn json_pointer_child(parent: &str, child: &str) -> String {
+    let escaped = child.replace('~', "~0").replace('/', "~1");
+    format!("{parent}/{escaped}")
+}
+
+fn format_container_summary(kind: &str, len: usize, item: &str) -> String {
+    let suffix = if len == 1 {
+        item.to_owned()
+    } else {
+        format!("{item}s")
+    };
+    format!("{kind} · {len} {suffix}")
+}
+
+#[component]
+fn ToolInputRaw(input: serde_json::Value) -> impl IntoView {
+    let tokens = highlighted_json_tokens(&input)
+        .into_iter()
+        .map(|token| match token.kind.class() {
+            Some(class) => view! { <span class=class>{token.text}</span> }.into_any(),
+            None => token.text.into_any(),
+        })
+        .collect::<Vec<_>>();
+
+    view! {
+        <pre class="node-detail-code tool-input-raw" aria-label="Raw JSON input">
+            <code>{tokens}</code>
+        </pre>
+    }
+}
+
+fn highlighted_json_tokens(value: &serde_json::Value) -> Vec<JsonToken> {
+    let mut tokens = Vec::new();
+    push_highlighted_json_tokens(value, 0, &mut tokens);
+    tokens
+}
+
+fn push_highlighted_json_tokens(
+    value: &serde_json::Value,
+    depth: usize,
+    tokens: &mut Vec<JsonToken>,
+) {
+    match value {
+        serde_json::Value::Object(values) => {
+            tokens.push(JsonToken::new(JsonTokenKind::Plain, "{"));
+            for (index, (key, value)) in values.iter().enumerate() {
+                tokens.push(JsonToken::new(
+                    JsonTokenKind::Plain,
+                    format!("\n{}", "  ".repeat(depth + 1)),
+                ));
+                tokens.push(JsonToken::new(
+                    JsonTokenKind::Key,
+                    serde_json::to_string(key).expect("JSON object key should serialize"),
+                ));
+                tokens.push(JsonToken::new(JsonTokenKind::Plain, ": "));
+                push_highlighted_json_tokens(value, depth + 1, tokens);
+                if index + 1 != values.len() {
+                    tokens.push(JsonToken::new(JsonTokenKind::Plain, ","));
+                }
+            }
+            if !values.is_empty() {
+                tokens.push(JsonToken::new(
+                    JsonTokenKind::Plain,
+                    format!("\n{}", "  ".repeat(depth)),
+                ));
+            }
+            tokens.push(JsonToken::new(JsonTokenKind::Plain, "}"));
+        }
+        serde_json::Value::Array(values) => {
+            tokens.push(JsonToken::new(JsonTokenKind::Plain, "["));
+            for (index, value) in values.iter().enumerate() {
+                tokens.push(JsonToken::new(
+                    JsonTokenKind::Plain,
+                    format!("\n{}", "  ".repeat(depth + 1)),
+                ));
+                push_highlighted_json_tokens(value, depth + 1, tokens);
+                if index + 1 != values.len() {
+                    tokens.push(JsonToken::new(JsonTokenKind::Plain, ","));
+                }
+            }
+            if !values.is_empty() {
+                tokens.push(JsonToken::new(
+                    JsonTokenKind::Plain,
+                    format!("\n{}", "  ".repeat(depth)),
+                ));
+            }
+            tokens.push(JsonToken::new(JsonTokenKind::Plain, "]"));
+        }
+        serde_json::Value::String(value) => tokens.push(JsonToken::new(
+            JsonTokenKind::String,
+            serde_json::to_string(value).expect("JSON string should serialize"),
+        )),
+        serde_json::Value::Number(value) => {
+            tokens.push(JsonToken::new(JsonTokenKind::Number, value.to_string()));
+        }
+        serde_json::Value::Bool(value) => {
+            tokens.push(JsonToken::new(JsonTokenKind::Boolean, value.to_string()));
+        }
+        serde_json::Value::Null => {
+            tokens.push(JsonToken::new(JsonTokenKind::Null, "null"));
+        }
+    }
+}
+
 #[component]
 fn ToolUseDetail(item: ToolUse) -> impl IntoView {
-    let input = pretty_json(&item.input);
     view! {
         <article class="node-detail-item">
             <header>
                 <strong>{item.name}</strong>
                 <code>{item.id}</code>
             </header>
-            <DetailCodeBlock label="Input" content=input/>
+            <ToolInput input=item.input/>
         </article>
     }
 }
@@ -1126,6 +1435,68 @@ mod tests {
     }
 
     #[test]
+    fn tool_input_defaults_to_an_html_safe_nested_list() {
+        let input = view! {
+            <ToolInput input=serde_json::json!({
+                "<command>": "printf </script>",
+                "nested": {
+                    "slash/key": [true, null],
+                },
+            })/>
+        }
+        .to_html();
+
+        assert!(input.contains(r#"role="group" aria-label="Input view""#));
+        assert!(input.contains(r#">List</button>"#));
+        assert!(input.contains(r#">Raw JSON</button>"#));
+        assert!(input.contains(r#"aria-pressed="true""#), "{input}");
+        assert!(input.contains("tool-input-list tool-input-list-root"));
+        assert!(input.contains(r#"data-json-pointer="/nested/slash~1key""#));
+        assert!(input.contains("&lt;command&gt;"));
+        assert!(input.contains("printf &lt;/script&gt;"));
+        assert!(!input.contains("<script>"));
+        assert!(!input.contains("tool-input-raw"));
+    }
+
+    #[test]
+    fn raw_tool_input_highlights_every_json_scalar_and_escapes_html() {
+        let value = serde_json::json!({
+            "<key>": "</script>",
+            "number": 42,
+            "boolean": false,
+            "nothing": null,
+        });
+        let raw = view! { <ToolInputRaw input=value.clone()/> }.to_html();
+        let serialized = highlighted_json_tokens(&value)
+            .into_iter()
+            .map(|token| token.text)
+            .collect::<String>();
+
+        for class in [
+            "json-key",
+            "json-string",
+            "json-number",
+            "json-boolean",
+            "json-null",
+        ] {
+            assert!(raw.contains(&format!(r#"class="{class}""#)));
+        }
+        assert!(raw.contains("&lt;key&gt;"));
+        assert!(raw.contains("&lt;/script&gt;"));
+        assert!(!raw.contains("<script>"));
+        assert_eq!(serialized, pretty_json(&value));
+    }
+
+    #[test]
+    fn tool_input_json_pointers_follow_rfc_6901_escaping() {
+        assert_eq!(json_pointer_child("", "slash/key"), "/slash~1key");
+        assert_eq!(
+            json_pointer_child("/slash~1key", "~nested"),
+            "/slash~1key/~0nested"
+        );
+    }
+
+    #[test]
     fn session_patch_fields_format_every_change() {
         let fields = session_patch_fields(SessionAnchorPatch {
             role: Some(SessionRole::Runner),
@@ -1176,11 +1547,106 @@ mod wasm_tests {
     use any_spawner::Executor;
     use js_sys::Promise;
     use leptos::leptos_dom::helpers::request_animation_frame;
-    use wasm_bindgen::{JsValue, UnwrapThrowExt};
+    use wasm_bindgen::{JsCast, JsValue, UnwrapThrowExt};
     use wasm_bindgen_futures::JsFuture;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn graph_items_tool_input_switches_between_list_and_raw_json() {
+        let window = web_sys::window().expect_throw("window should be available");
+        let document = window
+            .document()
+            .expect_throw("document should be available");
+        let root = document
+            .create_element("div")
+            .expect_throw("test root should be created")
+            .unchecked_into::<web_sys::HtmlElement>();
+        document
+            .body()
+            .expect_throw("document body should be available")
+            .append_child(&root)
+            .expect_throw("test root should be mounted");
+        let mounted = leptos::mount::mount_to(root.clone(), || {
+            view! {
+                <ToolInput input=serde_json::json!({
+                    "command": "true",
+                    "timeout": 30,
+                    "enabled": true,
+                    "optional": null,
+                })/>
+            }
+        });
+        let list_toggle = root
+            .query_selector(".tool-input-view-toggle button:first-child")
+            .expect_throw("list toggle query should succeed")
+            .expect_throw("list toggle should be rendered")
+            .unchecked_into::<web_sys::HtmlElement>();
+        let raw_toggle = root
+            .query_selector(".tool-input-view-toggle button:last-child")
+            .expect_throw("raw toggle query should succeed")
+            .expect_throw("raw toggle should be rendered")
+            .unchecked_into::<web_sys::HtmlElement>();
+
+        assert_eq!(
+            list_toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert!(
+            root.query_selector(".tool-input-list")
+                .unwrap_throw()
+                .is_some()
+        );
+        assert!(
+            root.query_selector(".tool-input-raw")
+                .unwrap_throw()
+                .is_none()
+        );
+
+        raw_toggle.click();
+        next_task().await;
+
+        assert_eq!(
+            raw_toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert!(
+            root.query_selector(".tool-input-list")
+                .unwrap_throw()
+                .is_none()
+        );
+        for selector in [
+            ".tool-input-raw .json-key",
+            ".tool-input-raw .json-string",
+            ".tool-input-raw .json-number",
+            ".tool-input-raw .json-boolean",
+            ".tool-input-raw .json-null",
+        ] {
+            assert!(root.query_selector(selector).unwrap_throw().is_some());
+        }
+
+        list_toggle.click();
+        next_task().await;
+
+        assert_eq!(
+            list_toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        assert!(
+            root.query_selector(".tool-input-list")
+                .unwrap_throw()
+                .is_some()
+        );
+        assert!(
+            root.query_selector(".tool-input-raw")
+                .unwrap_throw()
+                .is_none()
+        );
+
+        drop(mounted);
+        root.remove();
+    }
 
     #[wasm_bindgen_test]
     async fn graph_items_panel_selection_signals_read_initial_hash_and_track_changes_independently()
