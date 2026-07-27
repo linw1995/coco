@@ -1024,6 +1024,127 @@ pub async fn load_ancestry_nodes(
     node_rows_into_nodes(connection, path, rows).await
 }
 
+#[derive(QueryableByName)]
+struct ExecCommandNodeIdRow {
+    #[diesel(sql_type = Text)]
+    node_id: String,
+}
+
+pub(crate) const FIND_EXEC_COMMAND_NODE_ID_FOR_SESSION_QUERY: &str = r#"
+    WITH RECURSIVE
+    requested(session_id) AS (
+        VALUES (?)
+    ),
+    ancestry(node_id, parent_id, depth) AS (
+        SELECT id, parent_id, 0
+        FROM nodes
+        WHERE id = ?
+
+        UNION ALL
+
+        SELECT nodes.id, nodes.parent_id, ancestry.depth + 1
+        FROM nodes
+        JOIN ancestry ON nodes.id = ancestry.parent_id
+        WHERE ancestry.parent_id <> ''
+    ),
+    framed_results AS (
+        SELECT
+            ancestry.node_id AS result_node_id,
+            ancestry.depth AS result_depth,
+            node_tool_results.ordinal AS result_ordinal,
+            node_tool_results.tool_result_id,
+            char(10)
+                || replace(
+                    node_tool_results.output,
+                    char(13) || char(10),
+                    char(10)
+                )
+                || char(10) AS framed_output
+        FROM ancestry
+        JOIN node_tool_results ON node_tool_results.node_id = ancestry.node_id
+    ),
+    result_payload_offsets AS (
+        SELECT
+            *,
+            instr(framed_output, char(10) || 'stdout:' || char(10)) AS stdout_offset,
+            instr(framed_output, char(10) || 'stderr:' || char(10)) AS stderr_offset
+        FROM framed_results
+    ),
+    result_headers AS (
+        SELECT
+            result_node_id,
+            result_depth,
+            result_ordinal,
+            tool_result_id,
+            CASE
+                WHEN stdout_offset = 0 AND stderr_offset = 0 THEN framed_output
+                WHEN stdout_offset = 0 THEN substr(framed_output, 1, stderr_offset)
+                WHEN stderr_offset = 0 THEN substr(framed_output, 1, stdout_offset)
+                ELSE substr(framed_output, 1, min(stdout_offset, stderr_offset))
+            END AS header
+        FROM result_payload_offsets
+    ),
+    matching_results AS (
+        SELECT
+            result_node_id,
+            result_depth,
+            result_ordinal,
+            tool_result_id
+        FROM result_headers
+        CROSS JOIN requested
+        WHERE instr(requested.session_id, char(10)) = 0
+            AND instr(requested.session_id, char(13)) = 0
+            AND instr(
+                header,
+                char(10) || 'session_id: ' || requested.session_id || char(10)
+            ) = instr(header, char(10) || 'session_id: ')
+            AND instr(header, char(10) || 'session_id: ') > 0
+    ),
+    ranked_tool_uses AS (
+        SELECT
+            matching_results.result_node_id,
+            matching_results.result_depth,
+            matching_results.result_ordinal,
+            node_tool_uses.node_id AS tool_use_node_id,
+            node_tool_uses.name,
+            row_number() OVER (
+                PARTITION BY
+                    matching_results.result_node_id,
+                    matching_results.result_ordinal
+                ORDER BY tool_use_ancestry.depth, node_tool_uses.ordinal
+            ) AS tool_use_rank
+        FROM matching_results
+        JOIN node_tool_uses
+            ON node_tool_uses.tool_use_id = matching_results.tool_result_id
+        JOIN ancestry AS tool_use_ancestry
+            ON tool_use_ancestry.node_id = node_tool_uses.node_id
+    )
+    SELECT tool_use_node_id AS node_id
+    FROM ranked_tool_uses
+    WHERE tool_use_rank = 1
+        AND name = 'exec_command'
+    ORDER BY result_depth, result_ordinal
+    LIMIT 1
+"#;
+
+pub async fn find_exec_command_node_id_for_session(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    head_node_id: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    diesel::sql_query(FIND_EXEC_COMMAND_NODE_ID_FOR_SESSION_QUERY)
+        .bind::<Text, _>(session_id)
+        .bind::<Text, _>(head_node_id)
+        .get_result::<ExecCommandNodeIdRow>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+        .map(|row| row.map(|row| row.node_id))
+}
+
 pub async fn load_log_nodes(
     connection: &mut AsyncSqliteConnection,
     path: &Path,

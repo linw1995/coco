@@ -299,7 +299,19 @@ pub fn node_id_from_target(target: &str) -> Option<&str> {
         .filter(|node_id| !node_id.is_empty())
 }
 
-pub fn tool_use_input_links(node: &Node, ancestry: &[Node]) -> Vec<ToolUseInputLink> {
+pub fn write_stdin_session_ids(node: &Node) -> impl Iterator<Item = &str> {
+    node.kind
+        .as_tool_uses()
+        .into_iter()
+        .flatten()
+        .filter(|tool_use| tool_use.name == "write_stdin")
+        .filter_map(tool_use_session_id)
+}
+
+pub fn tool_use_input_links(
+    node: &Node,
+    exec_node_ids_by_session: &HashMap<String, String>,
+) -> Vec<ToolUseInputLink> {
     let Some(tool_uses) = node.kind.as_tool_uses() else {
         return Vec::new();
     };
@@ -310,13 +322,13 @@ pub fn tool_use_input_links(node: &Node, ancestry: &[Node]) -> Vec<ToolUseInputL
         .filter(|(_, tool_use)| tool_use.name == "write_stdin")
         .filter_map(|(tool_use_index, tool_use)| {
             let session_id = tool_use_session_id(tool_use)?;
-            let exec_command = find_exec_command_tool_use_for_session(ancestry, session_id)?;
+            let exec_node_id = exec_node_ids_by_session.get(session_id)?;
             Some(ToolUseInputLink {
                 tool_use_index,
                 tool_use_id: tool_use.id.clone(),
                 input_pointer: "/session_id".to_owned(),
                 value: session_id.to_owned(),
-                target: node_target_id(&exec_command.id),
+                target: node_target_id(exec_node_id),
             })
         })
         .collect()
@@ -327,58 +339,6 @@ fn tool_use_session_id(tool_use: &ToolUse) -> Option<&str> {
         .input
         .get("session_id")
         .and_then(serde_json::Value::as_str)
-}
-
-fn output_session_id(output: &str) -> Option<&str> {
-    for line in output.lines() {
-        let line = line.trim_end_matches('\r');
-        if matches!(line, "stdout:" | "stderr:") {
-            return None;
-        }
-        if let Some(session_id) = line.strip_prefix("session_id: ") {
-            return Some(session_id);
-        }
-    }
-    None
-}
-
-fn find_tool_use_for_result<'a>(
-    ancestry: &'a [Node],
-    tool_result_id: &str,
-) -> Option<(&'a Node, &'a ToolUse)> {
-    ancestry.iter().find_map(|node| {
-        let tool_uses = node.kind.as_tool_uses()?;
-        tool_uses
-            .iter()
-            .find(|tool_use| tool_use.id == tool_result_id)
-            .map(|tool_use| (node, tool_use))
-    })
-}
-
-fn find_exec_command_tool_use_for_session<'a>(
-    ancestry: &'a [Node],
-    session_id: &str,
-) -> Option<&'a Node> {
-    for node in ancestry {
-        let Some(tool_results) = node.kind.as_tool_results() else {
-            continue;
-        };
-        for tool_result in tool_results {
-            if output_session_id(&tool_result.output) != Some(session_id) {
-                continue;
-            }
-            let Some((tool_use_node, tool_use)) =
-                find_tool_use_for_result(ancestry, &tool_result.id)
-            else {
-                continue;
-            };
-            if tool_use.name == "exec_command" {
-                return Some(tool_use_node);
-            }
-        }
-    }
-
-    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,13 +583,6 @@ mod tests {
         }
     }
 
-    fn tool_result(id: &str, output: &str) -> ToolResult {
-        ToolResult {
-            id: id.to_owned(),
-            output: output.to_owned(),
-        }
-    }
-
     fn response(version: u64, nodes: Vec<GraphViewportNode>) -> GraphViewportResponse {
         GraphViewportResponse {
             version,
@@ -727,24 +680,10 @@ mod tests {
                 ),
             ]),
         );
-        let result = test_node(
-            "exec-result",
-            Kind::tool_result(tool_result(
-                "exec-call",
-                "Process running\nsession_id: exec-1\nexit_status: running\n",
-            )),
-        );
-        let exec = test_node(
-            "exec-node",
-            Kind::tool_use(tool_use(
-                "exec-call",
-                "exec_command",
-                serde_json::json!({"cmd": "sleep 10"}),
-            )),
-        );
+        let targets = HashMap::from([("exec-1".to_owned(), "exec-node".to_owned())]);
 
         assert_eq!(
-            tool_use_input_links(&current, &[current.clone(), result, exec]),
+            tool_use_input_links(&current, &targets),
             vec![ToolUseInputLink {
                 tool_use_index: 1,
                 tool_use_id: "write-1".to_owned(),
@@ -753,118 +692,6 @@ mod tests {
                 target: "detail-exec-node".to_owned(),
             }]
         );
-    }
-
-    #[test]
-    fn duplicate_session_ids_link_to_the_nearest_ancestor_exec_command() {
-        let current = test_node(
-            "write-node",
-            Kind::tool_use(tool_use(
-                "write-1",
-                "write_stdin",
-                serde_json::json!({"session_id": "reused-session"}),
-            )),
-        );
-        let recent_result = test_node(
-            "recent-result",
-            Kind::tool_result(tool_result(
-                "recent-exec-call",
-                "session_id: reused-session\nexit_status: running\n",
-            )),
-        );
-        let recent_exec = test_node(
-            "recent-exec-node",
-            Kind::tool_use(tool_use(
-                "recent-exec-call",
-                "exec_command",
-                serde_json::json!({"cmd": "recent"}),
-            )),
-        );
-        let old_result = test_node(
-            "old-result",
-            Kind::tool_result(tool_result(
-                "old-exec-call",
-                "session_id: reused-session\nexit_status: running\n",
-            )),
-        );
-        let old_exec = test_node(
-            "old-exec-node",
-            Kind::tool_use(tool_use(
-                "old-exec-call",
-                "exec_command",
-                serde_json::json!({"cmd": "old"}),
-            )),
-        );
-
-        let links = tool_use_input_links(
-            &current,
-            &[
-                current.clone(),
-                recent_result,
-                recent_exec,
-                old_result,
-                old_exec,
-            ],
-        );
-
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].target, "detail-recent-exec-node");
-    }
-
-    #[test]
-    fn stdout_session_id_does_not_shadow_an_older_structured_exec_header() {
-        let current = test_node(
-            "write-node",
-            Kind::tool_use(tool_use(
-                "write-1",
-                "write_stdin",
-                serde_json::json!({"session_id": "active-session"}),
-            )),
-        );
-        let unrelated_result = test_node(
-            "unrelated-result",
-            Kind::tool_result(tool_result(
-                "unrelated-exec-call",
-                "Process exited with code 0\nexit_status: 0\nstdout:\nsession_id: active-session\nstderr:\n",
-            )),
-        );
-        let unrelated_exec = test_node(
-            "unrelated-exec-node",
-            Kind::tool_use(tool_use(
-                "unrelated-exec-call",
-                "exec_command",
-                serde_json::json!({"cmd": "printf 'session_id: active-session'"}),
-            )),
-        );
-        let original_result = test_node(
-            "original-result",
-            Kind::tool_result(tool_result(
-                "original-exec-call",
-                "Process running\r\nsession_id: active-session\r\nexit_status: running\r\nstdout:\r\n\r\nstderr:\r\n",
-            )),
-        );
-        let original_exec = test_node(
-            "original-exec-node",
-            Kind::tool_use(tool_use(
-                "original-exec-call",
-                "exec_command",
-                serde_json::json!({"cmd": "sleep 10"}),
-            )),
-        );
-
-        let links = tool_use_input_links(
-            &current,
-            &[
-                current.clone(),
-                unrelated_result,
-                unrelated_exec,
-                original_result,
-                original_exec,
-            ],
-        );
-
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].target, "detail-original-exec-node");
     }
 
     #[test]
@@ -886,7 +713,7 @@ mod tests {
             ]),
         );
 
-        assert!(tool_use_input_links(&current, std::slice::from_ref(&current)).is_empty());
+        assert!(tool_use_input_links(&current, &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -906,40 +733,12 @@ mod tests {
                 ),
             ]),
         );
-        let first_result = test_node(
-            "result-1",
-            Kind::tool_result(tool_result("exec-call-1", "session_id: exec-1\n")),
-        );
-        let first_exec = test_node(
-            "exec-node-1",
-            Kind::tool_use(tool_use(
-                "exec-call-1",
-                "exec_command",
-                serde_json::json!({"cmd": "first"}),
-            )),
-        );
-        let second_result = test_node(
-            "result-2",
-            Kind::tool_result(tool_result("exec-call-2", "session_id: exec-2\n")),
-        );
-        let second_exec = test_node(
-            "exec-node-2",
-            Kind::tool_use(tool_use(
-                "exec-call-2",
-                "exec_command",
-                serde_json::json!({"cmd": "second"}),
-            )),
-        );
-
         let links = tool_use_input_links(
             &current,
-            &[
-                current.clone(),
-                second_result,
-                second_exec,
-                first_result,
-                first_exec,
-            ],
+            &HashMap::from([
+                ("exec-1".to_owned(), "exec-node-1".to_owned()),
+                ("exec-2".to_owned(), "exec-node-2".to_owned()),
+            ]),
         );
 
         assert_eq!(

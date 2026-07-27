@@ -4,7 +4,10 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use coco_mem::{GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore};
+use coco_mem::{
+    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore,
+    ToolSessionStore,
+};
 use snafu::{IntoError, prelude::*};
 use tokio::sync::watch;
 
@@ -1928,6 +1931,19 @@ impl WebGraphRuntime {
             current = node.parent;
         }
         Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolSessionStore for WebGraphRuntime {
+    async fn find_exec_command_node_id_for_session(
+        &self,
+        head_node_id: &str,
+        session_id: &str,
+    ) -> coco_mem::StoreResult<Option<String>> {
+        self.source
+            .find_exec_command_node_id_for_session(head_node_id, session_id)
+            .await
     }
 }
 

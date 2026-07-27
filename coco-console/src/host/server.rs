@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -14,7 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use coco_mem::{Kind, Node, Store, StoreError};
+use coco_mem::{Kind, Node, Store, StoreError, ToolSessionStore};
 use futures_util::{StreamExt, stream};
 use leptos::prelude::provide_context;
 use leptos_axum::handle_server_fns_with_context;
@@ -33,12 +34,13 @@ use crate::Result;
 use crate::api::{
     AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdgeKind,
     NodeDetailResponse, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
-    ProviderContextResponse,
+    ProviderContextResponse, ToolUseInputLink,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
     NodeView, ViewMode, node_id_from_target, provider_context_for_node, tool_use_input_links,
+    write_stdin_session_ids,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -446,16 +448,8 @@ where
     };
     match state.store.get_node(node_id).await {
         Ok(node) => {
-            let tool_use_input_links = if node
-                .kind
-                .as_tool_uses()
-                .is_some_and(|items| items.iter().any(|item| item.name == "write_stdin"))
-            {
-                let ancestry = state.store.ancestry(&node.id).await.context(StoreSnafu)?;
-                tool_use_input_links(&node, &ancestry)
-            } else {
-                Vec::new()
-            };
+            let tool_use_input_links =
+                resolve_tool_use_input_links(&state.web_graph, &node).await?;
             Ok(NodeDetailResponse::Found {
                 node: Box::new(node),
                 tool_use_input_links,
@@ -466,6 +460,27 @@ where
         }),
         Err(source) => Err(source).context(StoreSnafu),
     }
+}
+
+async fn resolve_tool_use_input_links<S>(store: &S, node: &Node) -> Result<Vec<ToolUseInputLink>>
+where
+    S: ToolSessionStore + Sync,
+{
+    let mut exec_node_ids_by_session = HashMap::new();
+    let mut resolved_sessions = HashSet::new();
+    for session_id in write_stdin_session_ids(node) {
+        if !resolved_sessions.insert(session_id) {
+            continue;
+        }
+        if let Some(exec_node_id) = store
+            .find_exec_command_node_id_for_session(&node.id, session_id)
+            .await
+            .context(StoreSnafu)?
+        {
+            exec_node_ids_by_session.insert(session_id.to_owned(), exec_node_id);
+        }
+    }
+    Ok(tool_use_input_links(node, &exec_node_ids_by_session))
 }
 
 async fn load_anchor_range<S>(
@@ -954,6 +969,35 @@ mod tests {
     use crate::ConsoleStore;
     use crate::host::web_graph_view::node_target_id;
 
+    struct RecordingToolSessionStore {
+        targets: HashMap<String, String>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ToolSessionStore for RecordingToolSessionStore {
+        async fn find_exec_command_node_id_for_session(
+            &self,
+            _head_node_id: &str,
+            session_id: &str,
+        ) -> coco_mem::StoreResult<Option<String>> {
+            self.calls.lock().unwrap().push(session_id.to_owned());
+            Ok(self.targets.get(session_id).cloned())
+        }
+    }
+
+    fn test_node(kind: Kind) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "id": "write-node",
+            "parent": "parent-node",
+            "created_at": "2026-07-25T00:00:00Z",
+            "role": "LLM",
+            "metadata": null,
+            "kind": kind,
+        }))
+        .expect("test node should deserialize")
+    }
+
     #[test]
     fn query_parser_decodes_repeated_values() {
         let query = parse_query("mode=all&known_node=node%3Aa&known_node=node%3Ab");
@@ -975,6 +1019,67 @@ mod tests {
     #[test]
     fn malformed_percent_encoding_is_preserved() {
         assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
+    }
+
+    #[tokio::test]
+    async fn tool_input_link_resolution_uses_only_the_narrow_store_and_deduplicates_sessions() {
+        let store = RecordingToolSessionStore {
+            targets: HashMap::from([
+                ("exec-1".to_owned(), "exec-node-1".to_owned()),
+                ("exec-2".to_owned(), "exec-node-2".to_owned()),
+            ]),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let node = test_node(Kind::tool_uses(vec![
+            ToolUse {
+                id: "write-1".to_owned(),
+                name: "write_stdin".to_owned(),
+                input: serde_json::json!({"session_id": "exec-1"}),
+            },
+            ToolUse {
+                id: "write-1-repeat".to_owned(),
+                name: "write_stdin".to_owned(),
+                input: serde_json::json!({"session_id": "exec-1"}),
+            },
+            ToolUse {
+                id: "write-2".to_owned(),
+                name: "write_stdin".to_owned(),
+                input: serde_json::json!({"session_id": "exec-2"}),
+            },
+            ToolUse {
+                id: "write-missing".to_owned(),
+                name: "write_stdin".to_owned(),
+                input: serde_json::json!({"session_id": "missing"}),
+            },
+            ToolUse {
+                id: "write-missing-repeat".to_owned(),
+                name: "write_stdin".to_owned(),
+                input: serde_json::json!({"session_id": "missing"}),
+            },
+            ToolUse {
+                id: "write-invalid".to_owned(),
+                name: "write_stdin".to_owned(),
+                input: serde_json::json!({"session_id": 42}),
+            },
+        ]));
+
+        let links = resolve_tool_use_input_links(&store, &node).await.unwrap();
+
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| (link.tool_use_index, link.target.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "detail-exec-node-1"),
+                (1, "detail-exec-node-1"),
+                (2, "detail-exec-node-2"),
+            ]
+        );
+        assert_eq!(
+            *store.calls.lock().unwrap(),
+            ["exec-1", "exec-2", "missing"]
+        );
     }
 
     #[tokio::test]

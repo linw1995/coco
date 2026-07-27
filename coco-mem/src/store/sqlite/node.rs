@@ -22,7 +22,7 @@ use crate::schema::{
     node_anchor_skill_results, node_metadata, node_relations, node_tool_results, node_tool_uses,
     nodes,
 };
-use crate::store::NodeStore;
+use crate::store::{NodeStore, ToolSessionStore};
 use crate::{
     Anchor, AnchorPayload, AnchorPayloadKind, BackendMetadata, GraphNodeRecord, Kind, MergeParent,
     NewNode, Node, NodeMetadata, PromptAnchor, PromptAttachment, PromptImageAttachment, Role,
@@ -34,10 +34,12 @@ mod read;
 mod row;
 mod write;
 
+#[cfg(test)]
+pub(crate) use read::FIND_EXEC_COMMAND_NODE_ID_FOR_SESSION_QUERY;
 pub use read::{
-    load_ancestry_nodes, load_child_ids_by_parent_ids, load_child_ids_page, load_child_nodes,
-    load_graph_node_records_by_exact_ids, load_log_nodes, load_node_by_exact_id,
-    load_node_by_prefix_or_branch, load_node_high_watermark, load_node_page,
+    find_exec_command_node_id_for_session, load_ancestry_nodes, load_child_ids_by_parent_ids,
+    load_child_ids_page, load_child_nodes, load_graph_node_records_by_exact_ids, load_log_nodes,
+    load_node_by_exact_id, load_node_by_prefix_or_branch, load_node_high_watermark, load_node_page,
     load_nodes_by_exact_ids, load_root_id, node_count, node_cursor_matches, resolve_ref_id,
     validate_new_node,
 };
@@ -146,5 +148,43 @@ impl NodeStore for SqliteStore {
     async fn list_children(&self, node_id: &str) -> Result<Vec<Node>> {
         let mut connection = self.connect().await?;
         load_child_nodes(&mut connection, &self.database_path, node_id).await
+    }
+}
+
+#[async_trait]
+impl ToolSessionStore for SqliteStore {
+    async fn find_exec_command_node_id_for_session(
+        &self,
+        head_node_id: &str,
+        session_id: &str,
+    ) -> Result<Option<String>> {
+        let mut connection = self.connect().await?;
+        find_exec_command_node_id_for_session(
+            &mut connection,
+            &self.database_path,
+            head_node_id,
+            session_id,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl ToolSessionStore for SqliteGraphStore {
+    async fn find_exec_command_node_id_for_session(
+        &self,
+        head_node_id: &str,
+        session_id: &str,
+    ) -> Result<Option<String>> {
+        let head_node_id = head_node_id.to_owned();
+        let session_id = session_id.to_owned();
+        let path = self.database_path.clone();
+        self.with_connection(move |connection| {
+            Box::pin(async move {
+                find_exec_command_node_id_for_session(connection, &path, &head_node_id, &session_id)
+                    .await
+            })
+        })
+        .await
     }
 }

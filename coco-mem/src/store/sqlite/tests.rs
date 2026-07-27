@@ -18,7 +18,7 @@ use crate::{
     PromptImageAttachment, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
     SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
     SkillRuntimeContext, SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError,
-    Tool, ToolResult, ToolUse,
+    Tool, ToolResult, ToolSessionStore, ToolUse,
 };
 use diesel::connection::InstrumentationEvent;
 use diesel::prelude::*;
@@ -56,6 +56,12 @@ struct JobSummaryRow {
     work_branch: String,
     base: String,
     status: String,
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct QueryPlanDetail {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    detail: String,
 }
 
 fn session_anchor_node(parent: &str) -> NewNode {
@@ -1620,6 +1626,223 @@ async fn append_persists_node_tool_item_rows() {
     );
     assert_eq!(node_content(&store, &tool_use_node).await, None);
     assert_eq!(node_content(&store, &tool_result_node).await, None);
+}
+
+async fn append_tool_use_node(store: &SqliteStore, parent: &str, id: &str, name: &str) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::tool_use(ToolUse {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                input: serde_json::json!({}),
+            }),
+        })
+        .await
+        .unwrap()
+}
+
+async fn append_tool_result_node(
+    store: &SqliteStore,
+    parent: &str,
+    results: Vec<(&str, &str)>,
+) -> String {
+    store
+        .append(NewNode {
+            parent: parent.to_owned(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::tool_results(
+                results
+                    .into_iter()
+                    .map(|(id, output)| ToolResult {
+                        id: id.to_owned(),
+                        output: output.to_owned(),
+                    })
+                    .collect(),
+            ),
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn tool_session_lookup_ignores_payload_spoofs_and_unrelated_long_chain_nodes() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let exec_id =
+        append_tool_use_node(&store, &store.root_id(), "original-exec", "exec_command").await;
+    let mut head_id = append_tool_result_node(
+        &store,
+        &exec_id,
+        vec![(
+            "original-exec",
+            "Process running\r\nsession_id: active-session\r\nexit_status: running\r\n",
+        )],
+    )
+    .await;
+
+    for index in 0..48 {
+        head_id = store
+            .append(NewNode {
+                parent: head_id,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text(format!("unrelated payload {index}")),
+            })
+            .await
+            .unwrap();
+    }
+
+    let spoof_exec_id =
+        append_tool_use_node(&store, &head_id, "stdout-spoof", "exec_command").await;
+    let stderr_spoof_id =
+        append_tool_use_node(&store, &spoof_exec_id, "stderr-spoof", "exec_command").await;
+    head_id = append_tool_result_node(
+        &store,
+        &stderr_spoof_id,
+        vec![
+            (
+                "stdout-spoof",
+                "Process exited\r\nstdout:\r\nsession_id: active-session\r\nstderr:\r\n",
+            ),
+            (
+                "stderr-spoof",
+                "Process exited\r\nstderr:\r\nsession_id: active-session\r\n",
+            ),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        store
+            .find_exec_command_node_id_for_session(&head_id, "active-session")
+            .await
+            .unwrap(),
+        Some(exec_id)
+    );
+    assert_eq!(
+        store
+            .find_exec_command_node_id_for_session(&head_id, "missing-session")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn tool_session_lookup_prefers_the_nearest_matching_result() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let old_exec_id =
+        append_tool_use_node(&store, &store.root_id(), "old-exec", "exec_command").await;
+    let old_result_id = append_tool_result_node(
+        &store,
+        &old_exec_id,
+        vec![("old-exec", "session_id: reused-session\n")],
+    )
+    .await;
+    let recent_exec_id =
+        append_tool_use_node(&store, &old_result_id, "recent-exec", "exec_command").await;
+    let head_id = append_tool_result_node(
+        &store,
+        &recent_exec_id,
+        vec![("recent-exec", "session_id: reused-session\n")],
+    )
+    .await;
+
+    assert_eq!(
+        store
+            .find_exec_command_node_id_for_session(&head_id, "reused-session")
+            .await
+            .unwrap(),
+        Some(recent_exec_id)
+    );
+}
+
+#[tokio::test]
+async fn tool_session_lookup_requires_the_tool_use_on_the_same_ancestry() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    append_tool_use_node(&store, &store.root_id(), "detached-exec", "exec_command").await;
+    let head_id = append_tool_result_node(
+        &store,
+        &store.root_id(),
+        vec![("detached-exec", "session_id: detached-session\n")],
+    )
+    .await;
+
+    assert_eq!(
+        store
+            .find_exec_command_node_id_for_session(&head_id, "detached-session")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .find_exec_command_node_id_for_session("unknown-head", "detached-session")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn tool_session_lookup_preserves_nearest_tool_use_shadowing() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let exec_id =
+        append_tool_use_node(&store, &store.root_id(), "shared-call", "exec_command").await;
+    let result_id = append_tool_result_node(
+        &store,
+        &exec_id,
+        vec![("shared-call", "session_id: active-session\n")],
+    )
+    .await;
+    let head_id = append_tool_use_node(&store, &result_id, "shared-call", "write_stdin").await;
+
+    assert_eq!(
+        store
+            .find_exec_command_node_id_for_session(&head_id, "active-session")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn tool_session_lookup_query_uses_existing_lookup_indexes() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let mut connection = store.connect().await.unwrap();
+    let plan = diesel::sql_query(format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::node::FIND_EXEC_COMMAND_NODE_ID_FOR_SESSION_QUERY
+    ))
+    .bind::<diesel::sql_types::Text, _>("session")
+    .bind::<diesel::sql_types::Text, _>(store.root_id())
+    .load::<QueryPlanDetail>(&mut connection)
+    .await
+    .unwrap();
+    let details = plan.into_iter().map(|row| row.detail).collect::<Vec<_>>();
+
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("node_tool_uses_tool_use_id_idx")),
+        "{details:#?}"
+    );
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("sqlite_autoindex_nodes_1") && detail.contains("(id=?)")
+        }),
+        "{details:#?}"
+    );
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("sqlite_autoindex_node_tool_results_1")
+                && detail.contains("(node_id=?)")
+        }),
+        "{details:#?}"
+    );
 }
 
 #[tokio::test]
