@@ -231,15 +231,27 @@ fn reorder_detail_rows(paths: &mut [AnchorRangeLayoutPath], occupied_routes: &[G
         let Some(x) = active_paths.first().map(|(_, point)| point.x) else {
             continue;
         };
-        let reserved_rows = occupied_routes
-            .iter()
-            .filter_map(|route| reserved_rows_at_x(*route, x))
-            .flatten()
-            .collect::<std::collections::BTreeSet<_>>();
         let desired_rows = active_paths
             .iter()
             .map(|(_, point)| nearest_row_for_y(point.y))
             .collect::<Vec<_>>();
+        let clearances = occupied_routes
+            .iter()
+            .filter_map(|route| route_clearance_at_x(*route, x))
+            .collect::<Vec<_>>();
+        let mut reserved_rows = clearances
+            .iter()
+            .filter_map(|clearance| canonical_rows_in_clearance(clearance.clone()))
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        for ((_, point), desired_row) in active_paths.iter().zip(&desired_rows) {
+            if clearances
+                .iter()
+                .any(|clearance| clearance.contains(&point.y))
+            {
+                reserved_rows.insert(*desired_row);
+            }
+        }
         for ((path_index, point), (desired_row, row)) in active_paths.into_iter().zip(
             desired_rows
                 .iter()
@@ -336,15 +348,39 @@ fn layout_path_edges(
         .collect()
 }
 
-fn reserved_rows_at_x(route: GraphBezierRoute, x: i32) -> Option<std::ops::RangeInclusive<usize>> {
+fn route_clearance_at_x(route: GraphBezierRoute, x: i32) -> Option<std::ops::RangeInclusive<i32>> {
     let left = route.source.x.min(route.target.x);
     let right = route.source.x.max(route.target.x);
-    if x <= left || x >= right {
+    let clearance_left = x.saturating_sub(NODE_RADIUS);
+    let clearance_right = x.saturating_add(NODE_RADIUS);
+    if clearance_right < left || clearance_left > right {
         return None;
     }
-    let left_y = route_y_at_x(route, x.saturating_sub(NODE_RADIUS));
-    let right_y = route_y_at_x(route, x.saturating_add(NODE_RADIUS));
-    Some(nearest_row_for_y(left_y.min(right_y))..=nearest_row_for_y(left_y.max(right_y)))
+    let left_y = route_y_at_x(route, clearance_left.clamp(left, right));
+    let right_y = route_y_at_x(route, clearance_right.clamp(left, right));
+    Some(
+        left_y.min(right_y).saturating_sub(NODE_RADIUS)
+            ..=left_y.max(right_y).saturating_add(NODE_RADIUS),
+    )
+}
+
+fn canonical_rows_in_clearance(
+    clearance: std::ops::RangeInclusive<i32>,
+) -> Option<std::ops::RangeInclusive<usize>> {
+    let start = i64::from(*clearance.start());
+    let end = i64::from(*clearance.end());
+    let padding = i64::from(GRAPH_PADDING);
+    let step = i64::from(LANE_ROW_STEP);
+    if end < padding {
+        return None;
+    }
+    let first = if start <= padding {
+        0
+    } else {
+        usize::try_from((start - padding + step - 1) / step).unwrap_or(usize::MAX)
+    };
+    let last = usize::try_from((end - padding) / step).unwrap_or(usize::MAX);
+    (first <= last).then_some(first..=last)
 }
 
 fn route_y_at_x(route: GraphBezierRoute, x: i32) -> i32 {
@@ -752,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_reordering_uses_the_nearest_free_row() {
+    fn detail_keeps_its_position_when_the_occupied_route_has_clearance() {
         let paths = vec![AnchorRangePath {
             nodes: vec![
                 node("source", None),
@@ -774,6 +810,32 @@ mod tests {
             &[occupied],
         );
 
-        assert_eq!(layout.paths[0].nodes[0].point, Point { x: 260, y: 56 });
+        assert_eq!(layout.paths[0].nodes[0].point, Point { x: 260, y: 120 });
+    }
+
+    #[test]
+    fn occupied_edge_reserves_adjacent_row_for_unsnapped_detail() {
+        let paths = vec![AnchorRangePath {
+            nodes: vec![
+                node("source", None),
+                node("detail", Some(GraphViewportEdgeKind::Primary)),
+                node("target", Some(GraphViewportEdgeKind::Primary)),
+            ],
+        }];
+        let occupied = GraphBezierRoute {
+            source: Point { x: 100, y: 90 },
+            control_1: Point { x: 180, y: 90 },
+            control_2: Point { x: 356, y: 90 },
+            target: Point { x: 436, y: 90 },
+        };
+
+        let layout = layout_anchor_range(
+            Point { x: 100, y: 104 },
+            Point { x: 436, y: 104 },
+            paths,
+            &[occupied],
+        );
+
+        assert_eq!(layout.paths[0].nodes[0].point, Point { x: 324, y: 56 });
     }
 }
