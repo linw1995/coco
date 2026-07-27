@@ -624,7 +624,8 @@ impl VirtualGraph {
             x: transform.transform_x(target.x),
             y: target.y,
         };
-        let layout = layout_anchor_range(source, expanded_target, paths.clone());
+        let occupied_routes = self.anchor_range_occupied_routes(&selection, transform)?;
+        let layout = layout_anchor_range(source, expanded_target, paths.clone(), &occupied_routes);
         let focus = Point {
             x: layout.bounds.left.saturating_add(layout.bounds.right) / 2,
             y: layout.bounds.top.saturating_add(layout.bounds.bottom) / 2,
@@ -677,9 +678,10 @@ impl VirtualGraph {
             x: transform.transform_x(target.x),
             y: target.y,
         };
+        let occupied_routes = self.anchor_range_occupied_routes(&selection, transform)?;
         self.anchor_range = Some(ExpandedAnchorRange {
             selection,
-            layout: layout_anchor_range(source, expanded_target, paths.clone()),
+            layout: layout_anchor_range(source, expanded_target, paths.clone(), &occupied_routes),
             paths,
             source,
             target,
@@ -736,6 +738,72 @@ impl VirtualGraph {
             }));
         }
         Ok(None)
+    }
+
+    fn anchor_range_occupied_routes(
+        &self,
+        selection: &AnchorRangeSelection,
+        transform: AnchorRangeTransform,
+    ) -> Result<Vec<GraphBezierRoute>, JsValue> {
+        let nodes = self
+            .node_group
+            .query_selector_all(".node-link[data-node-id][data-base-node-x]")?;
+        let mut rendered_node_x = BTreeMap::new();
+        for index in 0..nodes.length() {
+            let Some(node) = nodes.item(index) else {
+                continue;
+            };
+            let Ok(node) = node.dyn_into::<Element>() else {
+                continue;
+            };
+            let Some(node_id) = node.get_attribute("data-node-id") else {
+                continue;
+            };
+            let Some(x) = graph_item_i32(&node, "data-base-node-x") else {
+                continue;
+            };
+            rendered_node_x.insert(node_id, x);
+        }
+
+        let edges = self
+            .edge_group
+            .query_selector_all(".edge[data-render-key]")?;
+        let mut occupied = Vec::new();
+        for index in 0..edges.length() {
+            let Some(edge) = edges.item(index) else {
+                continue;
+            };
+            let Ok(edge) = edge.dyn_into::<Element>() else {
+                continue;
+            };
+            if edge_matches_anchor_range_selection(&edge, selection) {
+                continue;
+            }
+            let Some(route) = graph_edge_route_from_attributes(&edge) else {
+                continue;
+            };
+            let source_node_x = retained_edge_node_x(
+                &edge,
+                "data-source-id",
+                "data-source-node-id",
+                "data-source-node-x",
+                &rendered_node_x,
+            )?;
+            let target_node_x = retained_edge_node_x(
+                &edge,
+                "data-target-id",
+                "data-target-node-id",
+                "data-target-node-x",
+                &rendered_node_x,
+            )?;
+            occupied.push(transform_graph_route(
+                route,
+                source_node_x,
+                target_node_x,
+                transform,
+            ));
+        }
+        Ok(occupied)
     }
 
     fn sync_anchor_range(&self) -> Result<(), JsValue> {
@@ -1540,6 +1608,12 @@ fn edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
 
 fn graph_edge_key(kind: GraphViewportEdgeKind, source_id: &str, target_id: &str) -> String {
     format!("edge:{}:{source_id}:{target_id}", kind.key_part())
+}
+
+fn edge_matches_anchor_range_selection(edge: &Element, selection: &AnchorRangeSelection) -> bool {
+    edge.get_attribute("data-edge-kind").as_deref() == Some(selection.kind.key_part())
+        && edge.get_attribute("data-source-id").as_deref() == Some(selection.source.as_str())
+        && edge.get_attribute("data-target-id").as_deref() == Some(selection.target.as_str())
 }
 
 fn anchor_range_edge_path(edge: AnchorRangeLayoutEdge) -> String {
@@ -3562,6 +3636,72 @@ mod tests {
                 .and_then(|status| status.text_content())
                 .as_deref(),
             Some("Anchor endpoints are outside the rendered graph.")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_shift_edges_when_an_endpoint_node_is_outside_the_viewport() {
+        let fixture = GraphFixture::new();
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            let canvas = GraphCanvas {
+                width: 480,
+                height: 280,
+            };
+            graph.base_canvas = Some(canvas);
+            graph.canvas = Some(canvas);
+            graph
+                .upsert_graph_items(
+                    GraphViewportItems {
+                        nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
+                        edges: vec![
+                            graph_edge(
+                                GraphViewportEdgeKind::Primary,
+                                "source",
+                                "target",
+                                route((120, 80), (150, 80), (168, 80), (188, 80)),
+                            ),
+                            graph_edge(
+                                GraphViewportEdgeKind::Shadow,
+                                "source",
+                                "offscreen-target",
+                                route((120, 200), (150, 200), (168, 200), (188, 200)),
+                            ),
+                        ],
+                    },
+                    false,
+                )
+                .expect_throw("anchor graph items should render");
+            graph
+                .expand_anchor_range(
+                    selection,
+                    vec![AnchorRangePath {
+                        nodes: vec![
+                            anchor_range_node("source", None),
+                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                            anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                        ],
+                    }],
+                )
+                .expect_throw("anchor details should expand")
+                .expect_throw("anchor endpoints should be rendered");
+        }
+
+        let edge = fixture
+            .graph
+            .borrow()
+            .document
+            .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"offscreen-target\"]")
+            .expect_throw("offscreen endpoint edge query should succeed")
+            .expect_throw("offscreen endpoint edge should remain rendered");
+        assert_eq!(
+            edge.get_attribute("d").as_deref(),
+            Some("M 120 200 C 150 200, 280 200, 300 200")
         );
     }
 

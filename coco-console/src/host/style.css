@@ -217,7 +217,7 @@ body {
 }
 
 .anchor-range-frame {
-  fill: rgba(8, 11, 18, 0.96);
+  fill: none;
   pointer-events: none;
   stroke: rgba(96, 165, 250, 0.58);
   stroke-dasharray: 5 5;
