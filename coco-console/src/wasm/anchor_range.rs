@@ -4,7 +4,10 @@ use crate::api::{
 
 pub const DETAIL_RANK_STEP: i32 = 112;
 const LANE_ROW_STEP: i32 = 72;
+const GRAPH_PADDING: i32 = 56;
+const NODE_RADIUS: i32 = 18;
 const RANGE_PADDING: i32 = 52;
+const BEZIER_PARAMETER_SCALE: i64 = 1 << 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorRangeLayout {
@@ -145,14 +148,14 @@ pub fn layout_anchor_range(
     source: Point,
     target: Point,
     paths: Vec<AnchorRangePath>,
+    occupied_routes: &[GraphBezierRoute],
 ) -> AnchorRangeLayout {
     let inserted_left = target.x.saturating_sub(anchor_range_extra_width(&paths));
     let mut bounds = None;
     let mut detail_ids = std::collections::BTreeSet::new();
-    let paths = paths
+    let mut paths = paths
         .into_iter()
-        .enumerate()
-        .map(|(path_index, path)| {
+        .map(|path| {
             let detail_count = path.nodes.len().saturating_sub(2);
             let target_kind = path
                 .nodes
@@ -160,9 +163,6 @@ pub fn layout_anchor_range(
                 .and_then(|node| node.incoming_edge)
                 .unwrap_or(GraphViewportEdgeKind::Primary);
             let denominator = i64::try_from(detail_count + 1).unwrap_or(i64::MAX);
-            let lane_offset = i32::try_from(path_index)
-                .unwrap_or(i32::MAX)
-                .saturating_mul(LANE_ROW_STEP);
             let nodes = path
                 .nodes
                 .into_iter()
@@ -177,39 +177,32 @@ pub fn layout_anchor_range(
                                 .unwrap_or(i32::MAX)
                                 .saturating_mul(DETAIL_RANK_STEP),
                         ),
-                        y: interpolate(source.y, target.y, numerator, denominator)
-                            .saturating_add(lane_offset),
+                        y: interpolate(source.y, target.y, numerator, denominator),
                     };
                     detail_ids.insert(node.id.clone());
-                    bounds
-                        .get_or_insert_with(|| AnchorRangeBounds::from_points(point, point))
-                        .include(point);
                     AnchorRangeLayoutNode { node, point }
                 })
                 .collect::<Vec<_>>();
-
-            let mut points = Vec::with_capacity(nodes.len() + 2);
-            points.push((source, GraphViewportEdgeKind::Primary));
-            points.extend(nodes.iter().map(|node| {
-                (
-                    node.point,
-                    node.node
-                        .incoming_edge
-                        .unwrap_or(GraphViewportEdgeKind::Primary),
-                )
-            }));
-            points.push((target, target_kind));
-            let edges = points
-                .windows(2)
-                .map(|points| AnchorRangeLayoutEdge {
-                    kind: points[1].1,
-                    source: points[0].0,
-                    target: points[1].0,
-                })
-                .collect();
-            AnchorRangeLayoutPath { nodes, edges }
+            AnchorRangeLayoutPath {
+                nodes,
+                edges: vec![AnchorRangeLayoutEdge {
+                    kind: target_kind,
+                    source,
+                    target,
+                }],
+            }
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    reorder_detail_rows(&mut paths, occupied_routes);
+    for path in &mut paths {
+        path.edges = layout_path_edges(source, target, path);
+        for node in &path.nodes {
+            bounds
+                .get_or_insert_with(|| AnchorRangeBounds::from_points(node.point, node.point))
+                .include(node.point);
+        }
+    }
 
     AnchorRangeLayout {
         paths,
@@ -218,6 +211,226 @@ pub fn layout_anchor_range(
             .padded(RANGE_PADDING),
         detail_count: detail_ids.len(),
     }
+}
+
+fn reorder_detail_rows(paths: &mut [AnchorRangeLayoutPath], occupied_routes: &[GraphBezierRoute]) {
+    let column_count = paths
+        .iter()
+        .map(|path| path.nodes.len())
+        .max()
+        .unwrap_or_default();
+    for column in 0..column_count {
+        let mut active_paths = paths
+            .iter()
+            .enumerate()
+            .filter_map(|(path_index, path)| {
+                path.nodes.get(column).map(|node| (path_index, node.point))
+            })
+            .collect::<Vec<_>>();
+        active_paths.sort_by_key(|(path_index, point)| (point.y, *path_index));
+        let Some(x) = active_paths.first().map(|(_, point)| point.x) else {
+            continue;
+        };
+        let reserved_rows = occupied_routes
+            .iter()
+            .filter_map(|route| reserved_rows_at_x(*route, x))
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        let desired_rows = active_paths
+            .iter()
+            .map(|(_, point)| nearest_row_for_y(point.y))
+            .collect::<Vec<_>>();
+        for ((path_index, point), (desired_row, row)) in active_paths.into_iter().zip(
+            desired_rows
+                .iter()
+                .copied()
+                .zip(available_rows_nearest(&desired_rows, &reserved_rows)),
+        ) {
+            paths[path_index].nodes[column].point.y = if row == desired_row {
+                point.y
+            } else {
+                row_y(row)
+            };
+        }
+    }
+}
+
+fn available_rows_nearest(
+    desired_rows: &[usize],
+    reserved_rows: &std::collections::BTreeSet<usize>,
+) -> Vec<usize> {
+    let Some((first_desired, last_desired)) = desired_rows
+        .first()
+        .copied()
+        .zip(desired_rows.last().copied())
+    else {
+        return Vec::new();
+    };
+    let margin = desired_rows
+        .len()
+        .saturating_add(reserved_rows.len())
+        .saturating_add(1);
+    let candidates = (first_desired.saturating_sub(margin)..=last_desired.saturating_add(margin))
+        .filter(|row| !reserved_rows.contains(row))
+        .collect::<Vec<_>>();
+
+    let mut states = candidates
+        .iter()
+        .copied()
+        .map(|row| (row.abs_diff(desired_rows[0]) as u128, vec![row]))
+        .collect::<Vec<_>>();
+    for desired in desired_rows.iter().copied().skip(1) {
+        let mut next = Vec::with_capacity(candidates.len());
+        for (candidate_index, candidate) in candidates.iter().copied().enumerate() {
+            let best = states
+                .iter()
+                .take(candidate_index)
+                .map(|(cost, rows)| {
+                    let mut next_rows = rows.clone();
+                    next_rows.push(candidate);
+                    (
+                        cost.saturating_add(candidate.abs_diff(desired) as u128),
+                        next_rows,
+                    )
+                })
+                .min();
+            next.push(best.unwrap_or((u128::MAX, Vec::new())));
+        }
+        states = next;
+    }
+    states
+        .into_iter()
+        .min()
+        .map(|(_, rows)| rows)
+        .unwrap_or_default()
+}
+
+fn layout_path_edges(
+    source: Point,
+    target: Point,
+    path: &AnchorRangeLayoutPath,
+) -> Vec<AnchorRangeLayoutEdge> {
+    let target_kind = path
+        .edges
+        .first()
+        .map(|edge| edge.kind)
+        .unwrap_or(GraphViewportEdgeKind::Primary);
+    let mut points = Vec::with_capacity(path.nodes.len() + 2);
+    points.push((source, GraphViewportEdgeKind::Primary));
+    points.extend(path.nodes.iter().map(|node| {
+        (
+            node.point,
+            node.node
+                .incoming_edge
+                .unwrap_or(GraphViewportEdgeKind::Primary),
+        )
+    }));
+    points.push((target, target_kind));
+    points
+        .windows(2)
+        .map(|points| AnchorRangeLayoutEdge {
+            kind: points[1].1,
+            source: points[0].0,
+            target: points[1].0,
+        })
+        .collect()
+}
+
+fn reserved_rows_at_x(route: GraphBezierRoute, x: i32) -> Option<std::ops::RangeInclusive<usize>> {
+    let left = route.source.x.min(route.target.x);
+    let right = route.source.x.max(route.target.x);
+    if x <= left || x >= right {
+        return None;
+    }
+    let left_y = route_y_at_x(route, x.saturating_sub(NODE_RADIUS));
+    let right_y = route_y_at_x(route, x.saturating_add(NODE_RADIUS));
+    Some(nearest_row_for_y(left_y.min(right_y))..=nearest_row_for_y(left_y.max(right_y)))
+}
+
+fn route_y_at_x(route: GraphBezierRoute, x: i32) -> i32 {
+    if x <= route.source.x.min(route.target.x) {
+        return if route.source.x <= route.target.x {
+            route.source.y
+        } else {
+            route.target.y
+        };
+    }
+    if x >= route.source.x.max(route.target.x) {
+        return if route.source.x <= route.target.x {
+            route.target.y
+        } else {
+            route.source.y
+        };
+    }
+    let t = route_parameter_at_x(route, x);
+    cubic_coordinate(
+        route.source.y,
+        route.control_1.y,
+        route.control_2.y,
+        route.target.y,
+        t,
+    )
+}
+
+fn route_parameter_at_x(route: GraphBezierRoute, x: i32) -> i64 {
+    let mut lower = 0_i64;
+    let mut upper = BEZIER_PARAMETER_SCALE;
+    while upper - lower > 1 {
+        let middle = lower + (upper - lower) / 2;
+        let middle_x = cubic_coordinate(
+            route.source.x,
+            route.control_1.x,
+            route.control_2.x,
+            route.target.x,
+            middle,
+        );
+        if middle_x < x {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    lower + (upper - lower) / 2
+}
+
+fn cubic_coordinate(start: i32, control_1: i32, control_2: i32, end: i32, t: i64) -> i32 {
+    let t = i128::from(t);
+    let scale = i128::from(BEZIER_PARAMETER_SCALE);
+    let inverse = scale - t;
+    let denominator = scale.saturating_pow(3);
+    let numerator = i128::from(start)
+        .saturating_mul(inverse.saturating_pow(3))
+        .saturating_add(
+            i128::from(control_1)
+                .saturating_mul(3)
+                .saturating_mul(inverse.saturating_pow(2))
+                .saturating_mul(t),
+        )
+        .saturating_add(
+            i128::from(control_2)
+                .saturating_mul(3)
+                .saturating_mul(inverse)
+                .saturating_mul(t.saturating_pow(2)),
+        )
+        .saturating_add(i128::from(end).saturating_mul(t.saturating_pow(3)));
+    let value = numerator / denominator;
+    i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
+}
+
+fn nearest_row_for_y(y: i32) -> usize {
+    if y <= GRAPH_PADDING {
+        return 0;
+    }
+    let offset = i64::from(y) - i64::from(GRAPH_PADDING);
+    let rounded = offset.saturating_add(i64::from(LANE_ROW_STEP) / 2) / i64::from(LANE_ROW_STEP);
+    usize::try_from(rounded).unwrap_or(usize::MAX)
+}
+
+fn row_y(row: usize) -> i32 {
+    i32::try_from(row)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(LANE_ROW_STEP)
+        .saturating_add(GRAPH_PADDING)
 }
 
 impl AnchorRangeBounds {
@@ -291,7 +504,12 @@ mod tests {
         }];
         assert_eq!(anchor_range_extra_width(&paths), DETAIL_RANK_STEP * 2);
 
-        let layout = layout_anchor_range(Point { x: 100, y: 100 }, Point { x: 436, y: 100 }, paths);
+        let layout = layout_anchor_range(
+            Point { x: 100, y: 100 },
+            Point { x: 436, y: 100 },
+            paths,
+            &[],
+        );
 
         assert_eq!(layout.detail_count, 2);
         assert_eq!(layout.paths[0].nodes[0].point, Point { x: 212, y: 100 });
@@ -318,6 +536,7 @@ mod tests {
                 path(GraphViewportEdgeKind::Merge),
                 path(GraphViewportEdgeKind::Shadow),
             ],
+            &[],
         );
 
         assert_eq!(layout.detail_count, 1);
@@ -365,7 +584,7 @@ mod tests {
             x: transform.transform_x(324),
             y: 100,
         };
-        let layout = layout_anchor_range(Point { x: 100, y: 100 }, expanded_target, paths);
+        let layout = layout_anchor_range(Point { x: 100, y: 100 }, expanded_target, paths, &[]);
 
         assert_eq!(transform.transform_x(212), 212);
         assert_eq!(expanded_target.x, 436);
@@ -432,5 +651,129 @@ mod tests {
 
         assert_eq!(route.source, Point { x: 115, y: 110 });
         assert_eq!(route.target, Point { x: 197, y: 162 });
+    }
+
+    #[test]
+    fn expanded_details_skip_rows_occupied_by_other_edges() {
+        let paths = vec![AnchorRangePath {
+            nodes: vec![
+                node("source", None),
+                node("detail", Some(GraphViewportEdgeKind::Primary)),
+                node("target", Some(GraphViewportEdgeKind::Primary)),
+            ],
+        }];
+        let occupied = GraphBezierRoute {
+            source: Point {
+                x: 100,
+                y: GRAPH_PADDING,
+            },
+            control_1: Point {
+                x: 180,
+                y: GRAPH_PADDING,
+            },
+            control_2: Point {
+                x: 356,
+                y: GRAPH_PADDING,
+            },
+            target: Point {
+                x: 436,
+                y: GRAPH_PADDING,
+            },
+        };
+
+        let layout = layout_anchor_range(
+            Point {
+                x: 100,
+                y: GRAPH_PADDING,
+            },
+            Point {
+                x: 436,
+                y: GRAPH_PADDING,
+            },
+            paths,
+            &[occupied],
+        );
+
+        assert_eq!(
+            layout.paths[0].nodes[0].point,
+            Point {
+                x: 324,
+                y: GRAPH_PADDING + LANE_ROW_STEP,
+            }
+        );
+    }
+
+    #[test]
+    fn temporary_path_order_is_stable_around_occupied_rows() {
+        let path = |id| AnchorRangePath {
+            nodes: vec![
+                node("source", None),
+                node(id, Some(GraphViewportEdgeKind::Primary)),
+                node("target", Some(GraphViewportEdgeKind::Primary)),
+            ],
+        };
+        let occupied = GraphBezierRoute {
+            source: Point {
+                x: 100,
+                y: GRAPH_PADDING + LANE_ROW_STEP,
+            },
+            control_1: Point {
+                x: 180,
+                y: GRAPH_PADDING + LANE_ROW_STEP,
+            },
+            control_2: Point {
+                x: 356,
+                y: GRAPH_PADDING + LANE_ROW_STEP,
+            },
+            target: Point {
+                x: 436,
+                y: GRAPH_PADDING + LANE_ROW_STEP,
+            },
+        };
+
+        let layout = layout_anchor_range(
+            Point {
+                x: 100,
+                y: GRAPH_PADDING,
+            },
+            Point {
+                x: 436,
+                y: GRAPH_PADDING,
+            },
+            vec![path("first"), path("second")],
+            &[occupied],
+        );
+
+        assert_eq!(layout.paths[0].nodes[0].point.y, GRAPH_PADDING);
+        assert_eq!(
+            layout.paths[1].nodes[0].point.y,
+            GRAPH_PADDING + LANE_ROW_STEP * 2
+        );
+    }
+
+    #[test]
+    fn temporary_reordering_uses_the_nearest_free_row() {
+        let paths = vec![AnchorRangePath {
+            nodes: vec![
+                node("source", None),
+                node("detail", Some(GraphViewportEdgeKind::Primary)),
+                node("target", Some(GraphViewportEdgeKind::Primary)),
+            ],
+        }];
+        let occupied = GraphBezierRoute {
+            source: Point { x: 140, y: 100 },
+            control_1: Point { x: 170, y: 100 },
+            control_2: Point { x: 328, y: 220 },
+            target: Point { x: 348, y: 220 },
+        };
+
+        let layout = layout_anchor_range(
+            Point { x: 120, y: 100 },
+            Point { x: 372, y: 140 },
+            paths,
+            &[occupied],
+        );
+
+        assert_eq!(layout.paths[0].nodes[0].point, Point { x: 260, y: 56 });
     }
 }

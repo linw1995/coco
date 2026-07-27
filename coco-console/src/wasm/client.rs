@@ -624,7 +624,8 @@ impl VirtualGraph {
             x: transform.transform_x(target.x),
             y: target.y,
         };
-        let layout = layout_anchor_range(source, expanded_target, paths.clone());
+        let occupied_routes = self.anchor_range_occupied_routes(&selection, transform)?;
+        let layout = layout_anchor_range(source, expanded_target, paths.clone(), &occupied_routes);
         let focus = Point {
             x: layout.bounds.left.saturating_add(layout.bounds.right) / 2,
             y: layout.bounds.top.saturating_add(layout.bounds.bottom) / 2,
@@ -677,9 +678,10 @@ impl VirtualGraph {
             x: transform.transform_x(target.x),
             y: target.y,
         };
+        let occupied_routes = self.anchor_range_occupied_routes(&selection, transform)?;
         self.anchor_range = Some(ExpandedAnchorRange {
             selection,
-            layout: layout_anchor_range(source, expanded_target, paths.clone()),
+            layout: layout_anchor_range(source, expanded_target, paths.clone(), &occupied_routes),
             paths,
             source,
             target,
@@ -736,6 +738,72 @@ impl VirtualGraph {
             }));
         }
         Ok(None)
+    }
+
+    fn anchor_range_occupied_routes(
+        &self,
+        selection: &AnchorRangeSelection,
+        transform: AnchorRangeTransform,
+    ) -> Result<Vec<GraphBezierRoute>, JsValue> {
+        let nodes = self
+            .node_group
+            .query_selector_all(".node-link[data-node-id][data-base-node-x]")?;
+        let mut rendered_node_x = BTreeMap::new();
+        for index in 0..nodes.length() {
+            let Some(node) = nodes.item(index) else {
+                continue;
+            };
+            let Ok(node) = node.dyn_into::<Element>() else {
+                continue;
+            };
+            let Some(node_id) = node.get_attribute("data-node-id") else {
+                continue;
+            };
+            let Some(x) = graph_item_i32(&node, "data-base-node-x") else {
+                continue;
+            };
+            rendered_node_x.insert(node_id, x);
+        }
+
+        let edges = self
+            .edge_group
+            .query_selector_all(".edge[data-render-key]")?;
+        let mut occupied = Vec::new();
+        for index in 0..edges.length() {
+            let Some(edge) = edges.item(index) else {
+                continue;
+            };
+            let Ok(edge) = edge.dyn_into::<Element>() else {
+                continue;
+            };
+            if edge_matches_anchor_range_selection(&edge, selection) {
+                continue;
+            }
+            let Some(route) = graph_edge_route_from_attributes(&edge) else {
+                continue;
+            };
+            let source_node_x = retained_edge_node_x(
+                &edge,
+                "data-source-id",
+                "data-source-node-id",
+                "data-source-node-x",
+                &rendered_node_x,
+            )?;
+            let target_node_x = retained_edge_node_x(
+                &edge,
+                "data-target-id",
+                "data-target-node-id",
+                "data-target-node-x",
+                &rendered_node_x,
+            )?;
+            occupied.push(transform_graph_route(
+                route,
+                source_node_x,
+                target_node_x,
+                transform,
+            ));
+        }
+        Ok(occupied)
     }
 
     fn sync_anchor_range(&self) -> Result<(), JsValue> {
@@ -1540,6 +1608,12 @@ fn edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
 
 fn graph_edge_key(kind: GraphViewportEdgeKind, source_id: &str, target_id: &str) -> String {
     format!("edge:{}:{source_id}:{target_id}", kind.key_part())
+}
+
+fn edge_matches_anchor_range_selection(edge: &Element, selection: &AnchorRangeSelection) -> bool {
+    edge.get_attribute("data-edge-kind").as_deref() == Some(selection.kind.key_part())
+        && edge.get_attribute("data-source-id").as_deref() == Some(selection.source.as_str())
+        && edge.get_attribute("data-target-id").as_deref() == Some(selection.target.as_str())
 }
 
 fn anchor_range_edge_path(edge: AnchorRangeLayoutEdge) -> String {
@@ -3735,14 +3809,14 @@ mod tests {
             .expect_throw("detail node should remain expanded");
         assert_eq!(
             detail.get_attribute("transform").as_deref(),
-            Some("translate(260 120)")
+            Some("translate(260 56)")
         );
         let frame = document
             .query_selector(".anchor-range-frame")
             .expect_throw("range frame query should succeed")
             .expect_throw("range frame should remain rendered");
         assert_eq!(frame.get_attribute("x").as_deref(), Some("208"));
-        assert_eq!(frame.get_attribute("y").as_deref(), Some("68"));
+        assert_eq!(frame.get_attribute("y").as_deref(), Some("4"));
         let edge = document
             .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"target\"]")
             .expect_throw("edge query should succeed")
