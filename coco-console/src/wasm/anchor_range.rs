@@ -402,12 +402,84 @@ fn route_clearance_at_x(route: GraphBezierRoute, x: i32) -> Option<std::ops::Ran
     if clearance_right < left || clearance_left > right {
         return None;
     }
-    let left_y = route_y_at_x(route, clearance_left.clamp(left, right));
-    let right_y = route_y_at_x(route, clearance_right.clamp(left, right));
-    Some(
-        left_y.min(right_y).saturating_sub(NODE_RADIUS)
-            ..=left_y.max(right_y).saturating_add(NODE_RADIUS),
+    let span_left = clearance_left.clamp(left, right);
+    let span_right = clearance_right.clamp(left, right);
+    let left_y = route_y_at_x(route, span_left);
+    let right_y = route_y_at_x(route, span_right);
+    let mut minimum_y = left_y.min(right_y);
+    let mut maximum_y = left_y.max(right_y);
+    for parameter in cubic_extrema_parameters(
+        route.source.y,
+        route.control_1.y,
+        route.control_2.y,
+        route.target.y,
     )
+    .into_iter()
+    .flatten()
+    {
+        let extremum_x = cubic_coordinate_f64(
+            route.source.x,
+            route.control_1.x,
+            route.control_2.x,
+            route.target.x,
+            parameter,
+        );
+        if extremum_x < f64::from(span_left) || extremum_x > f64::from(span_right) {
+            continue;
+        }
+        let extremum_y = cubic_coordinate_f64(
+            route.source.y,
+            route.control_1.y,
+            route.control_2.y,
+            route.target.y,
+            parameter,
+        );
+        minimum_y = minimum_y.min(floored_i32(extremum_y));
+        maximum_y = maximum_y.max(ceiled_i32(extremum_y));
+    }
+    Some(minimum_y.saturating_sub(NODE_RADIUS)..=maximum_y.saturating_add(NODE_RADIUS))
+}
+
+fn cubic_extrema_parameters(
+    start: i32,
+    control_1: i32,
+    control_2: i32,
+    end: i32,
+) -> [Option<f64>; 2] {
+    let start = f64::from(start);
+    let control_1 = f64::from(control_1);
+    let control_2 = f64::from(control_2);
+    let end = f64::from(end);
+    let quadratic = end - 3.0 * control_2 + 3.0 * control_1 - start;
+    let linear = 2.0 * (control_2 - 2.0 * control_1 + start);
+    let constant = control_1 - start;
+    if quadratic == 0.0 {
+        return [
+            (linear != 0.0)
+                .then(|| -constant / linear)
+                .filter(|parameter| *parameter > 0.0 && *parameter < 1.0),
+            None,
+        ];
+    }
+    let discriminant = linear * linear - 4.0 * quadratic * constant;
+    if discriminant < 0.0 {
+        return [None, None];
+    }
+    let root = discriminant.sqrt();
+    [
+        Some((-linear - root) / (2.0 * quadratic))
+            .filter(|parameter| *parameter > 0.0 && *parameter < 1.0),
+        Some((-linear + root) / (2.0 * quadratic))
+            .filter(|parameter| *parameter > 0.0 && *parameter < 1.0),
+    ]
+}
+
+fn cubic_coordinate_f64(start: i32, control_1: i32, control_2: i32, end: i32, t: f64) -> f64 {
+    let inverse = 1.0 - t;
+    f64::from(start) * inverse.powi(3)
+        + 3.0 * f64::from(control_1) * inverse.powi(2) * t
+        + 3.0 * f64::from(control_2) * inverse * t.powi(2)
+        + f64::from(end) * t.powi(3)
 }
 
 fn canonical_rows_in_clearance(
@@ -557,6 +629,16 @@ fn rounded_i32(value: f64) -> i32 {
     value
         .round()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn floored_i32(value: f64) -> i32 {
+    value
+        .floor()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn ceiled_i32(value: f64) -> i32 {
+    value.ceil().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 #[cfg(test)]
@@ -993,5 +1075,20 @@ mod tests {
         );
 
         assert_eq!(layout.paths[0].nodes[0].point, Point { x: 324, y: 56 });
+    }
+
+    #[test]
+    fn occupied_route_clearance_includes_interior_bezier_extremum() {
+        let clearance = route_clearance_at_x(
+            GraphBezierRoute {
+                source: Point { x: 0, y: 56 },
+                control_1: Point { x: 100, y: 1_000 },
+                control_2: Point { x: 200, y: 1_000 },
+                target: Point { x: 300, y: 56 },
+            },
+            150,
+        );
+
+        assert_eq!(clearance, Some(735..=782));
     }
 }
