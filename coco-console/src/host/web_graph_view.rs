@@ -330,9 +330,16 @@ fn tool_use_session_id(tool_use: &ToolUse) -> Option<&str> {
 }
 
 fn output_session_id(output: &str) -> Option<&str> {
-    output
-        .lines()
-        .find_map(|line| line.strip_prefix("session_id: "))
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r');
+        if matches!(line, "stdout:" | "stderr:") {
+            return None;
+        }
+        if let Some(session_id) = line.strip_prefix("session_id: ") {
+            return Some(session_id);
+        }
+    }
+    None
 }
 
 fn find_tool_use_for_result<'a>(
@@ -810,6 +817,62 @@ mod tests {
 
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target, "detail-recent-exec-node");
+    }
+
+    #[test]
+    fn stdout_session_id_does_not_shadow_an_older_structured_exec_header() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_use(tool_use(
+                "write-1",
+                "write_stdin",
+                serde_json::json!({"session_id": "active-session"}),
+            )),
+        );
+        let unrelated_result = test_node(
+            "unrelated-result",
+            Kind::tool_result(tool_result(
+                "unrelated-exec-call",
+                "Process exited with code 0\nexit_status: 0\nstdout:\nsession_id: active-session\nstderr:\n",
+            )),
+        );
+        let unrelated_exec = test_node(
+            "unrelated-exec-node",
+            Kind::tool_use(tool_use(
+                "unrelated-exec-call",
+                "exec_command",
+                serde_json::json!({"cmd": "printf 'session_id: active-session'"}),
+            )),
+        );
+        let original_result = test_node(
+            "original-result",
+            Kind::tool_result(tool_result(
+                "original-exec-call",
+                "Process running\r\nsession_id: active-session\r\nexit_status: running\r\nstdout:\r\n\r\nstderr:\r\n",
+            )),
+        );
+        let original_exec = test_node(
+            "original-exec-node",
+            Kind::tool_use(tool_use(
+                "original-exec-call",
+                "exec_command",
+                serde_json::json!({"cmd": "sleep 10"}),
+            )),
+        );
+
+        let links = tool_use_input_links(
+            &current,
+            &[
+                current.clone(),
+                unrelated_result,
+                unrelated_exec,
+                original_result,
+                original_exec,
+            ],
+        );
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "detail-original-exec-node");
     }
 
     #[test]
