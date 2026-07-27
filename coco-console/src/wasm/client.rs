@@ -3809,14 +3809,14 @@ mod tests {
             .expect_throw("detail node should remain expanded");
         assert_eq!(
             detail.get_attribute("transform").as_deref(),
-            Some("translate(260 56)")
+            Some("translate(260 120)")
         );
         let frame = document
             .query_selector(".anchor-range-frame")
             .expect_throw("range frame query should succeed")
             .expect_throw("range frame should remain rendered");
         assert_eq!(frame.get_attribute("x").as_deref(), Some("208"));
-        assert_eq!(frame.get_attribute("y").as_deref(), Some("4"));
+        assert_eq!(frame.get_attribute("y").as_deref(), Some("68"));
         let edge = document
             .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"target\"]")
             .expect_throw("edge query should succeed")
