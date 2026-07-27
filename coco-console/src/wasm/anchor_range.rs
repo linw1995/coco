@@ -196,7 +196,7 @@ pub fn layout_anchor_range(
         })
         .collect::<Vec<_>>();
 
-    reorder_detail_rows(&mut paths, occupied_routes);
+    reorder_detail_rows(&mut paths, target, occupied_routes);
     for path in &mut paths {
         path.edges = layout_path_edges(source, target, path);
         for node in &path.nodes {
@@ -215,7 +215,11 @@ pub fn layout_anchor_range(
     }
 }
 
-fn reorder_detail_rows(paths: &mut [AnchorRangeLayoutPath], occupied_routes: &[GraphBezierRoute]) {
+fn reorder_detail_rows(
+    paths: &mut [AnchorRangeLayoutPath],
+    target: Point,
+    occupied_routes: &[GraphBezierRoute],
+) {
     let column_count = paths
         .iter()
         .map(|path| path.nodes.len())
@@ -237,9 +241,26 @@ fn reorder_detail_rows(paths: &mut [AnchorRangeLayoutPath], occupied_routes: &[G
             .iter()
             .map(|(_, point)| nearest_row_for_y(point.y))
             .collect::<Vec<_>>();
+        let ended_path_routes = paths.iter().filter_map(|path| {
+            (path.nodes.len() <= column)
+                .then(|| path.nodes.last())
+                .flatten()
+                .map(|node| {
+                    route_anchor_range_edge(
+                        AnchorRangeLayoutEdge {
+                            kind: GraphViewportEdgeKind::Primary,
+                            source: node.point,
+                            target,
+                        },
+                        f64::from(NODE_RADIUS),
+                    )
+                })
+        });
         let clearances = occupied_routes
             .iter()
-            .filter_map(|route| route_clearance_at_x(*route, x))
+            .copied()
+            .chain(ended_path_routes)
+            .filter_map(|route| route_clearance_at_x(route, x))
             .collect::<Vec<_>>();
         let mut reserved_rows = clearances
             .iter()
@@ -287,36 +308,59 @@ fn available_rows_nearest(
     let candidates = (first_desired.saturating_sub(margin)..=last_desired.saturating_add(margin))
         .filter(|row| !reserved_rows.contains(row))
         .collect::<Vec<_>>();
-
-    let mut states = candidates
-        .iter()
-        .copied()
-        .map(|row| (row.abs_diff(desired_rows[0]) as u128, vec![row]))
-        .collect::<Vec<_>>();
-    for desired in desired_rows.iter().copied().skip(1) {
-        let mut next = Vec::with_capacity(candidates.len());
-        for (candidate_index, candidate) in candidates.iter().copied().enumerate() {
-            let best = states
-                .iter()
-                .take(candidate_index)
-                .map(|(cost, rows)| {
-                    let mut next_rows = rows.clone();
-                    next_rows.push(candidate);
-                    (
-                        cost.saturating_add(candidate.abs_diff(desired) as u128),
-                        next_rows,
-                    )
-                })
-                .min();
-            next.push(best.unwrap_or((u128::MAX, Vec::new())));
-        }
-        states = next;
+    if candidates.len() < desired_rows.len() {
+        return Vec::new();
     }
-    states
-        .into_iter()
-        .min()
-        .map(|(_, rows)| rows)
-        .unwrap_or_default()
+
+    let mut costs = candidates
+        .iter()
+        .map(|candidate| candidate.abs_diff(desired_rows[0]) as u128)
+        .collect::<Vec<_>>();
+    let mut backpointers = Vec::with_capacity(desired_rows.len().saturating_sub(1));
+    for desired in desired_rows.iter().copied().skip(1) {
+        let mut next_costs = vec![u128::MAX; candidates.len()];
+        let mut predecessors = vec![None; candidates.len()];
+        let mut prefix_best = None;
+        for candidate_index in 0..candidates.len() {
+            if candidate_index > 0 {
+                let previous_index = candidate_index - 1;
+                if costs[previous_index] != u128::MAX
+                    && prefix_best.is_none_or(|best| costs[previous_index] < costs[best])
+                {
+                    prefix_best = Some(previous_index);
+                }
+            }
+            let Some(previous_index) = prefix_best else {
+                continue;
+            };
+            next_costs[candidate_index] = costs[previous_index]
+                .saturating_add(candidates[candidate_index].abs_diff(desired) as u128);
+            predecessors[candidate_index] = Some(previous_index);
+        }
+        costs = next_costs;
+        backpointers.push(predecessors);
+    }
+
+    let Some(mut candidate_index) = costs
+        .iter()
+        .enumerate()
+        .filter(|(_, cost)| **cost != u128::MAX)
+        .min_by_key(|(_, cost)| **cost)
+        .map(|(index, _)| index)
+    else {
+        return Vec::new();
+    };
+    let mut rows = vec![0; desired_rows.len()];
+    for row_index in (0..desired_rows.len()).rev() {
+        rows[row_index] = candidates[candidate_index];
+        if row_index > 0 {
+            let Some(previous_index) = backpointers[row_index - 1][candidate_index] else {
+                return Vec::new();
+            };
+            candidate_index = previous_index;
+        }
+    }
+    rows
 }
 
 fn layout_path_edges(
@@ -811,6 +855,55 @@ mod tests {
         assert_eq!(
             layout.paths[1].nodes[0].point.y,
             GRAPH_PADDING + LANE_ROW_STEP * 2
+        );
+    }
+
+    #[test]
+    fn shorter_path_tail_reserves_its_lane_in_later_columns() {
+        let layout = layout_anchor_range(
+            Point {
+                x: 100,
+                y: GRAPH_PADDING,
+            },
+            Point {
+                x: 548,
+                y: GRAPH_PADDING,
+            },
+            vec![
+                AnchorRangePath {
+                    nodes: vec![
+                        node("source", None),
+                        node("short", Some(GraphViewportEdgeKind::Primary)),
+                        node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                },
+                AnchorRangePath {
+                    nodes: vec![
+                        node("source", None),
+                        node("long-1", Some(GraphViewportEdgeKind::Primary)),
+                        node("long-2", Some(GraphViewportEdgeKind::Primary)),
+                        node("long-3", Some(GraphViewportEdgeKind::Primary)),
+                        node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                },
+            ],
+            &[],
+        );
+
+        assert_eq!(layout.paths[0].nodes[0].point.y, GRAPH_PADDING);
+        assert!(
+            layout.paths[1]
+                .nodes
+                .iter()
+                .all(|node| node.point.y == GRAPH_PADDING + LANE_ROW_STEP)
+        );
+    }
+
+    #[test]
+    fn distant_desired_rows_use_the_nearest_available_rows() {
+        assert_eq!(
+            available_rows_nearest(&[0, 50_000], &std::collections::BTreeSet::new()),
+            vec![0, 50_000]
         );
     }
 
