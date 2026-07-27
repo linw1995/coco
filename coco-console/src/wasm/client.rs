@@ -3640,6 +3640,72 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_shift_edges_when_an_endpoint_node_is_outside_the_viewport() {
+        let fixture = GraphFixture::new();
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            let canvas = GraphCanvas {
+                width: 480,
+                height: 280,
+            };
+            graph.base_canvas = Some(canvas);
+            graph.canvas = Some(canvas);
+            graph
+                .upsert_graph_items(
+                    GraphViewportItems {
+                        nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
+                        edges: vec![
+                            graph_edge(
+                                GraphViewportEdgeKind::Primary,
+                                "source",
+                                "target",
+                                route((120, 80), (150, 80), (168, 80), (188, 80)),
+                            ),
+                            graph_edge(
+                                GraphViewportEdgeKind::Shadow,
+                                "source",
+                                "offscreen-target",
+                                route((120, 200), (150, 200), (168, 200), (188, 200)),
+                            ),
+                        ],
+                    },
+                    false,
+                )
+                .expect_throw("anchor graph items should render");
+            graph
+                .expand_anchor_range(
+                    selection,
+                    vec![AnchorRangePath {
+                        nodes: vec![
+                            anchor_range_node("source", None),
+                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                            anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                        ],
+                    }],
+                )
+                .expect_throw("anchor details should expand")
+                .expect_throw("anchor endpoints should be rendered");
+        }
+
+        let edge = fixture
+            .graph
+            .borrow()
+            .document
+            .query_selector(".edge[data-source-id=\"source\"][data-target-id=\"offscreen-target\"]")
+            .expect_throw("offscreen endpoint edge query should succeed")
+            .expect_throw("offscreen endpoint edge should remain rendered");
+        assert_eq!(
+            edge.get_attribute("d").as_deref(),
+            Some("M 120 200 C 150 200, 280 200, 300 200")
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_insert_anchor_details_before_target_rank() {
         let fixture = GraphFixture::new();
         let selection = AnchorRangeSelection {

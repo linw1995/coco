@@ -1,5 +1,6 @@
 use crate::api::{
-    AnchorRangeNode, AnchorRangePath, GraphBezierRoute, GraphViewportEdgeKind, Point,
+    AnchorRangeNode, AnchorRangePath, GRAPH_SOURCE_PORT_OFFSET_X, GRAPH_TARGET_PORT_OFFSET_X,
+    GraphBezierRoute, GraphViewportEdgeKind, Point,
 };
 
 pub const DETAIL_RANK_STEP: i32 = 112;
@@ -77,12 +78,13 @@ pub fn transform_graph_route(
     target_node_x: Option<i32>,
     transform: AnchorRangeTransform,
 ) -> GraphBezierRoute {
-    let endpoint_delta = |node_x: Option<i32>, endpoint_x: i32| {
-        let anchor_x = node_x.unwrap_or(endpoint_x);
-        transform.transform_x(anchor_x).saturating_sub(anchor_x)
-    };
-    let source_delta = endpoint_delta(source_node_x, route.source.x);
-    let target_delta = endpoint_delta(target_node_x, route.target.x);
+    let source_node_x =
+        source_node_x.unwrap_or_else(|| route.source.x.saturating_sub(GRAPH_SOURCE_PORT_OFFSET_X));
+    let target_node_x =
+        target_node_x.unwrap_or_else(|| route.target.x.saturating_add(GRAPH_TARGET_PORT_OFFSET_X));
+    let endpoint_delta = |node_x: i32| transform.transform_x(node_x).saturating_sub(node_x);
+    let source_delta = endpoint_delta(source_node_x);
+    let target_delta = endpoint_delta(target_node_x);
     let translate = |point: Point, delta: i32| Point {
         x: point.x.saturating_add(delta),
         y: point.y,
@@ -643,6 +645,31 @@ mod tests {
 
         assert_eq!(
             transform_graph_route(route, Some(100), Some(212), transform),
+            GraphBezierRoute {
+                source: Point { x: 120, y: 80 },
+                control_1: Point { x: 150, y: 80 },
+                control_2: Point { x: 280, y: 80 },
+                target: Point { x: 300, y: 80 },
+            }
+        );
+    }
+
+    #[test]
+    fn graph_route_derives_missing_node_centers_from_endpoint_ports() {
+        let transform = AnchorRangeTransform {
+            source_x: 100,
+            target_x: 212,
+            extra_width: 112,
+        };
+        let route = GraphBezierRoute {
+            source: Point { x: 120, y: 80 },
+            control_1: Point { x: 150, y: 80 },
+            control_2: Point { x: 168, y: 80 },
+            target: Point { x: 188, y: 80 },
+        };
+
+        assert_eq!(
+            transform_graph_route(route, None, None, transform),
             GraphBezierRoute {
                 source: Point { x: 120, y: 80 },
                 control_1: Point { x: 150, y: 80 },
