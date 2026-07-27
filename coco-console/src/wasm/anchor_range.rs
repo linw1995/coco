@@ -196,7 +196,7 @@ pub fn layout_anchor_range(
         })
         .collect::<Vec<_>>();
 
-    reorder_detail_rows(&mut paths, target, occupied_routes);
+    reorder_detail_rows(&mut paths, source, target, occupied_routes);
     for path in &mut paths {
         path.edges = layout_path_edges(source, target, path);
         for node in &path.nodes {
@@ -217,6 +217,7 @@ pub fn layout_anchor_range(
 
 fn reorder_detail_rows(
     paths: &mut [AnchorRangeLayoutPath],
+    source: Point,
     target: Point,
     occupied_routes: &[GraphBezierRoute],
 ) {
@@ -241,21 +242,20 @@ fn reorder_detail_rows(
             .iter()
             .map(|(_, point)| nearest_row_for_y(point.y))
             .collect::<Vec<_>>();
-        let ended_path_routes = paths.iter().filter_map(|path| {
-            (path.nodes.len() <= column)
-                .then(|| path.nodes.last())
-                .flatten()
-                .map(|node| {
+        let ended_path_routes =
+            paths
+                .iter()
+                .filter(|path| path.nodes.len() <= column)
+                .map(|path| {
                     route_anchor_range_edge(
                         AnchorRangeLayoutEdge {
                             kind: GraphViewportEdgeKind::Primary,
-                            source: node.point,
+                            source: path.nodes.last().map_or(source, |node| node.point),
                             target,
                         },
                         f64::from(NODE_RADIUS),
                     )
-                })
-        });
+                });
         let clearances = occupied_routes
             .iter()
             .copied()
@@ -896,6 +896,42 @@ mod tests {
                 .nodes
                 .iter()
                 .all(|node| node.point.y == GRAPH_PADDING + LANE_ROW_STEP)
+        );
+    }
+
+    #[test]
+    fn direct_path_reserves_its_lane_for_detailed_paths() {
+        let layout = layout_anchor_range(
+            Point {
+                x: 100,
+                y: GRAPH_PADDING,
+            },
+            Point {
+                x: 324,
+                y: GRAPH_PADDING,
+            },
+            vec![
+                AnchorRangePath {
+                    nodes: vec![
+                        node("source", None),
+                        node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                },
+                AnchorRangePath {
+                    nodes: vec![
+                        node("source", None),
+                        node("detail", Some(GraphViewportEdgeKind::Primary)),
+                        node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                },
+            ],
+            &[],
+        );
+
+        assert!(layout.paths[0].nodes.is_empty());
+        assert_eq!(
+            layout.paths[1].nodes[0].point.y,
+            GRAPH_PADDING + LANE_ROW_STEP
         );
     }
 
