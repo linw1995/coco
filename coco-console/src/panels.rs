@@ -921,6 +921,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
     let mut index = 0;
     let mut expects_command = true;
     let mut at_word_start = true;
+    let mut in_assignment = false;
 
     while index < chars.len() {
         let start = index;
@@ -929,6 +930,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 index += 1;
                 expects_command = true;
                 at_word_start = true;
+                in_assignment = false;
                 push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
             }
             character if character.is_whitespace() => {
@@ -936,6 +938,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     index += 1;
                 }
                 at_word_start = true;
+                in_assignment = false;
                 push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
             }
             '#' if at_word_start => {
@@ -959,7 +962,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                         }
                     }
                 }
-                if expects_command {
+                if expects_command && !in_assignment {
                     expects_command = false;
                 }
                 at_word_start = false;
@@ -967,7 +970,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
             }
             '$' => {
                 index = shell_variable_end(&chars, index);
-                if expects_command {
+                if expects_command && !in_assignment {
                     expects_command = false;
                 }
                 at_word_start = false;
@@ -987,6 +990,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     expects_command = true;
                 }
                 at_word_start = true;
+                in_assignment = false;
                 push_shell_token(&mut tokens, ShellTokenKind::Operator, &chars[start..index]);
             }
             _ => {
@@ -997,19 +1001,22 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     index += 1;
                 }
                 let text = chars[start..index].iter().collect::<String>();
-                let keyword = is_shell_keyword(&text);
+                let assignment = expects_command && is_shell_assignment(&text);
+                let keyword = expects_command && !in_assignment && is_shell_keyword(&text);
                 let kind = if keyword {
                     ShellTokenKind::Keyword
                 } else if text.starts_with('-') {
                     ShellTokenKind::Option
-                } else if expects_command && !is_shell_assignment(&text) {
+                } else if expects_command && !in_assignment && !assignment {
                     ShellTokenKind::Command
                 } else {
                     ShellTokenKind::Plain
                 };
                 if keyword {
                     expects_command = shell_keyword_expects_command(&text);
-                } else if expects_command && !is_shell_assignment(&text) {
+                } else if assignment {
+                    in_assignment = true;
+                } else if expects_command && !in_assignment {
                     expects_command = false;
                 }
                 at_word_start = false;
@@ -1783,7 +1790,7 @@ mod tests {
     #[test]
     fn tool_input_cmd_renders_highlighted_shell_without_changing_the_command() {
         let command = concat!(
-            "FOO=bar printf '%s\\n' \"$HOME\" | sed -n '1p'\n",
+            "FOO=\"$HOME\" printf '%s\\n' \"$HOME\" | sed -n '1p'\n",
             "if test -n $HOME; then # inspect the value\n",
             "  echo '</script>'\n",
             "fi"
@@ -1825,6 +1832,25 @@ mod tests {
         assert!(input.contains(r#"aria-label="Shell command""#));
         assert!(input.contains("&lt;/script&gt;"));
         assert!(!input.contains("<script>"));
+    }
+
+    #[test]
+    fn shell_highlighter_recognizes_keywords_only_at_command_positions() {
+        let tokens = highlighted_shell_tokens("echo if foo");
+        let words = tokens
+            .iter()
+            .filter(|token| !token.text.trim().is_empty())
+            .map(|token| (token.kind, token.text.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            words,
+            vec![
+                (ShellTokenKind::Command, "echo"),
+                (ShellTokenKind::Plain, "if"),
+                (ShellTokenKind::Plain, "foo"),
+            ]
+        );
     }
 
     #[test]
