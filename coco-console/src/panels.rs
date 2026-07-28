@@ -922,15 +922,21 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
     let mut expects_command = true;
     let mut at_word_start = true;
     let mut in_assignment = false;
+    let mut in_redirection = false;
 
     while index < chars.len() {
         let start = index;
         match chars[index] {
+            '\\' if chars.get(index + 1) == Some(&'\n') => {
+                index += 2;
+                push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
+            }
             '\n' => {
                 index += 1;
                 expects_command = true;
                 at_word_start = true;
                 in_assignment = false;
+                in_redirection = false;
                 push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
             }
             character if character.is_whitespace() => {
@@ -939,6 +945,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 }
                 at_word_start = true;
                 in_assignment = false;
+                in_redirection = false;
                 push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
             }
             '#' if at_word_start => {
@@ -962,7 +969,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                         }
                     }
                 }
-                if expects_command && !in_assignment {
+                if expects_command && !in_assignment && !in_redirection {
                     expects_command = false;
                 }
                 at_word_start = false;
@@ -970,7 +977,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
             }
             '$' => {
                 index = shell_variable_end(&chars, index);
-                if expects_command && !in_assignment {
+                if expects_command && !in_assignment && !in_redirection {
                     expects_command = false;
                 }
                 at_word_start = false;
@@ -991,6 +998,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 }
                 at_word_start = true;
                 in_assignment = false;
+                in_redirection = matches!(operator, '<' | '>');
                 push_shell_token(&mut tokens, ShellTokenKind::Operator, &chars[start..index]);
             }
             _ => {
@@ -1002,12 +1010,23 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 }
                 let text = chars[start..index].iter().collect::<String>();
                 let assignment = expects_command && is_shell_assignment(&text);
-                let keyword = expects_command && !in_assignment && is_shell_keyword(&text);
+                let redirection_fd = expects_command
+                    && text.chars().all(|character| character.is_ascii_digit())
+                    && chars
+                        .get(index)
+                        .is_some_and(|character| matches!(character, '<' | '>'));
+                let keyword =
+                    expects_command && !in_assignment && !in_redirection && is_shell_keyword(&text);
                 let kind = if keyword {
                     ShellTokenKind::Keyword
                 } else if text.starts_with('-') {
                     ShellTokenKind::Option
-                } else if expects_command && !in_assignment && !assignment {
+                } else if expects_command
+                    && !in_assignment
+                    && !in_redirection
+                    && !assignment
+                    && !redirection_fd
+                {
                     ShellTokenKind::Command
                 } else {
                     ShellTokenKind::Plain
@@ -1016,7 +1035,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     expects_command = shell_keyword_expects_command(&text);
                 } else if assignment {
                     in_assignment = true;
-                } else if expects_command && !in_assignment {
+                } else if expects_command && !in_assignment && !in_redirection && !redirection_fd {
                     expects_command = false;
                 }
                 at_word_start = false;
@@ -1849,6 +1868,32 @@ mod tests {
                 (ShellTokenKind::Command, "echo"),
                 (ShellTokenKind::Plain, "if"),
                 (ShellTokenKind::Plain, "foo"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_highlighter_preserves_command_position_across_prefix_syntax() {
+        let redirection_tokens = highlighted_shell_tokens("2>/dev/null grep foo file\n<input cat");
+        let redirection_commands = redirection_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        let continuation_tokens = highlighted_shell_tokens("printf '%s' \\\nvalue");
+        let continuation_words = continuation_tokens
+            .iter()
+            .filter(|token| !token.text.trim().is_empty() && token.text != "\\\n")
+            .map(|token| (token.kind, token.text.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(redirection_commands, vec!["grep", "cat"]);
+        assert_eq!(
+            continuation_words,
+            vec![
+                (ShellTokenKind::Command, "printf"),
+                (ShellTokenKind::String, "'%s'"),
+                (ShellTokenKind::Plain, "value"),
             ]
         );
     }
