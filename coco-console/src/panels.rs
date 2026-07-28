@@ -930,11 +930,16 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
     let mut at_word_start = true;
     let mut in_assignment = false;
     let mut in_redirection = false;
+    let mut redirection_operand_started = false;
     let mut expects_heredoc_delimiter = false;
-    let mut heredoc_delimiter = None;
+    let mut heredoc_delimiter: Option<String> = None;
     let mut heredoc_strips_tabs = false;
     let mut in_heredoc_body = false;
     let mut case_phase = None;
+    let mut expects_function_name = false;
+    let mut expects_function_body = false;
+    let mut in_function_parameters = false;
+    let mut command_options_allowed = false;
 
     while index < chars.len() {
         let start = index;
@@ -976,9 +981,12 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     case_phase,
                     Some(ShellCasePhase::Subject | ShellCasePhase::Pattern)
                 );
+                expects_heredoc_delimiter = false;
                 at_word_start = true;
                 in_assignment = false;
                 in_redirection = false;
+                redirection_operand_started = false;
+                command_options_allowed = false;
                 in_heredoc_body = heredoc_delimiter.is_some();
                 push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
             }
@@ -986,9 +994,15 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 while index < chars.len() && chars[index].is_whitespace() && chars[index] != '\n' {
                     index += 1;
                 }
+                if heredoc_delimiter.is_some() {
+                    expects_heredoc_delimiter = false;
+                }
                 at_word_start = true;
                 in_assignment = false;
-                in_redirection = false;
+                if redirection_operand_started {
+                    in_redirection = false;
+                    redirection_operand_started = false;
+                }
                 push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
             }
             '#' if at_word_start => {
@@ -1014,12 +1028,14 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 }
                 if expects_command && !in_assignment && !in_redirection {
                     expects_command = false;
+                    command_options_allowed = false;
                 }
                 if expects_heredoc_delimiter {
-                    heredoc_delimiter =
-                        Some(chars[start + 1..index.saturating_sub(1)].iter().collect());
-                    expects_heredoc_delimiter = false;
+                    heredoc_delimiter
+                        .get_or_insert_default()
+                        .extend(chars[start + 1..index.saturating_sub(1)].iter().copied());
                 }
+                redirection_operand_started |= in_redirection;
                 at_word_start = false;
                 push_shell_token(&mut tokens, ShellTokenKind::String, &chars[start..index]);
             }
@@ -1027,7 +1043,14 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 index = shell_variable_end(&chars, index);
                 if expects_command && !in_assignment && !in_redirection {
                     expects_command = false;
+                    command_options_allowed = false;
                 }
+                if expects_heredoc_delimiter {
+                    heredoc_delimiter
+                        .get_or_insert_default()
+                        .extend(chars[start..index].iter().copied());
+                }
+                redirection_operand_started |= in_redirection;
                 at_word_start = false;
                 push_shell_token(&mut tokens, ShellTokenKind::Variable, &chars[start..index]);
             }
@@ -1039,6 +1062,13 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     if chars.get(index) == Some(&'>') {
                         index += 1;
                     }
+                } else if operator == ';' && chars.get(index) == Some(&'&') {
+                    index += 1;
+                } else if operator == ';'
+                    && chars.get(index) == Some(&';')
+                    && chars.get(index + 1) == Some(&'&')
+                {
+                    index += 2;
                 } else if index < chars.len()
                     && (chars[index] == operator
                         || (operator == '>' && chars[index] == '|')
@@ -1060,19 +1090,43 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     && !is_case_pattern_separator
                 {
                     expects_command = true;
+                    command_options_allowed = false;
                 }
                 if operator == ')' && case_phase == Some(ShellCasePhase::Pattern) {
                     case_phase = Some(ShellCasePhase::Command);
                     expects_command = true;
-                } else if operator_text == ";;" && case_phase == Some(ShellCasePhase::Command) {
+                } else if matches!(operator_text.as_str(), ";;" | ";&" | ";;&")
+                    && case_phase == Some(ShellCasePhase::Command)
+                {
                     case_phase = Some(ShellCasePhase::Pattern);
                     expects_command = false;
+                }
+                let starts_function_parameters = operator == '('
+                    && (expects_function_body
+                        || (!expects_command
+                            && tokens
+                                .last()
+                                .is_some_and(|token| token.kind == ShellTokenKind::Command)));
+                if starts_function_parameters {
+                    if let Some(function_name) = tokens
+                        .last_mut()
+                        .filter(|token| token.kind == ShellTokenKind::Command)
+                    {
+                        function_name.kind = ShellTokenKind::Plain;
+                    }
+                    expects_function_body = false;
+                    in_function_parameters = true;
+                } else if operator == ')' && in_function_parameters {
+                    in_function_parameters = false;
+                    expects_function_body = true;
                 }
                 at_word_start = true;
                 in_assignment = false;
                 in_redirection = is_redirection;
+                redirection_operand_started = false;
                 expects_heredoc_delimiter = matches!(operator_text.as_str(), "<<" | "<<-");
                 if expects_heredoc_delimiter {
+                    heredoc_delimiter = None;
                     heredoc_strips_tabs = operator_text == "<<-";
                 }
                 push_shell_token(&mut tokens, ShellTokenKind::Operator, &chars[start..index]);
@@ -1103,6 +1157,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 let keyword = !in_assignment
                     && !in_redirection
                     && ((expects_command && is_shell_keyword(&text))
+                        || (expects_function_body && text == "{")
                         || (case_phase == Some(ShellCasePhase::Subject) && text == "in")
                         || (case_phase.is_some() && text == "esac"));
                 let kind = if keyword {
@@ -1133,17 +1188,39 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                             case_phase = None;
                             expects_command = false;
                         }
-                        _ => expects_command = shell_keyword_expects_command(&text),
+                        "function" => {
+                            expects_function_name = true;
+                            expects_command = false;
+                        }
+                        "{" => {
+                            expects_function_body = false;
+                            expects_command = true;
+                        }
+                        "time" => {
+                            command_options_allowed = true;
+                            expects_command = true;
+                        }
+                        _ => {
+                            command_options_allowed = false;
+                            expects_command = shell_keyword_expects_command(&text);
+                        }
                     }
+                } else if expects_function_name {
+                    expects_function_name = false;
+                    expects_function_body = true;
                 } else if assignment {
                     in_assignment = true;
+                } else if expects_command && command_options_allowed && text.starts_with('-') {
                 } else if expects_command && !in_assignment && !in_redirection && !redirection_fd {
                     expects_command = false;
+                    command_options_allowed = false;
                 }
                 if expects_heredoc_delimiter {
-                    heredoc_delimiter = Some(text.clone());
-                    expects_heredoc_delimiter = false;
+                    heredoc_delimiter
+                        .get_or_insert_default()
+                        .push_str(&shell_unescape_word(&text));
                 }
+                redirection_operand_started |= in_redirection;
                 at_word_start = false;
                 tokens.push(ShellToken::new(kind, text));
             }
@@ -1151,6 +1228,21 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
     }
 
     tokens
+}
+
+fn shell_unescape_word(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut unescaped = String::with_capacity(text.len());
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            if let Some(escaped) = chars.next() {
+                unescaped.push(escaped);
+            }
+        } else {
+            unescaped.push(character);
+        }
+    }
+    unescaped
 }
 
 fn shell_variable_end(chars: &[char], start: usize) -> usize {
@@ -1984,7 +2076,7 @@ mod tests {
     fn shell_highlighter_preserves_command_position_across_prefix_syntax() {
         let redirection_tokens = highlighted_shell_tokens(concat!(
             "2>&1 grep foo file\n",
-            "<input cat\n",
+            "< input cat\n",
             "printf error >&2\n",
             "printf '%s' value &>/tmp/log tail"
         ));
@@ -2033,6 +2125,9 @@ mod tests {
             "cat <<-END\n",
             "\tpayload\n",
             "\tEND\n",
+            "cat <<'END'_SQL\n",
+            "payload\n",
+            "END_SQL\n",
             "printf done"
         ));
         let heredoc_commands = heredoc_tokens
@@ -2053,10 +2148,33 @@ mod tests {
             .filter(|token| token.kind == ShellTokenKind::Command)
             .map(|token| token.text.as_str())
             .collect::<Vec<_>>();
+        let function_tokens =
+            highlighted_shell_tokens("function foo { echo hi; }\nbar() { printf ok; }");
+        let function_commands = function_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        let time_tokens = highlighted_shell_tokens("time -p sleep 1");
+        let time_commands = time_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        let fallthrough_tokens =
+            highlighted_shell_tokens("case \"$x\" in x) echo x ;& y) echo y ;;& z) echo z;; esac");
+        let fallthrough_commands = fallthrough_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
 
-        assert_eq!(heredoc_commands, vec!["cat", "cat", "printf"]);
+        assert_eq!(heredoc_commands, vec!["cat", "cat", "cat", "printf"]);
         assert_eq!(case_commands, vec!["echo", "grep"]);
         assert_eq!(group_commands, vec!["echo"]);
+        assert_eq!(function_commands, vec!["echo", "printf"]);
+        assert_eq!(time_commands, vec!["sleep"]);
+        assert_eq!(fallthrough_commands, vec!["echo", "echo", "echo"]);
     }
 
     #[test]
