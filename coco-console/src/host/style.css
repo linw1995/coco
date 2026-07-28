@@ -1184,7 +1184,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   color: #94a3b8;
 }
 
-@media (max-width: 860px) {
+@media (max-width: 1024px) {
   body {
     min-height: 100svh;
     overflow: auto;
