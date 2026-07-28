@@ -1078,13 +1078,19 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 push_shell_token(&mut tokens, ShellTokenKind::Operator, &chars[start..index]);
             }
             _ => {
-                while index < chars.len()
-                    && !chars[index].is_whitespace()
-                    && !matches!(
-                        chars[index],
-                        '\'' | '"' | '$' | '|' | '&' | ';' | '<' | '>' | '(' | ')'
-                    )
-                {
+                while index < chars.len() {
+                    if chars[index] == '\\' && chars.get(index + 1).is_some() {
+                        index += 2;
+                        continue;
+                    }
+                    if chars[index].is_whitespace()
+                        || matches!(
+                            chars[index],
+                            '\'' | '"' | '$' | '|' | '&' | ';' | '<' | '>' | '(' | ')'
+                        )
+                    {
+                        break;
+                    }
                     index += 1;
                 }
                 let text = chars[start..index].iter().collect::<String>();
@@ -1193,7 +1199,8 @@ fn push_shell_token(tokens: &mut Vec<ShellToken>, kind: ShellTokenKind, chars: &
 fn is_shell_keyword(text: &str) -> bool {
     matches!(
         text,
-        "case"
+        "{" | "}"
+            | "case"
             | "do"
             | "done"
             | "elif"
@@ -1216,7 +1223,7 @@ fn is_shell_keyword(text: &str) -> bool {
 fn shell_keyword_expects_command(keyword: &str) -> bool {
     matches!(
         keyword,
-        "!" | "do" | "elif" | "else" | "if" | "then" | "time" | "until" | "while"
+        "!" | "{" | "do" | "elif" | "else" | "if" | "then" | "time" | "until" | "while"
     )
 }
 
@@ -2005,6 +2012,16 @@ mod tests {
                 (ShellTokenKind::Plain, "value"),
             ]
         );
+
+        let escaped_assignment_tokens =
+            highlighted_shell_tokens("FOO=hello\\ world printf '%s' ok");
+        let escaped_assignment_commands = escaped_assignment_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(escaped_assignment_commands, vec!["printf"]);
     }
 
     #[test]
@@ -2030,9 +2047,16 @@ mod tests {
             .filter(|token| token.kind == ShellTokenKind::Command)
             .map(|token| token.text.as_str())
             .collect::<Vec<_>>();
+        let group_tokens = highlighted_shell_tokens("{ echo hi; }");
+        let group_commands = group_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
 
         assert_eq!(heredoc_commands, vec!["cat", "cat", "printf"]);
         assert_eq!(case_commands, vec!["echo", "grep"]);
+        assert_eq!(group_commands, vec!["echo"]);
     }
 
     #[test]
