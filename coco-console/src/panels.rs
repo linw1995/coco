@@ -997,7 +997,8 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     index += 1;
                 }
                 let text = chars[start..index].iter().collect::<String>();
-                let kind = if is_shell_keyword(&text) {
+                let keyword = is_shell_keyword(&text);
+                let kind = if keyword {
                     ShellTokenKind::Keyword
                 } else if text.starts_with('-') {
                     ShellTokenKind::Option
@@ -1006,7 +1007,9 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 } else {
                     ShellTokenKind::Plain
                 };
-                if expects_command && !is_shell_assignment(&text) {
+                if keyword {
+                    expects_command = shell_keyword_expects_command(&text);
+                } else if expects_command && !is_shell_assignment(&text) {
                     expects_command = false;
                 }
                 at_word_start = false;
@@ -1080,6 +1083,13 @@ fn is_shell_keyword(text: &str) -> bool {
             | "time"
             | "until"
             | "while"
+    )
+}
+
+fn shell_keyword_expects_command(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "do" | "elif" | "else" | "if" | "then" | "time" | "until" | "while"
     )
 }
 
@@ -1786,6 +1796,11 @@ mod tests {
         }
         .to_html();
         let highlighted = highlighted_shell_tokens(command);
+        let highlighted_commands = highlighted
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             highlighted
@@ -1794,6 +1809,8 @@ mod tests {
                 .collect::<String>(),
             command
         );
+        assert!(highlighted_commands.contains(&"test"));
+        assert!(highlighted_commands.contains(&"echo"));
         for class in [
             "shell-command",
             "shell-option",
