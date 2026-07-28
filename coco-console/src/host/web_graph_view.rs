@@ -10,7 +10,7 @@ use snafu::prelude::*;
 use crate::api::{
     GRAPH_SOURCE_PORT_OFFSET_X, GRAPH_TARGET_PORT_OFFSET_X, GraphViewportDiffResponse,
     GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItemKind, GraphViewportItems,
-    GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse,
+    GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, ToolUseInputLink,
 };
 use crate::host::api::GraphViewportKnownItems;
 use crate::web_graph::{BezierRoute, Point};
@@ -299,6 +299,48 @@ pub fn node_id_from_target(target: &str) -> Option<&str> {
         .filter(|node_id| !node_id.is_empty())
 }
 
+pub fn write_stdin_session_ids(node: &Node) -> impl Iterator<Item = &str> {
+    node.kind
+        .as_tool_uses()
+        .into_iter()
+        .flatten()
+        .filter(|tool_use| tool_use.name == "write_stdin")
+        .filter_map(tool_use_session_id)
+}
+
+pub fn tool_use_input_links(
+    node: &Node,
+    exec_node_ids_by_session: &HashMap<String, String>,
+) -> Vec<ToolUseInputLink> {
+    let Some(tool_uses) = node.kind.as_tool_uses() else {
+        return Vec::new();
+    };
+
+    tool_uses
+        .iter()
+        .enumerate()
+        .filter(|(_, tool_use)| tool_use.name == "write_stdin")
+        .filter_map(|(tool_use_index, tool_use)| {
+            let session_id = tool_use_session_id(tool_use)?;
+            let exec_node_id = exec_node_ids_by_session.get(session_id)?;
+            Some(ToolUseInputLink {
+                tool_use_index,
+                tool_use_id: tool_use.id.clone(),
+                input_pointer: "/session_id".to_owned(),
+                value: session_id.to_owned(),
+                target: node_target_id(exec_node_id),
+            })
+        })
+        .collect()
+}
+
+fn tool_use_session_id(tool_use: &ToolUse) -> Option<&str> {
+    tool_use
+        .input
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointPortSlots {
     pub source: usize,
@@ -521,6 +563,26 @@ mod tests {
     use super::*;
     use crate::api::{GraphCanvas, GraphViewport};
 
+    fn test_node(id: &str, kind: Kind) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "parent": "parent-node",
+            "created_at": "2026-07-25T00:00:00Z",
+            "role": "LLM",
+            "metadata": null,
+            "kind": kind,
+        }))
+        .expect("test node should deserialize")
+    }
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> ToolUse {
+        ToolUse {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            input,
+        }
+    }
+
     fn response(version: u64, nodes: Vec<GraphViewportNode>) -> GraphViewportResponse {
         GraphViewportResponse {
             version,
@@ -599,5 +661,92 @@ mod tests {
         assert_eq!(edge_port_offset(0, 1), 0);
         assert_eq!(edge_port_offset(0, 2), -12);
         assert_eq!(edge_port_offset(1, 2), 12);
+    }
+
+    #[test]
+    fn tool_input_links_identify_the_exact_item_pointer_and_exec_target() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_uses(vec![
+                tool_use(
+                    "other",
+                    "search_skill",
+                    serde_json::json!({"session_id": "exec-1"}),
+                ),
+                tool_use(
+                    "write-1",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "exec-1", "chars": ""}),
+                ),
+            ]),
+        );
+        let targets = HashMap::from([("exec-1".to_owned(), "exec-node".to_owned())]);
+
+        assert_eq!(
+            tool_use_input_links(&current, &targets),
+            vec![ToolUseInputLink {
+                tool_use_index: 1,
+                tool_use_id: "write-1".to_owned(),
+                input_pointer: "/session_id".to_owned(),
+                value: "exec-1".to_owned(),
+                target: "detail-exec-node".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_input_links_skip_missing_non_string_and_unresolved_session_ids() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_uses(vec![
+                tool_use("missing", "write_stdin", serde_json::json!({"chars": ""})),
+                tool_use(
+                    "non-string",
+                    "write_stdin",
+                    serde_json::json!({"session_id": 42}),
+                ),
+                tool_use(
+                    "unresolved",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "unknown"}),
+                ),
+            ]),
+        );
+
+        assert!(tool_use_input_links(&current, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn multiple_write_stdin_calls_link_independently_by_item() {
+        let current = test_node(
+            "write-node",
+            Kind::tool_uses(vec![
+                tool_use(
+                    "write-1",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "exec-1"}),
+                ),
+                tool_use(
+                    "write-2",
+                    "write_stdin",
+                    serde_json::json!({"session_id": "exec-2"}),
+                ),
+            ]),
+        );
+        let links = tool_use_input_links(
+            &current,
+            &HashMap::from([
+                ("exec-1".to_owned(), "exec-node-1".to_owned()),
+                ("exec-2".to_owned(), "exec-node-2".to_owned()),
+            ]),
+        );
+
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| (link.tool_use_index, link.target.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "detail-exec-node-1"), (1, "detail-exec-node-2")]
+        );
     }
 }

@@ -7,7 +7,7 @@ use leptos::server_fn::codec::GetUrl;
 
 use crate::api::{
     AnchorRangeResponse, GraphViewportEdgeKind, NodeDetailResponse, ProviderContextItem,
-    ProviderContextResponse,
+    ProviderContextResponse, ToolUseInputLink,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -231,12 +231,15 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         NodeDetailResponse::Missing { target } => {
             view! { <NodeDetailMissing target=target/> }.into_any()
         }
-        NodeDetailResponse::Found { node } => view! { <NodeDetail node=*node/> }.into_any(),
+        NodeDetailResponse::Found {
+            node,
+            tool_use_input_links,
+        } => view! { <NodeDetail node=*node tool_use_input_links/> }.into_any(),
     }
 }
 
 #[component]
-fn NodeDetail(node: Node) -> impl IntoView {
+fn NodeDetail(node: Node, tool_use_input_links: Vec<ToolUseInputLink>) -> impl IntoView {
     let target = format!("{NODE_TARGET_PREFIX}{}", node.id);
     let kind = node_kind_name(&node.kind);
     let kind_class = format!("node-details node-detail kind-{kind}");
@@ -290,20 +293,30 @@ fn NodeDetail(node: Node) -> impl IntoView {
                     </div>
                 }).collect::<Vec<_>>()}
             </dl>
-            <NodeDetailBody kind=node.kind/>
+            <NodeDetailBody kind=node.kind tool_use_input_links/>
         </section>
     }
 }
 
 #[component]
-fn NodeDetailBody(kind: Kind) -> AnyView {
+fn NodeDetailBody(
+    kind: Kind,
+    #[prop(default = Vec::new())] tool_use_input_links: Vec<ToolUseInputLink>,
+) -> AnyView {
     match kind {
         Kind::Anchor(anchor) => {
             view! { <AnchorDetailBody payload=anchor.payload/> }.into_any()
         }
         Kind::ToolUse(items) => view! {
             <div class="node-detail-body node-detail-items">
-                {items.into_iter().map(|item| view! { <ToolUseDetail item=item/> }).collect::<Vec<_>>()}
+                {items.into_iter().enumerate().map(|(index, item)| {
+                    let input_links = tool_use_input_links
+                        .iter()
+                        .filter(|link| link.tool_use_index == index && link.tool_use_id == item.id)
+                        .cloned()
+                        .collect();
+                    view! { <ToolUseDetail item=item input_links/> }
+                }).collect::<Vec<_>>()}
             </div>
         }
         .into_any(),
@@ -636,7 +649,10 @@ impl JsonToken {
 }
 
 #[component]
-fn ToolInput(input: serde_json::Value) -> impl IntoView {
+fn ToolInput(
+    input: serde_json::Value,
+    #[prop(default = Vec::new())] input_links: Vec<ToolUseInputLink>,
+) -> impl IntoView {
     let view = ArcRwSignal::new(ToolInputView::List);
     let list_class_view = view.clone();
     let list_pressed_view = view.clone();
@@ -646,6 +662,7 @@ fn ToolInput(input: serde_json::Value) -> impl IntoView {
     let raw_click_view = view.clone();
     let content_view = view;
     let list_input = input.clone();
+    let list_input_links = input_links;
 
     view! {
         <section class="node-detail-section tool-input">
@@ -684,7 +701,13 @@ fn ToolInput(input: serde_json::Value) -> impl IntoView {
             </div>
             {move || match content_view.get() {
                 ToolInputView::List => {
-                    view! { <ToolInputList input=list_input.clone()/> }.into_any()
+                    view! {
+                        <ToolInputList
+                            input=list_input.clone()
+                            input_links=list_input_links.clone()
+                        />
+                    }
+                    .into_any()
                 }
                 ToolInputView::Raw => {
                     view! { <ToolInputRaw input=input.clone()/> }.into_any()
@@ -695,17 +718,24 @@ fn ToolInput(input: serde_json::Value) -> impl IntoView {
 }
 
 #[component]
-fn ToolInputList(input: serde_json::Value) -> impl IntoView {
-    tool_input_list(&input, "")
+fn ToolInputList(
+    input: serde_json::Value,
+    #[prop(default = Vec::new())] input_links: Vec<ToolUseInputLink>,
+) -> impl IntoView {
+    tool_input_list(&input, "", &input_links)
 }
 
-fn tool_input_list(value: &serde_json::Value, pointer: &str) -> AnyView {
+fn tool_input_list(
+    value: &serde_json::Value,
+    pointer: &str,
+    input_links: &[ToolUseInputLink],
+) -> AnyView {
     let entries = match value {
         serde_json::Value::Object(values) => values
             .iter()
             .map(|(key, value)| {
                 let pointer = json_pointer_child(pointer, key);
-                tool_input_list_entry(key.clone(), "json-key", value, pointer)
+                tool_input_list_entry(key.clone(), "json-key", value, pointer, input_links)
             })
             .collect::<Vec<_>>(),
         serde_json::Value::Array(values) => values
@@ -714,7 +744,7 @@ fn tool_input_list(value: &serde_json::Value, pointer: &str) -> AnyView {
             .map(|(index, value)| {
                 let label = index.to_string();
                 let pointer = json_pointer_child(pointer, &label);
-                tool_input_list_entry(label, "json-index", value, pointer)
+                tool_input_list_entry(label, "json-index", value, pointer, input_links)
             })
             .collect::<Vec<_>>(),
         _ => {
@@ -751,6 +781,7 @@ fn tool_input_list_entry(
     label_class: &'static str,
     value: &serde_json::Value,
     pointer: String,
+    input_links: &[ToolUseInputLink],
 ) -> AnyView {
     let summary = match value {
         serde_json::Value::Object(values) => {
@@ -762,7 +793,7 @@ fn tool_input_list_entry(
         _ => None,
     };
     if let Some(summary) = summary {
-        let children = tool_input_list(value, &pointer);
+        let children = tool_input_list(value, &pointer, input_links);
         view! {
             <li class="tool-input-entry tool-input-container" data-json-pointer=pointer>
                 <div class="tool-input-entry-heading">
@@ -774,10 +805,34 @@ fn tool_input_list_entry(
         }
         .into_any()
     } else {
+        let target = match value {
+            serde_json::Value::String(value) => input_links
+                .iter()
+                .find(|link| link.input_pointer == pointer && link.value == *value)
+                .map(|link| format!("#{}", link.target)),
+            serde_json::Value::Number(_)
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Null
+            | serde_json::Value::Object(_)
+            | serde_json::Value::Array(_) => None,
+        };
+        let scalar = tool_input_scalar(value);
         view! {
             <li class="tool-input-entry" data-json-pointer=pointer>
                 <span class=label_class>{label}</span>
-                {tool_input_scalar(value)}
+                {match target {
+                    Some(target) => view! {
+                        <a
+                            class="tool-input-value-link"
+                            href=target
+                            title="Open exec_command"
+                        >
+                            {scalar}
+                        </a>
+                    }
+                    .into_any(),
+                    None => scalar,
+                }}
             </li>
         }
         .into_any()
@@ -902,14 +957,14 @@ fn push_highlighted_json_tokens(
 }
 
 #[component]
-fn ToolUseDetail(item: ToolUse) -> impl IntoView {
+fn ToolUseDetail(item: ToolUse, input_links: Vec<ToolUseInputLink>) -> impl IntoView {
     view! {
         <article class="node-detail-item">
             <header>
                 <strong>{item.name}</strong>
                 <code>{item.id}</code>
             </header>
-            <ToolInput input=item.input/>
+            <ToolInput input=item.input input_links/>
         </article>
     }
 }
@@ -1210,6 +1265,7 @@ mod tests {
             request: "detail-node".to_owned(),
             response: Ok(NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("response".to_owned()))),
+                tool_use_input_links: Vec::new(),
             }),
         };
         let missing = LoadedPanel {
@@ -1294,6 +1350,7 @@ mod tests {
         let node = view! {
             <NodeDetailContent response=NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("<script>alert(1)</script>".to_owned()))),
+                tool_use_input_links: Vec::new(),
             }/>
         }
         .to_html();
@@ -1456,6 +1513,45 @@ mod tests {
         assert!(input.contains("printf &lt;/script&gt;"));
         assert!(!input.contains("<script>"));
         assert!(!input.contains("tool-input-raw"));
+    }
+
+    #[test]
+    fn tool_input_link_targets_only_the_matching_tool_item_and_pointer() {
+        let detail = view! {
+            <NodeDetailContent response=NodeDetailResponse::Found {
+                node: Box::new(test_node(Kind::tool_uses(vec![
+                    ToolUse {
+                        id: "write-1".to_owned(),
+                        name: "write_stdin".to_owned(),
+                        input: serde_json::json!({"session_id": "exec-1"}),
+                    },
+                    ToolUse {
+                        id: "write-2".to_owned(),
+                        name: "write_stdin".to_owned(),
+                        input: serde_json::json!({"session_id": "exec-1"}),
+                    },
+                ]))),
+                tool_use_input_links: vec![ToolUseInputLink {
+                    tool_use_index: 1,
+                    tool_use_id: "write-2".to_owned(),
+                    input_pointer: "/session_id".to_owned(),
+                    value: "exec-1".to_owned(),
+                    target: "detail-exec-node".to_owned(),
+                }],
+            }/>
+        }
+        .to_html();
+
+        assert_eq!(
+            detail.matches(r#"data-json-pointer="/session_id""#).count(),
+            2
+        );
+        assert_eq!(
+            detail.matches(r#"class="tool-input-value-link""#).count(),
+            1
+        );
+        assert!(detail.contains(r##"href="#detail-exec-node""##));
+        assert!(detail.contains(r#"title="Open exec_command""#));
     }
 
     #[test]

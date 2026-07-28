@@ -920,6 +920,24 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   white-space: pre-wrap;
 }
 
+.tool-input-value-link {
+  border-radius: 3px;
+  color: inherit;
+  min-width: 0;
+  text-decoration-color: color-mix(in srgb, var(--detail-accent) 58%, transparent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+.tool-input-value-link:hover {
+  text-decoration-color: var(--detail-accent);
+}
+
+.tool-input-value-link:focus-visible {
+  outline: 2px solid var(--detail-accent);
+  outline-offset: 2px;
+}
+
 .tool-input-summary {
   color: #64748b;
   flex: 0 0 auto;
