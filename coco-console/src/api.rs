@@ -22,6 +22,8 @@ pub enum NodeDetailResponse {
         tool_use_input_links: Vec<ToolUseInputLink>,
         #[serde(default)]
         tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
+        #[serde(default)]
+        tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
     },
 }
 
@@ -43,6 +45,13 @@ pub struct ToolInputShellHighlight {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolInputJsonHighlight {
+    pub tool_use_index: usize,
+    pub tool_use_id: String,
+    pub tokens: Vec<JsonHighlightToken>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ShellHighlightToken {
     pub kind: ShellHighlightKind,
     pub text: String,
@@ -59,6 +68,24 @@ pub enum ShellHighlightKind {
     Operator,
     Comment,
     Keyword,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct JsonHighlightToken {
+    pub kind: JsonHighlightKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonHighlightKind {
+    Plain,
+    Key,
+    String,
+    Number,
+    Boolean,
+    Null,
+    Escape,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

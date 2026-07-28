@@ -14,8 +14,8 @@ mod host {
     mod publisher;
     mod render;
     mod server;
-    mod shell_highlight;
     mod store;
+    mod syntax_highlight;
     mod web_graph_order;
     mod web_graph_runtime;
     #[allow(dead_code)]
