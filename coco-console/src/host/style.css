@@ -85,7 +85,7 @@ body {
 
 .content {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem) minmax(18rem, 24rem);
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 20rem) minmax(26rem, 32rem);
   min-height: 0;
   overflow: hidden;
 }
@@ -890,6 +890,34 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   display: block;
 }
 
+.tool-input-entry-shell {
+  display: block;
+}
+
+.tool-input-entry-shell > .json-key {
+  display: block;
+  margin-bottom: 0.3rem;
+}
+
+.tool-input-shell {
+  background: rgba(2, 6, 23, 0.74);
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 6px;
+  color: #cbd5e1;
+  font: inherit;
+  line-height: 1.55;
+  margin: 0;
+  max-height: 18rem;
+  overflow: auto;
+  padding: 0.58rem 0.64rem;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.tool-input-shell code {
+  font: inherit;
+}
+
 .tool-input-container {
   display: block;
 }
@@ -985,6 +1013,38 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 .json-null {
   color: #94a3b8;
   font-style: italic;
+}
+
+.shell-command {
+  color: #7dd3fc;
+  font-weight: 650;
+}
+
+.shell-option {
+  color: #f0abfc;
+}
+
+.shell-string {
+  color: #86efac;
+}
+
+.shell-variable {
+  color: #fbbf24;
+}
+
+.shell-operator {
+  color: #f472b6;
+  font-weight: 700;
+}
+
+.shell-comment {
+  color: #64748b;
+  font-style: italic;
+}
+
+.shell-keyword {
+  color: #c4b5fd;
+  font-weight: 650;
 }
 
 .node-detail-failure pre {
@@ -1124,7 +1184,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   color: #94a3b8;
 }
 
-@media (max-width: 860px) {
+@media (max-width: 1024px) {
   body {
     min-height: 100svh;
     overflow: auto;

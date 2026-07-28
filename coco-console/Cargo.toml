@@ -31,6 +31,8 @@ leptos = { workspace = true, features = ["islands", "ssr"] }
 leptos_axum = "0.8.10"
 tokio.workspace = true
 tracing.workspace = true
+tree-sitter-bash = "0.25.1"
+tree-sitter-highlight = "0.25.10"
 diesel.workspace = true
 diesel-async.workspace = true
 diesel_migrations.workspace = true

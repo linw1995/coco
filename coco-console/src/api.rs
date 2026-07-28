@@ -20,6 +20,8 @@ pub enum NodeDetailResponse {
     Found {
         node: Box<Node>,
         tool_use_input_links: Vec<ToolUseInputLink>,
+        #[serde(default)]
+        tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
     },
 }
 
@@ -30,6 +32,33 @@ pub struct ToolUseInputLink {
     pub input_pointer: String,
     pub value: String,
     pub target: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolInputShellHighlight {
+    pub tool_use_index: usize,
+    pub tool_use_id: String,
+    pub input_pointer: String,
+    pub tokens: Vec<ShellHighlightToken>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShellHighlightToken {
+    pub kind: ShellHighlightKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellHighlightKind {
+    Plain,
+    Command,
+    Option,
+    String,
+    Variable,
+    Operator,
+    Comment,
+    Keyword,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

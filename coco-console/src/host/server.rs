@@ -450,9 +450,12 @@ where
         Ok(node) => {
             let tool_use_input_links =
                 resolve_tool_use_input_links(&state.web_graph, &node).await?;
+            let tool_input_shell_highlights =
+                super::shell_highlight::tool_input_shell_highlights(&node);
             Ok(NodeDetailResponse::Found {
                 node: Box::new(node),
                 tool_use_input_links,
+                tool_input_shell_highlights,
             })
         }
         Err(error) if is_missing_node(&error) => Ok(NodeDetailResponse::Missing {
