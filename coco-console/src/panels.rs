@@ -660,6 +660,13 @@ enum ShellTokenKind {
     Keyword,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellCasePhase {
+    Subject,
+    Pattern,
+    Command,
+}
+
 impl ShellTokenKind {
     fn class(self) -> Option<&'static str> {
         match self {
@@ -923,9 +930,34 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
     let mut at_word_start = true;
     let mut in_assignment = false;
     let mut in_redirection = false;
+    let mut expects_heredoc_delimiter = false;
+    let mut heredoc_delimiter = None;
+    let mut in_heredoc_body = false;
+    let mut case_phase = None;
 
     while index < chars.len() {
         let start = index;
+        if in_heredoc_body {
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            let line = chars[start..index].iter().collect::<String>();
+            if index < chars.len() {
+                index += 1;
+            }
+            let closes_heredoc = heredoc_delimiter
+                .as_ref()
+                .is_some_and(|delimiter| line.trim_end_matches('\r') == delimiter);
+            push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
+            if closes_heredoc {
+                heredoc_delimiter = None;
+                in_heredoc_body = false;
+                expects_command = true;
+                at_word_start = true;
+            }
+            continue;
+        }
+
         match chars[index] {
             '\\' if chars.get(index + 1) == Some(&'\n') => {
                 index += 2;
@@ -933,10 +965,14 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
             }
             '\n' => {
                 index += 1;
-                expects_command = true;
+                expects_command = !matches!(
+                    case_phase,
+                    Some(ShellCasePhase::Subject | ShellCasePhase::Pattern)
+                );
                 at_word_start = true;
                 in_assignment = false;
                 in_redirection = false;
+                in_heredoc_body = heredoc_delimiter.is_some();
                 push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
             }
             character if character.is_whitespace() => {
@@ -972,6 +1008,11 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 if expects_command && !in_assignment && !in_redirection {
                     expects_command = false;
                 }
+                if expects_heredoc_delimiter {
+                    heredoc_delimiter =
+                        Some(chars[start + 1..index.saturating_sub(1)].iter().collect());
+                    expects_heredoc_delimiter = false;
+                }
                 at_word_start = false;
                 push_shell_token(&mut tokens, ShellTokenKind::String, &chars[start..index]);
             }
@@ -983,28 +1024,41 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 at_word_start = false;
                 push_shell_token(&mut tokens, ShellTokenKind::Variable, &chars[start..index]);
             }
-            '|' | '&' | ';' | '<' | '>' => {
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' => {
                 let operator = chars[index];
                 index += 1;
                 if index < chars.len()
                     && (chars[index] == operator
                         || (operator == '>' && chars[index] == '|')
-                        || (operator == '<' && chars[index] == '>'))
+                        || (operator == '<' && chars[index] == '>')
+                        || (matches!(operator, '<' | '>') && chars[index] == '&'))
                 {
                     index += 1;
                 }
+                let operator_text = chars[start..index].iter().collect::<String>();
                 if matches!(operator, '|' | '&' | ';') {
                     expects_command = true;
+                }
+                if operator == ')' && case_phase == Some(ShellCasePhase::Pattern) {
+                    case_phase = Some(ShellCasePhase::Command);
+                    expects_command = true;
+                } else if operator_text == ";;" && case_phase == Some(ShellCasePhase::Command) {
+                    case_phase = Some(ShellCasePhase::Pattern);
+                    expects_command = false;
                 }
                 at_word_start = true;
                 in_assignment = false;
                 in_redirection = matches!(operator, '<' | '>');
+                expects_heredoc_delimiter = operator_text == "<<";
                 push_shell_token(&mut tokens, ShellTokenKind::Operator, &chars[start..index]);
             }
             _ => {
                 while index < chars.len()
                     && !chars[index].is_whitespace()
-                    && !matches!(chars[index], '\'' | '"' | '$' | '|' | '&' | ';' | '<' | '>')
+                    && !matches!(
+                        chars[index],
+                        '\'' | '"' | '$' | '|' | '&' | ';' | '<' | '>' | '(' | ')'
+                    )
                 {
                     index += 1;
                 }
@@ -1015,8 +1069,11 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     && chars
                         .get(index)
                         .is_some_and(|character| matches!(character, '<' | '>'));
-                let keyword =
-                    expects_command && !in_assignment && !in_redirection && is_shell_keyword(&text);
+                let keyword = !in_assignment
+                    && !in_redirection
+                    && ((expects_command && is_shell_keyword(&text))
+                        || (case_phase == Some(ShellCasePhase::Subject) && text == "in")
+                        || (case_phase.is_some() && text == "esac"));
                 let kind = if keyword {
                     ShellTokenKind::Keyword
                 } else if text.starts_with('-') {
@@ -1032,11 +1089,29 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     ShellTokenKind::Plain
                 };
                 if keyword {
-                    expects_command = shell_keyword_expects_command(&text);
+                    match text.as_str() {
+                        "case" => {
+                            case_phase = Some(ShellCasePhase::Subject);
+                            expects_command = false;
+                        }
+                        "in" if case_phase == Some(ShellCasePhase::Subject) => {
+                            case_phase = Some(ShellCasePhase::Pattern);
+                            expects_command = false;
+                        }
+                        "esac" => {
+                            case_phase = None;
+                            expects_command = false;
+                        }
+                        _ => expects_command = shell_keyword_expects_command(&text),
+                    }
                 } else if assignment {
                     in_assignment = true;
                 } else if expects_command && !in_assignment && !in_redirection && !redirection_fd {
                     expects_command = false;
+                }
+                if expects_heredoc_delimiter {
+                    heredoc_delimiter = Some(text.clone());
+                    expects_heredoc_delimiter = false;
                 }
                 at_word_start = false;
                 tokens.push(ShellToken::new(kind, text));
@@ -1874,7 +1949,8 @@ mod tests {
 
     #[test]
     fn shell_highlighter_preserves_command_position_across_prefix_syntax() {
-        let redirection_tokens = highlighted_shell_tokens("2>/dev/null grep foo file\n<input cat");
+        let redirection_tokens =
+            highlighted_shell_tokens("2>&1 grep foo file\n<input cat\nprintf error >&2");
         let redirection_commands = redirection_tokens
             .iter()
             .filter(|token| token.kind == ShellTokenKind::Command)
@@ -1887,7 +1963,7 @@ mod tests {
             .map(|token| (token.kind, token.text.as_str()))
             .collect::<Vec<_>>();
 
-        assert_eq!(redirection_commands, vec!["grep", "cat"]);
+        assert_eq!(redirection_commands, vec!["grep", "cat", "printf"]);
         assert_eq!(
             continuation_words,
             vec![
@@ -1896,6 +1972,25 @@ mod tests {
                 (ShellTokenKind::Plain, "value"),
             ]
         );
+    }
+
+    #[test]
+    fn shell_highlighter_handles_heredocs_and_case_clauses() {
+        let heredoc_tokens = highlighted_shell_tokens("cat <<'EOF'\nhello\nEOF\nprintf done");
+        let heredoc_commands = heredoc_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        let case_tokens = highlighted_shell_tokens("case \"$x\" in foo) echo yes;; esac");
+        let case_commands = case_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(heredoc_commands, vec!["cat", "printf"]);
+        assert_eq!(case_commands, vec!["echo"]);
     }
 
     #[test]
