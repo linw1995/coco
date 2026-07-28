@@ -7,7 +7,8 @@ use leptos::server_fn::codec::GetUrl;
 
 use crate::api::{
     AnchorRangeResponse, GraphViewportEdgeKind, NodeDetailResponse, ProviderContextItem,
-    ProviderContextResponse, ToolUseInputLink,
+    ProviderContextResponse, ShellHighlightKind, ShellHighlightToken, ToolInputShellHighlight,
+    ToolUseInputLink,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -234,12 +235,20 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         NodeDetailResponse::Found {
             node,
             tool_use_input_links,
-        } => view! { <NodeDetail node=*node tool_use_input_links/> }.into_any(),
+            tool_input_shell_highlights,
+        } => view! {
+            <NodeDetail node=*node tool_use_input_links tool_input_shell_highlights/>
+        }
+        .into_any(),
     }
 }
 
 #[component]
-fn NodeDetail(node: Node, tool_use_input_links: Vec<ToolUseInputLink>) -> impl IntoView {
+fn NodeDetail(
+    node: Node,
+    tool_use_input_links: Vec<ToolUseInputLink>,
+    tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
+) -> impl IntoView {
     let target = format!("{NODE_TARGET_PREFIX}{}", node.id);
     let kind = node_kind_name(&node.kind);
     let kind_class = format!("node-details node-detail kind-{kind}");
@@ -293,7 +302,7 @@ fn NodeDetail(node: Node, tool_use_input_links: Vec<ToolUseInputLink>) -> impl I
                     </div>
                 }).collect::<Vec<_>>()}
             </dl>
-            <NodeDetailBody kind=node.kind tool_use_input_links/>
+            <NodeDetailBody kind=node.kind tool_use_input_links tool_input_shell_highlights/>
         </section>
     }
 }
@@ -302,6 +311,7 @@ fn NodeDetail(node: Node, tool_use_input_links: Vec<ToolUseInputLink>) -> impl I
 fn NodeDetailBody(
     kind: Kind,
     #[prop(default = Vec::new())] tool_use_input_links: Vec<ToolUseInputLink>,
+    #[prop(default = Vec::new())] tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
 ) -> AnyView {
     match kind {
         Kind::Anchor(anchor) => {
@@ -315,7 +325,14 @@ fn NodeDetailBody(
                         .filter(|link| link.tool_use_index == index && link.tool_use_id == item.id)
                         .cloned()
                         .collect();
-                    view! { <ToolUseDetail item=item input_links/> }
+                    let shell_highlights = tool_input_shell_highlights
+                        .iter()
+                        .filter(|highlight| {
+                            highlight.tool_use_index == index && highlight.tool_use_id == item.id
+                        })
+                        .cloned()
+                        .collect();
+                    view! { <ToolUseDetail item=item input_links shell_highlights/> }
                 }).collect::<Vec<_>>()}
             </div>
         }
@@ -648,32 +665,7 @@ impl JsonToken {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShellTokenKind {
-    Plain,
-    Command,
-    Option,
-    String,
-    Variable,
-    Operator,
-    Comment,
-    Keyword,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShellCasePhase {
-    Subject,
-    Pattern,
-    Command,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ShellHeredoc {
-    delimiter: String,
-    strips_tabs: bool,
-}
-
-impl ShellTokenKind {
+impl ShellHighlightKind {
     fn class(self) -> Option<&'static str> {
         match self {
             Self::Plain => None,
@@ -688,25 +680,11 @@ impl ShellTokenKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ShellToken {
-    kind: ShellTokenKind,
-    text: String,
-}
-
-impl ShellToken {
-    fn new(kind: ShellTokenKind, text: impl Into<String>) -> Self {
-        Self {
-            kind,
-            text: text.into(),
-        }
-    }
-}
-
 #[component]
 fn ToolInput(
     input: serde_json::Value,
     #[prop(default = Vec::new())] input_links: Vec<ToolUseInputLink>,
+    #[prop(default = Vec::new())] shell_highlights: Vec<ToolInputShellHighlight>,
 ) -> impl IntoView {
     let view = ArcRwSignal::new(ToolInputView::List);
     let list_class_view = view.clone();
@@ -718,6 +696,7 @@ fn ToolInput(
     let content_view = view;
     let list_input = input.clone();
     let list_input_links = input_links;
+    let list_shell_highlights = shell_highlights;
 
     view! {
         <section class="node-detail-section tool-input">
@@ -760,6 +739,7 @@ fn ToolInput(
                         <ToolInputList
                             input=list_input.clone()
                             input_links=list_input_links.clone()
+                            shell_highlights=list_shell_highlights.clone()
                         />
                     }
                     .into_any()
@@ -776,21 +756,30 @@ fn ToolInput(
 fn ToolInputList(
     input: serde_json::Value,
     #[prop(default = Vec::new())] input_links: Vec<ToolUseInputLink>,
+    #[prop(default = Vec::new())] shell_highlights: Vec<ToolInputShellHighlight>,
 ) -> impl IntoView {
-    tool_input_list(&input, "", &input_links)
+    tool_input_list(&input, "", &input_links, &shell_highlights)
 }
 
 fn tool_input_list(
     value: &serde_json::Value,
     pointer: &str,
     input_links: &[ToolUseInputLink],
+    shell_highlights: &[ToolInputShellHighlight],
 ) -> AnyView {
     let entries = match value {
         serde_json::Value::Object(values) => values
             .iter()
             .map(|(key, value)| {
                 let pointer = json_pointer_child(pointer, key);
-                tool_input_list_entry(key.clone(), "json-key", value, pointer, input_links)
+                tool_input_list_entry(
+                    key.clone(),
+                    "json-key",
+                    value,
+                    pointer,
+                    input_links,
+                    shell_highlights,
+                )
             })
             .collect::<Vec<_>>(),
         serde_json::Value::Array(values) => values
@@ -799,7 +788,14 @@ fn tool_input_list(
             .map(|(index, value)| {
                 let label = index.to_string();
                 let pointer = json_pointer_child(pointer, &label);
-                tool_input_list_entry(label, "json-index", value, pointer, input_links)
+                tool_input_list_entry(
+                    label,
+                    "json-index",
+                    value,
+                    pointer,
+                    input_links,
+                    shell_highlights,
+                )
             })
             .collect::<Vec<_>>(),
         _ => {
@@ -837,11 +833,22 @@ fn tool_input_list_entry(
     value: &serde_json::Value,
     pointer: String,
     input_links: &[ToolUseInputLink],
+    shell_highlights: &[ToolInputShellHighlight],
 ) -> AnyView {
     if label == "cmd"
         && let serde_json::Value::String(command) = value
     {
-        return tool_input_shell_entry(label, label_class, command, pointer);
+        let tokens = shell_highlights
+            .iter()
+            .find(|highlight| highlight.input_pointer == pointer)
+            .map(|highlight| highlight.tokens.clone())
+            .unwrap_or_else(|| {
+                vec![ShellHighlightToken {
+                    kind: ShellHighlightKind::Plain,
+                    text: command.clone(),
+                }]
+            });
+        return tool_input_shell_entry(label, label_class, tokens, pointer);
     }
 
     let summary = match value {
@@ -854,7 +861,7 @@ fn tool_input_list_entry(
         _ => None,
     };
     if let Some(summary) = summary {
-        let children = tool_input_list(value, &pointer, input_links);
+        let children = tool_input_list(value, &pointer, input_links, shell_highlights);
         view! {
             <li class="tool-input-entry tool-input-container" data-json-pointer=pointer>
                 <div class="tool-input-entry-heading">
@@ -903,10 +910,10 @@ fn tool_input_list_entry(
 fn tool_input_shell_entry(
     label: String,
     label_class: &'static str,
-    command: &str,
+    tokens: Vec<ShellHighlightToken>,
     pointer: String,
 ) -> AnyView {
-    let tokens = highlighted_shell_tokens(command)
+    let tokens = tokens
         .into_iter()
         .map(|token| match token.kind.class() {
             Some(class) => view! { <span class=class>{token.text}</span> }.into_any(),
@@ -926,513 +933,6 @@ fn tool_input_shell_entry(
         </li>
     }
     .into_any()
-}
-
-fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
-    let chars = command.chars().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    let mut expects_command = true;
-    let mut at_word_start = true;
-    let mut in_assignment = false;
-    let mut in_redirection = false;
-    let mut redirection_operand_started = false;
-    let mut expects_heredoc_delimiter = false;
-    let mut heredoc_delimiter: Option<String> = None;
-    let mut heredoc_strips_tabs = false;
-    let mut pending_heredocs: std::collections::VecDeque<ShellHeredoc> =
-        std::collections::VecDeque::new();
-    let mut in_heredoc_body = false;
-    let mut case_phases = Vec::new();
-    let mut in_arithmetic_command = false;
-    let mut array_assignment_depth = 0;
-    let mut expects_function_name = false;
-    let mut expects_function_body = false;
-    let mut in_function_parameters = false;
-    let mut command_options_allowed = false;
-
-    while index < chars.len() {
-        let start = index;
-        if in_heredoc_body {
-            let heredoc = pending_heredocs
-                .front()
-                .expect("heredoc body requires a pending delimiter");
-            while index < chars.len() && chars[index] != '\n' {
-                index += 1;
-            }
-            let line = chars[start..index].iter().collect::<String>();
-            if index < chars.len() {
-                index += 1;
-            }
-            let heredoc_line = if heredoc.strips_tabs {
-                line.trim_start_matches('\t')
-            } else {
-                &line
-            };
-            let closes_heredoc = heredoc_line.trim_end_matches('\r') == heredoc.delimiter.as_str();
-            push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
-            if closes_heredoc {
-                pending_heredocs.pop_front();
-                in_heredoc_body = !pending_heredocs.is_empty();
-                expects_command = !in_heredoc_body;
-                at_word_start = true;
-            }
-            continue;
-        }
-
-        match chars[index] {
-            '\\' if chars.get(index + 1) == Some(&'\n') => {
-                index += 2;
-                push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
-            }
-            '\n' => {
-                index += 1;
-                finish_shell_heredoc_delimiter(
-                    &mut expects_heredoc_delimiter,
-                    &mut heredoc_delimiter,
-                    heredoc_strips_tabs,
-                    &mut pending_heredocs,
-                );
-                expects_command = !matches!(
-                    case_phases.last(),
-                    Some(ShellCasePhase::Subject | ShellCasePhase::Pattern)
-                );
-                expects_heredoc_delimiter = false;
-                at_word_start = true;
-                in_assignment = array_assignment_depth > 0;
-                in_redirection = false;
-                redirection_operand_started = false;
-                command_options_allowed = false;
-                in_heredoc_body = !pending_heredocs.is_empty();
-                push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
-            }
-            character if character.is_whitespace() => {
-                while index < chars.len() && chars[index].is_whitespace() && chars[index] != '\n' {
-                    index += 1;
-                }
-                finish_shell_heredoc_delimiter(
-                    &mut expects_heredoc_delimiter,
-                    &mut heredoc_delimiter,
-                    heredoc_strips_tabs,
-                    &mut pending_heredocs,
-                );
-                at_word_start = true;
-                if array_assignment_depth == 0 {
-                    in_assignment = false;
-                }
-                if redirection_operand_started {
-                    in_redirection = false;
-                    redirection_operand_started = false;
-                }
-                push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
-            }
-            '#' if at_word_start => {
-                while index < chars.len() && chars[index] != '\n' {
-                    index += 1;
-                }
-                at_word_start = false;
-                push_shell_token(&mut tokens, ShellTokenKind::Comment, &chars[start..index]);
-            }
-            '\'' | '"' => {
-                let quote = chars[index];
-                index += 1;
-                while index < chars.len() {
-                    if chars[index] == '\\' && quote == '"' {
-                        index = (index + 2).min(chars.len());
-                    } else {
-                        let closes_quote = chars[index] == quote;
-                        index += 1;
-                        if closes_quote {
-                            break;
-                        }
-                    }
-                }
-                if expects_command && !in_assignment && !in_redirection {
-                    expects_command = false;
-                    command_options_allowed = false;
-                }
-                if expects_heredoc_delimiter {
-                    let fragment = chars[start + 1..index.saturating_sub(1)]
-                        .iter()
-                        .collect::<String>();
-                    let fragment = if quote == '"' {
-                        shell_unescape_double_quoted_word(&fragment)
-                    } else {
-                        fragment
-                    };
-                    heredoc_delimiter
-                        .get_or_insert_default()
-                        .push_str(&fragment);
-                }
-                redirection_operand_started |= in_redirection;
-                at_word_start = false;
-                push_shell_token(&mut tokens, ShellTokenKind::String, &chars[start..index]);
-            }
-            '$' => {
-                index = shell_variable_end(&chars, index);
-                if expects_command && !in_assignment && !in_redirection {
-                    expects_command = false;
-                    command_options_allowed = false;
-                }
-                if expects_heredoc_delimiter {
-                    heredoc_delimiter
-                        .get_or_insert_default()
-                        .extend(chars[start..index].iter().copied());
-                }
-                redirection_operand_started |= in_redirection;
-                at_word_start = false;
-                push_shell_token(&mut tokens, ShellTokenKind::Variable, &chars[start..index]);
-            }
-            '|' | '&' | ';' | '<' | '>' | '(' | ')' => {
-                finish_shell_heredoc_delimiter(
-                    &mut expects_heredoc_delimiter,
-                    &mut heredoc_delimiter,
-                    heredoc_strips_tabs,
-                    &mut pending_heredocs,
-                );
-                let operator = chars[index];
-                index += 1;
-                if operator == '&' && chars.get(index) == Some(&'>') {
-                    index += 1;
-                    if chars.get(index) == Some(&'>') {
-                        index += 1;
-                    }
-                } else if operator == ';' && chars.get(index) == Some(&'&') {
-                    index += 1;
-                } else if operator == ';'
-                    && chars.get(index) == Some(&';')
-                    && chars.get(index + 1) == Some(&'&')
-                {
-                    index += 2;
-                } else if index < chars.len()
-                    && (chars[index] == operator
-                        || (operator == '>' && chars[index] == '|')
-                        || (operator == '<' && chars[index] == '>')
-                        || (matches!(operator, '<' | '>') && chars[index] == '&'))
-                {
-                    index += 1;
-                }
-                if chars[start..index] == ['<', '<'] && chars.get(index) == Some(&'-') {
-                    index += 1;
-                }
-                let operator_text = chars[start..index].iter().collect::<String>();
-                if operator_text == "((" {
-                    in_arithmetic_command = true;
-                }
-                let is_redirection = !in_arithmetic_command
-                    && array_assignment_depth == 0
-                    && (matches!(operator, '<' | '>')
-                        || matches!(operator_text.as_str(), "&>" | "&>>"));
-                let is_case_pattern_separator =
-                    operator == '|' && case_phases.last() == Some(&ShellCasePhase::Pattern);
-                if matches!(operator, '|' | '&' | ';')
-                    && !is_redirection
-                    && !is_case_pattern_separator
-                    && !in_arithmetic_command
-                    && array_assignment_depth == 0
-                {
-                    expects_command = true;
-                    command_options_allowed = false;
-                }
-                if operator == ')'
-                    && !in_arithmetic_command
-                    && case_phases.last() == Some(&ShellCasePhase::Pattern)
-                {
-                    *case_phases
-                        .last_mut()
-                        .expect("case phase exists after matching its last value") =
-                        ShellCasePhase::Command;
-                    expects_command = true;
-                } else if matches!(operator_text.as_str(), ";;" | ";&" | ";;&")
-                    && case_phases.last() == Some(&ShellCasePhase::Command)
-                {
-                    *case_phases
-                        .last_mut()
-                        .expect("case phase exists after matching its last value") =
-                        ShellCasePhase::Pattern;
-                    expects_command = false;
-                }
-                let starts_function_parameters = operator == '('
-                    && operator_text != "(("
-                    && array_assignment_depth == 0
-                    && (expects_function_body
-                        || (!expects_command
-                            && tokens
-                                .last()
-                                .is_some_and(|token| token.kind == ShellTokenKind::Command)));
-                if starts_function_parameters {
-                    if let Some(function_name) = tokens
-                        .last_mut()
-                        .filter(|token| token.kind == ShellTokenKind::Command)
-                    {
-                        function_name.kind = ShellTokenKind::Plain;
-                    }
-                    expects_function_body = false;
-                    in_function_parameters = true;
-                } else if operator == ')' && in_function_parameters {
-                    in_function_parameters = false;
-                    expects_function_body = true;
-                }
-                if operator_text == "))" && in_arithmetic_command {
-                    in_arithmetic_command = false;
-                }
-                if operator == '(' && (in_assignment || array_assignment_depth > 0) {
-                    array_assignment_depth += 1;
-                } else if operator == ')' && array_assignment_depth > 0 {
-                    array_assignment_depth -= 1;
-                }
-                at_word_start = true;
-                in_assignment = array_assignment_depth > 0;
-                in_redirection = is_redirection;
-                redirection_operand_started = false;
-                expects_heredoc_delimiter = matches!(operator_text.as_str(), "<<" | "<<-");
-                if expects_heredoc_delimiter {
-                    heredoc_delimiter = None;
-                    heredoc_strips_tabs = operator_text == "<<-";
-                }
-                push_shell_token(&mut tokens, ShellTokenKind::Operator, &chars[start..index]);
-            }
-            _ => {
-                while index < chars.len() {
-                    if chars[index] == '\\' && chars.get(index + 1).is_some() {
-                        index += 2;
-                        continue;
-                    }
-                    if chars[index].is_whitespace()
-                        || matches!(
-                            chars[index],
-                            '\'' | '"' | '$' | '|' | '&' | ';' | '<' | '>' | '(' | ')'
-                        )
-                    {
-                        break;
-                    }
-                    index += 1;
-                }
-                let text = chars[start..index].iter().collect::<String>();
-                let assignment = expects_command && is_shell_assignment(&text);
-                let redirection_fd = expects_command
-                    && text.chars().all(|character| character.is_ascii_digit())
-                    && chars
-                        .get(index)
-                        .is_some_and(|character| matches!(character, '<' | '>'));
-                let keyword = !in_assignment
-                    && !in_redirection
-                    && ((expects_command && is_shell_keyword(&text))
-                        || (expects_function_body && text == "{")
-                        || (case_phases.last() == Some(&ShellCasePhase::Subject) && text == "in")
-                        || (!case_phases.is_empty() && text == "esac"));
-                let kind = if keyword {
-                    ShellTokenKind::Keyword
-                } else if text.starts_with('-') {
-                    ShellTokenKind::Option
-                } else if expects_command
-                    && !in_assignment
-                    && !in_redirection
-                    && !assignment
-                    && !redirection_fd
-                {
-                    ShellTokenKind::Command
-                } else {
-                    ShellTokenKind::Plain
-                };
-                if keyword {
-                    match text.as_str() {
-                        "case" => {
-                            case_phases.push(ShellCasePhase::Subject);
-                            expects_command = false;
-                        }
-                        "in" if case_phases.last() == Some(&ShellCasePhase::Subject) => {
-                            *case_phases
-                                .last_mut()
-                                .expect("case phase exists after matching its last value") =
-                                ShellCasePhase::Pattern;
-                            expects_command = false;
-                        }
-                        "esac" => {
-                            case_phases.pop();
-                            expects_command = false;
-                        }
-                        "function" => {
-                            expects_function_name = true;
-                            expects_command = false;
-                        }
-                        "{" => {
-                            expects_function_body = false;
-                            expects_command = true;
-                        }
-                        "time" => {
-                            command_options_allowed = true;
-                            expects_command = true;
-                        }
-                        _ => {
-                            command_options_allowed = false;
-                            expects_command = shell_keyword_expects_command(&text);
-                        }
-                    }
-                } else if expects_function_name {
-                    expects_function_name = false;
-                    expects_function_body = true;
-                } else if assignment {
-                    in_assignment = true;
-                } else if expects_command && command_options_allowed && text.starts_with('-') {
-                } else if expects_command && !in_assignment && !in_redirection && !redirection_fd {
-                    expects_command = false;
-                    command_options_allowed = false;
-                }
-                if expects_heredoc_delimiter {
-                    heredoc_delimiter
-                        .get_or_insert_default()
-                        .push_str(&shell_unescape_word(&text));
-                }
-                redirection_operand_started |= in_redirection;
-                at_word_start = false;
-                tokens.push(ShellToken::new(kind, text));
-            }
-        }
-    }
-
-    tokens
-}
-
-fn finish_shell_heredoc_delimiter(
-    expects_delimiter: &mut bool,
-    delimiter: &mut Option<String>,
-    strips_tabs: bool,
-    pending: &mut std::collections::VecDeque<ShellHeredoc>,
-) {
-    if !*expects_delimiter {
-        return;
-    }
-    let Some(delimiter) = delimiter.take() else {
-        return;
-    };
-    pending.push_back(ShellHeredoc {
-        delimiter,
-        strips_tabs,
-    });
-    *expects_delimiter = false;
-}
-
-fn shell_unescape_word(text: &str) -> String {
-    let mut chars = text.chars();
-    let mut unescaped = String::with_capacity(text.len());
-    while let Some(character) = chars.next() {
-        if character == '\\' {
-            if let Some(escaped) = chars.next() {
-                unescaped.push(escaped);
-            }
-        } else {
-            unescaped.push(character);
-        }
-    }
-    unescaped
-}
-
-fn shell_unescape_double_quoted_word(text: &str) -> String {
-    let mut chars = text.chars();
-    let mut unescaped = String::with_capacity(text.len());
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            unescaped.push(character);
-            continue;
-        }
-        let Some(escaped) = chars.next() else {
-            unescaped.push(character);
-            break;
-        };
-        if matches!(escaped, '$' | '`' | '"' | '\\') {
-            unescaped.push(escaped);
-        } else if escaped != '\n' {
-            unescaped.push(character);
-            unescaped.push(escaped);
-        }
-    }
-    unescaped
-}
-
-fn shell_variable_end(chars: &[char], start: usize) -> usize {
-    let next = start + 1;
-    if next >= chars.len() {
-        return next;
-    }
-
-    match chars[next] {
-        '{' => shell_balanced_end(chars, next, '{', '}'),
-        '(' => shell_balanced_end(chars, next, '(', ')'),
-        character if character.is_ascii_alphabetic() || character == '_' => {
-            let mut index = next + 1;
-            while index < chars.len()
-                && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
-            {
-                index += 1;
-            }
-            index
-        }
-        _ => (next + 1).min(chars.len()),
-    }
-}
-
-fn shell_balanced_end(chars: &[char], start: usize, open: char, close: char) -> usize {
-    let mut depth = 0;
-    let mut index = start;
-    while index < chars.len() {
-        if chars[index] == open {
-            depth += 1;
-        } else if chars[index] == close {
-            depth -= 1;
-            if depth == 0 {
-                return index + 1;
-            }
-        }
-        index += 1;
-    }
-    chars.len()
-}
-
-fn push_shell_token(tokens: &mut Vec<ShellToken>, kind: ShellTokenKind, chars: &[char]) {
-    tokens.push(ShellToken::new(kind, chars.iter().collect::<String>()));
-}
-
-fn is_shell_keyword(text: &str) -> bool {
-    matches!(
-        text,
-        "{" | "}"
-            | "case"
-            | "do"
-            | "done"
-            | "elif"
-            | "else"
-            | "esac"
-            | "fi"
-            | "for"
-            | "function"
-            | "if"
-            | "in"
-            | "!"
-            | "select"
-            | "then"
-            | "time"
-            | "until"
-            | "while"
-    )
-}
-
-fn shell_keyword_expects_command(keyword: &str) -> bool {
-    matches!(
-        keyword,
-        "!" | "{" | "do" | "elif" | "else" | "if" | "then" | "time" | "until" | "while"
-    )
-}
-
-fn is_shell_assignment(text: &str) -> bool {
-    let Some((name, _)) = text.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name.chars().enumerate().all(|(index, character)| {
-            character == '_'
-                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
-        })
 }
 
 fn tool_input_scalar(value: &serde_json::Value) -> AnyView {
@@ -1553,14 +1053,18 @@ fn push_highlighted_json_tokens(
 }
 
 #[component]
-fn ToolUseDetail(item: ToolUse, input_links: Vec<ToolUseInputLink>) -> impl IntoView {
+fn ToolUseDetail(
+    item: ToolUse,
+    input_links: Vec<ToolUseInputLink>,
+    shell_highlights: Vec<ToolInputShellHighlight>,
+) -> impl IntoView {
     view! {
         <article class="node-detail-item">
             <header>
                 <strong>{item.name}</strong>
                 <code>{item.id}</code>
             </header>
-            <ToolInput input=item.input input_links/>
+            <ToolInput input=item.input input_links shell_highlights/>
         </article>
     }
 }
@@ -1862,6 +1366,7 @@ mod tests {
             response: Ok(NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("response".to_owned()))),
                 tool_use_input_links: Vec::new(),
+                tool_input_shell_highlights: Vec::new(),
             }),
         };
         let missing = LoadedPanel {
@@ -1947,6 +1452,7 @@ mod tests {
             <NodeDetailContent response=NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("<script>alert(1)</script>".to_owned()))),
                 tool_use_input_links: Vec::new(),
+                tool_input_shell_highlights: Vec::new(),
             }/>
         }
         .to_html();
@@ -2113,35 +1619,79 @@ mod tests {
 
     #[test]
     fn tool_input_cmd_renders_highlighted_shell_without_changing_the_command() {
-        let command = concat!(
-            "FOO=\"$HOME\" printf '%s\\n' \"$HOME\" | sed -n '1p'\n",
-            "if test -n $HOME; then # inspect the value\n",
-            "  echo '</script>'\n",
-            "fi"
-        );
+        let tokens = vec![
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Keyword,
+                text: "if".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Command,
+                text: "printf".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Option,
+                text: "-v".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::String,
+                text: "'</script>'".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Variable,
+                text: "$HOME".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Operator,
+                text: "|".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Comment,
+                text: "# inspect".to_owned(),
+            },
+        ];
+        let command = tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<String>();
         let input = view! {
-            <ToolInput input=serde_json::json!({
-                "cmd": command,
-                "tty": false,
-            })/>
+            <ToolInput
+                input=serde_json::json!({
+                    "cmd": command,
+                    "tty": false,
+                })
+                shell_highlights=vec![ToolInputShellHighlight {
+                    tool_use_index: 0,
+                    tool_use_id: "exec".to_owned(),
+                    input_pointer: "/cmd".to_owned(),
+                    tokens,
+                }]
+            />
         }
         .to_html();
-        let highlighted = highlighted_shell_tokens(command);
-        let highlighted_commands = highlighted
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            highlighted
-                .iter()
-                .map(|token| token.text.as_str())
-                .collect::<String>(),
-            command
-        );
-        assert!(highlighted_commands.contains(&"test"));
-        assert!(highlighted_commands.contains(&"echo"));
         for class in [
             "shell-command",
             "shell-option",
@@ -2156,175 +1706,6 @@ mod tests {
         assert!(input.contains(r#"aria-label="Shell command""#));
         assert!(input.contains("&lt;/script&gt;"));
         assert!(!input.contains("<script>"));
-    }
-
-    #[test]
-    fn shell_highlighter_recognizes_keywords_only_at_command_positions() {
-        let tokens = highlighted_shell_tokens("echo if foo");
-        let words = tokens
-            .iter()
-            .filter(|token| !token.text.trim().is_empty())
-            .map(|token| (token.kind, token.text.as_str()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            words,
-            vec![
-                (ShellTokenKind::Command, "echo"),
-                (ShellTokenKind::Plain, "if"),
-                (ShellTokenKind::Plain, "foo"),
-            ]
-        );
-    }
-
-    #[test]
-    fn shell_highlighter_preserves_command_position_across_prefix_syntax() {
-        let redirection_tokens = highlighted_shell_tokens(concat!(
-            "2>&1 grep foo file\n",
-            "< input cat\n",
-            "printf error >&2\n",
-            "printf '%s' value &>/tmp/log tail"
-        ));
-        let redirection_commands = redirection_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let continuation_tokens = highlighted_shell_tokens("printf '%s' \\\nvalue");
-        let continuation_words = continuation_tokens
-            .iter()
-            .filter(|token| !token.text.trim().is_empty() && token.text != "\\\n")
-            .map(|token| (token.kind, token.text.as_str()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            redirection_commands,
-            vec!["grep", "cat", "printf", "printf"]
-        );
-        assert_eq!(
-            continuation_words,
-            vec![
-                (ShellTokenKind::Command, "printf"),
-                (ShellTokenKind::String, "'%s'"),
-                (ShellTokenKind::Plain, "value"),
-            ]
-        );
-
-        let escaped_assignment_tokens =
-            highlighted_shell_tokens("FOO=hello\\ world printf '%s' ok");
-        let escaped_assignment_commands = escaped_assignment_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(escaped_assignment_commands, vec!["printf"]);
-
-        let array_assignment_tokens = highlighted_shell_tokens("FOO=(one two) printf '%s' ok");
-        let array_assignment_commands = array_assignment_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(array_assignment_commands, vec!["printf"]);
-    }
-
-    #[test]
-    fn shell_highlighter_handles_heredocs_and_case_clauses() {
-        let heredoc_tokens = highlighted_shell_tokens(concat!(
-            "cat <<'EOF'\n",
-            "hello\n",
-            "EOF\n",
-            "cat <<-END\n",
-            "\tpayload\n",
-            "\tEND\n",
-            "cat <<'END'_SQL\n",
-            "payload\n",
-            "END_SQL\n",
-            "cat <<\"E\\\"OF\"\n",
-            "payload\n",
-            "E\"OF\n",
-            "printf done"
-        ));
-        let heredoc_commands = heredoc_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let multiple_heredoc_tokens = highlighted_shell_tokens(concat!(
-            "cat <<EOF <<END\n",
-            "first\n",
-            "EOF\n",
-            "second\n",
-            "END\n",
-            "printf done"
-        ));
-        let multiple_heredoc_commands = multiple_heredoc_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let case_tokens =
-            highlighted_shell_tokens("case \"$x\" in foo|bar) echo yes;; esac\n! grep value");
-        let case_commands = case_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let group_tokens = highlighted_shell_tokens("{ echo hi; }");
-        let group_commands = group_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let function_tokens =
-            highlighted_shell_tokens("function foo { echo hi; }\nbar() { printf ok; }");
-        let function_commands = function_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let time_tokens = highlighted_shell_tokens("time -p sleep 1");
-        let time_commands = time_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let fallthrough_tokens =
-            highlighted_shell_tokens("case \"$x\" in x) echo x ;& y) echo y ;;& z) echo z;; esac");
-        let fallthrough_commands = fallthrough_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let arithmetic_tokens =
-            highlighted_shell_tokens("for ((i=0; i<3; i++)); do echo \"$i\"; done");
-        let arithmetic_commands = arithmetic_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-        let nested_case_tokens = highlighted_shell_tokens(concat!(
-            "case \"$x\" in a) ",
-            "case \"$y\" in b) echo b;; esac;; ",
-            "c) echo c;; esac"
-        ));
-        let nested_case_commands = nested_case_tokens
-            .iter()
-            .filter(|token| token.kind == ShellTokenKind::Command)
-            .map(|token| token.text.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(heredoc_commands, vec!["cat", "cat", "cat", "cat", "printf"]);
-        assert_eq!(multiple_heredoc_commands, vec!["cat", "printf"]);
-        assert_eq!(case_commands, vec!["echo", "grep"]);
-        assert_eq!(group_commands, vec!["echo"]);
-        assert_eq!(function_commands, vec!["echo", "printf"]);
-        assert_eq!(time_commands, vec!["sleep"]);
-        assert_eq!(fallthrough_commands, vec!["echo", "echo", "echo"]);
-        assert_eq!(arithmetic_commands, vec!["echo"]);
-        assert_eq!(nested_case_commands, vec!["echo", "echo"]);
     }
 
     #[test]
@@ -2350,6 +1731,7 @@ mod tests {
                     value: "exec-1".to_owned(),
                     target: "detail-exec-node".to_owned(),
                 }],
+                tool_input_shell_highlights: Vec::new(),
             }/>
         }
         .to_html();

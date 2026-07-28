@@ -14,6 +14,7 @@ mod host {
     mod publisher;
     mod render;
     mod server;
+    mod shell_highlight;
     mod store;
     mod web_graph_order;
     mod web_graph_runtime;
