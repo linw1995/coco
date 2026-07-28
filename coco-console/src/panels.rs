@@ -648,6 +648,48 @@ impl JsonToken {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellTokenKind {
+    Plain,
+    Command,
+    Option,
+    String,
+    Variable,
+    Operator,
+    Comment,
+    Keyword,
+}
+
+impl ShellTokenKind {
+    fn class(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Command => Some("shell-command"),
+            Self::Option => Some("shell-option"),
+            Self::String => Some("shell-string"),
+            Self::Variable => Some("shell-variable"),
+            Self::Operator => Some("shell-operator"),
+            Self::Comment => Some("shell-comment"),
+            Self::Keyword => Some("shell-keyword"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellToken {
+    kind: ShellTokenKind,
+    text: String,
+}
+
+impl ShellToken {
+    fn new(kind: ShellTokenKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+        }
+    }
+}
+
 #[component]
 fn ToolInput(
     input: serde_json::Value,
@@ -783,6 +825,12 @@ fn tool_input_list_entry(
     pointer: String,
     input_links: &[ToolUseInputLink],
 ) -> AnyView {
+    if label == "cmd"
+        && let serde_json::Value::String(command) = value
+    {
+        return tool_input_shell_entry(label, label_class, command, pointer);
+    }
+
     let summary = match value {
         serde_json::Value::Object(values) => {
             Some(format_container_summary("Object", values.len(), "field"))
@@ -837,6 +885,213 @@ fn tool_input_list_entry(
         }
         .into_any()
     }
+}
+
+fn tool_input_shell_entry(
+    label: String,
+    label_class: &'static str,
+    command: &str,
+    pointer: String,
+) -> AnyView {
+    let tokens = highlighted_shell_tokens(command)
+        .into_iter()
+        .map(|token| match token.kind.class() {
+            Some(class) => view! { <span class=class>{token.text}</span> }.into_any(),
+            None => token.text.into_any(),
+        })
+        .collect::<Vec<_>>();
+
+    view! {
+        <li
+            class="tool-input-entry tool-input-entry-shell"
+            data-json-pointer=pointer
+        >
+            <span class=label_class>{label}</span>
+            <pre class="tool-input-shell" aria-label="Shell command">
+                <code>{tokens}</code>
+            </pre>
+        </li>
+    }
+    .into_any()
+}
+
+fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    let mut expects_command = true;
+    let mut at_word_start = true;
+
+    while index < chars.len() {
+        let start = index;
+        match chars[index] {
+            '\n' => {
+                index += 1;
+                expects_command = true;
+                at_word_start = true;
+                push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
+            }
+            character if character.is_whitespace() => {
+                while index < chars.len() && chars[index].is_whitespace() && chars[index] != '\n' {
+                    index += 1;
+                }
+                at_word_start = true;
+                push_shell_token(&mut tokens, ShellTokenKind::Plain, &chars[start..index]);
+            }
+            '#' if at_word_start => {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+                at_word_start = false;
+                push_shell_token(&mut tokens, ShellTokenKind::Comment, &chars[start..index]);
+            }
+            '\'' | '"' => {
+                let quote = chars[index];
+                index += 1;
+                while index < chars.len() {
+                    if chars[index] == '\\' && quote == '"' {
+                        index = (index + 2).min(chars.len());
+                    } else {
+                        let closes_quote = chars[index] == quote;
+                        index += 1;
+                        if closes_quote {
+                            break;
+                        }
+                    }
+                }
+                if expects_command {
+                    expects_command = false;
+                }
+                at_word_start = false;
+                push_shell_token(&mut tokens, ShellTokenKind::String, &chars[start..index]);
+            }
+            '$' => {
+                index = shell_variable_end(&chars, index);
+                if expects_command {
+                    expects_command = false;
+                }
+                at_word_start = false;
+                push_shell_token(&mut tokens, ShellTokenKind::Variable, &chars[start..index]);
+            }
+            '|' | '&' | ';' | '<' | '>' => {
+                let operator = chars[index];
+                index += 1;
+                if index < chars.len()
+                    && (chars[index] == operator
+                        || (operator == '>' && chars[index] == '|')
+                        || (operator == '<' && chars[index] == '>'))
+                {
+                    index += 1;
+                }
+                if matches!(operator, '|' | '&' | ';') {
+                    expects_command = true;
+                }
+                at_word_start = true;
+                push_shell_token(&mut tokens, ShellTokenKind::Operator, &chars[start..index]);
+            }
+            _ => {
+                while index < chars.len()
+                    && !chars[index].is_whitespace()
+                    && !matches!(chars[index], '\'' | '"' | '$' | '|' | '&' | ';' | '<' | '>')
+                {
+                    index += 1;
+                }
+                let text = chars[start..index].iter().collect::<String>();
+                let kind = if is_shell_keyword(&text) {
+                    ShellTokenKind::Keyword
+                } else if text.starts_with('-') {
+                    ShellTokenKind::Option
+                } else if expects_command && !is_shell_assignment(&text) {
+                    ShellTokenKind::Command
+                } else {
+                    ShellTokenKind::Plain
+                };
+                if expects_command && !is_shell_assignment(&text) {
+                    expects_command = false;
+                }
+                at_word_start = false;
+                tokens.push(ShellToken::new(kind, text));
+            }
+        }
+    }
+
+    tokens
+}
+
+fn shell_variable_end(chars: &[char], start: usize) -> usize {
+    let next = start + 1;
+    if next >= chars.len() {
+        return next;
+    }
+
+    match chars[next] {
+        '{' => shell_balanced_end(chars, next, '{', '}'),
+        '(' => shell_balanced_end(chars, next, '(', ')'),
+        character if character.is_ascii_alphabetic() || character == '_' => {
+            let mut index = next + 1;
+            while index < chars.len()
+                && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+            {
+                index += 1;
+            }
+            index
+        }
+        _ => (next + 1).min(chars.len()),
+    }
+}
+
+fn shell_balanced_end(chars: &[char], start: usize, open: char, close: char) -> usize {
+    let mut depth = 0;
+    let mut index = start;
+    while index < chars.len() {
+        if chars[index] == open {
+            depth += 1;
+        } else if chars[index] == close {
+            depth -= 1;
+            if depth == 0 {
+                return index + 1;
+            }
+        }
+        index += 1;
+    }
+    chars.len()
+}
+
+fn push_shell_token(tokens: &mut Vec<ShellToken>, kind: ShellTokenKind, chars: &[char]) {
+    tokens.push(ShellToken::new(kind, chars.iter().collect::<String>()));
+}
+
+fn is_shell_keyword(text: &str) -> bool {
+    matches!(
+        text,
+        "case"
+            | "do"
+            | "done"
+            | "elif"
+            | "else"
+            | "esac"
+            | "fi"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "select"
+            | "then"
+            | "time"
+            | "until"
+            | "while"
+    )
+}
+
+fn is_shell_assignment(text: &str) -> bool {
+    let Some((name, _)) = text.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
 }
 
 fn tool_input_scalar(value: &serde_json::Value) -> AnyView {
@@ -1513,6 +1768,46 @@ mod tests {
         assert!(input.contains("printf &lt;/script&gt;"));
         assert!(!input.contains("<script>"));
         assert!(!input.contains("tool-input-raw"));
+    }
+
+    #[test]
+    fn tool_input_cmd_renders_highlighted_shell_without_changing_the_command() {
+        let command = concat!(
+            "FOO=bar printf '%s\\n' \"$HOME\" | sed -n '1p'\n",
+            "if test -n $HOME; then # inspect the value\n",
+            "  echo '</script>'\n",
+            "fi"
+        );
+        let input = view! {
+            <ToolInput input=serde_json::json!({
+                "cmd": command,
+                "tty": false,
+            })/>
+        }
+        .to_html();
+        let highlighted = highlighted_shell_tokens(command);
+
+        assert_eq!(
+            highlighted
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<String>(),
+            command
+        );
+        for class in [
+            "shell-command",
+            "shell-option",
+            "shell-string",
+            "shell-variable",
+            "shell-operator",
+            "shell-comment",
+            "shell-keyword",
+        ] {
+            assert!(input.contains(&format!(r#"class="{class}""#)), "{input}");
+        }
+        assert!(input.contains(r#"aria-label="Shell command""#));
+        assert!(input.contains("&lt;/script&gt;"));
+        assert!(!input.contains("<script>"));
     }
 
     #[test]
