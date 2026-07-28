@@ -6,7 +6,7 @@ use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
 
 use crate::api::{
-    AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightToken,
+    AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
     NodeDetailResponse, ProviderContextItem, ProviderContextResponse, ShellHighlightKind,
     ShellHighlightToken, ToolInputJsonHighlight, ToolInputShellHighlight, ToolUseInputLink,
 };
@@ -345,15 +345,20 @@ fn NodeDetailBody(
                         })
                         .cloned()
                         .collect();
-                    let json_highlight = tool_input_json_highlights
+                    let json_highlight_ranges = tool_input_json_highlights
                         .iter()
                         .find(|highlight| {
                             highlight.tool_use_index == index && highlight.tool_use_id == item.id
                         })
-                        .map(|highlight| highlight.tokens.clone())
+                        .map(|highlight| highlight.ranges.clone())
                         .unwrap_or_default();
                     view! {
-                        <ToolUseDetail item=item input_links shell_highlights json_highlight/>
+                        <ToolUseDetail
+                            item=item
+                            input_links
+                            shell_highlights
+                            json_highlight_ranges
+                        />
                     }
                 }).collect::<Vec<_>>()}
             </div>
@@ -683,7 +688,7 @@ fn ToolInput(
     input: serde_json::Value,
     #[prop(default = Vec::new())] input_links: Vec<ToolUseInputLink>,
     #[prop(default = Vec::new())] shell_highlights: Vec<ToolInputShellHighlight>,
-    #[prop(default = Vec::new())] json_highlight: Vec<JsonHighlightToken>,
+    #[prop(default = Vec::new())] json_highlight_ranges: Vec<JsonHighlightRange>,
 ) -> impl IntoView {
     let view = ArcRwSignal::new(ToolInputView::List);
     let list_class_view = view.clone();
@@ -696,7 +701,7 @@ fn ToolInput(
     let list_input = input.clone();
     let list_input_links = input_links;
     let list_shell_highlights = shell_highlights;
-    let raw_json_highlight = json_highlight;
+    let raw_json_highlight_ranges = json_highlight_ranges;
 
     view! {
         <section class="node-detail-section tool-input">
@@ -748,7 +753,7 @@ fn ToolInput(
                     view! {
                         <ToolInputRaw
                             input=input.clone()
-                            tokens=raw_json_highlight.clone()
+                            ranges=raw_json_highlight_ranges.clone()
                         />
                     }
                     .into_any()
@@ -971,22 +976,10 @@ fn format_container_summary(kind: &str, len: usize, item: &str) -> String {
 #[component]
 fn ToolInputRaw(
     input: serde_json::Value,
-    #[prop(default = Vec::new())] tokens: Vec<JsonHighlightToken>,
+    #[prop(default = Vec::new())] ranges: Vec<JsonHighlightRange>,
 ) -> impl IntoView {
-    let tokens = if tokens.is_empty() {
-        vec![JsonHighlightToken {
-            kind: JsonHighlightKind::Plain,
-            text: pretty_json(&input),
-        }]
-    } else {
-        tokens
-    }
-    .into_iter()
-    .map(|token| match token.kind.class() {
-        Some(class) => view! { <span class=class>{token.text}</span> }.into_any(),
-        None => token.text.into_any(),
-    })
-    .collect::<Vec<_>>();
+    let source = pretty_json(&input);
+    let tokens = highlighted_json_views(source, &ranges);
 
     view! {
         <pre class="node-detail-code tool-input-raw" aria-label="Raw JSON input">
@@ -995,12 +988,40 @@ fn ToolInputRaw(
     }
 }
 
+fn highlighted_json_views(source: String, ranges: &[JsonHighlightRange]) -> Vec<AnyView> {
+    let mut tokens = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start < cursor
+            || range.end <= range.start
+            || range.end > source.len()
+            || !source.is_char_boundary(range.start)
+            || !source.is_char_boundary(range.end)
+        {
+            return vec![source.into_any()];
+        }
+        if cursor < range.start {
+            tokens.push(source[cursor..range.start].to_owned().into_any());
+        }
+        let text = source[range.start..range.end].to_owned();
+        tokens.push(match range.kind.class() {
+            Some(class) => view! { <span class=class>{text}</span> }.into_any(),
+            None => text.into_any(),
+        });
+        cursor = range.end;
+    }
+    if cursor < source.len() {
+        tokens.push(source[cursor..].to_owned().into_any());
+    }
+    tokens
+}
+
 #[component]
 fn ToolUseDetail(
     item: ToolUse,
     input_links: Vec<ToolUseInputLink>,
     shell_highlights: Vec<ToolInputShellHighlight>,
-    json_highlight: Vec<JsonHighlightToken>,
+    json_highlight_ranges: Vec<JsonHighlightRange>,
 ) -> impl IntoView {
     view! {
         <article class="node-detail-item">
@@ -1008,7 +1029,12 @@ fn ToolUseDetail(
                 <strong>{item.name}</strong>
                 <code>{item.id}</code>
             </header>
-            <ToolInput input=item.input input_links shell_highlights json_highlight/>
+            <ToolInput
+                input=item.input
+                input_links
+                shell_highlights
+                json_highlight_ranges
+            />
         </article>
     }
 }
@@ -1264,6 +1290,16 @@ fn provider_context_target(query: &str) -> Option<String> {
         let (name, value) = part.split_once('=')?;
         (name == "context" && value.starts_with(NODE_TARGET_PREFIX)).then(|| value.to_owned())
     })
+}
+
+#[cfg(test)]
+fn test_json_range(source: &str, text: &str, kind: JsonHighlightKind) -> JsonHighlightRange {
+    let start = source.find(text).expect("test JSON token should exist");
+    JsonHighlightRange {
+        kind,
+        start,
+        end: start + text.len(),
+    }
 }
 
 #[cfg(test)]
@@ -1702,36 +1738,22 @@ mod tests {
             "number": 42,
             "boolean": false,
             "nothing": null,
+            "escaped": "line\nbreak",
         });
+        let source = pretty_json(&value);
+        let mut ranges = vec![
+            test_json_range(&source, "\"<key>\"", JsonHighlightKind::Key),
+            test_json_range(&source, "\"</script>\"", JsonHighlightKind::String),
+            test_json_range(&source, "42", JsonHighlightKind::Number),
+            test_json_range(&source, "false", JsonHighlightKind::Boolean),
+            test_json_range(&source, "null", JsonHighlightKind::Null),
+            test_json_range(&source, "\\n", JsonHighlightKind::Escape),
+        ];
+        ranges.sort_by_key(|range| range.start);
         let raw = view! {
             <ToolInputRaw
                 input=value
-                tokens=vec![
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Key,
-                        text: "\"<key>\"".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::String,
-                        text: "\"</script>\"".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Number,
-                        text: "42".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Boolean,
-                        text: "false".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Null,
-                        text: "null".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Escape,
-                        text: "\\n".to_owned(),
-                    },
-                ]
+                ranges
             />
         }
         .to_html();
@@ -1749,6 +1771,26 @@ mod tests {
         assert!(raw.contains("&lt;key&gt;"));
         assert!(raw.contains("&lt;/script&gt;"));
         assert!(!raw.contains("<script>"));
+    }
+
+    #[test]
+    fn raw_tool_input_falls_back_to_plain_json_for_invalid_ranges() {
+        let value = serde_json::json!({"unsafe": "</script>"});
+        let raw = view! {
+            <ToolInputRaw
+                input=value
+                ranges=vec![JsonHighlightRange {
+                    kind: JsonHighlightKind::String,
+                    start: 1,
+                    end: usize::MAX,
+                }]
+            />
+        }
+        .to_html();
+
+        assert!(raw.contains("&lt;/script&gt;"));
+        assert!(!raw.contains("<script>"));
+        assert!(!raw.contains("json-string"));
     }
 
     #[test]
@@ -1832,36 +1874,31 @@ mod wasm_tests {
             .expect_throw("document body should be available")
             .append_child(&root)
             .expect_throw("test root should be mounted");
-        let mounted = leptos::mount::mount_to(root.clone(), || {
+        let input = serde_json::json!({
+            "command": "true",
+            "timeout": 30,
+            "enabled": true,
+            "optional": null,
+        });
+        let source = pretty_json(&input);
+        let boolean_start = source
+            .rfind("true")
+            .expect("test JSON boolean should exist");
+        let mut json_highlight_ranges = vec![
+            test_json_range(&source, "\"command\"", JsonHighlightKind::Key),
+            test_json_range(&source, "\"true\"", JsonHighlightKind::String),
+            test_json_range(&source, "30", JsonHighlightKind::Number),
+            JsonHighlightRange {
+                kind: JsonHighlightKind::Boolean,
+                start: boolean_start,
+                end: boolean_start + "true".len(),
+            },
+            test_json_range(&source, "null", JsonHighlightKind::Null),
+        ];
+        json_highlight_ranges.sort_by_key(|range| range.start);
+        let mounted = leptos::mount::mount_to(root.clone(), move || {
             view! {
-                <ToolInput input=serde_json::json!({
-                    "command": "true",
-                    "timeout": 30,
-                    "enabled": true,
-                    "optional": null,
-                })
-                json_highlight=vec![
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Key,
-                        text: "\"command\"".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::String,
-                        text: "\"true\"".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Number,
-                        text: "30".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Boolean,
-                        text: "true".to_owned(),
-                    },
-                    JsonHighlightToken {
-                        kind: JsonHighlightKind::Null,
-                        text: "null".to_owned(),
-                    },
-                ]
+                <ToolInput input json_highlight_ranges
                 />
             }
         });

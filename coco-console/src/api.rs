@@ -48,7 +48,7 @@ pub struct ToolInputShellHighlight {
 pub struct ToolInputJsonHighlight {
     pub tool_use_index: usize,
     pub tool_use_id: String,
-    pub tokens: Vec<JsonHighlightToken>,
+    pub ranges: Vec<JsonHighlightRange>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -71,9 +71,10 @@ pub enum ShellHighlightKind {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct JsonHighlightToken {
+pub struct JsonHighlightRange {
     pub kind: JsonHighlightKind,
-    pub text: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

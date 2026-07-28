@@ -2,7 +2,7 @@ use coco_types::{Kind, Node};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 use crate::api::{
-    JsonHighlightKind, JsonHighlightToken, ShellHighlightKind, ShellHighlightToken,
+    JsonHighlightKind, JsonHighlightRange, ShellHighlightKind, ShellHighlightToken,
     ToolInputJsonHighlight, ToolInputShellHighlight,
 };
 
@@ -39,7 +39,7 @@ pub fn tool_input_syntax_highlights(node: &Node) -> ToolInputSyntaxHighlights {
             result.json.push(ToolInputJsonHighlight {
                 tool_use_index,
                 tool_use_id: item.id.clone(),
-                tokens: highlighted_json_tokens(&source, configuration, &mut json_highlighter),
+                ranges: highlighted_json_ranges(&source, configuration, &mut json_highlighter),
             });
         }
         if let Some(configuration) = bash_highlight_configuration() {
@@ -211,11 +211,12 @@ fn bash_highlight_priority(kind: ShellHighlightKind) -> u8 {
     }
 }
 
-fn highlighted_json_tokens(
+fn highlighted_json_ranges(
     source: &str,
     configuration: &HighlightConfiguration,
     highlighter: &mut Highlighter,
-) -> Vec<JsonHighlightToken> {
+) -> Vec<JsonHighlightRange> {
+    let mut offset = 0;
     highlighted_tokens(
         source,
         configuration,
@@ -224,9 +225,14 @@ fn highlighted_json_tokens(
         active_json_highlight_kind,
     )
     .into_iter()
-    .map(|token| JsonHighlightToken {
-        kind: token.kind,
-        text: token.text,
+    .filter_map(|token| {
+        let start = offset;
+        offset += token.text.len();
+        (token.kind != JsonHighlightKind::Plain).then_some(JsonHighlightRange {
+            kind: token.kind,
+            start,
+            end: offset,
+        })
     })
     .collect()
 }
@@ -392,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_sitter_highlights_pretty_json_without_changing_source() {
+    fn tree_sitter_returns_valid_pretty_json_ranges() {
         let source = serde_json::to_string_pretty(&serde_json::json!({
             "<key>": "line\nbreak",
             "number": 42,
@@ -401,15 +407,8 @@ mod tests {
         }))
         .unwrap();
         let configuration = json_highlight_configuration().unwrap();
-        let tokens = highlighted_json_tokens(&source, configuration, &mut Highlighter::new());
+        let ranges = highlighted_json_ranges(&source, configuration, &mut Highlighter::new());
 
-        assert_eq!(
-            tokens
-                .iter()
-                .map(|token| token.text.as_str())
-                .collect::<String>(),
-            source
-        );
         for kind in [
             JsonHighlightKind::Key,
             JsonHighlightKind::String,
@@ -418,8 +417,19 @@ mod tests {
             JsonHighlightKind::Null,
             JsonHighlightKind::Escape,
         ] {
-            assert!(tokens.iter().any(|token| token.kind == kind), "{kind:?}");
+            assert!(ranges.iter().any(|range| range.kind == kind), "{kind:?}");
         }
+        for range in &ranges {
+            assert!(source.is_char_boundary(range.start));
+            assert!(source.is_char_boundary(range.end));
+            assert!(range.start < range.end);
+        }
+        assert!(
+            ranges
+                .iter()
+                .filter(|range| range.kind == JsonHighlightKind::Key)
+                .all(|range| source[range.start..range.end].starts_with('"'))
+        );
     }
 
     #[test]
@@ -449,7 +459,12 @@ mod tests {
         assert_eq!(highlights.len(), 2);
         assert_eq!(highlights[0].tool_use_index, 0);
         assert_eq!(highlights[0].tool_use_id, "first");
+        assert!(!highlights[0].ranges.is_empty());
         assert_eq!(highlights[1].tool_use_index, 1);
         assert_eq!(highlights[1].tool_use_id, "second");
+        assert!(!highlights[1].ranges.is_empty());
+        let response = serde_json::to_string(&highlights).unwrap();
+        assert!(!response.contains("\"cmd\""));
+        assert!(!response.contains("\"session_id\""));
     }
 }
