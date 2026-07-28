@@ -945,6 +945,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
     let mut in_heredoc_body = false;
     let mut case_phases = Vec::new();
     let mut in_arithmetic_command = false;
+    let mut array_assignment_depth = 0;
     let mut expects_function_name = false;
     let mut expects_function_body = false;
     let mut in_function_parameters = false;
@@ -998,7 +999,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 );
                 expects_heredoc_delimiter = false;
                 at_word_start = true;
-                in_assignment = false;
+                in_assignment = array_assignment_depth > 0;
                 in_redirection = false;
                 redirection_operand_started = false;
                 command_options_allowed = false;
@@ -1016,7 +1017,9 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     &mut pending_heredocs,
                 );
                 at_word_start = true;
-                in_assignment = false;
+                if array_assignment_depth == 0 {
+                    in_assignment = false;
+                }
                 if redirection_operand_started {
                     in_redirection = false;
                     redirection_operand_started = false;
@@ -1049,9 +1052,17 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     command_options_allowed = false;
                 }
                 if expects_heredoc_delimiter {
+                    let fragment = chars[start + 1..index.saturating_sub(1)]
+                        .iter()
+                        .collect::<String>();
+                    let fragment = if quote == '"' {
+                        shell_unescape_double_quoted_word(&fragment)
+                    } else {
+                        fragment
+                    };
                     heredoc_delimiter
                         .get_or_insert_default()
-                        .extend(chars[start + 1..index.saturating_sub(1)].iter().copied());
+                        .push_str(&fragment);
                 }
                 redirection_operand_started |= in_redirection;
                 at_word_start = false;
@@ -1109,6 +1120,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     in_arithmetic_command = true;
                 }
                 let is_redirection = !in_arithmetic_command
+                    && array_assignment_depth == 0
                     && (matches!(operator, '<' | '>')
                         || matches!(operator_text.as_str(), "&>" | "&>>"));
                 let is_case_pattern_separator =
@@ -1117,6 +1129,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                     && !is_redirection
                     && !is_case_pattern_separator
                     && !in_arithmetic_command
+                    && array_assignment_depth == 0
                 {
                     expects_command = true;
                     command_options_allowed = false;
@@ -1141,6 +1154,7 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 }
                 let starts_function_parameters = operator == '('
                     && operator_text != "(("
+                    && array_assignment_depth == 0
                     && (expects_function_body
                         || (!expects_command
                             && tokens
@@ -1162,8 +1176,13 @@ fn highlighted_shell_tokens(command: &str) -> Vec<ShellToken> {
                 if operator_text == "))" && in_arithmetic_command {
                     in_arithmetic_command = false;
                 }
+                if operator == '(' && (in_assignment || array_assignment_depth > 0) {
+                    array_assignment_depth += 1;
+                } else if operator == ')' && array_assignment_depth > 0 {
+                    array_assignment_depth -= 1;
+                }
                 at_word_start = true;
-                in_assignment = false;
+                in_assignment = array_assignment_depth > 0;
                 in_redirection = is_redirection;
                 redirection_operand_started = false;
                 expects_heredoc_delimiter = matches!(operator_text.as_str(), "<<" | "<<-");
@@ -1304,6 +1323,28 @@ fn shell_unescape_word(text: &str) -> String {
             }
         } else {
             unescaped.push(character);
+        }
+    }
+    unescaped
+}
+
+fn shell_unescape_double_quoted_word(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut unescaped = String::with_capacity(text.len());
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            unescaped.push(character);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            unescaped.push(character);
+            break;
+        };
+        if matches!(escaped, '$' | '`' | '"' | '\\') {
+            unescaped.push(escaped);
+        } else if escaped != '\n' {
+            unescaped.push(character);
+            unescaped.push(escaped);
         }
     }
     unescaped
@@ -2178,6 +2219,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(escaped_assignment_commands, vec!["printf"]);
+
+        let array_assignment_tokens = highlighted_shell_tokens("FOO=(one two) printf '%s' ok");
+        let array_assignment_commands = array_assignment_tokens
+            .iter()
+            .filter(|token| token.kind == ShellTokenKind::Command)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(array_assignment_commands, vec!["printf"]);
     }
 
     #[test]
@@ -2192,6 +2242,9 @@ mod tests {
             "cat <<'END'_SQL\n",
             "payload\n",
             "END_SQL\n",
+            "cat <<\"E\\\"OF\"\n",
+            "payload\n",
+            "E\"OF\n",
             "printf done"
         ));
         let heredoc_commands = heredoc_tokens
@@ -2263,7 +2316,7 @@ mod tests {
             .map(|token| token.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(heredoc_commands, vec!["cat", "cat", "cat", "printf"]);
+        assert_eq!(heredoc_commands, vec!["cat", "cat", "cat", "cat", "printf"]);
         assert_eq!(multiple_heredoc_commands, vec!["cat", "printf"]);
         assert_eq!(case_commands, vec!["echo", "grep"]);
         assert_eq!(group_commands, vec!["echo"]);
