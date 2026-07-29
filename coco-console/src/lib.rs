@@ -15,6 +15,7 @@ mod host {
     mod render;
     mod server;
     mod store;
+    mod syntax_highlight;
     mod web_graph_order;
     mod web_graph_runtime;
     #[allow(dead_code)]

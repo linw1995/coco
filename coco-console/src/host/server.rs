@@ -450,9 +450,12 @@ where
         Ok(node) => {
             let tool_use_input_links =
                 resolve_tool_use_input_links(&state.web_graph, &node).await?;
+            let highlights = super::syntax_highlight::tool_input_syntax_highlights(&node);
             Ok(NodeDetailResponse::Found {
                 node: Box::new(node),
                 tool_use_input_links,
+                tool_input_shell_highlights: highlights.shell,
+                tool_input_json_highlights: highlights.json,
             })
         }
         Err(error) if is_missing_node(&error) => Ok(NodeDetailResponse::Missing {

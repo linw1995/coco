@@ -20,6 +20,10 @@ pub enum NodeDetailResponse {
     Found {
         node: Box<Node>,
         tool_use_input_links: Vec<ToolUseInputLink>,
+        #[serde(default)]
+        tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
+        #[serde(default)]
+        tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
     },
 }
 
@@ -30,6 +34,59 @@ pub struct ToolUseInputLink {
     pub input_pointer: String,
     pub value: String,
     pub target: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolInputShellHighlight {
+    pub tool_use_index: usize,
+    pub tool_use_id: String,
+    pub input_pointer: String,
+    pub tokens: Vec<ShellHighlightToken>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolInputJsonHighlight {
+    pub tool_use_index: usize,
+    pub tool_use_id: String,
+    pub ranges: Vec<JsonHighlightRange>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShellHighlightToken {
+    pub kind: ShellHighlightKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellHighlightKind {
+    Plain,
+    Command,
+    Option,
+    String,
+    Variable,
+    Operator,
+    Comment,
+    Keyword,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct JsonHighlightRange {
+    pub kind: JsonHighlightKind,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonHighlightKind {
+    Plain,
+    Key,
+    String,
+    Number,
+    Boolean,
+    Null,
+    Escape,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use leptos::{
     leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
 };
 
-const MOBILE_VIEWPORT_MAX_WIDTH: i32 = 860;
+const MOBILE_VIEWPORT_MAX_WIDTH: i32 = 1024;
 const GRAPH_REVISION_EVENT: &str = "coco-graph-revision";
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
 

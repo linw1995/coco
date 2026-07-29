@@ -6,8 +6,9 @@ use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
 
 use crate::api::{
-    AnchorRangeResponse, GraphViewportEdgeKind, NodeDetailResponse, ProviderContextItem,
-    ProviderContextResponse, ToolUseInputLink,
+    AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
+    NodeDetailResponse, ProviderContextItem, ProviderContextResponse, ShellHighlightKind,
+    ShellHighlightToken, ToolInputJsonHighlight, ToolInputShellHighlight, ToolUseInputLink,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -245,12 +246,27 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         NodeDetailResponse::Found {
             node,
             tool_use_input_links,
-        } => view! { <NodeDetail node=*node tool_use_input_links/> }.into_any(),
+            tool_input_shell_highlights,
+            tool_input_json_highlights,
+        } => view! {
+            <NodeDetail
+                node=*node
+                tool_use_input_links
+                tool_input_shell_highlights
+                tool_input_json_highlights
+            />
+        }
+        .into_any(),
     }
 }
 
 #[component]
-fn NodeDetail(node: Node, tool_use_input_links: Vec<ToolUseInputLink>) -> impl IntoView {
+fn NodeDetail(
+    node: Node,
+    tool_use_input_links: Vec<ToolUseInputLink>,
+    tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
+    tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
+) -> impl IntoView {
     let target = format!("{NODE_TARGET_PREFIX}{}", node.id);
     let kind = node_kind_name(&node.kind);
     let kind_class = format!("node-details node-detail kind-{kind}");
@@ -304,7 +320,12 @@ fn NodeDetail(node: Node, tool_use_input_links: Vec<ToolUseInputLink>) -> impl I
                     </div>
                 }).collect::<Vec<_>>()}
             </dl>
-            <NodeDetailBody kind=node.kind tool_use_input_links/>
+            <NodeDetailBody
+                kind=node.kind
+                tool_use_input_links
+                tool_input_shell_highlights
+                tool_input_json_highlights
+            />
         </section>
     }
 }
@@ -313,6 +334,8 @@ fn NodeDetail(node: Node, tool_use_input_links: Vec<ToolUseInputLink>) -> impl I
 fn NodeDetailBody(
     kind: Kind,
     #[prop(default = Vec::new())] tool_use_input_links: Vec<ToolUseInputLink>,
+    #[prop(default = Vec::new())] tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
+    #[prop(default = Vec::new())] tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
 ) -> AnyView {
     match kind {
         Kind::Anchor(anchor) => {
@@ -326,7 +349,28 @@ fn NodeDetailBody(
                         .filter(|link| link.tool_use_index == index && link.tool_use_id == item.id)
                         .cloned()
                         .collect();
-                    view! { <ToolUseDetail item=item input_links/> }
+                    let shell_highlights = tool_input_shell_highlights
+                        .iter()
+                        .filter(|highlight| {
+                            highlight.tool_use_index == index && highlight.tool_use_id == item.id
+                        })
+                        .cloned()
+                        .collect();
+                    let json_highlight_ranges = tool_input_json_highlights
+                        .iter()
+                        .find(|highlight| {
+                            highlight.tool_use_index == index && highlight.tool_use_id == item.id
+                        })
+                        .map(|highlight| highlight.ranges.clone())
+                        .unwrap_or_default();
+                    view! {
+                        <ToolUseDetail
+                            item=item
+                            input_links
+                            shell_highlights
+                            json_highlight_ranges
+                        />
+                    }
                 }).collect::<Vec<_>>()}
             </div>
         }
@@ -621,17 +665,7 @@ enum ToolInputView {
     Raw,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JsonTokenKind {
-    Plain,
-    Key,
-    String,
-    Number,
-    Boolean,
-    Null,
-}
-
-impl JsonTokenKind {
+impl JsonHighlightKind {
     fn class(self) -> Option<&'static str> {
         match self {
             Self::Plain => None,
@@ -640,21 +674,22 @@ impl JsonTokenKind {
             Self::Number => Some("json-number"),
             Self::Boolean => Some("json-boolean"),
             Self::Null => Some("json-null"),
+            Self::Escape => Some("json-escape"),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct JsonToken {
-    kind: JsonTokenKind,
-    text: String,
-}
-
-impl JsonToken {
-    fn new(kind: JsonTokenKind, text: impl Into<String>) -> Self {
-        Self {
-            kind,
-            text: text.into(),
+impl ShellHighlightKind {
+    fn class(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Command => Some("shell-command"),
+            Self::Option => Some("shell-option"),
+            Self::String => Some("shell-string"),
+            Self::Variable => Some("shell-variable"),
+            Self::Operator => Some("shell-operator"),
+            Self::Comment => Some("shell-comment"),
+            Self::Keyword => Some("shell-keyword"),
         }
     }
 }
@@ -663,6 +698,8 @@ impl JsonToken {
 fn ToolInput(
     input: serde_json::Value,
     #[prop(default = Vec::new())] input_links: Vec<ToolUseInputLink>,
+    #[prop(default = Vec::new())] shell_highlights: Vec<ToolInputShellHighlight>,
+    #[prop(default = Vec::new())] json_highlight_ranges: Vec<JsonHighlightRange>,
 ) -> impl IntoView {
     let view = ArcRwSignal::new(ToolInputView::List);
     let list_class_view = view.clone();
@@ -674,6 +711,8 @@ fn ToolInput(
     let content_view = view;
     let list_input = input.clone();
     let list_input_links = input_links;
+    let list_shell_highlights = shell_highlights;
+    let raw_json_highlight_ranges = json_highlight_ranges;
 
     view! {
         <section class="node-detail-section tool-input">
@@ -716,12 +755,19 @@ fn ToolInput(
                         <ToolInputList
                             input=list_input.clone()
                             input_links=list_input_links.clone()
+                            shell_highlights=list_shell_highlights.clone()
                         />
                     }
                     .into_any()
                 }
                 ToolInputView::Raw => {
-                    view! { <ToolInputRaw input=input.clone()/> }.into_any()
+                    view! {
+                        <ToolInputRaw
+                            input=input.clone()
+                            ranges=raw_json_highlight_ranges.clone()
+                        />
+                    }
+                    .into_any()
                 }
             }}
         </section>
@@ -732,21 +778,30 @@ fn ToolInput(
 fn ToolInputList(
     input: serde_json::Value,
     #[prop(default = Vec::new())] input_links: Vec<ToolUseInputLink>,
+    #[prop(default = Vec::new())] shell_highlights: Vec<ToolInputShellHighlight>,
 ) -> impl IntoView {
-    tool_input_list(&input, "", &input_links)
+    tool_input_list(&input, "", &input_links, &shell_highlights)
 }
 
 fn tool_input_list(
     value: &serde_json::Value,
     pointer: &str,
     input_links: &[ToolUseInputLink],
+    shell_highlights: &[ToolInputShellHighlight],
 ) -> AnyView {
     let entries = match value {
         serde_json::Value::Object(values) => values
             .iter()
             .map(|(key, value)| {
                 let pointer = json_pointer_child(pointer, key);
-                tool_input_list_entry(key.clone(), "json-key", value, pointer, input_links)
+                tool_input_list_entry(
+                    key.clone(),
+                    "json-key",
+                    value,
+                    pointer,
+                    input_links,
+                    shell_highlights,
+                )
             })
             .collect::<Vec<_>>(),
         serde_json::Value::Array(values) => values
@@ -755,7 +810,14 @@ fn tool_input_list(
             .map(|(index, value)| {
                 let label = index.to_string();
                 let pointer = json_pointer_child(pointer, &label);
-                tool_input_list_entry(label, "json-index", value, pointer, input_links)
+                tool_input_list_entry(
+                    label,
+                    "json-index",
+                    value,
+                    pointer,
+                    input_links,
+                    shell_highlights,
+                )
             })
             .collect::<Vec<_>>(),
         _ => {
@@ -793,7 +855,24 @@ fn tool_input_list_entry(
     value: &serde_json::Value,
     pointer: String,
     input_links: &[ToolUseInputLink],
+    shell_highlights: &[ToolInputShellHighlight],
 ) -> AnyView {
+    if label == "cmd"
+        && let serde_json::Value::String(command) = value
+    {
+        let tokens = shell_highlights
+            .iter()
+            .find(|highlight| highlight.input_pointer == pointer)
+            .map(|highlight| highlight.tokens.clone())
+            .unwrap_or_else(|| {
+                vec![ShellHighlightToken {
+                    kind: ShellHighlightKind::Plain,
+                    text: command.clone(),
+                }]
+            });
+        return tool_input_shell_entry(label, label_class, tokens, pointer);
+    }
+
     let summary = match value {
         serde_json::Value::Object(values) => {
             Some(format_container_summary("Object", values.len(), "field"))
@@ -804,7 +883,7 @@ fn tool_input_list_entry(
         _ => None,
     };
     if let Some(summary) = summary {
-        let children = tool_input_list(value, &pointer, input_links);
+        let children = tool_input_list(value, &pointer, input_links, shell_highlights);
         view! {
             <li class="tool-input-entry tool-input-container" data-json-pointer=pointer>
                 <div class="tool-input-entry-heading">
@@ -850,6 +929,34 @@ fn tool_input_list_entry(
     }
 }
 
+fn tool_input_shell_entry(
+    label: String,
+    label_class: &'static str,
+    tokens: Vec<ShellHighlightToken>,
+    pointer: String,
+) -> AnyView {
+    let tokens = tokens
+        .into_iter()
+        .map(|token| match token.kind.class() {
+            Some(class) => view! { <span class=class>{token.text}</span> }.into_any(),
+            None => token.text.into_any(),
+        })
+        .collect::<Vec<_>>();
+
+    view! {
+        <li
+            class="tool-input-entry tool-input-entry-shell"
+            data-json-pointer=pointer
+        >
+            <span class=label_class>{label}</span>
+            <pre class="tool-input-shell" aria-label="Shell command">
+                <code>{tokens}</code>
+            </pre>
+        </li>
+    }
+    .into_any()
+}
+
 fn tool_input_scalar(value: &serde_json::Value) -> AnyView {
     let (class, text) = match value {
         serde_json::Value::String(value) => ("json-string", value.clone()),
@@ -878,14 +985,12 @@ fn format_container_summary(kind: &str, len: usize, item: &str) -> String {
 }
 
 #[component]
-fn ToolInputRaw(input: serde_json::Value) -> impl IntoView {
-    let tokens = highlighted_json_tokens(&input)
-        .into_iter()
-        .map(|token| match token.kind.class() {
-            Some(class) => view! { <span class=class>{token.text}</span> }.into_any(),
-            None => token.text.into_any(),
-        })
-        .collect::<Vec<_>>();
+fn ToolInputRaw(
+    input: serde_json::Value,
+    #[prop(default = Vec::new())] ranges: Vec<JsonHighlightRange>,
+) -> impl IntoView {
+    let source = pretty_json(&input);
+    let tokens = highlighted_json_views(source, &ranges);
 
     view! {
         <pre class="node-detail-code tool-input-raw" aria-label="Raw JSON input">
@@ -894,88 +999,53 @@ fn ToolInputRaw(input: serde_json::Value) -> impl IntoView {
     }
 }
 
-fn highlighted_json_tokens(value: &serde_json::Value) -> Vec<JsonToken> {
-    let mut tokens = Vec::new();
-    push_highlighted_json_tokens(value, 0, &mut tokens);
+fn highlighted_json_views(source: String, ranges: &[JsonHighlightRange]) -> Vec<AnyView> {
+    let mut tokens = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start < cursor
+            || range.end <= range.start
+            || range.end > source.len()
+            || !source.is_char_boundary(range.start)
+            || !source.is_char_boundary(range.end)
+        {
+            return vec![source.into_any()];
+        }
+        if cursor < range.start {
+            tokens.push(source[cursor..range.start].to_owned().into_any());
+        }
+        let text = source[range.start..range.end].to_owned();
+        tokens.push(match range.kind.class() {
+            Some(class) => view! { <span class=class>{text}</span> }.into_any(),
+            None => text.into_any(),
+        });
+        cursor = range.end;
+    }
+    if cursor < source.len() {
+        tokens.push(source[cursor..].to_owned().into_any());
+    }
     tokens
 }
 
-fn push_highlighted_json_tokens(
-    value: &serde_json::Value,
-    depth: usize,
-    tokens: &mut Vec<JsonToken>,
-) {
-    match value {
-        serde_json::Value::Object(values) => {
-            tokens.push(JsonToken::new(JsonTokenKind::Plain, "{"));
-            for (index, (key, value)) in values.iter().enumerate() {
-                tokens.push(JsonToken::new(
-                    JsonTokenKind::Plain,
-                    format!("\n{}", "  ".repeat(depth + 1)),
-                ));
-                tokens.push(JsonToken::new(
-                    JsonTokenKind::Key,
-                    serde_json::to_string(key).expect("JSON object key should serialize"),
-                ));
-                tokens.push(JsonToken::new(JsonTokenKind::Plain, ": "));
-                push_highlighted_json_tokens(value, depth + 1, tokens);
-                if index + 1 != values.len() {
-                    tokens.push(JsonToken::new(JsonTokenKind::Plain, ","));
-                }
-            }
-            if !values.is_empty() {
-                tokens.push(JsonToken::new(
-                    JsonTokenKind::Plain,
-                    format!("\n{}", "  ".repeat(depth)),
-                ));
-            }
-            tokens.push(JsonToken::new(JsonTokenKind::Plain, "}"));
-        }
-        serde_json::Value::Array(values) => {
-            tokens.push(JsonToken::new(JsonTokenKind::Plain, "["));
-            for (index, value) in values.iter().enumerate() {
-                tokens.push(JsonToken::new(
-                    JsonTokenKind::Plain,
-                    format!("\n{}", "  ".repeat(depth + 1)),
-                ));
-                push_highlighted_json_tokens(value, depth + 1, tokens);
-                if index + 1 != values.len() {
-                    tokens.push(JsonToken::new(JsonTokenKind::Plain, ","));
-                }
-            }
-            if !values.is_empty() {
-                tokens.push(JsonToken::new(
-                    JsonTokenKind::Plain,
-                    format!("\n{}", "  ".repeat(depth)),
-                ));
-            }
-            tokens.push(JsonToken::new(JsonTokenKind::Plain, "]"));
-        }
-        serde_json::Value::String(value) => tokens.push(JsonToken::new(
-            JsonTokenKind::String,
-            serde_json::to_string(value).expect("JSON string should serialize"),
-        )),
-        serde_json::Value::Number(value) => {
-            tokens.push(JsonToken::new(JsonTokenKind::Number, value.to_string()));
-        }
-        serde_json::Value::Bool(value) => {
-            tokens.push(JsonToken::new(JsonTokenKind::Boolean, value.to_string()));
-        }
-        serde_json::Value::Null => {
-            tokens.push(JsonToken::new(JsonTokenKind::Null, "null"));
-        }
-    }
-}
-
 #[component]
-fn ToolUseDetail(item: ToolUse, input_links: Vec<ToolUseInputLink>) -> impl IntoView {
+fn ToolUseDetail(
+    item: ToolUse,
+    input_links: Vec<ToolUseInputLink>,
+    shell_highlights: Vec<ToolInputShellHighlight>,
+    json_highlight_ranges: Vec<JsonHighlightRange>,
+) -> impl IntoView {
     view! {
         <article class="node-detail-item">
             <header>
                 <strong>{item.name}</strong>
                 <code>{item.id}</code>
             </header>
-            <ToolInput input=item.input input_links/>
+            <ToolInput
+                input=item.input
+                input_links
+                shell_highlights
+                json_highlight_ranges
+            />
         </article>
     }
 }
@@ -1234,6 +1304,16 @@ fn provider_context_target(query: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+fn test_json_range(source: &str, text: &str, kind: JsonHighlightKind) -> JsonHighlightRange {
+    let start = source.find(text).expect("test JSON token should exist");
+    JsonHighlightRange {
+        kind,
+        start,
+        end: start + text.len(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use coco_types::{Anchor, PromptAnchor, SessionRole, SkillResultAnchor};
@@ -1277,6 +1357,8 @@ mod tests {
             response: Ok(NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("response".to_owned()))),
                 tool_use_input_links: Vec::new(),
+                tool_input_shell_highlights: Vec::new(),
+                tool_input_json_highlights: Vec::new(),
             }),
         };
         let missing = LoadedPanel {
@@ -1362,6 +1444,8 @@ mod tests {
             <NodeDetailContent response=NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("<script>alert(1)</script>".to_owned()))),
                 tool_use_input_links: Vec::new(),
+                tool_input_shell_highlights: Vec::new(),
+                tool_input_json_highlights: Vec::new(),
             }/>
         }
         .to_html();
@@ -1527,6 +1611,97 @@ mod tests {
     }
 
     #[test]
+    fn tool_input_cmd_renders_highlighted_shell_without_changing_the_command() {
+        let tokens = vec![
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Keyword,
+                text: "if".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Command,
+                text: "printf".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Option,
+                text: "-v".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::String,
+                text: "'</script>'".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Variable,
+                text: "$HOME".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Operator,
+                text: "|".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Plain,
+                text: " ".to_owned(),
+            },
+            ShellHighlightToken {
+                kind: ShellHighlightKind::Comment,
+                text: "# inspect".to_owned(),
+            },
+        ];
+        let command = tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<String>();
+        let input = view! {
+            <ToolInput
+                input=serde_json::json!({
+                    "cmd": command,
+                    "tty": false,
+                })
+                shell_highlights=vec![ToolInputShellHighlight {
+                    tool_use_index: 0,
+                    tool_use_id: "exec".to_owned(),
+                    input_pointer: "/cmd".to_owned(),
+                    tokens,
+                }]
+            />
+        }
+        .to_html();
+        for class in [
+            "shell-command",
+            "shell-option",
+            "shell-string",
+            "shell-variable",
+            "shell-operator",
+            "shell-comment",
+            "shell-keyword",
+        ] {
+            assert!(input.contains(&format!(r#"class="{class}""#)), "{input}");
+        }
+        assert!(input.contains(r#"aria-label="Shell command""#));
+        assert!(input.contains("&lt;/script&gt;"));
+        assert!(!input.contains("<script>"));
+    }
+
+    #[test]
     fn tool_input_link_targets_only_the_matching_tool_item_and_pointer() {
         let detail = view! {
             <NodeDetailContent response=NodeDetailResponse::Found {
@@ -1549,6 +1724,8 @@ mod tests {
                     value: "exec-1".to_owned(),
                     target: "detail-exec-node".to_owned(),
                 }],
+                tool_input_shell_highlights: Vec::new(),
+                tool_input_json_highlights: Vec::new(),
             }/>
         }
         .to_html();
@@ -1566,18 +1743,31 @@ mod tests {
     }
 
     #[test]
-    fn raw_tool_input_highlights_every_json_scalar_and_escapes_html() {
+    fn raw_tool_input_renders_server_json_highlights_and_escapes_html() {
         let value = serde_json::json!({
             "<key>": "</script>",
             "number": 42,
             "boolean": false,
             "nothing": null,
+            "escaped": "line\nbreak",
         });
-        let raw = view! { <ToolInputRaw input=value.clone()/> }.to_html();
-        let serialized = highlighted_json_tokens(&value)
-            .into_iter()
-            .map(|token| token.text)
-            .collect::<String>();
+        let source = pretty_json(&value);
+        let mut ranges = vec![
+            test_json_range(&source, "\"<key>\"", JsonHighlightKind::Key),
+            test_json_range(&source, "\"</script>\"", JsonHighlightKind::String),
+            test_json_range(&source, "42", JsonHighlightKind::Number),
+            test_json_range(&source, "false", JsonHighlightKind::Boolean),
+            test_json_range(&source, "null", JsonHighlightKind::Null),
+            test_json_range(&source, "\\n", JsonHighlightKind::Escape),
+        ];
+        ranges.sort_by_key(|range| range.start);
+        let raw = view! {
+            <ToolInputRaw
+                input=value
+                ranges
+            />
+        }
+        .to_html();
 
         for class in [
             "json-key",
@@ -1585,13 +1775,33 @@ mod tests {
             "json-number",
             "json-boolean",
             "json-null",
+            "json-escape",
         ] {
             assert!(raw.contains(&format!(r#"class="{class}""#)));
         }
         assert!(raw.contains("&lt;key&gt;"));
         assert!(raw.contains("&lt;/script&gt;"));
         assert!(!raw.contains("<script>"));
-        assert_eq!(serialized, pretty_json(&value));
+    }
+
+    #[test]
+    fn raw_tool_input_falls_back_to_plain_json_for_invalid_ranges() {
+        let value = serde_json::json!({"unsafe": "</script>"});
+        let raw = view! {
+            <ToolInputRaw
+                input=value
+                ranges=vec![JsonHighlightRange {
+                    kind: JsonHighlightKind::String,
+                    start: 1,
+                    end: usize::MAX,
+                }]
+            />
+        }
+        .to_html();
+
+        assert!(raw.contains("&lt;/script&gt;"));
+        assert!(!raw.contains("<script>"));
+        assert!(!raw.contains("json-string"));
     }
 
     #[test]
@@ -1675,14 +1885,32 @@ mod wasm_tests {
             .expect_throw("document body should be available")
             .append_child(&root)
             .expect_throw("test root should be mounted");
-        let mounted = leptos::mount::mount_to(root.clone(), || {
+        let input = serde_json::json!({
+            "command": "true",
+            "timeout": 30,
+            "enabled": true,
+            "optional": null,
+        });
+        let source = pretty_json(&input);
+        let boolean_start = source
+            .rfind("true")
+            .expect("test JSON boolean should exist");
+        let mut json_highlight_ranges = vec![
+            test_json_range(&source, "\"command\"", JsonHighlightKind::Key),
+            test_json_range(&source, "\"true\"", JsonHighlightKind::String),
+            test_json_range(&source, "30", JsonHighlightKind::Number),
+            JsonHighlightRange {
+                kind: JsonHighlightKind::Boolean,
+                start: boolean_start,
+                end: boolean_start + "true".len(),
+            },
+            test_json_range(&source, "null", JsonHighlightKind::Null),
+        ];
+        json_highlight_ranges.sort_by_key(|range| range.start);
+        let mounted = leptos::mount::mount_to(root.clone(), move || {
             view! {
-                <ToolInput input=serde_json::json!({
-                    "command": "true",
-                    "timeout": 30,
-                    "enabled": true,
-                    "optional": null,
-                })/>
+                <ToolInput input json_highlight_ranges
+                />
             }
         });
         let list_toggle = root

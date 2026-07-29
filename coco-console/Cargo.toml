@@ -5,7 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 # Shared domain types.
@@ -31,6 +31,9 @@ leptos = { workspace = true, features = ["islands", "ssr"] }
 leptos_axum = "0.8.10"
 tokio.workspace = true
 tracing.workspace = true
+tree-sitter-bash = "0.25.1"
+tree-sitter-highlight = "0.25.10"
+tree-sitter-json = "0.24.8"
 diesel.workspace = true
 diesel-async.workspace = true
 diesel_migrations.workspace = true
