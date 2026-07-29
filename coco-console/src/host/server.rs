@@ -451,8 +451,10 @@ where
             let tool_use_input_links =
                 resolve_tool_use_input_links(&state.web_graph, &node).await?;
             let highlights = super::syntax_highlight::tool_input_syntax_highlights(&node);
+            let markdown_documents = super::markdown::node_markdown_documents(&node);
             Ok(NodeDetailResponse::Found {
                 node: Box::new(node),
+                markdown_documents,
                 tool_use_input_links,
                 tool_input_shell_highlights: highlights.shell,
                 tool_input_json_highlights: highlights.json,
@@ -1152,11 +1154,18 @@ mod tests {
         .await;
         let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
         let detail: NodeDetailResponse = serde_json::from_slice(&detail_body).unwrap();
-        let NodeDetailResponse::Found { node, .. } = detail else {
+        let NodeDetailResponse::Found {
+            node,
+            markdown_documents,
+            ..
+        } = detail
+        else {
             panic!("node detail should be found");
         };
         assert_eq!(node.kind, Kind::Text("direct detail".to_owned()));
         assert_eq!(node.id, node_id);
+        assert_eq!(markdown_documents.len(), 1);
+        assert_eq!(markdown_documents[0].source, "direct detail");
 
         let request = Request::builder()
             .uri(format!(

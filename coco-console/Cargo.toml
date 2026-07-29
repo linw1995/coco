@@ -32,8 +32,10 @@ leptos_axum = "0.8.10"
 tokio.workspace = true
 tracing.workspace = true
 tree-sitter-bash = "0.25.1"
-tree-sitter-highlight = "0.25.10"
+tree-sitter-highlight = "0.26.11"
 tree-sitter-json = "0.24.8"
+tree-sitter = "0.26.11"
+tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 diesel.workspace = true
 diesel-async.workspace = true
 diesel_migrations.workspace = true

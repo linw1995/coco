@@ -11,6 +11,7 @@ mod host {
     mod api;
     mod config;
     mod error;
+    mod markdown;
     mod publisher;
     mod render;
     mod server;
