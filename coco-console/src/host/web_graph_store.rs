@@ -1,11 +1,12 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use coco_mem::GraphNodeCursor;
+use diesel::sql_types::{BigInt, Text};
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, Insertable, OptionalExtension, QueryDsl, Queryable,
-    Selectable, SelectableHelper,
+    QueryableByName, Selectable, SelectableHelper,
 };
 use diesel_async::AsyncConnection;
 use diesel_migrations::{EmbeddedMigrations, embed_migrations};
@@ -19,7 +20,8 @@ use crate::web_graph::{
 const DATABASE_FILE_NAME: &str = "web-graph.sqlite3";
 const WRITE_BATCH_SIZE: usize = 64;
 const MAX_READ_BATCH_SIZE: usize = 128;
-const LAYOUT_VERSION: u32 = 2;
+// This version covers every source-derived projection stored alongside the layouts.
+const LAYOUT_VERSION: u32 = 3;
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("web-graph-migrations");
 
 mod database;
@@ -28,8 +30,8 @@ mod spatial;
 
 use database::{AsyncSqliteConnection, Database};
 use schema::{
-    web_graph_edge_routes, web_graph_edges, web_graph_layouts, web_graph_node_placements,
-    web_graph_nodes, web_graph_state,
+    web_graph_edge_routes, web_graph_edges, web_graph_exec_sessions, web_graph_layouts,
+    web_graph_node_placements, web_graph_nodes, web_graph_state, web_graph_tool_uses,
 };
 pub use spatial::{Viewport, ViewportCursor, ViewportPage};
 
@@ -46,6 +48,32 @@ pub struct StoredGraphState {
     pub source_version: SourceVersion,
     pub source_cursor: Option<GraphNodeCursor>,
     pub layout_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSessionProjection {
+    pub source_row_id: i64,
+    pub node_id: String,
+    pub tool_uses: Vec<ProjectedToolUse>,
+    pub exec_session_results: Vec<ProjectedExecSessionResult>,
+}
+
+impl ToolSessionProjection {
+    pub fn is_empty(&self) -> bool {
+        self.tool_uses.is_empty() && self.exec_session_results.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedToolUse {
+    pub tool_use_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedExecSessionResult {
+    pub tool_result_id: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,6 +454,48 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
+    pub async fn tool_session_links(
+        &self,
+        session_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        use diesel_async::RunQueryDsl;
+
+        validate_read_batch_size(session_ids.len())?;
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let path = self.path.clone();
+        let mut connection = self.database.acquire().await?;
+        web_graph_exec_sessions::table
+            .filter(web_graph_exec_sessions::session_id.eq_any(session_ids))
+            .select((
+                web_graph_exec_sessions::session_id,
+                web_graph_exec_sessions::exec_node_id,
+            ))
+            .load::<(String, String)>(&mut connection)
+            .await
+            .context(QuerySnafu { path })
+            .map(|rows| rows.into_iter().collect())
+    }
+
+    pub async fn apply_tool_session_projection(
+        &self,
+        projection: &ToolSessionProjection,
+    ) -> Result<()> {
+        if projection.is_empty() {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let projection = projection.clone();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .immediate_transaction::<_, TransactionError, _>(async |connection| {
+                apply_tool_session_projection(connection, &projection).await
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
     pub async fn replace(&self, graph: &Graph) -> Result<()> {
         let snapshot = graph.snapshot();
         let path = self.path.clone();
@@ -527,6 +597,14 @@ struct StateRow {
 #[diesel(table_name = web_graph_nodes)]
 struct NodeRow {
     node_id: String,
+}
+
+#[derive(Debug, QueryableByName)]
+struct ToolUseMatchRow {
+    #[diesel(sql_type = Text)]
+    node_id: String,
+    #[diesel(sql_type = Text)]
+    name: String,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable)]
@@ -1169,6 +1247,69 @@ fn invalid_value(column: &'static str, value: impl ToString) -> TransactionError
     })
 }
 
+const FIND_TOOL_USE_QUERY: &str = r#"
+    SELECT node_id, name
+    FROM web_graph_tool_uses
+    WHERE tool_use_id = ?
+        AND source_row_id < ?
+    LIMIT 1
+"#;
+
+const UPSERT_TOOL_USE_QUERY: &str = r#"
+    INSERT INTO web_graph_tool_uses (tool_use_id, source_row_id, node_id, name)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (tool_use_id) DO UPDATE SET
+        source_row_id = excluded.source_row_id,
+        node_id = excluded.node_id,
+        name = excluded.name
+    WHERE excluded.source_row_id > web_graph_tool_uses.source_row_id
+"#;
+
+const UPSERT_EXEC_SESSION_QUERY: &str = r#"
+    INSERT INTO web_graph_exec_sessions (session_id, source_row_id, exec_node_id)
+    VALUES (?, ?, ?)
+    ON CONFLICT (session_id) DO UPDATE SET
+        source_row_id = excluded.source_row_id,
+        exec_node_id = excluded.exec_node_id
+    WHERE excluded.source_row_id > web_graph_exec_sessions.source_row_id
+"#;
+
+async fn apply_tool_session_projection(
+    connection: &mut AsyncSqliteConnection,
+    projection: &ToolSessionProjection,
+) -> std::result::Result<(), TransactionError> {
+    use diesel_async::RunQueryDsl;
+
+    for tool_use in &projection.tool_uses {
+        diesel::sql_query(UPSERT_TOOL_USE_QUERY)
+            .bind::<Text, _>(&tool_use.tool_use_id)
+            .bind::<BigInt, _>(projection.source_row_id)
+            .bind::<Text, _>(&projection.node_id)
+            .bind::<Text, _>(&tool_use.name)
+            .execute(connection)
+            .await?;
+    }
+
+    for result in &projection.exec_session_results {
+        let tool_use = diesel::sql_query(FIND_TOOL_USE_QUERY)
+            .bind::<Text, _>(&result.tool_result_id)
+            .bind::<BigInt, _>(projection.source_row_id)
+            .get_result::<ToolUseMatchRow>(connection)
+            .await
+            .optional()?;
+        let Some(tool_use) = tool_use.filter(|tool_use| tool_use.name == "exec_command") else {
+            continue;
+        };
+        diesel::sql_query(UPSERT_EXEC_SESSION_QUERY)
+            .bind::<Text, _>(&result.session_id)
+            .bind::<BigInt, _>(projection.source_row_id)
+            .bind::<Text, _>(tool_use.node_id)
+            .execute(connection)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn replace_snapshot(
     connection: &mut AsyncSqliteConnection,
     snapshot: &Snapshot,
@@ -1177,6 +1318,12 @@ async fn replace_snapshot(
 
     let rows = snapshot_rows(snapshot)?;
     spatial::clear(connection).await?;
+    diesel::delete(web_graph_exec_sessions::table)
+        .execute(connection)
+        .await?;
+    diesel::delete(web_graph_tool_uses::table)
+        .execute(connection)
+        .await?;
     diesel::delete(web_graph_edge_routes::table)
         .execute(connection)
         .await?;

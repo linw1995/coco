@@ -74,19 +74,6 @@ pub trait NodeStore {
     async fn list_children(&self, node_id: &str) -> StoreResult<Vec<Node>>;
 }
 
-/// Tool session lookup API used by interactive clients.
-#[async_trait]
-pub trait ToolSessionStore {
-    /// Finds the nearest preceding `exec_command` node for a session on the primary-parent chain.
-    ///
-    /// Returns `None` when either the head node or a matching session does not exist.
-    async fn find_exec_command_node_id_for_session(
-        &self,
-        head_node_id: &str,
-        session_id: &str,
-    ) -> StoreResult<Option<String>>;
-}
-
 /// Branch reference storage API.
 #[async_trait]
 pub trait BranchStore {

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -15,7 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use coco_mem::{Kind, Node, Store, StoreError, ToolSessionStore};
+use coco_mem::{Kind, Node, Store, StoreError};
 use futures_util::{StreamExt, stream};
 use leptos::prelude::provide_context;
 use leptos_axum::handle_server_fns_with_context;
@@ -465,24 +465,31 @@ where
     }
 }
 
+#[async_trait]
+trait ToolUseInputLinkStore {
+    async fn tool_session_links(&self, session_ids: &[String]) -> Result<HashMap<String, String>>;
+}
+
+#[async_trait]
+impl ToolUseInputLinkStore for WebGraphRuntime {
+    async fn tool_session_links(&self, session_ids: &[String]) -> Result<HashMap<String, String>> {
+        WebGraphRuntime::tool_session_links(self, session_ids).await
+    }
+}
+
 async fn resolve_tool_use_input_links<S>(store: &S, node: &Node) -> Result<Vec<ToolUseInputLink>>
 where
-    S: ToolSessionStore + Sync,
+    S: ToolUseInputLinkStore + Sync,
 {
-    let mut exec_node_ids_by_session = HashMap::new();
-    let mut resolved_sessions = HashSet::new();
-    for session_id in write_stdin_session_ids(node) {
-        if !resolved_sessions.insert(session_id) {
-            continue;
-        }
-        if let Some(exec_node_id) = store
-            .find_exec_command_node_id_for_session(&node.id, session_id)
-            .await
-            .context(StoreSnafu)?
-        {
-            exec_node_ids_by_session.insert(session_id.to_owned(), exec_node_id);
-        }
+    let session_ids = write_stdin_session_ids(node)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
     }
+    let exec_node_ids_by_session = store.tool_session_links(&session_ids).await?;
     Ok(tool_use_input_links(node, &exec_node_ids_by_session))
 }
 
@@ -962,6 +969,7 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use axum::body::to_bytes;
     use coco_mem::{
         Anchor, BranchStore, Kind, MergeParent, NewNode, NodeStore, PromptAnchor, Role,
@@ -972,20 +980,19 @@ mod tests {
     use crate::ConsoleStore;
     use crate::host::web_graph_view::node_target_id;
 
-    struct RecordingToolSessionStore {
+    struct RecordingToolUseInputLinkStore {
         targets: HashMap<String, String>,
         calls: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
-    impl ToolSessionStore for RecordingToolSessionStore {
-        async fn find_exec_command_node_id_for_session(
+    impl ToolUseInputLinkStore for RecordingToolUseInputLinkStore {
+        async fn tool_session_links(
             &self,
-            _head_node_id: &str,
-            session_id: &str,
-        ) -> coco_mem::StoreResult<Option<String>> {
-            self.calls.lock().unwrap().push(session_id.to_owned());
-            Ok(self.targets.get(session_id).cloned())
+            session_ids: &[String],
+        ) -> Result<HashMap<String, String>> {
+            self.calls.lock().unwrap().extend_from_slice(session_ids);
+            Ok(self.targets.clone())
         }
     }
 
@@ -1025,8 +1032,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_input_link_resolution_uses_only_the_narrow_store_and_deduplicates_sessions() {
-        let store = RecordingToolSessionStore {
+    async fn tool_input_link_resolution_uses_one_store_lookup() {
+        let store = RecordingToolUseInputLinkStore {
             targets: HashMap::from([
                 ("exec-1".to_owned(), "exec-node-1".to_owned()),
                 ("exec-2".to_owned(), "exec-node-2".to_owned()),
@@ -1212,6 +1219,7 @@ mod tests {
             .await
             .unwrap();
         let state = AppState { store, web_graph };
+        state.web_graph.catch_up().await.unwrap();
 
         let detail = load_node_detail(&state, &node_target_id(&write_id))
             .await

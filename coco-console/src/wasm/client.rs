@@ -21,7 +21,7 @@ use crate::api::{
     GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
 use crate::panels::{
-    PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, load_anchor_range,
+    PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, load_anchor_range, notify_graph_revision,
     reveal_node_detail_on_mobile,
 };
 use crate::viewport::{
@@ -165,7 +165,10 @@ fn install_graph_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>
 
 fn handle_graph_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
     match data.parse::<u64>() {
-        Ok(version) => request_graph_items_refresh(graph, version),
+        Ok(version) => {
+            request_graph_items_refresh(graph, version);
+            notify_graph_revision();
+        }
         Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
     }
 }
