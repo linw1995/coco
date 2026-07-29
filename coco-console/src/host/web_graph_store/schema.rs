@@ -101,6 +101,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    web_graph_tool_session_states (node_id) {
+        node_id -> Text,
+        source_row_id -> BigInt,
+        parent_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     web_graph_tool_use_input_links (node_id, ordinal) {
         node_id -> Text,
         ordinal -> BigInt,
@@ -146,6 +154,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     web_graph_route_spatial_index,
     web_graph_route_spatial_items,
     web_graph_state,
+    web_graph_tool_session_states,
     web_graph_tool_use_input_links,
     web_graph_tool_uses,
 );
