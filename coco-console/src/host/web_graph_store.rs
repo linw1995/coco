@@ -52,7 +52,7 @@ pub struct StoredGraphState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ToolSessionProjection {
+pub struct ToolSessionProjection {
     pub node_id: String,
     pub tool_uses: Vec<ProjectedToolUse>,
     pub exec_session_results: Vec<ProjectedExecSessionResult>,
@@ -68,21 +68,21 @@ impl ToolSessionProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProjectedToolUse {
+pub struct ProjectedToolUse {
     pub ordinal: usize,
     pub tool_use_id: String,
     pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProjectedExecSessionResult {
+pub struct ProjectedExecSessionResult {
     pub ordinal: usize,
     pub tool_result_id: String,
     pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProjectedWriteStdinSession {
+pub struct ProjectedWriteStdinSession {
     pub ordinal: usize,
     pub session_id: String,
 }
@@ -482,7 +482,7 @@ impl WebGraphStore {
             .map(|rows| rows.into_iter().collect())
     }
 
-    pub(super) async fn apply_tool_session_projection(
+    pub async fn apply_tool_session_projection(
         &self,
         projection: &ToolSessionProjection,
     ) -> Result<()> {
