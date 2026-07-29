@@ -889,38 +889,39 @@ impl WebGraphRuntime {
             }
             let page_complete = page.complete;
             let processed_nodes = page.entries.len();
-            let page_node_ids = page
-                .entries
-                .iter()
-                .map(|entry| entry.node_id.clone())
-                .collect::<Vec<_>>();
-            let source_nodes = self
-                .source
-                .graph_nodes_by_ids(&page_node_ids)
-                .await
-                .context(StoreSnafu)?
-                .into_iter()
-                .map(|node| (node.id.clone(), node))
-                .collect::<BTreeMap<_, _>>();
             let mut changed_source_nodes = 0_u64;
             let mut nodes_to_reflow = Vec::new();
-            for entry in &page.entries {
-                let result = self.ensure_source_node(entry).await?;
-                if result.changed {
-                    changed_source_nodes = changed_source_nodes.saturating_add(1);
-                }
-                nodes_to_reflow.extend(result.added_nodes);
-                nodes_to_reflow.push(entry.node_id.clone());
-                let source_node = source_nodes.get(&entry.node_id).with_context(|| {
-                    WebGraphSourceNodeMissingSnafu {
-                        node_id: entry.node_id.clone(),
-                    }
-                })?;
-                let projection = tool_session_projection(source_node);
-                self.store
-                    .apply_tool_session_projection(&projection)
+            for entries in page.entries.chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE) {
+                let node_ids = entries
+                    .iter()
+                    .map(|entry| entry.node_id.clone())
+                    .collect::<Vec<_>>();
+                let source_nodes = self
+                    .source
+                    .graph_nodes_by_ids(&node_ids)
                     .await
-                    .context(WebGraphStoreSnafu)?;
+                    .context(StoreSnafu)?
+                    .into_iter()
+                    .map(|node| (node.id.clone(), node))
+                    .collect::<BTreeMap<_, _>>();
+                for entry in entries {
+                    let result = self.ensure_source_node(entry).await?;
+                    if result.changed {
+                        changed_source_nodes = changed_source_nodes.saturating_add(1);
+                    }
+                    nodes_to_reflow.extend(result.added_nodes);
+                    nodes_to_reflow.push(entry.node_id.clone());
+                    let source_node = source_nodes.get(&entry.node_id).with_context(|| {
+                        WebGraphSourceNodeMissingSnafu {
+                            node_id: entry.node_id.clone(),
+                        }
+                    })?;
+                    let projection = tool_session_projection(source_node);
+                    self.store
+                        .apply_tool_session_projection(&projection)
+                        .await
+                        .context(WebGraphStoreSnafu)?;
+                }
             }
             let page_cursor = page
                 .entries
