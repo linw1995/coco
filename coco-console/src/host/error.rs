@@ -49,11 +49,6 @@ pub enum Error {
     #[snafu(display("Web graph references missing source node {node_id}"))]
     WebGraphSourceNodeMissing { node_id: String },
 
-    #[snafu(display(
-        "Web graph tool session projection for {node_id} is missing primary parent {parent_id}"
-    ))]
-    WebGraphToolSessionParentMissing { node_id: String, parent_id: String },
-
     #[snafu(display("Web graph revision {revision} cannot be advanced"))]
     WebGraphRevisionExhausted { revision: u64 },
 

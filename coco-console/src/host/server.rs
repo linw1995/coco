@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -467,13 +467,13 @@ where
 
 #[async_trait]
 trait ToolUseInputLinkStore {
-    async fn tool_session_links(&self, node_id: &str) -> Result<HashMap<String, String>>;
+    async fn tool_session_links(&self, session_ids: &[String]) -> Result<HashMap<String, String>>;
 }
 
 #[async_trait]
 impl ToolUseInputLinkStore for WebGraphRuntime {
-    async fn tool_session_links(&self, node_id: &str) -> Result<HashMap<String, String>> {
-        WebGraphRuntime::tool_session_links(self, node_id).await
+    async fn tool_session_links(&self, session_ids: &[String]) -> Result<HashMap<String, String>> {
+        WebGraphRuntime::tool_session_links(self, session_ids).await
     }
 }
 
@@ -481,10 +481,15 @@ async fn resolve_tool_use_input_links<S>(store: &S, node: &Node) -> Result<Vec<T
 where
     S: ToolUseInputLinkStore + Sync,
 {
-    if write_stdin_session_ids(node).next().is_none() {
+    let session_ids = write_stdin_session_ids(node)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if session_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let exec_node_ids_by_session = store.tool_session_links(&node.id).await?;
+    let exec_node_ids_by_session = store.tool_session_links(&session_ids).await?;
     Ok(tool_use_input_links(node, &exec_node_ids_by_session))
 }
 
@@ -982,8 +987,11 @@ mod tests {
 
     #[async_trait]
     impl ToolUseInputLinkStore for RecordingToolUseInputLinkStore {
-        async fn tool_session_links(&self, node_id: &str) -> Result<HashMap<String, String>> {
-            self.calls.lock().unwrap().push(node_id.to_owned());
+        async fn tool_session_links(
+            &self,
+            session_ids: &[String],
+        ) -> Result<HashMap<String, String>> {
+            self.calls.lock().unwrap().extend_from_slice(session_ids);
             Ok(self.targets.clone())
         }
     }
@@ -1078,7 +1086,10 @@ mod tests {
                 (2, "detail-exec-node-2"),
             ]
         );
-        assert_eq!(*store.calls.lock().unwrap(), ["write-node"]);
+        assert_eq!(
+            *store.calls.lock().unwrap(),
+            ["exec-1", "exec-2", "missing"]
+        );
     }
 
     #[tokio::test]

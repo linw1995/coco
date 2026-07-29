@@ -1,8 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coco_mem::{GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore};
@@ -14,7 +13,7 @@ use super::error::{
     WebGraphOrderSnafu, WebGraphParentPlacementMissingSnafu, WebGraphRevisionExhaustedSnafu,
     WebGraphSourceCursorMismatchSnafu, WebGraphSourceCursorRegressedSnafu,
     WebGraphSourceCursorStalledSnafu, WebGraphSourceNodeMissingSnafu,
-    WebGraphSourceVersionExhaustedSnafu, WebGraphStoreSnafu, WebGraphToolSessionParentMissingSnafu,
+    WebGraphSourceVersionExhaustedSnafu, WebGraphStoreSnafu,
 };
 use super::publisher::ConsolePublisher;
 use super::web_graph_order::{
@@ -22,8 +21,8 @@ use super::web_graph_order::{
     stable_column_order,
 };
 use super::web_graph_store::{
-    Error as StoreError, ProjectedExecSession, ProjectedToolUse, ProjectedToolUseInputLink,
-    StoredGraphState, ToolSessionProjection, Viewport, WebGraphStore,
+    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse, StoredGraphState,
+    ToolSessionProjection, Viewport, WebGraphStore,
 };
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
@@ -58,305 +57,6 @@ pub(crate) struct WebGraphRuntime {
     source: SqliteGraphStore,
     publisher: ConsolePublisher,
     ready: watch::Sender<u64>,
-    tool_sessions: Arc<tokio::sync::Mutex<ToolSessionProjector>>,
-}
-
-#[derive(Debug, Clone)]
-struct ToolUseBinding {
-    node_id: String,
-    name: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ToolSessionState {
-    tool_uses: PersistentStringMap<ToolUseBinding>,
-    exec_sessions: PersistentStringMap<String>,
-}
-
-#[derive(Debug, Default)]
-struct ToolSessionProjector {
-    states: HashMap<String, ToolSessionState>,
-    through_source_row_id: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-struct PersistentStringMap<V> {
-    root: PersistentStringMapRoot<V>,
-}
-
-type PersistentStringMapRoot<V> = Option<Arc<PersistentStringMapNode<V>>>;
-type PersistentStringMapSplit<V> = (PersistentStringMapRoot<V>, PersistentStringMapRoot<V>);
-
-impl<V> Default for PersistentStringMap<V> {
-    fn default() -> Self {
-        Self { root: None }
-    }
-}
-
-#[derive(Debug)]
-struct PersistentStringMapNode<V> {
-    key: String,
-    value: V,
-    priority: u64,
-    left: Option<Arc<Self>>,
-    right: Option<Arc<Self>>,
-}
-
-impl<V> PersistentStringMap<V>
-where
-    V: Clone,
-{
-    fn get(&self, key: &str) -> Option<&V> {
-        let mut node = self.root.as_deref();
-        while let Some(current) = node {
-            match key.cmp(&current.key) {
-                std::cmp::Ordering::Less => node = current.left.as_deref(),
-                std::cmp::Ordering::Equal => return Some(&current.value),
-                std::cmp::Ordering::Greater => node = current.right.as_deref(),
-            }
-        }
-        None
-    }
-
-    fn insert(&mut self, key: String, value: V) {
-        self.root = Some(persistent_map_insert(self.root.take(), key, value));
-    }
-}
-
-fn persistent_map_insert<V>(
-    root: PersistentStringMapRoot<V>,
-    key: String,
-    value: V,
-) -> Arc<PersistentStringMapNode<V>>
-where
-    V: Clone,
-{
-    let Some(root) = root else {
-        return Arc::new(PersistentStringMapNode {
-            priority: persistent_map_priority(&key),
-            key,
-            value,
-            left: None,
-            right: None,
-        });
-    };
-    match key.cmp(&root.key) {
-        std::cmp::Ordering::Equal => {
-            return Arc::new(PersistentStringMapNode {
-                key,
-                value,
-                priority: root.priority,
-                left: root.left.clone(),
-                right: root.right.clone(),
-            });
-        }
-        std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {}
-    }
-    let priority = persistent_map_priority(&key);
-    if (priority, key.as_str()) < (root.priority, root.key.as_str()) {
-        let (left, right) = persistent_map_split(Some(root), &key);
-        return Arc::new(PersistentStringMapNode {
-            key,
-            value,
-            priority,
-            left,
-            right,
-        });
-    }
-    if key.as_str() < root.key.as_str() {
-        Arc::new(PersistentStringMapNode {
-            key: root.key.clone(),
-            value: root.value.clone(),
-            priority: root.priority,
-            left: Some(persistent_map_insert(root.left.clone(), key, value)),
-            right: root.right.clone(),
-        })
-    } else {
-        Arc::new(PersistentStringMapNode {
-            key: root.key.clone(),
-            value: root.value.clone(),
-            priority: root.priority,
-            left: root.left.clone(),
-            right: Some(persistent_map_insert(root.right.clone(), key, value)),
-        })
-    }
-}
-
-fn persistent_map_split<V>(
-    root: PersistentStringMapRoot<V>,
-    key: &str,
-) -> PersistentStringMapSplit<V>
-where
-    V: Clone,
-{
-    let Some(root) = root else {
-        return (None, None);
-    };
-    match key.cmp(&root.key) {
-        std::cmp::Ordering::Less => {
-            let (left, middle) = persistent_map_split(root.left.clone(), key);
-            let right = Arc::new(PersistentStringMapNode {
-                key: root.key.clone(),
-                value: root.value.clone(),
-                priority: root.priority,
-                left: middle,
-                right: root.right.clone(),
-            });
-            (left, Some(right))
-        }
-        std::cmp::Ordering::Equal => (root.left.clone(), root.right.clone()),
-        std::cmp::Ordering::Greater => {
-            let (middle, right) = persistent_map_split(root.right.clone(), key);
-            let left = Arc::new(PersistentStringMapNode {
-                key: root.key.clone(),
-                value: root.value.clone(),
-                priority: root.priority,
-                left: root.left.clone(),
-                right: middle,
-            });
-            (Some(left), right)
-        }
-    }
-}
-
-fn persistent_map_priority(key: &str) -> u64 {
-    // Stable priorities keep the tree balanced independently of append order while clones share
-    // every untouched subtree.
-    key.as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
-}
-
-impl ToolSessionProjector {
-    fn apply_stored(&mut self, projection: ToolSessionProjection) -> crate::Result<()> {
-        let mut state =
-            self.inherited_state(&projection.node_id, projection.parent_id.as_deref())?;
-        let mut local_tool_use_ids = BTreeSet::new();
-        for tool_use in &projection.tool_uses {
-            if local_tool_use_ids.insert(tool_use.tool_use_id.clone()) {
-                state.tool_uses.insert(
-                    tool_use.tool_use_id.clone(),
-                    ToolUseBinding {
-                        node_id: projection.node_id.clone(),
-                        name: tool_use.name.clone(),
-                    },
-                );
-            }
-        }
-        let mut local_session_ids = BTreeSet::new();
-        for session in &projection.exec_sessions {
-            if local_session_ids.insert(session.session_id.clone()) {
-                state
-                    .exec_sessions
-                    .insert(session.session_id.clone(), session.exec_node_id.clone());
-            }
-        }
-        self.states.insert(projection.node_id, state);
-        self.through_source_row_id = Some(
-            self.through_source_row_id
-                .map_or(projection.source_row_id, |current| {
-                    current.max(projection.source_row_id)
-                }),
-        );
-        Ok(())
-    }
-
-    fn project(&mut self, source_row_id: i64, node: &Node) -> crate::Result<ToolSessionProjection> {
-        let parent_id = (!node.parent.is_empty()).then(|| node.parent.clone());
-        let mut state = self.inherited_state(&node.id, parent_id.as_deref())?;
-        let mut projection = ToolSessionProjection {
-            source_row_id,
-            node_id: node.id.clone(),
-            parent_id,
-            tool_uses: Vec::new(),
-            exec_sessions: Vec::new(),
-            input_links: Vec::new(),
-        };
-        if let Some(tool_uses) = node.kind.as_tool_uses() {
-            let mut local_tool_use_ids = BTreeSet::new();
-            for (ordinal, tool_use) in tool_uses.iter().enumerate() {
-                projection.tool_uses.push(ProjectedToolUse {
-                    ordinal,
-                    tool_use_id: tool_use.id.clone(),
-                    name: tool_use.name.clone(),
-                });
-                if local_tool_use_ids.insert(tool_use.id.clone()) {
-                    state.tool_uses.insert(
-                        tool_use.id.clone(),
-                        ToolUseBinding {
-                            node_id: node.id.clone(),
-                            name: tool_use.name.clone(),
-                        },
-                    );
-                }
-                if tool_use.name == "write_stdin"
-                    && let Some(session_id) = tool_use
-                        .input
-                        .get("session_id")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|session_id| valid_session_id(session_id))
-                    && let Some(exec_node_id) = state.exec_sessions.get(session_id)
-                {
-                    projection.input_links.push(ProjectedToolUseInputLink {
-                        ordinal,
-                        session_id: session_id.to_owned(),
-                        exec_node_id: exec_node_id.clone(),
-                    });
-                }
-            }
-        }
-        if let Some(tool_results) = node.kind.as_tool_results() {
-            let mut local_session_ids = BTreeSet::new();
-            for (ordinal, tool_result) in tool_results.iter().enumerate() {
-                let Some(tool_use) = state.tool_uses.get(&tool_result.id) else {
-                    continue;
-                };
-                if tool_use.name != "exec_command" {
-                    continue;
-                }
-                let Some(session_id) = exec_session_id_from_output(&tool_result.output) else {
-                    continue;
-                };
-                if !local_session_ids.insert(session_id.clone()) {
-                    continue;
-                }
-                let exec_node_id = tool_use.node_id.clone();
-                state
-                    .exec_sessions
-                    .insert(session_id.clone(), exec_node_id.clone());
-                projection.exec_sessions.push(ProjectedExecSession {
-                    ordinal,
-                    session_id,
-                    exec_node_id,
-                });
-            }
-        }
-        self.states.insert(node.id.clone(), state);
-        self.through_source_row_id = Some(
-            self.through_source_row_id
-                .map_or(source_row_id, |current| current.max(source_row_id)),
-        );
-        Ok(projection)
-    }
-
-    fn inherited_state(
-        &self,
-        node_id: &str,
-        parent_id: Option<&str>,
-    ) -> crate::Result<ToolSessionState> {
-        let Some(parent_id) = parent_id else {
-            return Ok(ToolSessionState::default());
-        };
-        self.states
-            .get(parent_id)
-            .cloned()
-            .with_context(|| WebGraphToolSessionParentMissingSnafu {
-                node_id: node_id.to_owned(),
-                parent_id: parent_id.to_owned(),
-            })
-    }
 }
 
 #[derive(Debug)]
@@ -997,7 +697,6 @@ impl WebGraphRuntime {
             source,
             publisher,
             ready,
-            tool_sessions: Arc::new(tokio::sync::Mutex::new(ToolSessionProjector::default())),
         })
     }
 
@@ -1118,9 +817,6 @@ impl WebGraphRuntime {
     }
 
     async fn catch_up_with_page_size(&self, page_size: NonZeroUsize) -> crate::Result<()> {
-        let mut tool_sessions = self.tool_sessions.lock().await;
-        self.restore_tool_session_projector(&mut tool_sessions)
-            .await?;
         let mut progress: Option<CatchUpProgress> = None;
         loop {
             let state = self
@@ -1220,7 +916,7 @@ impl WebGraphRuntime {
                             node_id: entry.node_id.clone(),
                         }
                     })?;
-                    let projection = tool_sessions.project(entry.row_id, source_node)?;
+                    let projection = tool_session_projection(entry.row_id, source_node);
                     self.store
                         .apply_tool_session_projection(&projection)
                         .await
@@ -1246,32 +942,6 @@ impl WebGraphRuntime {
                 return Ok(());
             }
             progress.log_progress_if_due(current_row_id, current_revision);
-            tokio::task::yield_now().await;
-        }
-    }
-
-    async fn restore_tool_session_projector(
-        &self,
-        projector: &mut ToolSessionProjector,
-    ) -> crate::Result<()> {
-        let page_size =
-            NonZeroUsize::new(GRAPH_READ_BATCH_SIZE).expect("graph read batch size is non-zero");
-        loop {
-            let page = self
-                .store
-                .tool_session_projection_page(projector.through_source_row_id, page_size)
-                .await
-                .context(WebGraphStoreSnafu)?;
-            if page.is_empty() {
-                return Ok(());
-            }
-            let complete = page.len() < page_size.get();
-            for projection in page {
-                projector.apply_stored(projection)?;
-            }
-            if complete {
-                return Ok(());
-            }
             tokio::task::yield_now().await;
         }
     }
@@ -2291,10 +1961,10 @@ impl WebGraphRuntime {
 impl WebGraphRuntime {
     pub async fn tool_session_links(
         &self,
-        node_id: &str,
+        session_ids: &[String],
     ) -> crate::Result<std::collections::HashMap<String, String>> {
         self.store
-            .tool_session_links(node_id)
+            .tool_session_links(session_ids)
             .await
             .context(WebGraphStoreSnafu)
     }
@@ -2327,6 +1997,35 @@ fn empty_graph() -> crate::Result<Graph> {
         },
     })
     .context(WebGraphModelSnafu)
+}
+
+fn tool_session_projection(source_row_id: i64, node: &Node) -> ToolSessionProjection {
+    let mut projection = ToolSessionProjection {
+        source_row_id,
+        node_id: node.id.clone(),
+        tool_uses: Vec::new(),
+        exec_session_results: Vec::new(),
+    };
+    if let Some(tool_uses) = node.kind.as_tool_uses() {
+        for tool_use in tool_uses {
+            projection.tool_uses.push(ProjectedToolUse {
+                tool_use_id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+            });
+        }
+    }
+    if let Some(tool_results) = node.kind.as_tool_results() {
+        projection
+            .exec_session_results
+            .extend(tool_results.iter().filter_map(|tool_result| {
+                let session_id = exec_session_id_from_output(&tool_result.output)?;
+                Some(ProjectedExecSessionResult {
+                    tool_result_id: tool_result.id.clone(),
+                    session_id,
+                })
+            }));
+    }
+    projection
 }
 
 fn exec_session_id_from_output(output: &str) -> Option<String> {
@@ -2505,26 +2204,6 @@ mod tests {
         fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
             self.next_u64() % denominator < numerator
         }
-    }
-
-    #[test]
-    fn persistent_string_map_keeps_branch_updates_isolated() {
-        let mut parent = PersistentStringMap::default();
-        parent.insert("shared".to_owned(), "parent".to_owned());
-        parent.insert("parent-only".to_owned(), "value".to_owned());
-        let mut left = parent.clone();
-        let mut right = parent.clone();
-
-        left.insert("shared".to_owned(), "left".to_owned());
-        right.insert("shared".to_owned(), "right".to_owned());
-        right.insert("right-only".to_owned(), "value".to_owned());
-
-        assert_eq!(parent.get("shared").map(String::as_str), Some("parent"));
-        assert_eq!(left.get("shared").map(String::as_str), Some("left"));
-        assert_eq!(right.get("shared").map(String::as_str), Some("right"));
-        assert_eq!(left.get("parent-only").map(String::as_str), Some("value"));
-        assert_eq!(left.get("right-only"), None);
-        assert_eq!(right.get("right-only").map(String::as_str), Some("value"));
     }
 
     #[test]
@@ -3170,8 +2849,27 @@ mod tests {
             "Process exited\nstdout:\nsession_id: active-session\nstderr:\n",
         )
         .await;
-        let recent_exec_id =
-            append_tool_use(&writer, &spoof_result_id, "recent-exec", "exec_command").await;
+        let initial_reused_exec_id = append_tool_use(
+            &writer,
+            &spoof_result_id,
+            "initial-reused-exec",
+            "exec_command",
+        )
+        .await;
+        let initial_reused_result_id = append_tool_result(
+            &writer,
+            &initial_reused_exec_id,
+            "initial-reused-exec",
+            "session_id: reused-session\n",
+        )
+        .await;
+        let recent_exec_id = append_tool_use(
+            &writer,
+            &initial_reused_result_id,
+            "recent-exec",
+            "exec_command",
+        )
+        .await;
         let recent_result_id = append_tool_result(
             &writer,
             &recent_exec_id,
@@ -3190,7 +2888,7 @@ mod tests {
             "session_id: shadowed-session\n",
         )
         .await;
-        let write_id = writer
+        writer
             .append(NewNode {
                 parent: shared_result_id,
                 role: Role::LLM,
@@ -3205,6 +2903,12 @@ mod tests {
             })
             .await
             .unwrap();
+        let session_ids = vec![
+            "active-session".to_owned(),
+            "reused-session".to_owned(),
+            "missing-session".to_owned(),
+            "shadowed-session".to_owned(),
+        ];
         let path = writer.store_path().to_owned();
         let runtime = WebGraphRuntime::open(&path, ConsolePublisher::new())
             .await
@@ -3216,9 +2920,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            runtime.tool_session_links(&write_id).await.unwrap(),
+            runtime.tool_session_links(&session_ids).await.unwrap(),
             std::collections::HashMap::from([
-                ("active-session".to_owned(), exec_id.clone()),
+                ("active-session".to_owned(), exec_id),
                 ("reused-session".to_owned(), recent_exec_id),
             ])
         );
@@ -3227,79 +2931,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            reopened.tool_session_links(&write_id).await.unwrap().len(),
-            2
-        );
-        let write_after_reopen = writer
-            .append(NewNode {
-                parent: write_id,
-                role: Role::LLM,
-                metadata: None,
-                kind: Kind::tool_use(write_stdin_tool_use("write-after-reopen", "active-session")),
-            })
-            .await
-            .unwrap();
-        reopened.catch_up().await.unwrap();
-        assert_eq!(
             reopened
-                .tool_session_links(&write_after_reopen)
+                .tool_session_links(&session_ids)
                 .await
-                .unwrap(),
-            std::collections::HashMap::from([("active-session".to_owned(), exec_id)])
-        );
-    }
-
-    #[tokio::test]
-    async fn catch_up_keeps_reused_session_ids_isolated_by_primary_parent() {
-        let writer = SqliteStore::open_temporary().await.unwrap();
-        let root = writer.root_id();
-        let first_exec_id = append_tool_use(&writer, &root, "first-exec", "exec_command").await;
-        let first_result_id = append_tool_result(
-            &writer,
-            &first_exec_id,
-            "first-exec",
-            "Process running\nsession_id: reused-session\n",
-        )
-        .await;
-        let second_exec_id = append_tool_use(&writer, &root, "second-exec", "exec_command").await;
-        let second_result_id = append_tool_result(
-            &writer,
-            &second_exec_id,
-            "second-exec",
-            "Process running\nsession_id: reused-session\n",
-        )
-        .await;
-        let first_write_id = writer
-            .append(NewNode {
-                parent: first_result_id,
-                role: Role::LLM,
-                metadata: None,
-                kind: Kind::tool_use(write_stdin_tool_use("first-write", "reused-session")),
-            })
-            .await
-            .unwrap();
-        let second_write_id = writer
-            .append(NewNode {
-                parent: second_result_id,
-                role: Role::LLM,
-                metadata: None,
-                kind: Kind::tool_use(write_stdin_tool_use("second-write", "reused-session")),
-            })
-            .await
-            .unwrap();
-        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
-            .await
-            .unwrap();
-
-        runtime.catch_up().await.unwrap();
-
-        assert_eq!(
-            runtime.tool_session_links(&first_write_id).await.unwrap(),
-            std::collections::HashMap::from([("reused-session".to_owned(), first_exec_id)])
-        );
-        assert_eq!(
-            runtime.tool_session_links(&second_write_id).await.unwrap(),
-            std::collections::HashMap::from([("reused-session".to_owned(), second_exec_id)])
+                .unwrap()
+                .len(),
+            2
         );
     }
 
