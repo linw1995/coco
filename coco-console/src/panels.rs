@@ -723,18 +723,20 @@ fn render_markdown_nodes(nodes: Vec<MarkdownNode>) -> Vec<AnyView> {
 
 fn render_markdown_node(node: MarkdownNode) -> AnyView {
     match node {
+        node @ (MarkdownNode::Text { .. }
+        | MarkdownNode::Emphasis { .. }
+        | MarkdownNode::Strong { .. }
+        | MarkdownNode::Strikethrough { .. }
+        | MarkdownNode::InlineCode { .. }
+        | MarkdownNode::Link { .. }
+        | MarkdownNode::LineBreak) => render_markdown_inline(node),
+        node => render_markdown_block(node),
+    }
+}
+
+fn render_markdown_inline(node: MarkdownNode) -> AnyView {
+    match node {
         MarkdownNode::Text { text } => text.into_any(),
-        MarkdownNode::Paragraph { children } => {
-            view! { <p>{render_markdown_nodes(children)}</p> }.into_any()
-        }
-        MarkdownNode::Heading { level, children } => match level {
-            1 => view! { <h1>{render_markdown_nodes(children)}</h1> }.into_any(),
-            2 => view! { <h2>{render_markdown_nodes(children)}</h2> }.into_any(),
-            3 => view! { <h3>{render_markdown_nodes(children)}</h3> }.into_any(),
-            4 => view! { <h4>{render_markdown_nodes(children)}</h4> }.into_any(),
-            5 => view! { <h5>{render_markdown_nodes(children)}</h5> }.into_any(),
-            _ => view! { <h6>{render_markdown_nodes(children)}</h6> }.into_any(),
-        },
         MarkdownNode::Emphasis { children } => {
             view! { <em>{render_markdown_nodes(children)}</em> }.into_any()
         }
@@ -748,15 +750,27 @@ fn render_markdown_node(node: MarkdownNode) -> AnyView {
         MarkdownNode::Link {
             destination,
             children,
-        } => {
-            if safe_markdown_link(&destination) {
-                view! {
-                    <a href=destination>{render_markdown_nodes(children)}</a>
-                }
-                .into_any()
-            } else {
-                view! { <span>{render_markdown_nodes(children)}</span> }.into_any()
-            }
+        } => render_markdown_link(destination, children),
+        MarkdownNode::LineBreak => view! { <br/> }.into_any(),
+        _ => unreachable!("block nodes are rendered separately"),
+    }
+}
+
+fn render_markdown_link(destination: String, children: Vec<MarkdownNode>) -> AnyView {
+    if safe_markdown_link(&destination) {
+        view! {
+            <a href=destination>{render_markdown_nodes(children)}</a>
+        }
+        .into_any()
+    } else {
+        view! { <span>{render_markdown_nodes(children)}</span> }.into_any()
+    }
+}
+
+fn render_markdown_block(node: MarkdownNode) -> AnyView {
+    match node {
+        MarkdownNode::Paragraph { children } => {
+            view! { <p>{render_markdown_nodes(children)}</p> }.into_any()
         }
         MarkdownNode::UnorderedList { items } => view! {
             <ul>
@@ -777,12 +791,30 @@ fn render_markdown_node(node: MarkdownNode) -> AnyView {
         MarkdownNode::BlockQuote { children } => {
             view! { <blockquote>{render_markdown_nodes(children)}</blockquote> }.into_any()
         }
+        node => render_markdown_leaf_block(node),
+    }
+}
+
+fn render_markdown_leaf_block(node: MarkdownNode) -> AnyView {
+    match node {
+        MarkdownNode::Heading { level, children } => render_markdown_heading(level, children),
         MarkdownNode::CodeBlock { language, code } => view! {
             <pre class="markdown-code" data-language=language><code>{code}</code></pre>
         }
         .into_any(),
         MarkdownNode::ThematicBreak => view! { <hr/> }.into_any(),
-        MarkdownNode::LineBreak => view! { <br/> }.into_any(),
+        _ => unreachable!("inline and structural block nodes are rendered separately"),
+    }
+}
+
+fn render_markdown_heading(level: u8, children: Vec<MarkdownNode>) -> AnyView {
+    match level {
+        1 => view! { <h1>{render_markdown_nodes(children)}</h1> }.into_any(),
+        2 => view! { <h2>{render_markdown_nodes(children)}</h2> }.into_any(),
+        3 => view! { <h3>{render_markdown_nodes(children)}</h3> }.into_any(),
+        4 => view! { <h4>{render_markdown_nodes(children)}</h4> }.into_any(),
+        5 => view! { <h5>{render_markdown_nodes(children)}</h5> }.into_any(),
+        _ => view! { <h6>{render_markdown_nodes(children)}</h6> }.into_any(),
     }
 }
 
@@ -1677,6 +1709,89 @@ mod tests {
         assert!(node.contains("&lt;script&gt;"), "{node}");
         assert!(!node.contains("<script>"), "{node}");
         assert!(!node.contains("href=\"javascript:"), "{node}");
+    }
+
+    #[test]
+    fn markdown_renderer_supports_all_simple_nodes() {
+        let text = |value: &str| MarkdownNode::Text {
+            text: value.to_owned(),
+        };
+        let mut nodes = (1..=6)
+            .map(|level| MarkdownNode::Heading {
+                level,
+                children: vec![text(&format!("heading-{level}"))],
+            })
+            .collect::<Vec<_>>();
+        nodes.extend([
+            MarkdownNode::Paragraph {
+                children: vec![
+                    MarkdownNode::Emphasis {
+                        children: vec![text("emphasis")],
+                    },
+                    MarkdownNode::Strong {
+                        children: vec![text("strong")],
+                    },
+                    MarkdownNode::Strikethrough {
+                        children: vec![text("deleted")],
+                    },
+                    MarkdownNode::InlineCode {
+                        code: "inline".to_owned(),
+                    },
+                    MarkdownNode::Link {
+                        destination: "https://example.com".to_owned(),
+                        children: vec![text("link")],
+                    },
+                    MarkdownNode::LineBreak,
+                ],
+            },
+            MarkdownNode::UnorderedList {
+                items: vec![vec![text("bullet")]],
+            },
+            MarkdownNode::OrderedList {
+                start: 3,
+                items: vec![vec![text("ordered")]],
+            },
+            MarkdownNode::BlockQuote {
+                children: vec![MarkdownNode::Paragraph {
+                    children: vec![text("quote")],
+                }],
+            },
+            MarkdownNode::CodeBlock {
+                language: Some("rust".to_owned()),
+                code: "fn main() {}".to_owned(),
+            },
+            MarkdownNode::ThematicBreak,
+        ]);
+
+        let rendered = view! {
+            <div>{render_markdown_nodes(nodes)}</div>
+        }
+        .to_html();
+
+        for tag in [
+            "<h1",
+            "<h2",
+            "<h3",
+            "<h4",
+            "<h5",
+            "<h6",
+            "<em",
+            "<strong",
+            "<del",
+            "<code",
+            "<a",
+            "<br",
+            "<ul",
+            "<ol",
+            "<blockquote",
+            "<pre",
+            "<hr",
+        ] {
+            assert!(rendered.contains(tag), "missing {tag}: {rendered}");
+        }
+        assert!(rendered.contains(r#"href="https://example.com""#));
+        assert!(rendered.contains(r#"start="3""#));
+        assert!(rendered.contains(r#"data-language="rust""#));
     }
 
     #[test]

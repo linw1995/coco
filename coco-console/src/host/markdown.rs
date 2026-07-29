@@ -61,18 +61,29 @@ fn render_block(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> Vec<
         "paragraph" => vec![MarkdownNode::Paragraph {
             children: block_inline(tree, node, source),
         }],
-        "atx_heading" => vec![MarkdownNode::Heading {
-            level: atx_heading_level(node),
-            children: block_inline(tree, node, source),
-        }],
-        "setext_heading" => vec![MarkdownNode::Heading {
-            level: setext_heading_level(node),
-            children: block_inline(tree, node, source),
-        }],
+        "atx_heading" | "setext_heading" => vec![render_heading(tree, node, source)],
         "list" => vec![render_list(tree, node, source)],
         "block_quote" => vec![MarkdownNode::BlockQuote {
             children: block_children(tree, node, source),
         }],
+        _ => render_leaf_block(tree, node, source),
+    }
+}
+
+fn render_heading(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
+    let level = match node.kind() {
+        "atx_heading" => atx_heading_level(node),
+        "setext_heading" => setext_heading_level(node),
+        _ => 1,
+    };
+    MarkdownNode::Heading {
+        level,
+        children: block_inline(tree, node, source),
+    }
+}
+
+fn render_leaf_block(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> Vec<MarkdownNode> {
+    match node.kind() {
         "fenced_code_block" => vec![render_fenced_code(node, source)],
         "indented_code_block" => vec![MarkdownNode::CodeBlock {
             language: None,
@@ -182,43 +193,43 @@ fn inline_children(node: SyntaxNode<'_>, source: &str) -> Vec<MarkdownNode> {
 
 fn render_inline(node: SyntaxNode<'_>, source: &str, rendered: &mut Vec<MarkdownNode>) {
     match node.kind() {
-        "emphasis" => rendered.push(MarkdownNode::Emphasis {
-            children: inline_children(node, source),
-        }),
-        "strong_emphasis" => rendered.push(MarkdownNode::Strong {
-            children: inline_children(node, source),
-        }),
-        "strikethrough" => rendered.push(MarkdownNode::Strikethrough {
-            children: inline_children(node, source),
-        }),
+        "emphasis" | "strong_emphasis" | "strikethrough" => {
+            rendered.push(render_emphasis(node, source));
+        }
         "code_span" => rendered.push(MarkdownNode::InlineCode {
             code: code_span_text(node, source),
         }),
         "inline_link" => rendered.push(render_link(node, source)),
-        "image" => {
-            let mut cursor = node.walk();
-            if let Some(description) = node
-                .named_children(&mut cursor)
-                .find(|child| child.kind() == "image_description")
-            {
-                rendered.extend(inline_children(description, source));
-            }
-        }
-        "uri_autolink" | "email_autolink" => {
-            let text = node_text(node, source)
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .to_owned();
-            let destination = if node.kind() == "email_autolink" {
-                format!("mailto:{text}")
-            } else {
-                text.clone()
-            };
-            rendered.push(MarkdownNode::Link {
-                destination,
-                children: vec![text_node(&text)],
-            });
-        }
+        "image" => render_image_description(node, source, rendered),
+        _ => render_inline_atom(node, source, rendered),
+    }
+}
+
+fn render_emphasis(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
+    let children = inline_children(node, source);
+    match node.kind() {
+        "emphasis" => MarkdownNode::Emphasis { children },
+        "strong_emphasis" => MarkdownNode::Strong { children },
+        "strikethrough" => MarkdownNode::Strikethrough { children },
+        _ => MarkdownNode::Text {
+            text: node_text(node, source).to_owned(),
+        },
+    }
+}
+
+fn render_image_description(node: SyntaxNode<'_>, source: &str, rendered: &mut Vec<MarkdownNode>) {
+    let mut cursor = node.walk();
+    if let Some(description) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "image_description")
+    {
+        rendered.extend(inline_children(description, source));
+    }
+}
+
+fn render_inline_atom(node: SyntaxNode<'_>, source: &str, rendered: &mut Vec<MarkdownNode>) {
+    match node.kind() {
+        "uri_autolink" | "email_autolink" => rendered.push(render_autolink(node, source)),
         "hard_line_break" => rendered.push(MarkdownNode::LineBreak),
         "backslash_escape" => push_text(
             rendered,
@@ -236,6 +247,22 @@ fn render_inline(node: SyntaxNode<'_>, source: &str, rendered: &mut Vec<Markdown
             }
         }
         _ => push_text(rendered, node_text(node, source)),
+    }
+}
+
+fn render_autolink(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
+    let text = node_text(node, source)
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_owned();
+    let destination = if node.kind() == "email_autolink" {
+        format!("mailto:{text}")
+    } else {
+        text.clone()
+    };
+    MarkdownNode::Link {
+        destination,
+        children: vec![text_node(&text)],
     }
 }
 
@@ -378,5 +405,48 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    #[test]
+    fn tree_sitter_handles_supported_block_and_inline_variants() {
+        let document = parse(concat!(
+            "Setext heading\n--------------\n\n",
+            "1. ordered\n2. list\n\n",
+            "> quote\n\n",
+            "    indented code\n\n",
+            "***\n\n",
+            "~~gone~~ <https://example.com> <user@example.com> ![alt](image.png)  \n",
+            "next \\* literal\n",
+        ));
+        let rendered = format!("{:?}", document.blocks);
+
+        assert!(matches!(
+            &document.blocks[0],
+            MarkdownNode::Heading { level: 2, .. }
+        ));
+        assert!(matches!(
+            &document.blocks[1],
+            MarkdownNode::OrderedList { start: 1, items } if items.len() == 2
+        ));
+        assert!(matches!(
+            &document.blocks[2],
+            MarkdownNode::BlockQuote { .. }
+        ));
+        assert!(matches!(
+            &document.blocks[3],
+            MarkdownNode::CodeBlock { language: None, .. }
+        ));
+        assert!(rendered.contains("indented code"));
+        assert!(matches!(&document.blocks[4], MarkdownNode::ThematicBreak));
+        for expected in [
+            "Strikethrough",
+            "https://example.com",
+            "mailto:user@example.com",
+            "LineBreak",
+            "alt",
+            "* literal",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
     }
 }
