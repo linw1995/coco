@@ -1015,6 +1015,11 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   font-style: italic;
 }
 
+.json-escape {
+  color: #fda4af;
+  font-weight: 650;
+}
+
 .shell-command {
   color: #7dd3fc;
   font-weight: 650;
