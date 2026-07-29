@@ -10,9 +10,6 @@ pub fn node_markdown_documents(node: &Node) -> Vec<MarkdownDocument> {
     let mut sources = Vec::new();
     match &node.kind {
         Kind::Text(text) => sources.push(text.as_str()),
-        Kind::ToolResult(items) => {
-            sources.extend(items.iter().map(|item| item.output.as_str()));
-        }
         Kind::Anchor(anchor) => match &anchor.payload {
             AnchorPayload::Session(session) => {
                 sources.push(session.prompt.as_str());
@@ -27,7 +24,7 @@ pub fn node_markdown_documents(node: &Node) -> Vec<MarkdownDocument> {
             AnchorPayload::SkillResult(result) => sources.push(result.output.as_str()),
             AnchorPayload::SessionPatch(_) => {}
         },
-        Kind::ToolUse(_) | Kind::Failure(_) => {}
+        Kind::ToolUse(_) | Kind::ToolResult(_) | Kind::Failure(_) => {}
     }
 
     let mut seen = HashSet::new();
@@ -286,10 +283,22 @@ fn render_link(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
 fn code_span_text(node: SyntaxNode<'_>, source: &str) -> String {
     let text = node_text(node, source);
     let delimiter_len = text.bytes().take_while(|byte| *byte == b'`').count();
-    text.get(delimiter_len..text.len().saturating_sub(delimiter_len))
-        .unwrap_or_default()
-        .trim_matches(' ')
-        .replace('\n', " ")
+    normalize_code_span(
+        text.get(delimiter_len..text.len().saturating_sub(delimiter_len))
+            .unwrap_or_default(),
+    )
+}
+
+fn normalize_code_span(text: &str) -> String {
+    let normalized = text.replace('\n', " ");
+    if normalized.starts_with(' ')
+        && normalized.ends_with(' ')
+        && normalized.bytes().any(|byte| byte != b' ')
+    {
+        normalized[1..normalized.len() - 1].to_owned()
+    } else {
+        normalized
+    }
 }
 
 fn atx_heading_level(node: SyntaxNode<'_>) -> u8 {
@@ -343,9 +352,22 @@ fn push_text(rendered: &mut Vec<MarkdownNode>, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coco_types::ToolResult;
 
     fn parse(source: &str) -> MarkdownDocument {
         parse_document(&mut MarkdownParser::default(), source).unwrap()
+    }
+
+    fn test_node(kind: Kind) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "id": "node-1",
+            "parent": "parent-node",
+            "created_at": "2026-07-25T00:00:00Z",
+            "role": "User",
+            "metadata": null,
+            "kind": kind,
+        }))
+        .expect("test node should deserialize")
     }
 
     #[test]
@@ -448,5 +470,23 @@ mod tests {
         ] {
             assert!(rendered.contains(expected), "{rendered}");
         }
+    }
+
+    #[test]
+    fn tool_results_remain_preformatted_text() {
+        let node = test_node(Kind::ToolResult(vec![ToolResult {
+            id: "tool-1".to_owned(),
+            output: "first line\nsecond line".to_owned(),
+        }]));
+
+        assert!(node_markdown_documents(&node).is_empty());
+    }
+
+    #[test]
+    fn code_spans_follow_commonmark_space_normalization() {
+        assert_eq!(normalize_code_span("  code  "), " code ");
+        assert_eq!(normalize_code_span("   "), "   ");
+        assert_eq!(normalize_code_span("code\nspan"), "code span");
+        assert_eq!(normalize_code_span(" code "), "code");
     }
 }
