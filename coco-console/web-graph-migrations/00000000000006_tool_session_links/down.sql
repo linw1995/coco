@@ -1,0 +1,5 @@
+DROP TABLE web_graph_tool_use_input_links;
+DROP INDEX web_graph_exec_sessions_session_id_idx;
+DROP TABLE web_graph_exec_sessions;
+DROP INDEX web_graph_tool_uses_tool_use_id_idx;
+DROP TABLE web_graph_tool_uses;

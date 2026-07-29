@@ -4,10 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use coco_mem::{
-    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore,
-    ToolSessionStore,
-};
+use coco_mem::{GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore};
 use snafu::{IntoError, prelude::*};
 use tokio::sync::watch;
 
@@ -23,7 +20,10 @@ use super::web_graph_order::{
     IncomingEdge, Result as OrderResult, nearest_row_for_y, reserved_rows_from_placements,
     stable_column_order,
 };
-use super::web_graph_store::{Error as StoreError, StoredGraphState, Viewport, WebGraphStore};
+use super::web_graph_store::{
+    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse, ProjectedWriteStdinSession,
+    StoredGraphState, ToolSessionProjection, Viewport, WebGraphStore,
+};
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
     GRAPH_ROW_STEP, ViewMode, diff_graph_viewport_responses, edge_key, edge_port_offset,
@@ -889,6 +889,19 @@ impl WebGraphRuntime {
             }
             let page_complete = page.complete;
             let processed_nodes = page.entries.len();
+            let page_node_ids = page
+                .entries
+                .iter()
+                .map(|entry| entry.node_id.clone())
+                .collect::<Vec<_>>();
+            let source_nodes = self
+                .source
+                .graph_nodes_by_ids(&page_node_ids)
+                .await
+                .context(StoreSnafu)?
+                .into_iter()
+                .map(|node| (node.id.clone(), node))
+                .collect::<BTreeMap<_, _>>();
             let mut changed_source_nodes = 0_u64;
             let mut nodes_to_reflow = Vec::new();
             for entry in &page.entries {
@@ -898,6 +911,16 @@ impl WebGraphRuntime {
                 }
                 nodes_to_reflow.extend(result.added_nodes);
                 nodes_to_reflow.push(entry.node_id.clone());
+                let source_node = source_nodes.get(&entry.node_id).with_context(|| {
+                    WebGraphSourceNodeMissingSnafu {
+                        node_id: entry.node_id.clone(),
+                    }
+                })?;
+                let projection = tool_session_projection(source_node);
+                self.store
+                    .apply_tool_session_projection(&projection)
+                    .await
+                    .context(WebGraphStoreSnafu)?;
             }
             let page_cursor = page
                 .entries
@@ -1934,16 +1957,15 @@ impl WebGraphRuntime {
     }
 }
 
-#[async_trait::async_trait]
-impl ToolSessionStore for WebGraphRuntime {
-    async fn find_exec_command_node_id_for_session(
+impl WebGraphRuntime {
+    pub async fn tool_session_links(
         &self,
-        head_node_id: &str,
-        session_id: &str,
-    ) -> coco_mem::StoreResult<Option<String>> {
-        self.source
-            .find_exec_command_node_id_for_session(head_node_id, session_id)
+        node_id: &str,
+    ) -> crate::Result<std::collections::HashMap<String, String>> {
+        self.store
+            .tool_session_links(node_id)
             .await
+            .context(WebGraphStoreSnafu)
     }
 }
 
@@ -1974,6 +1996,74 @@ fn empty_graph() -> crate::Result<Graph> {
         },
     })
     .context(WebGraphModelSnafu)
+}
+
+fn tool_session_projection(node: &Node) -> ToolSessionProjection {
+    let mut projection = ToolSessionProjection {
+        node_id: node.id.clone(),
+        tool_uses: Vec::new(),
+        exec_session_results: Vec::new(),
+        write_stdin_sessions: Vec::new(),
+    };
+    if let Some(tool_uses) = node.kind.as_tool_uses() {
+        for (ordinal, tool_use) in tool_uses.iter().enumerate() {
+            projection.tool_uses.push(ProjectedToolUse {
+                ordinal,
+                tool_use_id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+            });
+            if tool_use.name == "write_stdin"
+                && let Some(session_id) = tool_use
+                    .input
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|session_id| valid_session_id(session_id))
+            {
+                projection
+                    .write_stdin_sessions
+                    .push(ProjectedWriteStdinSession {
+                        ordinal,
+                        session_id: session_id.to_owned(),
+                    });
+            }
+        }
+    }
+    if let Some(tool_results) = node.kind.as_tool_results() {
+        projection
+            .exec_session_results
+            .extend(
+                tool_results
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ordinal, tool_result)| {
+                        let session_id = exec_session_id_from_output(&tool_result.output)?;
+                        Some(ProjectedExecSessionResult {
+                            ordinal,
+                            tool_result_id: tool_result.id.clone(),
+                            session_id,
+                        })
+                    }),
+            );
+    }
+    projection
+}
+
+fn exec_session_id_from_output(output: &str) -> Option<String> {
+    for raw_line in output.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if matches!(line, "stdout:" | "stderr:") {
+            return None;
+        }
+        let Some(session_id) = line.strip_prefix("session_id: ") else {
+            continue;
+        };
+        return valid_session_id(session_id).then(|| session_id.to_owned());
+    }
+    None
+}
+
+fn valid_session_id(session_id: &str) -> bool {
+    !session_id.contains(['\n', '\r'])
 }
 
 fn raw_parent_edges(node: &GraphNodeRecord) -> Vec<ParentEdge> {
@@ -2101,7 +2191,7 @@ mod tests {
 
     use coco_mem::{
         Anchor, BranchStore, Kind, MergeParent, NewNode, NewNodeContent, NodeStore, PromptAnchor,
-        Role, SqliteStore,
+        Role, SqliteStore, ToolResult, ToolUse,
     };
     use diesel::Connection;
     use diesel::connection::SimpleConnection;
@@ -2161,6 +2251,26 @@ mod tests {
         progress.observe_high_watermark(&through);
         assert_eq!(progress.total_nodes(), 8);
         assert_eq!(progress.pending_nodes(6), 6);
+    }
+
+    #[test]
+    fn exec_session_parser_only_reads_the_result_header() {
+        assert_eq!(
+            exec_session_id_from_output(
+                "Process running\r\nsession_id: active-session\r\nexit_status: running\r\n"
+            ),
+            Some("active-session".to_owned())
+        );
+        assert_eq!(
+            exec_session_id_from_output(
+                "Process exited\nstdout:\nsession_id: stdout-spoof\nstderr:\n"
+            ),
+            None
+        );
+        assert_eq!(
+            exec_session_id_from_output("Process exited\nstderr:\nsession_id: stderr-spoof\n"),
+            None
+        );
     }
 
     #[test]
@@ -2736,6 +2846,89 @@ mod tests {
                 nearest_row_for_y(route_y_at_x(route, point.x))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn catch_up_persists_tool_session_links() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let exec_id = append_tool_use(&writer, &root, "exec", "exec_command").await;
+        let result_id = append_tool_result(
+            &writer,
+            &exec_id,
+            "exec",
+            "Process running\r\nsession_id: active-session\r\nexit_status: running\r\n",
+        )
+        .await;
+        let spoof_exec_id =
+            append_tool_use(&writer, &result_id, "spoof-exec", "exec_command").await;
+        let spoof_result_id = append_tool_result(
+            &writer,
+            &spoof_exec_id,
+            "spoof-exec",
+            "Process exited\nstdout:\nsession_id: active-session\nstderr:\n",
+        )
+        .await;
+        let recent_exec_id =
+            append_tool_use(&writer, &spoof_result_id, "recent-exec", "exec_command").await;
+        let recent_result_id = append_tool_result(
+            &writer,
+            &recent_exec_id,
+            "recent-exec",
+            "session_id: reused-session\n",
+        )
+        .await;
+        let shared_exec_id =
+            append_tool_use(&writer, &recent_result_id, "shared-call", "exec_command").await;
+        let shared_non_exec_id =
+            append_tool_use(&writer, &shared_exec_id, "shared-call", "other_tool").await;
+        let shared_result_id = append_tool_result(
+            &writer,
+            &shared_non_exec_id,
+            "shared-call",
+            "session_id: shadowed-session\n",
+        )
+        .await;
+        let write_id = writer
+            .append(NewNode {
+                parent: shared_result_id,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_uses(vec![
+                    write_stdin_tool_use("write-active", "active-session"),
+                    write_stdin_tool_use("write-reused", "reused-session"),
+                    write_stdin_tool_use("write-missing", "missing-session"),
+                    write_stdin_tool_use("write-active-again", "active-session"),
+                    write_stdin_tool_use("write-shadowed", "shadowed-session"),
+                ]),
+            })
+            .await
+            .unwrap();
+        let path = writer.store_path().to_owned();
+        let runtime = WebGraphRuntime::open(&path, ConsolePublisher::new())
+            .await
+            .unwrap();
+
+        runtime
+            .catch_up_with_page_size(NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.tool_session_links(&write_id).await.unwrap(),
+            std::collections::HashMap::from([
+                ("active-session".to_owned(), exec_id),
+                ("reused-session".to_owned(), recent_exec_id),
+            ])
+        );
+        drop(runtime);
+        let reopened = WebGraphRuntime::open(path, ConsolePublisher::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.tool_session_links(&write_id).await.unwrap().len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -3556,6 +3749,50 @@ mod tests {
                 append_text(store, &parent, &format!("fuzz seed {seed} node {index}")).await
             };
             node_ids.push(node_id);
+        }
+    }
+
+    async fn append_tool_use(store: &impl NodeStore, parent: &str, id: &str, name: &str) -> String {
+        store
+            .append(NewNode {
+                parent: parent.to_owned(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::tool_use(ToolUse {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    input: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn append_tool_result(
+        store: &impl NodeStore,
+        parent: &str,
+        id: &str,
+        output: &str,
+    ) -> String {
+        store
+            .append(NewNode {
+                parent: parent.to_owned(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::tool_result(ToolResult {
+                    id: id.to_owned(),
+                    output: output.to_owned(),
+                }),
+            })
+            .await
+            .unwrap()
+    }
+
+    fn write_stdin_tool_use(id: &str, session_id: &str) -> ToolUse {
+        ToolUse {
+            id: id.to_owned(),
+            name: "write_stdin".to_owned(),
+            input: serde_json::json!({"session_id": session_id}),
         }
     }
 

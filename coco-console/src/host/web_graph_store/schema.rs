@@ -26,6 +26,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    web_graph_exec_sessions (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> BigInt,
+        session_id -> Text,
+        exec_node_id -> Text,
+    }
+}
+
+diesel::table! {
     web_graph_layouts (layout_kind) {
         layout_kind -> Text,
         canvas_width -> Integer,
@@ -92,6 +101,24 @@ diesel::table! {
 }
 
 diesel::table! {
+    web_graph_tool_use_input_links (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> BigInt,
+        session_id -> Text,
+        exec_node_id -> Text,
+    }
+}
+
+diesel::table! {
+    web_graph_tool_uses (node_id, ordinal) {
+        node_id -> Text,
+        ordinal -> BigInt,
+        tool_use_id -> Text,
+        name -> Text,
+    }
+}
+
+diesel::table! {
     web_graph_state (id) {
         id -> Integer,
         format_version -> Integer,
@@ -110,6 +137,7 @@ diesel::joinable!(web_graph_node_placements -> web_graph_nodes (node_id));
 diesel::allow_tables_to_appear_in_same_query!(
     web_graph_edge_routes,
     web_graph_edges,
+    web_graph_exec_sessions,
     web_graph_layouts,
     web_graph_node_placements,
     web_graph_node_spatial_index,
@@ -118,4 +146,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     web_graph_route_spatial_index,
     web_graph_route_spatial_items,
     web_graph_state,
+    web_graph_tool_use_input_links,
+    web_graph_tool_uses,
 );
