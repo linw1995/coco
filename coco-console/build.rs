@@ -68,11 +68,14 @@ fn run() -> BuildResult<()> {
 
     let mut wasm_build = Command::new("cargo");
     wasm_build
-        .arg("build")
+        .arg("rustc")
         .arg("--manifest-path")
         .arg(manifest_dir.join("Cargo.toml"))
         .arg("--target")
         .arg(WASM_TARGET)
+        .arg("--lib")
+        .arg("--crate-type")
+        .arg("cdylib")
         .env("CARGO_TARGET_DIR", &wasm_target_dir);
     // Host coverage flags require a profiler runtime that wasm32-unknown-unknown does not provide.
     // Keep coverage enabled for host tests, but build the generated wasm client without those flags.
