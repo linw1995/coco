@@ -865,7 +865,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   border-left: 2px solid color-mix(in srgb, var(--detail-accent) 68%, transparent);
   border-radius: 0 7px 7px 0;
   margin: 0;
-  max-height: 18rem;
+  max-height: min(60svh, 32rem);
   overflow: auto;
   padding: 0.5rem 0.56rem;
 }
@@ -899,7 +899,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   margin-bottom: 0.3rem;
 }
 
-.tool-input-shell {
+.node-detail-section pre.tool-input-shell {
   background: rgba(2, 6, 23, 0.74);
   border: 1px solid rgba(148, 163, 184, 0.13);
   border-radius: 6px;
@@ -907,7 +907,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   font: inherit;
   line-height: 1.55;
   margin: 0;
-  max-height: 18rem;
+  max-height: none;
   overflow: auto;
   padding: 0.58rem 0.64rem;
   tab-size: 2;
@@ -986,6 +986,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 }
 
 .node-detail-section pre.tool-input-raw {
+  max-height: min(60svh, 32rem);
   overflow-wrap: normal;
   white-space: pre;
 }
