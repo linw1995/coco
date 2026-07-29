@@ -84,7 +84,7 @@ fn render_leaf_block(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) ->
         "fenced_code_block" => vec![render_fenced_code(node, source)],
         "indented_code_block" => vec![MarkdownNode::CodeBlock {
             language: None,
-            code: dedent_code(node_text(node, source)),
+            code: dedent_code(node, source),
         }],
         "thematic_break" => vec![MarkdownNode::ThematicBreak],
         "html_block" => vec![MarkdownNode::Paragraph {
@@ -328,10 +328,26 @@ fn setext_heading_level(node: SyntaxNode<'_>) -> u8 {
         .unwrap_or(1)
 }
 
-fn dedent_code(source: &str) -> String {
-    source
+fn dedent_code(node: SyntaxNode<'_>, source: &str) -> String {
+    let text = node_text(node, source);
+    let block_indent = text
         .lines()
-        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.bytes().take_while(|byte| *byte == b' ').count())
+        .next()
+        .unwrap_or_default();
+    let container_indent = node.start_position().column;
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let indent = block_indent + usize::from(index > 0) * container_indent;
+            let offset = line
+                .bytes()
+                .take(indent)
+                .take_while(|byte| *byte == b' ')
+                .count();
+            &line[offset..]
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -534,6 +550,24 @@ mod tests {
                 language: None,
                 code: "line\n\n".to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn nested_indented_code_removes_container_indentation() {
+        let document = parse("- item\n\n      first\n        second\n");
+
+        assert!(
+            matches!(
+                &document.blocks[0],
+                MarkdownNode::UnorderedList { items }
+                    if items[0].contains(&MarkdownNode::CodeBlock {
+                        language: None,
+                        code: "first\n  second".to_owned(),
+                    })
+            ),
+            "{:#?}",
+            document.blocks
         );
     }
 }
