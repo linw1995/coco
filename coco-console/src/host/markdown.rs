@@ -330,17 +330,11 @@ fn setext_heading_level(node: SyntaxNode<'_>) -> u8 {
 
 fn dedent_code(node: SyntaxNode<'_>, source: &str) -> String {
     let text = node_text(node, source);
-    let block_indent = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.bytes().take_while(|byte| *byte == b' ').count())
-        .next()
-        .unwrap_or_default();
     let container_indent = node.start_position().column;
-    text.lines()
+    text.split_inclusive('\n')
         .enumerate()
         .map(|(index, line)| {
-            let indent = block_indent + usize::from(index > 0) * container_indent;
+            let indent = 4 + usize::from(index > 0) * container_indent;
             let offset = line
                 .bytes()
                 .take(indent)
@@ -348,8 +342,7 @@ fn dedent_code(node: SyntaxNode<'_>, source: &str) -> String {
                 .count();
             &line[offset..]
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
 }
 
 fn node_text<'a>(node: SyntaxNode<'_>, source: &'a str) -> &'a str {
@@ -563,11 +556,24 @@ mod tests {
                 MarkdownNode::UnorderedList { items }
                     if items[0].contains(&MarkdownNode::CodeBlock {
                         language: None,
-                        code: "first\n  second".to_owned(),
+                        code: "first\n  second\n".to_owned(),
                     })
             ),
             "{:#?}",
             document.blocks
+        );
+    }
+
+    #[test]
+    fn indented_code_preserves_content_indentation_and_line_endings() {
+        let document = parse("      first\n    second\n");
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::CodeBlock {
+                language: None,
+                code: "  first\nsecond\n".to_owned(),
+            }]
         );
     }
 }
