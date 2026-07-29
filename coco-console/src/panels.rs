@@ -13,7 +13,9 @@ use crate::api::{
 #[cfg(target_arch = "wasm32")]
 mod client;
 #[cfg(target_arch = "wasm32")]
-pub use client::{PROVIDER_CONTEXT_RENDERED_EVENT, reveal_node_detail_on_mobile};
+pub use client::{
+    PROVIDER_CONTEXT_RENDERED_EVENT, notify_graph_revision, reveal_node_detail_on_mobile,
+};
 
 const NODE_TARGET_PREFIX: &str = "detail-";
 pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
@@ -99,8 +101,10 @@ pub fn NodeDetailPanel() -> impl IntoView {
 #[component]
 fn NodeDetailPanelBody() -> impl IntoView {
     let selection = use_panel_selection();
+    let graph_revision = use_graph_revision();
     let selected_target = Memo::new(move |_| selection.get().target);
     let detail = LocalResource::new(move || {
+        graph_revision.track();
         let request = selected_target.get();
         async move {
             let target = request?;
@@ -184,6 +188,13 @@ fn use_panel_selection() -> RwSignal<PanelSelection> {
     #[cfg(target_arch = "wasm32")]
     client::subscribe_to_panel_selection(selection);
     selection
+}
+
+fn use_graph_revision() -> RwSignal<u64> {
+    let revision = RwSignal::new(0);
+    #[cfg(target_arch = "wasm32")]
+    client::subscribe_to_graph_revision(revision);
+    revision
 }
 
 #[cfg(any(target_arch = "wasm32", test))]

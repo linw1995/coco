@@ -6,6 +6,7 @@ use leptos::{
 };
 
 const MOBILE_VIEWPORT_MAX_WIDTH: i32 = 860;
+const GRAPH_REVISION_EVENT: &str = "coco-graph-revision";
 pub const PROVIDER_CONTEXT_RENDERED_EVENT: &str = "coco-provider-context-rendered";
 
 pub fn subscribe_to_panel_selection(selection: RwSignal<PanelSelection>) {
@@ -16,6 +17,16 @@ pub fn subscribe_to_panel_selection(selection: RwSignal<PanelSelection>) {
         });
         on_cleanup(move || listener.remove());
     });
+}
+
+pub fn subscribe_to_graph_revision(revision: RwSignal<u64>) {
+    let listener = window_event_listener(
+        ev::Custom::<web_sys::Event>::new(GRAPH_REVISION_EVENT),
+        move |_| {
+            revision.update(|revision| *revision = revision.saturating_add(1));
+        },
+    );
+    on_cleanup(move || listener.remove());
 }
 
 fn current_panel_selection() -> PanelSelection {
@@ -30,6 +41,15 @@ pub fn reveal_node_detail_on_mobile() {
         return;
     };
     reveal_node_detail(document, viewport_width);
+}
+
+pub fn notify_graph_revision() {
+    let Ok(event) = web_sys::Event::new(GRAPH_REVISION_EVENT) else {
+        return;
+    };
+    if let Some(window) = web_sys::window() {
+        let _ = window.dispatch_event(&event);
+    }
 }
 
 fn reveal_node_detail(document: web_sys::Document, viewport_width: i32) {
@@ -65,6 +85,19 @@ mod tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn graph_items_graph_revision_events_advance_the_panel_signal() {
+        _ = any_spawner::Executor::init_wasm_bindgen();
+        let owner = Owner::new();
+        owner.set();
+        let revision = RwSignal::new(0);
+        subscribe_to_graph_revision(revision);
+
+        notify_graph_revision();
+
+        assert_eq!(revision.get_untracked(), 1);
+    }
 
     #[wasm_bindgen_test]
     async fn graph_items_mobile_node_detail_reveal_scrolls_target_into_view() {

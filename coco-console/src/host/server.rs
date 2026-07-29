@@ -188,7 +188,6 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let web_graph = WebGraphRuntime::open(graph_store_path, publisher).await?;
-    web_graph.catch_up().await?;
     let source_changes = web_graph.subscribe_source_changes();
     let listener =
         TcpListener::bind(config.addr).context(BindConsoleSnafu { addr: config.addr })?;
@@ -971,7 +970,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::ConsoleStore;
-    use crate::host::web_graph_store::WebGraphStore;
     use crate::host::web_graph_view::node_target_id;
 
     struct RecordingToolUseInputLinkStore {
@@ -1531,70 +1529,6 @@ mod tests {
             response,
             ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
         ));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn server_starts_after_initial_projection_catch_up() {
-        let source = SqliteStore::open_temporary().await.unwrap();
-        let publisher = ConsolePublisher::new();
-        let store = ConsoleStore::new(source.clone(), publisher.clone());
-        let exec_id = store
-            .append(NewNode {
-                parent: store.root_id(),
-                role: Role::LLM,
-                metadata: None,
-                kind: Kind::tool_use(ToolUse {
-                    id: "exec-call".to_owned(),
-                    name: "exec_command".to_owned(),
-                    input: serde_json::json!({"cmd": "sleep 10"}),
-                }),
-            })
-            .await
-            .unwrap();
-        let result_id = store
-            .append(NewNode {
-                parent: exec_id.clone(),
-                role: Role::User,
-                metadata: None,
-                kind: Kind::tool_result(ToolResult {
-                    id: "exec-call".to_owned(),
-                    output: "Process running\nsession_id: exec-1\nexit_status: running\n"
-                        .to_owned(),
-                }),
-            })
-            .await
-            .unwrap();
-        let write_id = store
-            .append(NewNode {
-                parent: result_id,
-                role: Role::LLM,
-                metadata: None,
-                kind: Kind::tool_use(ToolUse {
-                    id: "write-call".to_owned(),
-                    name: "write_stdin".to_owned(),
-                    input: serde_json::json!({"session_id": "exec-1", "chars": ""}),
-                }),
-            })
-            .await
-            .unwrap();
-
-        let handle = start_console_server_with_graph_store_path(
-            ConsoleConfig {
-                addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            },
-            store,
-            publisher,
-            source.store_path().to_path_buf(),
-        )
-        .await
-        .unwrap();
-
-        let web_graph_store = WebGraphStore::open(source.store_path()).await.unwrap();
-        assert_eq!(
-            web_graph_store.tool_session_links(&write_id).await.unwrap(),
-            HashMap::from([("exec-1".to_owned(), exec_id)])
-        );
-        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
