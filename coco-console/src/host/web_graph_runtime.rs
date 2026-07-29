@@ -1962,10 +1962,22 @@ impl WebGraphRuntime {
         &self,
         node_id: &str,
     ) -> crate::Result<std::collections::HashMap<String, String>> {
-        self.store
-            .tool_session_links(node_id)
-            .await
-            .context(WebGraphStoreSnafu)
+        let mut revisions = self.subscribe();
+        loop {
+            revisions.borrow_and_update();
+            if let Some(links) = self
+                .store
+                .tool_session_links(node_id)
+                .await
+                .context(WebGraphStoreSnafu)?
+            {
+                return Ok(links);
+            }
+            revisions
+                .changed()
+                .await
+                .expect("web graph runtime retains the revision publisher");
+        }
     }
 }
 
@@ -2908,6 +2920,13 @@ mod tests {
         let runtime = WebGraphRuntime::open(&path, ConsolePublisher::new())
             .await
             .unwrap();
+        let pending_links = tokio::spawn({
+            let runtime = runtime.clone();
+            let write_id = write_id.clone();
+            async move { runtime.tool_session_links(&write_id).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending_links.is_finished());
 
         runtime
             .catch_up_with_page_size(NonZeroUsize::new(1).unwrap())
@@ -2915,7 +2934,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            runtime.tool_session_links(&write_id).await.unwrap(),
+            timeout(Duration::from_secs(2), pending_links)
+                .await
+                .expect("link lookup should complete after projection catch-up")
+                .unwrap()
+                .unwrap(),
             std::collections::HashMap::from([
                 ("active-session".to_owned(), exec_id),
                 ("reused-session".to_owned(), recent_exec_id),

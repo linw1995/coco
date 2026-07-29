@@ -465,21 +465,36 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
-    pub async fn tool_session_links(&self, node_id: &str) -> Result<HashMap<String, String>> {
+    pub async fn tool_session_links(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<HashMap<String, String>>> {
         use diesel_async::RunQueryDsl;
 
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
-        web_graph_tool_use_input_links::table
-            .filter(web_graph_tool_use_input_links::node_id.eq(node_id))
-            .select((
-                web_graph_tool_use_input_links::session_id,
-                web_graph_tool_use_input_links::exec_node_id,
-            ))
-            .load::<(String, String)>(&mut connection)
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let projected = diesel::select(diesel::dsl::exists(
+                    web_graph_tool_uses::table.filter(web_graph_tool_uses::node_id.eq(node_id)),
+                ))
+                .get_result::<bool>(connection)
+                .await?;
+                if !projected {
+                    return Ok(None);
+                }
+                let rows = web_graph_tool_use_input_links::table
+                    .filter(web_graph_tool_use_input_links::node_id.eq(node_id))
+                    .select((
+                        web_graph_tool_use_input_links::session_id,
+                        web_graph_tool_use_input_links::exec_node_id,
+                    ))
+                    .load::<(String, String)>(connection)
+                    .await?;
+                Ok(Some(rows.into_iter().collect()))
+            })
             .await
-            .context(QuerySnafu { path })
-            .map(|rows| rows.into_iter().collect())
+            .map_err(|error| error.into_store_error(path))
     }
 
     pub(super) async fn apply_tool_session_projection(
