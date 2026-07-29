@@ -87,8 +87,9 @@ fn render_leaf_block(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) ->
             code: dedent_code(node, source),
         }],
         "thematic_break" => vec![MarkdownNode::ThematicBreak],
-        "html_block" => vec![MarkdownNode::Paragraph {
-            children: vec![text_node(node_text(node, source).trim_end())],
+        "html_block" => vec![MarkdownNode::CodeBlock {
+            language: None,
+            code: node_text(node, source).to_owned(),
         }],
         "pipe_table" => vec![MarkdownNode::CodeBlock {
             language: None,
@@ -133,7 +134,7 @@ fn render_list(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> Markd
     let items = node
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "list_item")
-        .map(|item| block_children(tree, item, source))
+        .map(|item| render_list_item(tree, item, source))
         .collect::<Vec<_>>();
     let marker = node
         .named_child(0)
@@ -151,6 +152,25 @@ fn render_list(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> Markd
         }
         _ => MarkdownNode::UnorderedList { items },
     }
+}
+
+fn render_list_item(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> Vec<MarkdownNode> {
+    let mut cursor = node.walk();
+    let marker = node
+        .named_children(&mut cursor)
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "task_list_marker_checked" | "task_list_marker_unchecked"
+            )
+        })
+        .map(|marker| format!("{} ", node_text(marker, source)));
+    let mut blocks = block_children(tree, node, source);
+    if let (Some(marker), Some(MarkdownNode::Paragraph { children })) = (marker, blocks.first_mut())
+    {
+        prepend_text(children, &marker);
+    }
+    blocks
 }
 
 fn render_fenced_code(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
@@ -335,14 +355,27 @@ fn dedent_code(node: SyntaxNode<'_>, source: &str) -> String {
         .enumerate()
         .map(|(index, line)| {
             let indent = 4 + usize::from(index > 0) * container_indent;
-            let offset = line
-                .bytes()
-                .take(indent)
-                .take_while(|byte| *byte == b' ')
-                .count();
+            let offset = indentation_offset(line, indent);
             &line[offset..]
         })
         .collect()
+}
+
+fn indentation_offset(line: &str, target_columns: usize) -> usize {
+    let mut columns = 0;
+    let mut offset = 0;
+    for (index, byte) in line.bytes().enumerate() {
+        if columns >= target_columns {
+            break;
+        }
+        match byte {
+            b' ' => columns += 1,
+            b'\t' => columns += 4 - columns % 4,
+            _ => break,
+        }
+        offset = index + 1;
+    }
+    offset
 }
 
 fn node_text<'a>(node: SyntaxNode<'_>, source: &'a str) -> &'a str {
@@ -363,6 +396,14 @@ fn push_text(rendered: &mut Vec<MarkdownNode>, text: &str) {
         previous.push_str(text);
     } else {
         rendered.push(text_node(text));
+    }
+}
+
+fn prepend_text(rendered: &mut Vec<MarkdownNode>, text: &str) {
+    if let Some(MarkdownNode::Text { text: first }) = rendered.first_mut() {
+        first.insert_str(0, text);
+    } else {
+        rendered.insert(0, text_node(text));
     }
 }
 
@@ -573,6 +614,52 @@ mod tests {
             vec![MarkdownNode::CodeBlock {
                 language: None,
                 code: "  first\nsecond\n".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn multiline_html_remains_preformatted() {
+        let source = "<pre>\nfirst\nsecond\n</pre>\n";
+        let document = parse(source);
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::CodeBlock {
+                language: None,
+                code: source.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn task_list_markers_remain_literal_text() {
+        let document = parse("- [x] deployed\n- [ ] pending\n");
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::UnorderedList {
+                items: vec![
+                    vec![MarkdownNode::Paragraph {
+                        children: vec![text_node("[x] deployed")],
+                    }],
+                    vec![MarkdownNode::Paragraph {
+                        children: vec![text_node("[ ] pending")],
+                    }],
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn tab_prefixed_indented_code_removes_four_columns() {
+        let document = parse("\tcommand\n");
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::CodeBlock {
+                language: None,
+                code: "command\n".to_owned(),
             }]
         );
     }
