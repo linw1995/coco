@@ -87,8 +87,12 @@ fn render_leaf_block(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) ->
             code: dedent_code(node_text(node, source)),
         }],
         "thematic_break" => vec![MarkdownNode::ThematicBreak],
-        "html_block" | "pipe_table" => vec![MarkdownNode::Paragraph {
+        "html_block" => vec![MarkdownNode::Paragraph {
             children: vec![text_node(node_text(node, source).trim_end())],
+        }],
+        "pipe_table" => vec![MarkdownNode::CodeBlock {
+            language: None,
+            code: node_text(node, source).to_owned(),
         }],
         "link_reference_definition"
         | "minus_metadata"
@@ -165,10 +169,7 @@ fn render_fenced_code(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
             _ => {}
         }
     }
-    MarkdownNode::CodeBlock {
-        language,
-        code: code.trim_end_matches('\n').to_owned(),
-    }
+    MarkdownNode::CodeBlock { language, code }
 }
 
 fn inline_children(node: SyntaxNode<'_>, source: &str) -> Vec<MarkdownNode> {
@@ -234,6 +235,10 @@ fn render_inline_atom(node: SyntaxNode<'_>, source: &str, rendered: &mut Vec<Mar
                 .strip_prefix('\\')
                 .unwrap_or_default(),
         ),
+        "entity_reference" | "numeric_character_reference" => {
+            let decoded = html_escape::decode_html_entities(node_text(node, source));
+            push_text(rendered, &decoded);
+        }
         "emphasis_delimiter" | "code_span_delimiter" => {}
         _ if node.is_named() => {
             let children = inline_children(node, source);
@@ -270,7 +275,10 @@ fn render_link(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "link_text" => children = inline_children(child, source),
-            "link_destination" => destination = node_text(child, source).to_owned(),
+            "link_destination" => {
+                destination =
+                    html_escape::decode_html_entities(node_text(child, source)).into_owned();
+            }
             _ => {}
         }
     }
@@ -405,7 +413,7 @@ mod tests {
         assert!(matches!(
             &document.blocks[3],
             MarkdownNode::CodeBlock { language: Some(language), code }
-                if language == "rust" && code == "fn main() {}"
+                if language == "rust" && code == "fn main() {}\n"
         ));
     }
 
@@ -488,5 +496,44 @@ mod tests {
         assert_eq!(normalize_code_span("   "), "   ");
         assert_eq!(normalize_code_span("code\nspan"), "code span");
         assert_eq!(normalize_code_span(" code "), "code");
+    }
+
+    #[test]
+    fn character_references_are_decoded_as_text() {
+        let document = parse("A &amp; B &#35; C &#x1F600;");
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::Paragraph {
+                children: vec![text_node("A & B # C 😀")],
+            }]
+        );
+    }
+
+    #[test]
+    fn unsupported_tables_remain_preformatted() {
+        let source = "| A | B |\n| - | - |\n| 1 | 2 |\n";
+        let document = parse(source);
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::CodeBlock {
+                language: None,
+                code: source.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn fenced_code_preserves_trailing_blank_lines() {
+        let document = parse("```\nline\n\n```\n");
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::CodeBlock {
+                language: None,
+                code: "line\n\n".to_owned(),
+            }]
+        );
     }
 }
