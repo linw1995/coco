@@ -118,6 +118,7 @@ fn NodeDetailPanelBody() -> impl IntoView {
             })
         }
     });
+    // Island bodies also render during SSR; only the hydrated browser runs this DOM side effect.
     #[cfg(target_arch = "wasm32")]
     Effect::new(move || {
         let current = selected_target.get();
