@@ -762,7 +762,17 @@ async fn client_wasm(Path(version): Path<String>, headers: HeaderMap) -> Respons
         return not_found().await;
     }
 
-    let encoding = preferred_wasm_encoding(&headers);
+    let Some(encoding) = preferred_wasm_encoding(&headers) else {
+        let mut response = response_with_body(
+            StatusCode::NOT_ACCEPTABLE,
+            "text/plain; charset=utf-8",
+            Body::from("no acceptable wasm representation"),
+        );
+        response
+            .headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        return response;
+    };
     let mut response = immutable_response_with_body(
         StatusCode::OK,
         "application/wasm",
@@ -804,19 +814,40 @@ impl WasmEncoding {
     }
 }
 
-fn preferred_wasm_encoding(headers: &HeaderMap) -> WasmEncoding {
+fn preferred_wasm_encoding(headers: &HeaderMap) -> Option<WasmEncoding> {
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        return Some(WasmEncoding::Identity);
+    }
+
     let brotli_quality = encoding_quality(headers, "br");
     let gzip_quality = encoding_quality(headers, "gzip");
-    if brotli_quality > 0.0 && brotli_quality >= gzip_quality {
-        WasmEncoding::Brotli
-    } else if gzip_quality > 0.0 {
-        WasmEncoding::Gzip
+    let identity_quality = identity_quality(headers);
+    if brotli_quality > 0.0 && brotli_quality >= gzip_quality && brotli_quality >= identity_quality
+    {
+        Some(WasmEncoding::Brotli)
+    } else if gzip_quality > 0.0 && gzip_quality >= identity_quality {
+        Some(WasmEncoding::Gzip)
+    } else if identity_quality > 0.0 {
+        Some(WasmEncoding::Identity)
     } else {
-        WasmEncoding::Identity
+        None
     }
 }
 
 fn encoding_quality(headers: &HeaderMap, requested: &str) -> f32 {
+    let (explicit_quality, wildcard_quality) = parsed_encoding_quality(headers, requested);
+    explicit_quality.or(wildcard_quality).unwrap_or(0.0)
+}
+
+fn identity_quality(headers: &HeaderMap) -> f32 {
+    let (explicit_quality, wildcard_quality) = parsed_encoding_quality(headers, "identity");
+    explicit_quality.unwrap_or(match wildcard_quality {
+        Some(0.0) => 0.0,
+        _ => 1.0,
+    })
+}
+
+fn parsed_encoding_quality(headers: &HeaderMap, requested: &str) -> (Option<f32>, Option<f32>) {
     let mut explicit_quality: Option<f32> = None;
     let mut wildcard_quality: Option<f32> = None;
     for value in headers.get_all(header::ACCEPT_ENCODING) {
@@ -830,13 +861,12 @@ fn encoding_quality(headers: &HeaderMap, requested: &str) -> f32 {
             };
             let quality = parts
                 .find_map(|parameter| {
-                    parameter
-                        .trim()
-                        .strip_prefix("q=")
-                        .and_then(|value| value.parse::<f32>().ok())
+                    let (name, value) = parameter.split_once('=')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| value.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0))
                 })
-                .unwrap_or(1.0)
-                .clamp(0.0, 1.0);
+                .unwrap_or(1.0);
             if name.eq_ignore_ascii_case(requested) {
                 explicit_quality =
                     Some(explicit_quality.map_or(quality, |current| current.max(quality)));
@@ -846,7 +876,7 @@ fn encoding_quality(headers: &HeaderMap, requested: &str) -> f32 {
             }
         }
     }
-    explicit_quality.or(wildcard_quality).unwrap_or(0.0)
+    (explicit_quality, wildcard_quality)
 }
 
 async fn method_not_allowed() -> Response {
@@ -1275,7 +1305,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::ACCEPT_ENCODING,
-            HeaderValue::from_static("br;q=0.2, gzip;q=0.8"),
+            HeaderValue::from_static("br;q=0.2, gzip;q=0.8, identity;q=0.5"),
         );
         let gzip = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
         assert_eq!(
@@ -1296,10 +1326,36 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::ACCEPT_ENCODING,
-            HeaderValue::from_static("*;q=0.7, br;q=0"),
+            HeaderValue::from_static("*;q=0.7, br;q=0, identity;q=0.2"),
         );
 
-        assert_eq!(preferred_wasm_encoding(&headers), WasmEncoding::Gzip);
+        assert_eq!(preferred_wasm_encoding(&headers), Some(WasmEncoding::Gzip));
+    }
+
+    #[tokio::test]
+    async fn client_wasm_honors_identity_quality_and_rejects_excluded_encodings() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip;q=0.1, identity;q=1"),
+        );
+        assert_eq!(
+            preferred_wasm_encoding(&headers),
+            Some(WasmEncoding::Identity)
+        );
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("br;Q=0, gzip;q=0, identity;q=0"),
+        );
+        assert_eq!(preferred_wasm_encoding(&headers), None);
+
+        let response = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            response.headers().get(header::VARY).unwrap(),
+            "Accept-Encoding"
+        );
     }
 
     #[tokio::test]
