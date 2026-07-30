@@ -48,6 +48,7 @@ const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.htm
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
+const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Clone)]
 struct AppState<S> {
@@ -276,9 +277,7 @@ async fn access_log(
 ) -> Response {
     let started_at = Instant::now();
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    apply_default_cache_control(&mut response);
     tracing::info!(
         %peer_addr,
         method = %method,
@@ -745,7 +744,7 @@ async fn client_js(Path(version): Path<String>) -> Response {
     if version != CLIENT_ASSET_VERSION {
         return not_found().await;
     }
-    response_with_body(
+    immutable_response_with_body(
         StatusCode::OK,
         "text/javascript; charset=utf-8",
         Body::from(COCO_CONSOLE_JS),
@@ -756,7 +755,7 @@ async fn client_wasm(Path(version): Path<String>) -> Response {
     if version != CLIENT_ASSET_VERSION {
         return not_found().await;
     }
-    response_with_body(
+    immutable_response_with_body(
         StatusCode::OK,
         "application/wasm",
         Body::from(COCO_CONSOLE_WASM),
@@ -966,6 +965,26 @@ fn response_with_body(status: StatusCode, content_type: &'static str, body: Body
     response
 }
 
+fn apply_default_cache_control(response: &mut Response) {
+    response
+        .headers_mut()
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+}
+
+fn immutable_response_with_body(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Body,
+) -> Response {
+    let mut response = response_with_body(status, content_type, body);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(IMMUTABLE_CACHE_CONTROL),
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,6 +1048,25 @@ mod tests {
     #[test]
     fn malformed_percent_encoding_is_preserved() {
         assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
+    }
+
+    #[test]
+    fn default_cache_control_preserves_explicit_cache_policy() {
+        let mut dynamic =
+            response_with_body(StatusCode::OK, "text/plain; charset=utf-8", Body::empty());
+        apply_default_cache_control(&mut dynamic);
+        assert_eq!(
+            dynamic.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        let mut asset =
+            immutable_response_with_body(StatusCode::OK, "application/wasm", Body::empty());
+        apply_default_cache_control(&mut asset);
+        assert_eq!(
+            asset.headers().get(header::CACHE_CONTROL).unwrap(),
+            IMMUTABLE_CACHE_CONTROL
+        );
     }
 
     #[tokio::test]
@@ -1097,12 +1135,20 @@ mod tests {
         let js = client_js(Path(CLIENT_ASSET_VERSION.to_owned())).await;
         assert_eq!(js.status(), StatusCode::OK);
         assert_eq!(
+            js.headers().get(header::CACHE_CONTROL).unwrap(),
+            IMMUTABLE_CACHE_CONTROL
+        );
+        assert_eq!(
             to_bytes(js.into_body(), usize::MAX).await.unwrap(),
             COCO_CONSOLE_JS
         );
 
         let wasm = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned())).await;
         assert_eq!(wasm.status(), StatusCode::OK);
+        assert_eq!(
+            wasm.headers().get(header::CACHE_CONTROL).unwrap(),
+            IMMUTABLE_CACHE_CONTROL
+        );
         assert_eq!(
             to_bytes(wasm.into_body(), usize::MAX).await.unwrap(),
             COCO_CONSOLE_WASM
