@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use coco_types::{
     AnchorPayload, Kind, Node, PromptAttachment, SessionAnchor, SessionAnchorPatch,
     SkillInvocationAnchor, SkillInvocationMode, Tool, ToolResult, ToolUse,
@@ -7,8 +9,9 @@ use leptos::server_fn::codec::GetUrl;
 
 use crate::api::{
     AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
-    NodeDetailResponse, ProviderContextItem, ProviderContextResponse, ShellHighlightKind,
-    ShellHighlightToken, ToolInputJsonHighlight, ToolInputShellHighlight, ToolUseInputLink,
+    MarkdownDocument, MarkdownNode, NodeDetailResponse, ProviderContextItem,
+    ProviderContextResponse, ShellHighlightKind, ShellHighlightToken, ToolInputJsonHighlight,
+    ToolInputShellHighlight, ToolUseInputLink,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -245,12 +248,14 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         }
         NodeDetailResponse::Found {
             node,
+            markdown_documents,
             tool_use_input_links,
             tool_input_shell_highlights,
             tool_input_json_highlights,
         } => view! {
             <NodeDetail
                 node=*node
+                markdown_documents
                 tool_use_input_links
                 tool_input_shell_highlights
                 tool_input_json_highlights
@@ -263,10 +268,12 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
 #[component]
 fn NodeDetail(
     node: Node,
+    markdown_documents: Vec<MarkdownDocument>,
     tool_use_input_links: Vec<ToolUseInputLink>,
     tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
     tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
 ) -> impl IntoView {
+    let markdown_documents = Arc::new(markdown_documents);
     let target = format!("{NODE_TARGET_PREFIX}{}", node.id);
     let kind = node_kind_name(&node.kind);
     let kind_class = format!("node-details node-detail kind-{kind}");
@@ -322,6 +329,7 @@ fn NodeDetail(
             </dl>
             <NodeDetailBody
                 kind=node.kind
+                markdown_documents
                 tool_use_input_links
                 tool_input_shell_highlights
                 tool_input_json_highlights
@@ -333,14 +341,16 @@ fn NodeDetail(
 #[component]
 fn NodeDetailBody(
     kind: Kind,
+    #[prop(default = Arc::new(Vec::new()))] markdown_documents: Arc<Vec<MarkdownDocument>>,
     #[prop(default = Vec::new())] tool_use_input_links: Vec<ToolUseInputLink>,
     #[prop(default = Vec::new())] tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
     #[prop(default = Vec::new())] tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
 ) -> AnyView {
     match kind {
-        Kind::Anchor(anchor) => {
-            view! { <AnchorDetailBody payload=anchor.payload/> }.into_any()
+        Kind::Anchor(anchor) => view! {
+            <AnchorDetailBody payload=anchor.payload markdown_documents/>
         }
+        .into_any(),
         Kind::ToolUse(items) => view! {
             <div class="node-detail-body node-detail-items">
                 {items.into_iter().enumerate().map(|(index, item)| {
@@ -377,13 +387,20 @@ fn NodeDetailBody(
         .into_any(),
         Kind::ToolResult(items) => view! {
             <div class="node-detail-body node-detail-items">
-                {items.into_iter().map(|item| view! { <ToolResultDetail item=item/> }).collect::<Vec<_>>()}
+                {items.into_iter().map(|item| {
+                    view! {
+                        <ToolResultDetail
+                            item=item
+                            markdown_documents=markdown_documents.clone()
+                        />
+                    }
+                }).collect::<Vec<_>>()}
             </div>
         }
         .into_any(),
         Kind::Text(text) => view! {
             <div class="node-detail-body">
-                <DetailTextBlock label="Text" content=text/>
+                <DetailTextBlock label="Text" content=text markdown_documents/>
             </div>
         }
         .into_any(),
@@ -400,30 +417,43 @@ fn NodeDetailBody(
 }
 
 #[component]
-fn AnchorDetailBody(payload: AnchorPayload) -> AnyView {
+fn AnchorDetailBody(
+    payload: AnchorPayload,
+    markdown_documents: Arc<Vec<MarkdownDocument>>,
+) -> AnyView {
     match payload {
-        AnchorPayload::Session(session) => {
-            view! { <SessionAnchorDetail session=*session/> }.into_any()
+        AnchorPayload::Session(session) => view! {
+            <SessionAnchorDetail session=*session markdown_documents/>
         }
+        .into_any(),
         AnchorPayload::SessionPatch(patch) => {
             view! { <SessionPatchDetail patch=patch/> }.into_any()
         }
         AnchorPayload::Prompt(prompt) => view! {
             <div class="node-detail-body">
-                <DetailTextBlock label="Prompt" content=prompt.prompt/>
+                <DetailTextBlock
+                    label="Prompt"
+                    content=prompt.prompt
+                    markdown_documents
+                />
                 <PromptAttachments attachments=prompt.attachments/>
             </div>
         }
         .into_any(),
-        AnchorPayload::SkillInvocation(invocation) => {
-            view! { <SkillInvocationDetail invocation=invocation/> }.into_any()
+        AnchorPayload::SkillInvocation(invocation) => view! {
+            <SkillInvocationDetail invocation=invocation markdown_documents/>
         }
+        .into_any(),
         AnchorPayload::SkillResult(result) => view! {
             <div class="node-detail-body">
                 <dl class="node-detail-properties">
                     <div><dt>"Skill"</dt><dd>{result.skill_name}</dd></div>
                 </dl>
-                <DetailTextBlock label="Output" content=result.output/>
+                <DetailTextBlock
+                    label="Output"
+                    content=result.output
+                    markdown_documents
+                />
             </div>
         }
         .into_any(),
@@ -431,7 +461,10 @@ fn AnchorDetailBody(payload: AnchorPayload) -> AnyView {
 }
 
 #[component]
-fn SessionAnchorDetail(session: SessionAnchor) -> impl IntoView {
+fn SessionAnchorDetail(
+    session: SessionAnchor,
+    markdown_documents: Arc<Vec<MarkdownDocument>>,
+) -> impl IntoView {
     let SessionAnchor {
         role,
         provider_profile,
@@ -475,8 +508,16 @@ fn SessionAnchorDetail(session: SessionAnchor) -> impl IntoView {
                     {skill.handoff.map(|handoff| view! { <p>{handoff}</p> })}
                 </section>
             })}
-            <DetailTextBlock label="Prompt" content=prompt/>
-            <DetailTextBlock label="System prompt" content=system_prompt/>
+            <DetailTextBlock
+                label="Prompt"
+                content=prompt
+                markdown_documents=markdown_documents.clone()
+            />
+            <DetailTextBlock
+                label="System prompt"
+                content=system_prompt
+                markdown_documents
+            />
             {additional_params.map(|params| view! {
                 <DetailCodeBlock label="Additional params" content=params/>
             })}
@@ -510,7 +551,10 @@ fn SessionPatchDetail(patch: SessionAnchorPatch) -> impl IntoView {
 }
 
 #[component]
-fn SkillInvocationDetail(invocation: SkillInvocationAnchor) -> impl IntoView {
+fn SkillInvocationDetail(
+    invocation: SkillInvocationAnchor,
+    markdown_documents: Arc<Vec<MarkdownDocument>>,
+) -> impl IntoView {
     let (mode, prompt) = match invocation.mode {
         SkillInvocationMode::InheritContext => ("Inherit context", None),
         SkillInvocationMode::Handoff { prompt } => ("Handoff", Some(prompt)),
@@ -522,7 +566,11 @@ fn SkillInvocationDetail(invocation: SkillInvocationAnchor) -> impl IntoView {
                 <div><dt>"Mode"</dt><dd>{mode}</dd></div>
             </dl>
             {prompt.map(|prompt| view! {
-                <DetailTextBlock label="Handoff prompt" content=prompt/>
+                <DetailTextBlock
+                    label="Handoff prompt"
+                    content=prompt
+                    markdown_documents=markdown_documents.clone()
+                />
             })}
         </div>
     }
@@ -640,13 +688,146 @@ fn DetailTags(label: &'static str, values: Vec<String>, empty: &'static str) -> 
 }
 
 #[component]
-fn DetailTextBlock(label: &'static str, content: String) -> impl IntoView {
+fn DetailTextBlock(
+    label: &'static str,
+    content: String,
+    #[prop(default = Arc::new(Vec::new()))] markdown_documents: Arc<Vec<MarkdownDocument>>,
+) -> impl IntoView {
+    let document = markdown_documents
+        .iter()
+        .find(|document| document.source == content)
+        .cloned();
+    let body = if content.is_empty() {
+        view! { <pre>"Empty"</pre> }.into_any()
+    } else if let Some(document) = document {
+        view! {
+            <div class="markdown-body">
+                {render_markdown_nodes(document.blocks)}
+            </div>
+        }
+        .into_any()
+    } else {
+        view! { <pre>{content}</pre> }.into_any()
+    };
     view! {
         <section class="node-detail-section">
             <h3>{label}</h3>
-            <pre>{if content.is_empty() { "Empty".to_owned() } else { content }}</pre>
+            {body}
         </section>
     }
+}
+
+fn render_markdown_nodes(nodes: Vec<MarkdownNode>) -> Vec<AnyView> {
+    nodes.into_iter().map(render_markdown_node).collect()
+}
+
+fn render_markdown_node(node: MarkdownNode) -> AnyView {
+    match node {
+        node @ (MarkdownNode::Text { .. }
+        | MarkdownNode::Emphasis { .. }
+        | MarkdownNode::Strong { .. }
+        | MarkdownNode::Strikethrough { .. }
+        | MarkdownNode::InlineCode { .. }
+        | MarkdownNode::Link { .. }
+        | MarkdownNode::LineBreak) => render_markdown_inline(node),
+        node => render_markdown_block(node),
+    }
+}
+
+fn render_markdown_inline(node: MarkdownNode) -> AnyView {
+    match node {
+        MarkdownNode::Text { text } => text.into_any(),
+        MarkdownNode::Emphasis { children } => {
+            view! { <em>{render_markdown_nodes(children)}</em> }.into_any()
+        }
+        MarkdownNode::Strong { children } => {
+            view! { <strong>{render_markdown_nodes(children)}</strong> }.into_any()
+        }
+        MarkdownNode::Strikethrough { children } => {
+            view! { <del>{render_markdown_nodes(children)}</del> }.into_any()
+        }
+        MarkdownNode::InlineCode { code } => view! { <code>{code}</code> }.into_any(),
+        MarkdownNode::Link {
+            destination,
+            children,
+        } => render_markdown_link(destination, children),
+        MarkdownNode::LineBreak => view! { <br/> }.into_any(),
+        _ => unreachable!("block nodes are rendered separately"),
+    }
+}
+
+fn render_markdown_link(destination: String, children: Vec<MarkdownNode>) -> AnyView {
+    if safe_markdown_link(&destination) {
+        view! {
+            <a href=destination>{render_markdown_nodes(children)}</a>
+        }
+        .into_any()
+    } else {
+        view! { <span>{render_markdown_nodes(children)}</span> }.into_any()
+    }
+}
+
+fn render_markdown_block(node: MarkdownNode) -> AnyView {
+    match node {
+        MarkdownNode::Paragraph { children } => {
+            view! { <p>{render_markdown_nodes(children)}</p> }.into_any()
+        }
+        MarkdownNode::UnorderedList { items } => view! {
+            <ul>
+                {items.into_iter().map(|children| {
+                    view! { <li>{render_markdown_nodes(children)}</li> }
+                }).collect::<Vec<_>>()}
+            </ul>
+        }
+        .into_any(),
+        MarkdownNode::OrderedList { start, items } => view! {
+            <ol start=start>
+                {items.into_iter().map(|children| {
+                    view! { <li>{render_markdown_nodes(children)}</li> }
+                }).collect::<Vec<_>>()}
+            </ol>
+        }
+        .into_any(),
+        MarkdownNode::BlockQuote { children } => {
+            view! { <blockquote>{render_markdown_nodes(children)}</blockquote> }.into_any()
+        }
+        node => render_markdown_leaf_block(node),
+    }
+}
+
+fn render_markdown_leaf_block(node: MarkdownNode) -> AnyView {
+    match node {
+        MarkdownNode::Heading { level, children } => render_markdown_heading(level, children),
+        MarkdownNode::CodeBlock { language, code } => view! {
+            <pre class="markdown-code" data-language=language><code>{code}</code></pre>
+        }
+        .into_any(),
+        MarkdownNode::ThematicBreak => view! { <hr/> }.into_any(),
+        _ => unreachable!("inline and structural block nodes are rendered separately"),
+    }
+}
+
+fn render_markdown_heading(level: u8, children: Vec<MarkdownNode>) -> AnyView {
+    match level {
+        1 => view! { <h1>{render_markdown_nodes(children)}</h1> }.into_any(),
+        2 => view! { <h2>{render_markdown_nodes(children)}</h2> }.into_any(),
+        3 => view! { <h3>{render_markdown_nodes(children)}</h3> }.into_any(),
+        4 => view! { <h4>{render_markdown_nodes(children)}</h4> }.into_any(),
+        5 => view! { <h5>{render_markdown_nodes(children)}</h5> }.into_any(),
+        _ => view! { <h6>{render_markdown_nodes(children)}</h6> }.into_any(),
+    }
+}
+
+fn safe_markdown_link(destination: &str) -> bool {
+    if destination.chars().any(char::is_control) {
+        return false;
+    }
+    let normalized = destination.trim().to_ascii_lowercase();
+    normalized.starts_with("http://")
+        || normalized.starts_with("https://")
+        || normalized.starts_with("mailto:")
+        || normalized.starts_with('/')
+        || normalized.starts_with('#')
 }
 
 #[component]
@@ -1051,14 +1232,21 @@ fn ToolUseDetail(
 }
 
 #[component]
-fn ToolResultDetail(item: ToolResult) -> impl IntoView {
+fn ToolResultDetail(
+    item: ToolResult,
+    markdown_documents: Arc<Vec<MarkdownDocument>>,
+) -> impl IntoView {
     view! {
         <article class="node-detail-item">
             <header>
                 <strong>"Tool result"</strong>
                 <code>{item.id}</code>
             </header>
-            <DetailTextBlock label="Output" content=item.output/>
+            <DetailTextBlock
+                label="Output"
+                content=item.output
+                markdown_documents
+            />
         </article>
     }
 }
@@ -1356,6 +1544,7 @@ mod tests {
             request: "detail-node".to_owned(),
             response: Ok(NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("response".to_owned()))),
+                markdown_documents: Vec::new(),
                 tool_use_input_links: Vec::new(),
                 tool_input_shell_highlights: Vec::new(),
                 tool_input_json_highlights: Vec::new(),
@@ -1443,6 +1632,7 @@ mod tests {
         let node = view! {
             <NodeDetailContent response=NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("<script>alert(1)</script>".to_owned()))),
+                markdown_documents: Vec::new(),
                 tool_use_input_links: Vec::new(),
                 tool_input_shell_highlights: Vec::new(),
                 tool_input_json_highlights: Vec::new(),
@@ -1466,6 +1656,142 @@ mod tests {
         assert!(node_error.contains("node failed"));
         assert!(provider_error.contains("Failed to load provider context."));
         assert!(provider_error.contains("provider failed"));
+    }
+
+    #[test]
+    fn node_detail_renders_server_parsed_markdown_safely() {
+        let source = "# Rendered\n\n**safe** [bad](javascript:alert(1)) <script>";
+        let node = view! {
+            <NodeDetailContent response=NodeDetailResponse::Found {
+                node: Box::new(test_node(Kind::Text(source.to_owned()))),
+                markdown_documents: vec![MarkdownDocument {
+                    source: source.to_owned(),
+                    blocks: vec![
+                        MarkdownNode::Heading {
+                            level: 1,
+                            children: vec![MarkdownNode::Text {
+                                text: "Rendered".to_owned(),
+                            }],
+                        },
+                        MarkdownNode::Paragraph {
+                            children: vec![
+                                MarkdownNode::Strong {
+                                    children: vec![MarkdownNode::Text {
+                                        text: "safe".to_owned(),
+                                    }],
+                                },
+                                MarkdownNode::Text {
+                                    text: " ".to_owned(),
+                                },
+                                MarkdownNode::Link {
+                                    destination: "javascript:alert(1)".to_owned(),
+                                    children: vec![MarkdownNode::Text {
+                                        text: "bad".to_owned(),
+                                    }],
+                                },
+                                MarkdownNode::Text {
+                                    text: " <script>".to_owned(),
+                                },
+                            ],
+                        },
+                    ],
+                }],
+                tool_use_input_links: Vec::new(),
+                tool_input_shell_highlights: Vec::new(),
+                tool_input_json_highlights: Vec::new(),
+            }/>
+        }
+        .to_html();
+
+        assert!(node.contains(r#"class="markdown-body""#), "{node}");
+        assert!(node.contains("<h1>Rendered"), "{node}");
+        assert!(node.contains("<strong>safe"), "{node}");
+        assert!(node.contains("&lt;script&gt;"), "{node}");
+        assert!(!node.contains("<script>"), "{node}");
+        assert!(!node.contains("href=\"javascript:"), "{node}");
+    }
+
+    #[test]
+    fn markdown_renderer_supports_all_simple_nodes() {
+        let text = |value: &str| MarkdownNode::Text {
+            text: value.to_owned(),
+        };
+        let mut nodes = (1..=6)
+            .map(|level| MarkdownNode::Heading {
+                level,
+                children: vec![text(&format!("heading-{level}"))],
+            })
+            .collect::<Vec<_>>();
+        nodes.extend([
+            MarkdownNode::Paragraph {
+                children: vec![
+                    MarkdownNode::Emphasis {
+                        children: vec![text("emphasis")],
+                    },
+                    MarkdownNode::Strong {
+                        children: vec![text("strong")],
+                    },
+                    MarkdownNode::Strikethrough {
+                        children: vec![text("deleted")],
+                    },
+                    MarkdownNode::InlineCode {
+                        code: "inline".to_owned(),
+                    },
+                    MarkdownNode::Link {
+                        destination: "https://example.com".to_owned(),
+                        children: vec![text("link")],
+                    },
+                    MarkdownNode::LineBreak,
+                ],
+            },
+            MarkdownNode::UnorderedList {
+                items: vec![vec![text("bullet")]],
+            },
+            MarkdownNode::OrderedList {
+                start: 3,
+                items: vec![vec![text("ordered")]],
+            },
+            MarkdownNode::BlockQuote {
+                children: vec![MarkdownNode::Paragraph {
+                    children: vec![text("quote")],
+                }],
+            },
+            MarkdownNode::CodeBlock {
+                language: Some("rust".to_owned()),
+                code: "fn main() {}".to_owned(),
+            },
+            MarkdownNode::ThematicBreak,
+        ]);
+
+        let rendered = view! {
+            <div>{render_markdown_nodes(nodes)}</div>
+        }
+        .to_html();
+
+        for tag in [
+            "<h1",
+            "<h2",
+            "<h3",
+            "<h4",
+            "<h5",
+            "<h6",
+            "<em",
+            "<strong",
+            "<del",
+            "<code",
+            "<a",
+            "<br",
+            "<ul",
+            "<ol",
+            "<blockquote",
+            "<pre",
+            "<hr",
+        ] {
+            assert!(rendered.contains(tag), "missing {tag}: {rendered}");
+        }
+        assert!(rendered.contains(r#"href="https://example.com""#));
+        assert!(rendered.contains(r#"start="3""#));
+        assert!(rendered.contains(r#"data-language="rust""#));
     }
 
     #[test]
@@ -1717,6 +2043,7 @@ mod tests {
                         input: serde_json::json!({"session_id": "exec-1"}),
                     },
                 ]))),
+                markdown_documents: Vec::new(),
                 tool_use_input_links: vec![ToolUseInputLink {
                     tool_use_index: 1,
                     tool_use_id: "write-2".to_owned(),

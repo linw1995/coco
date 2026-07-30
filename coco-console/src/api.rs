@@ -19,12 +19,67 @@ pub enum NodeDetailResponse {
     },
     Found {
         node: Box<Node>,
+        #[serde(default)]
+        markdown_documents: Vec<MarkdownDocument>,
         tool_use_input_links: Vec<ToolUseInputLink>,
         #[serde(default)]
         tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
         #[serde(default)]
         tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MarkdownDocument {
+    pub source: String,
+    pub blocks: Vec<MarkdownNode>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MarkdownNode {
+    Text {
+        text: String,
+    },
+    Paragraph {
+        children: Vec<MarkdownNode>,
+    },
+    Heading {
+        level: u8,
+        children: Vec<MarkdownNode>,
+    },
+    Emphasis {
+        children: Vec<MarkdownNode>,
+    },
+    Strong {
+        children: Vec<MarkdownNode>,
+    },
+    Strikethrough {
+        children: Vec<MarkdownNode>,
+    },
+    InlineCode {
+        code: String,
+    },
+    Link {
+        destination: String,
+        children: Vec<MarkdownNode>,
+    },
+    UnorderedList {
+        items: Vec<Vec<MarkdownNode>>,
+    },
+    OrderedList {
+        start: u64,
+        items: Vec<Vec<MarkdownNode>>,
+    },
+    BlockQuote {
+        children: Vec<MarkdownNode>,
+    },
+    CodeBlock {
+        language: Option<String>,
+        code: String,
+    },
+    ThematicBreak,
+    LineBreak,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

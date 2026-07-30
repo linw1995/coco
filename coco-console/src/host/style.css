@@ -706,6 +706,135 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   tab-size: 2;
 }
 
+.markdown-body {
+  background: rgba(15, 23, 42, 0.68);
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-left: 2px solid color-mix(in srgb, var(--detail-accent) 68%, transparent);
+  border-radius: 0 7px 7px 0;
+  color: #e7edf7;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  max-height: 22rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 0.68rem 0.72rem;
+}
+
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p {
+  margin: 0.55rem 0;
+}
+
+.node-detail-section .markdown-body h1,
+.node-detail-section .markdown-body h2,
+.node-detail-section .markdown-body h3,
+.node-detail-section .markdown-body h4,
+.node-detail-section .markdown-body h5,
+.node-detail-section .markdown-body h6 {
+  color: #f8fafc;
+  font-weight: 700;
+  letter-spacing: normal;
+  line-height: 1.3;
+  margin: 0.85rem 0 0.42rem;
+  text-transform: none;
+}
+
+.node-detail-section .markdown-body h1 {
+  font-size: 1.08rem;
+}
+
+.node-detail-section .markdown-body h2 {
+  font-size: 0.98rem;
+}
+
+.node-detail-section .markdown-body h3 {
+  font-size: 0.9rem;
+}
+
+.node-detail-section .markdown-body h4,
+.node-detail-section .markdown-body h5,
+.node-detail-section .markdown-body h6 {
+  font-size: 0.82rem;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0.55rem 0;
+  padding-left: 1.4rem;
+}
+
+.markdown-body li {
+  margin: 0.18rem 0;
+}
+
+.markdown-body li > p {
+  margin: 0;
+}
+
+.markdown-body blockquote {
+  border-left: 2px solid rgba(148, 163, 184, 0.42);
+  color: #b6c2d2;
+  margin: 0.65rem 0;
+  padding-left: 0.72rem;
+}
+
+.markdown-body a {
+  color: #93c5fd;
+  text-decoration-color: rgba(147, 197, 253, 0.5);
+  text-underline-offset: 0.15em;
+}
+
+.markdown-body a:hover {
+  text-decoration-color: #93c5fd;
+}
+
+.markdown-body code {
+  background: rgba(2, 6, 23, 0.66);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 4px;
+  color: #bae6fd;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.72rem;
+  padding: 0.08rem 0.24rem;
+}
+
+.node-detail-section .markdown-body pre.markdown-code {
+  background: rgba(2, 6, 23, 0.74);
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 6px;
+  color: #cbd5e1;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.72rem;
+  margin: 0.65rem 0;
+  max-height: none;
+  overflow: auto;
+  overflow-wrap: normal;
+  padding: 0.58rem 0.64rem;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.markdown-body pre.markdown-code code {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+}
+
+.markdown-body hr {
+  border: 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.22);
+  margin: 0.8rem 0;
+}
+
 .node-detail-tags {
   display: flex;
   flex-wrap: wrap;
