@@ -859,6 +859,7 @@ fn parsed_encoding_quality(headers: &HeaderMap, requested: &str) -> (Option<f32>
             let Some(name) = parts.next() else {
                 continue;
             };
+            let name = name.trim();
             let quality = parts
                 .find_map(|parameter| {
                     let (name, value) = parameter.split_once('=')?;
@@ -1343,6 +1344,12 @@ mod tests {
             preferred_wasm_encoding(&headers),
             Some(WasmEncoding::Identity)
         );
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip ; q=1, identity;q=0"),
+        );
+        assert_eq!(preferred_wasm_encoding(&headers), Some(WasmEncoding::Gzip));
 
         headers.insert(
             header::ACCEPT_ENCODING,
