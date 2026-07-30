@@ -1,15 +1,18 @@
 // grcov: ignore-start
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use snafu::prelude::*;
 
 type BuildResult<T> = Result<T, BuildError>;
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
+const WASM_PROFILE: &str = "wasm-release";
 const COVERAGE_ENV_VARS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE"];
 
 #[derive(Debug, Snafu)]
@@ -25,6 +28,22 @@ enum BuildError {
 
     #[snafu(display("Failed to read wasm asset {}: {source}", path.display()))]
     ReadAsset { path: PathBuf, source: io::Error },
+
+    #[snafu(display("Failed to write wasm asset {}: {source}", path.display()))]
+    WriteAsset { path: PathBuf, source: io::Error },
+
+    #[snafu(display("Failed to replace {} with {}: {source}", target.display(), source_path.display()))]
+    ReplaceAsset {
+        source_path: PathBuf,
+        target: PathBuf,
+        source: io::Error,
+    },
+
+    #[snafu(display("Failed to compress wasm asset with {encoding}: {source}"))]
+    CompressAsset {
+        encoding: &'static str,
+        source: io::Error,
+    },
 
     #[snafu(display("Failed to run {program}: {source}"))]
     RunCommand { program: String, source: io::Error },
@@ -62,7 +81,7 @@ fn run() -> BuildResult<()> {
     let wasm_target_dir = out_dir.join("wasm-target");
     let wasm_file = wasm_target_dir
         .join(WASM_TARGET)
-        .join("debug")
+        .join(WASM_PROFILE)
         .join("coco_console.wasm");
     let pkg_dir = out_dir.join("pkg");
 
@@ -73,6 +92,8 @@ fn run() -> BuildResult<()> {
         .arg(manifest_dir.join("Cargo.toml"))
         .arg("--target")
         .arg(WASM_TARGET)
+        .arg("--profile")
+        .arg(WASM_PROFILE)
         .arg("--lib")
         .arg("--crate-type")
         .arg("cdylib")
@@ -93,8 +114,48 @@ fn run() -> BuildResult<()> {
             .arg(&pkg_dir)
             .arg(&wasm_file),
     )?;
+    optimize_wasm(&pkg_dir)?;
+    precompress_wasm(&pkg_dir)?;
     let asset_version = asset_version(&pkg_dir)?;
     println!("cargo:rustc-env=COCO_CONSOLE_ASSET_VERSION={asset_version}");
+    Ok(())
+}
+
+fn optimize_wasm(pkg_dir: &std::path::Path) -> BuildResult<()> {
+    let wasm_path = pkg_dir.join("coco_console_bg.wasm");
+    let optimized_path = pkg_dir.join("coco_console_bg.opt.wasm");
+    run_command(
+        Command::new("wasm-opt")
+            .arg("-Oz")
+            .arg(&wasm_path)
+            .arg("-o")
+            .arg(&optimized_path),
+    )?;
+    fs::rename(&optimized_path, &wasm_path).context(ReplaceAssetSnafu {
+        source_path: optimized_path,
+        target: wasm_path,
+    })
+}
+
+fn precompress_wasm(pkg_dir: &std::path::Path) -> BuildResult<()> {
+    let wasm_path = pkg_dir.join("coco_console_bg.wasm");
+    let bytes = fs::read(&wasm_path).context(ReadAssetSnafu { path: wasm_path })?;
+
+    let mut brotli_bytes = Vec::new();
+    brotli::CompressorReader::new(bytes.as_slice(), 4096, 11, 22)
+        .read_to_end(&mut brotli_bytes)
+        .context(CompressAssetSnafu { encoding: "br" })?;
+    let brotli_path = pkg_dir.join("coco_console_bg.wasm.br");
+    fs::write(&brotli_path, brotli_bytes).context(WriteAssetSnafu { path: brotli_path })?;
+
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
+    gzip.write_all(&bytes)
+        .context(CompressAssetSnafu { encoding: "gzip" })?;
+    let gzip_bytes = gzip
+        .finish()
+        .context(CompressAssetSnafu { encoding: "gzip" })?;
+    let gzip_path = pkg_dir.join("coco_console_bg.wasm.gz");
+    fs::write(&gzip_path, gzip_bytes).context(WriteAssetSnafu { path: gzip_path })?;
     Ok(())
 }
 

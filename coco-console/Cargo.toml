@@ -82,7 +82,9 @@ web-sys = { version = "=0.3.94", features = [
 ] }
 
 [build-dependencies]
-# Build script error handling.
+# Build script error handling and asset compression.
+brotli = "8"
+flate2 = "1"
 snafu.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
