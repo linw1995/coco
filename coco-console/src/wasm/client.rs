@@ -2593,26 +2593,25 @@ async fn render_anchor_range(
         graph.show_status("No detail nodes exist between the selected anchors.");
         return None;
     }
-    let mut prepared =
-        match graph
-            .borrow()
-            .prepare_anchor_range(selection.clone(), paths.clone(), None)
-        {
-            Ok(Some(prepared)) => prepared,
-            Ok(None) => {
-                let mut graph = graph.borrow_mut();
-                let _ = graph.collapse_anchor_range();
-                graph.show_status("Anchor endpoints are outside the rendered graph.");
-                return None;
-            }
-            Err(error) => {
-                web_sys::console::error_1(&error);
-                graph
-                    .borrow()
-                    .show_status("Failed to prepare anchor details.");
-                return None;
-            }
-        };
+    let prepared = graph
+        .borrow()
+        .prepare_anchor_range(selection.clone(), paths.clone(), None);
+    let mut prepared = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            let mut graph = graph.borrow_mut();
+            let _ = graph.collapse_anchor_range();
+            graph.show_status("Anchor endpoints are outside the rendered graph.");
+            return None;
+        }
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            graph
+                .borrow()
+                .show_status("Failed to prepare anchor details.");
+            return None;
+        }
+    };
     loop {
         let layout = layout_anchor_range_chunk(prepared.request.clone()).await;
         let mut graph = graph.borrow_mut();
