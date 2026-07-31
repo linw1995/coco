@@ -134,6 +134,10 @@ pub fn same_viewport(left: ViewportState, right: ViewportState) -> bool {
         && left.overscan == right.overscan
 }
 
+pub fn right_aligned_viewport_x(canvas_width: f64, viewport_width: f64) -> f64 {
+    (canvas_width - viewport_width).max(0.0)
+}
+
 pub fn needs_full_viewport_fetch(rendered: ViewportState, current: ViewportState) -> bool {
     needs_full_fetch(ViewportBounds::rendered(rendered), current)
 }
@@ -205,7 +209,7 @@ fn short_axis_zoom(
 mod tests {
     use super::{
         ViewportDrag, ViewportState, needs_full_viewport_fetch, needs_full_viewport_jump_fetch,
-        same_viewport, short_canvas_auto_zoom,
+        right_aligned_viewport_x, same_viewport, short_canvas_auto_zoom,
     };
 
     fn viewport(x: f64, y: f64) -> ViewportState {
@@ -379,6 +383,12 @@ mod tests {
             short_canvas_auto_zoom(1000.0, 600.0, 1600.0, 900.0, 1.25),
             1.25
         );
+    }
+
+    #[test]
+    fn right_aligned_viewport_origin_clamps_short_canvases() {
+        assert_eq!(right_aligned_viewport_x(2400.0, 1280.0), 1120.0);
+        assert_eq!(right_aligned_viewport_x(900.0, 1280.0), 0.0);
     }
 
     #[test]

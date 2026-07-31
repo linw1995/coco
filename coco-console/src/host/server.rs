@@ -300,10 +300,15 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    html_response(render_index_page(
-        view_mode_from_query(&query),
-        state.web_graph.current_revision(),
-    ))
+    let mode = view_mode_from_query(&query);
+    match state
+        .web_graph
+        .rightmost_viewport(mode, GraphViewportRequest::default())
+        .await
+    {
+        Ok(viewport) => html_response(render_index_page(mode, &viewport)),
+        Err(error) => plain_error(error.to_string()),
+    }
 }
 
 async fn style_css() -> Response {
@@ -1490,6 +1495,13 @@ mod tests {
         let viewport: crate::api::GraphViewportResponse =
             serde_json::from_slice(&viewport_body).unwrap();
         assert!(viewport.nodes.iter().any(|node| node.id == node_id));
+
+        let index = index_page(State(state.clone()), RawQuery(Some("mode=all".to_owned()))).await;
+        let index_body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
+        let index_body = String::from_utf8(index_body.to_vec()).unwrap();
+        assert!(index_body.contains(&format!("data-node-id=\"{node_id}\"")));
+        assert!(index_body.contains("class=\"graph-bg\""));
+        assert!(!index_body.contains("Loading graph..."));
 
         let detail = node_detail(
             State(state.clone()),

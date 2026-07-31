@@ -1,4 +1,5 @@
 mod api;
+mod graph_render;
 mod panels;
 
 #[allow(dead_code)]

@@ -20,12 +20,19 @@ use crate::api::{
     GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItems,
     GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
+#[cfg(test)]
+use crate::graph_render::truncate_label;
+use crate::graph_render::{
+    bezier_path, edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style,
+    node_group_class, node_label, node_title_text, percent_encode, render_element_id,
+};
 use crate::panels::{
     PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, load_anchor_range, notify_graph_revision,
     reveal_node_detail_on_mobile,
 };
 use crate::viewport::{
-    MIN_OVERSCAN, ViewportDrag, ViewportState, rounded_i32, same_viewport, short_canvas_auto_zoom,
+    MIN_OVERSCAN, ViewportDrag, ViewportState, right_aligned_viewport_x, rounded_i32,
+    same_viewport, short_canvas_auto_zoom,
 };
 
 use super::anchor_range::{
@@ -295,7 +302,7 @@ impl VirtualGraph {
         let stored_viewport = ViewportState::load(&window);
         let auto_fit_short_canvas = stored_viewport.is_none();
         let viewport = stored_viewport
-            .unwrap_or_else(|| viewport_from_element(&elements.root.graph_wrap, 0.0, 0.0, zoom));
+            .unwrap_or_else(|| initial_viewport_from_elements(&elements.root.graph_wrap, zoom));
         let auto_follow = initial_auto_follow(&window);
         let version = current_version(&document).unwrap_or_default();
 
@@ -1518,6 +1525,33 @@ fn initial_zoom(graph_wrap: &Element) -> f64 {
         .clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
+fn initial_viewport_origin(graph_wrap: &Element) -> (f64, f64) {
+    (
+        initial_viewport_coordinate(graph_wrap, "data-viewport-x"),
+        initial_viewport_coordinate(graph_wrap, "data-viewport-y"),
+    )
+}
+
+fn initial_viewport_from_elements(graph_wrap: &Element, zoom: f64) -> ViewportState {
+    let (x, y) = initial_viewport_origin(graph_wrap);
+    let mut viewport = viewport_from_element(graph_wrap, x, y, zoom);
+    if let Some(canvas_width) = graph_wrap
+        .get_attribute("data-canvas-width")
+        .and_then(|value| value.parse::<f64>().ok())
+    {
+        viewport.x = right_aligned_viewport_x(canvas_width, viewport.width);
+    }
+    viewport
+}
+
+fn initial_viewport_coordinate(graph_wrap: &Element, attribute: &str) -> f64 {
+    graph_wrap
+        .get_attribute(attribute)
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or_default()
+        .max(0.0)
+}
+
 fn initial_auto_follow(window: &Window) -> bool {
     stored_auto_follow_value(window).is_some_and(|value| value == "1" || value == "true")
 }
@@ -1654,14 +1688,6 @@ fn update_auto_follow(graph: Rc<RefCell<VirtualGraph>>, enabled: bool) {
     request_viewport_update(graph, pending_update);
 }
 
-fn edge_style(kind: GraphViewportEdgeKind) -> (&'static str, &'static str) {
-    match kind {
-        GraphViewportEdgeKind::Primary => ("edge primary-parent", "url(#arrowhead)"),
-        GraphViewportEdgeKind::Merge => ("edge merge-parent", "url(#merge-arrowhead)"),
-        GraphViewportEdgeKind::Shadow => ("edge shadow-parent", "url(#shadow-arrowhead)"),
-    }
-}
-
 fn graph_edge_key(kind: GraphViewportEdgeKind, source_id: &str, target_id: &str) -> String {
     format!("edge:{}:{source_id}:{target_id}", kind.key_part())
 }
@@ -1674,26 +1700,6 @@ fn edge_matches_anchor_range_selection(edge: &Element, selection: &AnchorRangeSe
 
 fn anchor_range_edge_path(edge: AnchorRangeLayoutEdge) -> String {
     bezier_path(route_anchor_range_edge(edge, NODE_RADIUS))
-}
-
-fn edge_kind_label(kind: GraphViewportEdgeKind) -> &'static str {
-    match kind {
-        GraphViewportEdgeKind::Primary => "Primary parent",
-        GraphViewportEdgeKind::Merge => "Merge parent",
-        GraphViewportEdgeKind::Shadow => "Shadow parent",
-    }
-}
-
-fn edge_hit_target_label(edge: &GraphViewportEdge) -> String {
-    let kind = edge_kind_label(edge.kind).to_lowercase();
-    format!(
-        "Expand {kind} relationship from {} to {}",
-        edge.source_id, edge.target_id
-    )
-}
-
-fn edge_hit_target_id(key: &str) -> String {
-    format!("{}-hit", render_element_id(key))
 }
 
 fn apply_graph_viewport_metadata(
@@ -1893,26 +1899,6 @@ fn set_node_group_attributes(group: &Element, node: &GraphViewportNode) -> Resul
             ("class", node_group_class(node)),
             ("transform", format!("translate({} {})", node.x, node.y)),
         ],
-    )
-}
-
-fn node_group_class(node: &GraphViewportNode) -> String {
-    let mut class = format!("node {}", css_token(&node.kind));
-    if !node.labels.is_empty() {
-        class.push_str(" active");
-    }
-    class
-}
-
-fn node_title_text(node: &GraphViewportNode) -> String {
-    let labels = if node.labels.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", node.labels.join(", "))
-    };
-    format!(
-        "{} · {}{}: {}",
-        node.short_id, node.kind, labels, node.summary
     )
 }
 
@@ -3325,83 +3311,6 @@ fn clear_children(element: &Element) {
     element.set_text_content(Some(""));
 }
 
-fn render_element_id(key: &str) -> String {
-    format!("graph-render-{}", percent_encode(key))
-}
-
-fn node_label(node: &GraphViewportNode) -> String {
-    if node.labels.is_empty() {
-        node.short_id.clone()
-    } else {
-        let mut labels = node
-            .labels
-            .iter()
-            .take(2)
-            .map(|label| truncate_label(label, 12))
-            .collect::<Vec<_>>();
-        if node.labels.len() > labels.len() {
-            labels.push(format!("+{}", node.labels.len() - labels.len()));
-        }
-        format!("{} {}", node.short_id, labels.join(" · "))
-    }
-}
-
-fn truncate_label(label: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut chars = label.chars();
-    let prefix = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        let truncated = prefix
-            .chars()
-            .take(max_chars.saturating_sub(1))
-            .collect::<String>();
-        format!("{truncated}…")
-    } else {
-        prefix
-    }
-}
-
-fn bezier_path(route: GraphBezierRoute) -> String {
-    format!(
-        "M {} {} C {} {}, {} {}, {} {}",
-        route.source.x,
-        route.source.y,
-        route.control_1.x,
-        route.control_1.y,
-        route.control_2.x,
-        route.control_2.y,
-        route.target.x,
-        route.target.y,
-    )
-}
-
-fn css_token(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-fn percent_encode(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
-}
-
 fn session_storage(window: &Window) -> Option<web_sys::Storage> {
     window.session_storage().ok().flatten()
 }
@@ -3423,6 +3332,10 @@ mod tests {
 
     impl GraphFixture {
         fn new() -> Self {
+            Self::with_canvas_width_offset(None)
+        }
+
+        fn with_canvas_width_offset(canvas_width_offset: Option<f64>) -> Self {
             let window = web_sys::window().expect_throw("window should be available");
             if let Some(storage) = session_storage(&window) {
                 let _ = storage.remove_item(AUTO_FOLLOW_KEY);
@@ -3481,6 +3394,18 @@ mod tests {
                 .expect_throw("document body should be available")
                 .append_child(&root)
                 .expect_throw("test root should be mounted");
+            if let Some(offset) = canvas_width_offset {
+                let graph_wrap = root
+                    .query_selector(".graph-wrap")
+                    .expect_throw("graph wrapper query should succeed")
+                    .expect_throw("graph wrapper should exist");
+                graph_wrap
+                    .set_attribute(
+                        "data-canvas-width",
+                        &(graph_client_width(&graph_wrap) + offset).to_string(),
+                    )
+                    .expect_throw("SSR canvas width should be set");
+            }
             let graph =
                 VirtualGraph::new(window, document).expect_throw("test graph should be created");
 
@@ -3511,6 +3436,13 @@ mod tests {
         graph.borrow_mut().anchor_range_selection = Some(selection.clone());
         apply_anchor_range_response(graph, selection, Ok(AnchorRangeResponse::Found { paths }))
             .await
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_initial_viewport_aligns_with_ssr_canvas_right_edge() {
+        let fixture = GraphFixture::with_canvas_width_offset(Some(320.0));
+
+        assert_eq!(rounded_i32(fixture.graph.borrow().viewport.x), 320);
     }
 
     #[wasm_bindgen_test]
