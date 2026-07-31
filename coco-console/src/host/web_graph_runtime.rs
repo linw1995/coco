@@ -959,6 +959,28 @@ impl WebGraphRuntime {
         }
     }
 
+    pub async fn rightmost_viewport(
+        &self,
+        mode: ViewMode,
+        request: GraphViewportRequest,
+    ) -> crate::Result<GraphViewportResponse> {
+        let mut request = request.normalized();
+        loop {
+            let canvas = self
+                .store
+                .canvas(layout_kind(mode))
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?
+                .value;
+            request.x = rightmost_viewport_x(canvas.width, request.width);
+            let response = self.viewport(mode, request).await?;
+            if response.viewport.x == rightmost_viewport_x(response.canvas.width, request.width) {
+                return Ok(response);
+            }
+        }
+    }
+
     pub async fn viewport_after(
         &self,
         mode: ViewMode,
@@ -2148,6 +2170,10 @@ fn graph_viewport(request: GraphViewportRequest) -> GraphViewport {
         height: request.height,
         overscan: request.overscan,
     }
+}
+
+fn rightmost_viewport_x(canvas_width: i32, viewport_width: i32) -> i32 {
+    canvas_width.saturating_sub(viewport_width).max(0)
 }
 
 fn empty_viewport_response(
@@ -3692,6 +3718,12 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rightmost_viewport_origin_clamps_short_canvases() {
+        assert_eq!(rightmost_viewport_x(2400, 1280), 1120);
+        assert_eq!(rightmost_viewport_x(900, 1280), 0);
     }
 
     async fn append_fuzz_nodes(
