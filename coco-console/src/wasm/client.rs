@@ -638,16 +638,14 @@ impl VirtualGraph {
     ) -> Result<Option<PreparedAnchorRange>, JsValue> {
         let fallback_source = fallback.map(|(source, _)| source);
         let fallback_target = fallback.map(|(_, target)| target);
-        let Some(source) = self.rendered_node_point(&selection.source)? else {
-            let Some(source) = fallback_source else {
-                return Ok(None);
-            };
-            return self.prepare_anchor_range_with_points(
-                selection,
-                paths,
-                source,
-                fallback_target,
-            );
+        let source = match self.rendered_node_point(&selection.source)? {
+            Some(source) => source,
+            None => {
+                let Some(source) = fallback_source else {
+                    return Ok(None);
+                };
+                source
+            }
         };
         let target = match self.rendered_node_point(&selection.target)? {
             Some(target) => target,
@@ -4179,6 +4177,70 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_prepare_anchor_range_uses_current_target_with_cached_source() {
+        let fixture = GraphFixture::new();
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .apply_full(GraphViewportResponse {
+                    version: 1,
+                    canvas: GraphCanvas {
+                        width: 480,
+                        height: 280,
+                    },
+                    viewport: viewport(),
+                    nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
+                    edges: Vec::new(),
+                })
+                .expect_throw("initial anchor graph should render");
+            graph
+                .apply_diff(GraphViewportDiffResponse {
+                    version: 2,
+                    canvas: GraphCanvas {
+                        width: 480,
+                        height: 280,
+                    },
+                    previous_viewport: viewport(),
+                    viewport: viewport(),
+                    added: GraphViewportItems::default(),
+                    updated: GraphViewportItems {
+                        nodes: vec![graph_node("target", 260, 140)],
+                        edges: Vec::new(),
+                    },
+                    removed: vec![GraphViewportRemovedItem {
+                        kind: crate::api::GraphViewportItemKind::Node,
+                        key: "node:source".to_owned(),
+                    }],
+                })
+                .expect_throw("source virtualization should preserve the current target");
+        }
+
+        let prepared = fixture
+            .graph
+            .borrow()
+            .prepare_anchor_range(
+                selection,
+                vec![AnchorRangePath {
+                    nodes: vec![
+                        anchor_range_node("source", None),
+                        anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                }],
+                Some((Point { x: 100, y: 80 }, Point { x: 212, y: 80 })),
+            )
+            .expect_throw("anchor range preparation should succeed")
+            .expect_throw("cached source should keep the range available");
+
+        assert_eq!(prepared.source, Point { x: 100, y: 80 });
+        assert_eq!(prepared.target, Point { x: 260, y: 140 });
     }
 
     #[wasm_bindgen_test]

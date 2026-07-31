@@ -72,9 +72,16 @@ fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
     match payload {
         PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
         PanelDetailPayload::Provider(response) => {
-            view! { <ProviderContextContent response/> }.into_any()
+            view! { <LazyProviderContextContent response/> }.into_any()
         }
     }
+}
+
+#[component]
+fn LazyProviderContextContent(response: ProviderContextResponse) -> impl IntoView {
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(client::notify_provider_context_rendered);
+    view! { <ProviderContextContent response/> }
 }
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
@@ -183,17 +190,6 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
             Some(LoadedPanel { request, response })
         }
     });
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(move || {
-        let current = selected_context.get();
-        let loaded = provider_context.get().flatten();
-        if loaded.is_some_and(|loaded| {
-            Some(&loaded.request) == current.as_ref() && loaded.response.is_ok()
-        }) {
-            client::notify_provider_context_rendered();
-        }
-    });
-
     view! {
         <div class="panel-content">
             {move || {
