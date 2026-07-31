@@ -2582,35 +2582,6 @@ async fn load_and_expand_anchor_range(
     }
 }
 
-#[cfg(test)]
-fn apply_anchor_range_response(
-    graph: &mut VirtualGraph,
-    selection: AnchorRangeSelection,
-    response: Result<AnchorRangeResponse, String>,
-) -> Option<Point> {
-    match response {
-        Ok(AnchorRangeResponse::Found { paths }) => {
-            if anchor_range_extra_width(&paths) == 0 {
-                let _ = graph.collapse_anchor_range();
-                graph.show_status("No detail nodes exist between the selected anchors.");
-                None
-            } else {
-                render_anchor_range_paths(graph, selection, paths)
-            }
-        }
-        Ok(AnchorRangeResponse::Missing) => {
-            let _ = graph.collapse_anchor_range();
-            graph.show_status("The selected anchor relationship is no longer available.");
-            None
-        }
-        Err(error) => {
-            let _ = graph.collapse_anchor_range();
-            graph.show_status(&format!("Failed to load anchor details: {error}"));
-            None
-        }
-    }
-}
-
 async fn render_anchor_range(
     graph: Rc<RefCell<VirtualGraph>>,
     selection: AnchorRangeSelection,
@@ -2678,30 +2649,6 @@ async fn render_anchor_range(
                 None
             }
         };
-    }
-}
-
-#[cfg(test)]
-fn render_anchor_range_paths(
-    graph: &mut VirtualGraph,
-    selection: AnchorRangeSelection,
-    paths: Vec<crate::api::AnchorRangePath>,
-) -> Option<Point> {
-    match graph.expand_anchor_range(selection, paths) {
-        Ok(Some(focus)) => {
-            graph.hide_status();
-            Some(focus)
-        }
-        Ok(None) => {
-            let _ = graph.collapse_anchor_range();
-            graph.show_status("Anchor endpoints are outside the rendered graph.");
-            None
-        }
-        Err(error) => {
-            web_sys::console::error_1(&error);
-            graph.show_status("Failed to render anchor details.");
-            None
-        }
     }
 }
 
@@ -3652,13 +3599,20 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_expand_anchor_details_inside_the_svg_graph() {
+    async fn graph_items_expand_anchor_details_inside_the_svg_graph() {
         let fixture = GraphFixture::new();
         let selection = AnchorRangeSelection {
             source: "source".to_owned(),
             target: "target".to_owned(),
             kind: GraphViewportEdgeKind::Primary,
         };
+        let paths = vec![crate::api::AnchorRangePath {
+            nodes: vec![
+                anchor_range_node("source", None),
+                anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+            ],
+        }];
         {
             let mut graph = fixture.graph.borrow_mut();
             let canvas = GraphCanvas {
@@ -3688,23 +3642,12 @@ mod tests {
                 )
                 .expect_throw("anchor graph items should render");
             graph.anchor_range_selection = Some(selection.clone());
-            assert!(
-                apply_anchor_range_response(
-                    &mut graph,
-                    selection,
-                    Ok(AnchorRangeResponse::Found {
-                        paths: vec![crate::api::AnchorRangePath {
-                            nodes: vec![
-                                anchor_range_node("source", None),
-                                anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
-                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                            ],
-                        }],
-                    }),
-                )
-                .is_some()
-            );
         }
+        assert!(
+            render_anchor_range(fixture.graph.clone(), selection, paths)
+                .await
+                .is_some()
+        );
 
         let document = fixture.graph.borrow().document.clone();
         assert!(
@@ -3862,32 +3805,28 @@ mod tests {
                 .is_none()
         );
 
-        {
-            let selection = AnchorRangeSelection {
-                source: "source".to_owned(),
-                target: "target".to_owned(),
-                kind: GraphViewportEdgeKind::Primary,
-            };
-            let mut graph = fixture.graph.borrow_mut();
-            graph.anchor_range_selection = Some(selection.clone());
-            assert!(
-                apply_anchor_range_response(
-                    &mut graph,
-                    selection,
-                    Ok(AnchorRangeResponse::Found {
-                        paths: vec![crate::api::AnchorRangePath {
-                            nodes: vec![
-                                anchor_range_node("source", None),
-                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                            ],
-                        }],
-                    }),
-                )
-                .is_none()
-            );
-            assert!(graph.anchor_range_selection.is_none());
-            assert!(graph.anchor_range.is_none());
-        }
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        fixture.graph.borrow_mut().anchor_range_selection = Some(selection.clone());
+        assert!(
+            render_anchor_range(
+                fixture.graph.clone(),
+                selection,
+                vec![crate::api::AnchorRangePath {
+                    nodes: vec![
+                        anchor_range_node("source", None),
+                        anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                }],
+            )
+            .await
+            .is_none()
+        );
+        assert!(fixture.graph.borrow().anchor_range_selection.is_none());
+        assert!(fixture.graph.borrow().anchor_range.is_none());
         assert_eq!(
             document
                 .query_selector(".graph-status")
@@ -3897,33 +3836,29 @@ mod tests {
             Some("No detail nodes exist between the selected anchors.")
         );
 
-        {
-            let selection = AnchorRangeSelection {
-                source: "missing-source".to_owned(),
-                target: "target".to_owned(),
-                kind: GraphViewportEdgeKind::Primary,
-            };
-            let mut graph = fixture.graph.borrow_mut();
-            graph.anchor_range_selection = Some(selection.clone());
-            assert!(
-                apply_anchor_range_response(
-                    &mut graph,
-                    selection,
-                    Ok(AnchorRangeResponse::Found {
-                        paths: vec![crate::api::AnchorRangePath {
-                            nodes: vec![
-                                anchor_range_node("missing-source", None),
-                                anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
-                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                            ],
-                        }],
-                    }),
-                )
-                .is_none()
-            );
-            assert!(graph.anchor_range_selection.is_none());
-            assert!(graph.anchor_range.is_none());
-        }
+        let selection = AnchorRangeSelection {
+            source: "missing-source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        fixture.graph.borrow_mut().anchor_range_selection = Some(selection.clone());
+        assert!(
+            render_anchor_range(
+                fixture.graph.clone(),
+                selection,
+                vec![crate::api::AnchorRangePath {
+                    nodes: vec![
+                        anchor_range_node("missing-source", None),
+                        anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                        anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                }],
+            )
+            .await
+            .is_none()
+        );
+        assert!(fixture.graph.borrow().anchor_range_selection.is_none());
+        assert!(fixture.graph.borrow().anchor_range.is_none());
         assert_eq!(
             document
                 .query_selector(".graph-status")
@@ -4072,7 +4007,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_reflow_open_anchor_range_with_cached_or_current_endpoints() {
+    async fn graph_items_reflow_open_anchor_range_with_cached_or_current_endpoints() {
         let fixture = GraphFixture::new();
         let initial_route = route((120, 80), (150, 80), (168, 80), (188, 80));
         let updated_route = route((140, 100), (170, 100), (216, 140), (236, 140));
@@ -4162,6 +4097,9 @@ mod tests {
                 })
                 .expect_throw("anchor graph reflow should render");
         }
+        refresh_expanded_anchor_range(fixture.graph.clone())
+            .await
+            .expect_throw("lazy anchor graph reflow should render");
 
         let document = fixture.graph.borrow().document.clone();
         let detail = document

@@ -2579,6 +2579,56 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn graph_items_lazy_panel_views_mount_into_the_current_hosts() {
+        let window = web_sys::window().expect_throw("window should be available");
+        let document = window
+            .document()
+            .expect_throw("document should be available");
+        let root = document
+            .create_element("div")
+            .expect_throw("test root should be created");
+        root.set_inner_html(&format!(
+            r#"<div id="{NODE_DETAIL_CONTENT_ID}"></div><div id="{PROVIDER_CONTEXT_CONTENT_ID}"></div>"#,
+        ));
+        document
+            .body()
+            .expect_throw("document body should be available")
+            .append_child(&root)
+            .expect_throw("test root should be mounted");
+
+        let node_view =
+            render_panel_detail_chunk(PanelDetailPayload::Node(NodeDetailResponse::Missing {
+                target: "detail-node".to_owned(),
+            }))
+            .await;
+        mount_panel_detail(NODE_DETAIL_CONTENT_ID, node_view)
+            .expect_throw("node detail should mount");
+        let provider_view = render_panel_detail_chunk(PanelDetailPayload::Provider(
+            ProviderContextResponse::Missing {
+                target: "detail-provider".to_owned(),
+            },
+        ))
+        .await;
+        mount_panel_detail(PROVIDER_CONTEXT_CONTENT_ID, provider_view)
+            .expect_throw("provider context should mount");
+        next_task().await;
+
+        assert!(
+            root.text_content()
+                .unwrap_or_default()
+                .contains("detail-node")
+        );
+        assert!(
+            root.text_content()
+                .unwrap_or_default()
+                .contains("detail-provider")
+        );
+
+        PANEL_DETAIL_MOUNTS.with(|mounts| mounts.borrow_mut().clear());
+        root.remove();
+    }
+
+    #[wasm_bindgen_test]
     async fn graph_items_panel_selection_signals_read_initial_hash_and_track_changes_independently()
     {
         _ = Executor::init_wasm_bindgen();
