@@ -45,6 +45,7 @@ in {
       cargo-about
       cargo-deny
       cargo-nextest
+      binaryen
       wasm-bindgen-cli
       chromedriver
 
@@ -62,6 +63,7 @@ in {
     packages = with pkgs; [
       prek
       diesel-cli
+      binaryen
       wasm-bindgen-cli
       cargo-about
       cargo-deny
@@ -77,6 +79,7 @@ in {
     ];
     packages = with pkgs; [
       cargo-nextest
+      binaryen
       grcov
       wasm-bindgen-cli
     ];

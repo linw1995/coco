@@ -69,6 +69,7 @@
     outputHashes = builtins.fromJSON (builtins.readFile (root + /nix/cargo-git-output-hashes.json));
 
     nativeBuildInputs = with packagePkgs; [
+      binaryen
       wasm-bindgen-cli
     ];
   };

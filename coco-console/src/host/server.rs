@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, RawQuery, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -48,6 +48,10 @@ const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.htm
 const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
 const COCO_CONSOLE_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
+const COCO_CONSOLE_WASM_BR: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm.br"));
+const COCO_CONSOLE_WASM_GZIP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm.gz"));
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Clone)]
@@ -753,15 +757,127 @@ async fn client_js(Path(version): Path<String>) -> Response {
     )
 }
 
-async fn client_wasm(Path(version): Path<String>) -> Response {
+async fn client_wasm(Path(version): Path<String>, headers: HeaderMap) -> Response {
     if version != CLIENT_ASSET_VERSION {
         return not_found().await;
     }
-    immutable_response_with_body(
+
+    let Some(encoding) = preferred_wasm_encoding(&headers) else {
+        let mut response = response_with_body(
+            StatusCode::NOT_ACCEPTABLE,
+            "text/plain; charset=utf-8",
+            Body::from("no acceptable wasm representation"),
+        );
+        response
+            .headers_mut()
+            .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        return response;
+    };
+    let mut response = immutable_response_with_body(
         StatusCode::OK,
         "application/wasm",
-        Body::from(COCO_CONSOLE_WASM),
-    )
+        Body::from(encoding.body()),
+    );
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    if let Some(value) = encoding.header_value() {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, value);
+    }
+    response
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WasmEncoding {
+    Brotli,
+    Gzip,
+    Identity,
+}
+
+impl WasmEncoding {
+    fn body(self) -> &'static [u8] {
+        match self {
+            Self::Brotli => COCO_CONSOLE_WASM_BR,
+            Self::Gzip => COCO_CONSOLE_WASM_GZIP,
+            Self::Identity => COCO_CONSOLE_WASM,
+        }
+    }
+
+    fn header_value(self) -> Option<HeaderValue> {
+        match self {
+            Self::Brotli => Some(HeaderValue::from_static("br")),
+            Self::Gzip => Some(HeaderValue::from_static("gzip")),
+            Self::Identity => None,
+        }
+    }
+}
+
+fn preferred_wasm_encoding(headers: &HeaderMap) -> Option<WasmEncoding> {
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        return Some(WasmEncoding::Identity);
+    }
+
+    let brotli_quality = encoding_quality(headers, "br");
+    let gzip_quality = encoding_quality(headers, "gzip");
+    let identity_quality = identity_quality(headers);
+    if brotli_quality > 0.0 && brotli_quality >= gzip_quality && brotli_quality >= identity_quality
+    {
+        Some(WasmEncoding::Brotli)
+    } else if gzip_quality > 0.0 && gzip_quality >= identity_quality {
+        Some(WasmEncoding::Gzip)
+    } else if identity_quality > 0.0 {
+        Some(WasmEncoding::Identity)
+    } else {
+        None
+    }
+}
+
+fn encoding_quality(headers: &HeaderMap, requested: &str) -> f32 {
+    let (explicit_quality, wildcard_quality) = parsed_encoding_quality(headers, requested);
+    explicit_quality.or(wildcard_quality).unwrap_or(0.0)
+}
+
+fn identity_quality(headers: &HeaderMap) -> f32 {
+    let (explicit_quality, wildcard_quality) = parsed_encoding_quality(headers, "identity");
+    explicit_quality.unwrap_or(match wildcard_quality {
+        Some(0.0) => 0.0,
+        _ => 1.0,
+    })
+}
+
+fn parsed_encoding_quality(headers: &HeaderMap, requested: &str) -> (Option<f32>, Option<f32>) {
+    let mut explicit_quality: Option<f32> = None;
+    let mut wildcard_quality: Option<f32> = None;
+    for value in headers.get_all(header::ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for item in value.split(',') {
+            let mut parts = item.trim().split(';');
+            let Some(name) = parts.next() else {
+                continue;
+            };
+            let name = name.trim();
+            let quality = parts
+                .find_map(|parameter| {
+                    let (name, value) = parameter.split_once('=')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| value.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0))
+                })
+                .unwrap_or(1.0);
+            if name.eq_ignore_ascii_case(requested) {
+                explicit_quality =
+                    Some(explicit_quality.map_or(quality, |current| current.max(quality)));
+            } else if name == "*" {
+                wildcard_quality =
+                    Some(wildcard_quality.map_or(quality, |current| current.max(quality)));
+            }
+        }
+    }
+    (explicit_quality, wildcard_quality)
 }
 
 async fn method_not_allowed() -> Response {
@@ -1145,12 +1261,14 @@ mod tests {
             COCO_CONSOLE_JS
         );
 
-        let wasm = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned())).await;
+        let wasm = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), HeaderMap::new()).await;
         assert_eq!(wasm.status(), StatusCode::OK);
         assert_eq!(
             wasm.headers().get(header::CACHE_CONTROL).unwrap(),
             IMMUTABLE_CACHE_CONTROL
         );
+        assert_eq!(wasm.headers().get(header::VARY).unwrap(), "Accept-Encoding");
+        assert!(!wasm.headers().contains_key(header::CONTENT_ENCODING));
         assert_eq!(
             to_bytes(wasm.into_body(), usize::MAX).await.unwrap(),
             COCO_CONSOLE_WASM
@@ -1161,8 +1279,89 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            client_wasm(Path("stale-build".to_owned())).await.status(),
+            client_wasm(Path("stale-build".to_owned()), HeaderMap::new())
+                .await
+                .status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn client_wasm_serves_the_preferred_precompressed_asset() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
+        let brotli = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
+        assert_eq!(
+            brotli.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "br"
+        );
+        assert_eq!(
+            to_bytes(brotli.into_body(), usize::MAX).await.unwrap(),
+            COCO_CONSOLE_WASM_BR
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("br;q=0.2, gzip;q=0.8, identity;q=0.5"),
+        );
+        let gzip = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
+        assert_eq!(
+            gzip.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        assert_eq!(
+            to_bytes(gzip.into_body(), usize::MAX).await.unwrap(),
+            COCO_CONSOLE_WASM_GZIP
+        );
+
+        assert!(COCO_CONSOLE_WASM_BR.len() < COCO_CONSOLE_WASM.len());
+        assert!(COCO_CONSOLE_WASM_GZIP.len() < COCO_CONSOLE_WASM.len());
+    }
+
+    #[test]
+    fn wasm_encoding_quality_honors_explicit_exclusions_and_wildcards() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("*;q=0.7, br;q=0, identity;q=0.2"),
+        );
+
+        assert_eq!(preferred_wasm_encoding(&headers), Some(WasmEncoding::Gzip));
+    }
+
+    #[tokio::test]
+    async fn client_wasm_honors_identity_quality_and_rejects_excluded_encodings() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip;q=0.1, identity;q=1"),
+        );
+        assert_eq!(
+            preferred_wasm_encoding(&headers),
+            Some(WasmEncoding::Identity)
+        );
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip ; q=1, identity;q=0"),
+        );
+        assert_eq!(preferred_wasm_encoding(&headers), Some(WasmEncoding::Gzip));
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("br;Q=0, gzip;q=0, identity;q=0"),
+        );
+        assert_eq!(preferred_wasm_encoding(&headers), None);
+
+        let response = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            response.headers().get(header::VARY).unwrap(),
+            "Accept-Encoding"
         );
     }
 
