@@ -8,12 +8,14 @@ use std::process::{Command, ExitStatus};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 
 type BuildResult<T> = Result<T, BuildError>;
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 const WASM_PROFILE: &str = "wasm-release";
+const SPLIT_LINK_PLACEHOLDER: &str = "./__wasm_split.______________________.js";
 const COVERAGE_ENV_VARS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "LLVM_PROFILE_FILE"];
 
 #[derive(Debug, Snafu)]
@@ -65,6 +67,9 @@ enum BuildError {
 
     #[snafu(display("Failed to serialize wasm split manifest: {source}"))]
     SerializeSplitManifest { source: serde_json::Error },
+
+    #[snafu(display("WASM split link placeholder was not found in {}", path.display()))]
+    MissingSplitLinkPlaceholder { path: PathBuf },
 }
 
 fn main() {
@@ -164,11 +169,12 @@ fn split_wasm(
         options.output_dir = pkg_dir;
         options.main_out_path = split_wasm_file;
         options.main_module = "./coco_console.js";
-        options.link_name = "./__wasm_split.______________________.js";
+        options.link_name = SPLIT_LINK_PLACEHOLDER;
         options
     })
     .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     .context(SplitWasmSnafu)?;
+    finalize_split_link(pkg_dir, split_wasm_file)?;
     let prefetch_map = split.prefetch_map.into_iter().collect::<BTreeMap<_, _>>();
     let manifest = serde_json::to_vec_pretty(&prefetch_map).context(SerializeSplitManifestSnafu)?;
     let manifest_path = pkg_dir.join("__wasm_split_manifest.json");
@@ -176,6 +182,55 @@ fn split_wasm(
         path: manifest_path,
     })?;
     Ok(split.split_modules)
+}
+
+fn finalize_split_link(pkg_dir: &Path, split_wasm_file: &Path) -> BuildResult<()> {
+    let placeholder_name = SPLIT_LINK_PLACEHOLDER.trim_start_matches("./");
+    let placeholder_path = pkg_dir.join(placeholder_name);
+    let link_bytes = fs::read(&placeholder_path).context(ReadAssetSnafu {
+        path: placeholder_path.clone(),
+    })?;
+    let hash = truncated_sha256(&link_bytes);
+    let final_name = format!("__wasm_split.{hash}.js");
+    let final_link = format!("./{final_name}");
+    debug_assert_eq!(SPLIT_LINK_PLACEHOLDER.len(), final_link.len());
+
+    let mut wasm = fs::read(split_wasm_file).context(ReadAssetSnafu {
+        path: split_wasm_file.to_path_buf(),
+    })?;
+    let positions = wasm
+        .windows(SPLIT_LINK_PLACEHOLDER.len())
+        .enumerate()
+        .filter_map(|(position, bytes)| {
+            (bytes == SPLIT_LINK_PLACEHOLDER.as_bytes()).then_some(position)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !positions.is_empty(),
+        MissingSplitLinkPlaceholderSnafu {
+            path: split_wasm_file.to_path_buf(),
+        }
+    );
+    for position in positions {
+        wasm[position..position + final_link.len()].copy_from_slice(final_link.as_bytes());
+    }
+    fs::write(split_wasm_file, wasm).context(WriteAssetSnafu {
+        path: split_wasm_file.to_path_buf(),
+    })?;
+
+    let final_path = pkg_dir.join(final_name);
+    fs::rename(&placeholder_path, &final_path).context(ReplaceAssetSnafu {
+        source_path: placeholder_path,
+        target: final_path,
+    })?;
+    Ok(())
+}
+
+fn truncated_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)[..11]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn optimize_wasm_assets(wasm_assets: &[PathBuf]) -> BuildResult<()> {

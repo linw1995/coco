@@ -537,6 +537,7 @@ dependencies = [
  "leptos_axum",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "snafu",
  "tokio",
  "tracing",

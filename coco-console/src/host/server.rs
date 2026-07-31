@@ -1403,6 +1403,33 @@ mod tests {
             );
         }
 
+        let split_loaders = CLIENT_ASSETS
+            .iter()
+            .filter(|asset| asset.path.starts_with("__wasm_split.") && asset.path.ends_with(".js"))
+            .collect::<Vec<_>>();
+        assert_eq!(split_loaders.len(), 1);
+        let split_loader = split_loaders[0];
+        let split_hash = split_loader
+            .path
+            .strip_prefix("__wasm_split.")
+            .and_then(|path| path.strip_suffix(".js"))
+            .unwrap();
+        assert_eq!(split_hash.len(), 22);
+        assert!(split_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let split_import = format!("./{}", split_loader.path);
+        let base_wasm = client_asset_by_path("coco_console_bg.wasm").identity;
+        assert!(
+            base_wasm
+                .windows(split_import.len())
+                .any(|bytes| bytes == split_import.as_bytes())
+        );
+        assert!(
+            !base_wasm
+                .windows(22)
+                .any(|bytes| bytes == b"______________________")
+        );
+
         let manifest =
             std::str::from_utf8(client_asset_by_path("__wasm_split_manifest.json").identity)
                 .unwrap();
