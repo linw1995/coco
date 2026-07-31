@@ -58,6 +58,25 @@ struct ProviderContextRequest {
     context: Option<String>,
 }
 
+enum PanelDetailPayload {
+    Node(NodeDetailResponse),
+    Provider(ProviderContextResponse),
+}
+
+#[cfg_attr(not(test), leptos::prelude::lazy(panel_detail))]
+async fn render_panel_detail(payload: PanelDetailPayload) -> AnyView {
+    panel_detail_view(payload)
+}
+
+fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
+    match payload {
+        PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
+        PanelDetailPayload::Provider(response) => {
+            view! { <ProviderContextContent response/> }.into_any()
+        }
+    }
+}
+
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
 async fn load_node_detail(target: String) -> Result<NodeDetailResponse, ServerFnError> {
     let context = expect_context::<crate::host::PanelServerContext>();
@@ -218,7 +237,9 @@ fn node_detail_view(
     match (current.as_ref(), loaded) {
         (None, _) => view! { <NodeDetailDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => view! { <NodeDetailContent response=response/> }.into_any(),
+            Ok(response) => {
+                Suspend::new(render_panel_detail(PanelDetailPayload::Node(response))).into_any()
+            }
             Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
         },
         _ => view! { <NodeDetailLoading/> }.into_any(),
@@ -232,7 +253,9 @@ fn provider_context_view(
     match (current.as_ref(), loaded) {
         (None, _) => view! { <ProviderContextDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => view! { <ProviderContextContent response=response/> }.into_any(),
+            Ok(response) => {
+                Suspend::new(render_panel_detail(PanelDetailPayload::Provider(response))).into_any()
+            }
             Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
         },
         _ => view! { <ProviderContextLoading/> }.into_any(),
@@ -1629,21 +1652,19 @@ mod tests {
 
     #[test]
     fn panel_components_render_typed_success_and_error_states() {
-        let node = view! {
-            <NodeDetailContent response=NodeDetailResponse::Found {
-                node: Box::new(test_node(Kind::Text("<script>alert(1)</script>".to_owned()))),
-                markdown_documents: Vec::new(),
-                tool_use_input_links: Vec::new(),
-                tool_input_shell_highlights: Vec::new(),
-                tool_input_json_highlights: Vec::new(),
-            }/>
-        }
+        let node = panel_detail_view(PanelDetailPayload::Node(NodeDetailResponse::Found {
+            node: Box::new(test_node(Kind::Text(
+                "<script>alert(1)</script>".to_owned(),
+            ))),
+            markdown_documents: Vec::new(),
+            tool_use_input_links: Vec::new(),
+            tool_input_shell_highlights: Vec::new(),
+            tool_input_json_highlights: Vec::new(),
+        }))
         .to_html();
-        let provider = view! {
-            <ProviderContextContent response=ProviderContextResponse::Found {
-                items: Vec::new(),
-            }/>
-        }
+        let provider = panel_detail_view(PanelDetailPayload::Provider(
+            ProviderContextResponse::Found { items: Vec::new() },
+        ))
         .to_html();
         let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
         let provider_error =

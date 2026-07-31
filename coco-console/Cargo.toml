@@ -82,10 +82,12 @@ web-sys = { version = "=0.3.94", features = [
 ] }
 
 [build-dependencies]
-# Build script error handling and asset compression.
+# Build script error handling, asset packaging, and wasm splitting.
 brotli = "8"
 flate2 = "1"
+serde_json.workspace = true
 snafu.workspace = true
+wasm_split_cli_support = "0.2.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Host server tests.
