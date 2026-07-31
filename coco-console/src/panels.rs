@@ -1,3 +1,7 @@
+#[cfg(target_arch = "wasm32")]
+use std::cell::Cell;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 use std::sync::Arc;
 
 use coco_types::{
@@ -77,17 +81,17 @@ thread_local! {
 
 #[cfg(target_arch = "wasm32")]
 #[leptos::prelude::lazy(panel_detail)]
-fn render_panel_detail_chunk(payload: PanelDetailPayload) -> Result<(), String> {
-    let (host_id, view) = match payload {
-        PanelDetailPayload::Node(response) => (
-            NODE_DETAIL_CONTENT_ID,
-            view! { <NodeDetailContent response/> }.into_any(),
-        ),
-        PanelDetailPayload::Provider(response) => (
-            PROVIDER_CONTEXT_CONTENT_ID,
-            view! { <ProviderContextContent response/> }.into_any(),
-        ),
-    };
+fn render_panel_detail_chunk(payload: PanelDetailPayload) -> AnyView {
+    match payload {
+        PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
+        PanelDetailPayload::Provider(response) => {
+            view! { <ProviderContextContent response/> }.into_any()
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn mount_panel_detail(host_id: &'static str, view: AnyView) -> Result<(), String> {
     let host = web_sys::window()
         .and_then(|window| window.document())
         .and_then(|document| document.get_element_by_id(host_id))
@@ -157,9 +161,17 @@ fn NodeDetailPanelBody() -> impl IntoView {
     let selection = use_panel_selection();
     let graph_revision = use_graph_revision();
     let selected_target = Memo::new(move |_| selection.get().target);
+    #[cfg(target_arch = "wasm32")]
+    let detail_generation = Rc::new(Cell::new(0_u64));
     let detail = LocalResource::new(move || {
         graph_revision.track();
         let request = selected_target.get();
+        #[cfg(target_arch = "wasm32")]
+        let (generation, detail_generation) = {
+            let generation = detail_generation.get().wrapping_add(1);
+            detail_generation.set(generation);
+            (generation, detail_generation.clone())
+        };
         async move {
             let target = request?;
             let response = load_node_detail(target.clone())
@@ -167,7 +179,19 @@ fn NodeDetailPanelBody() -> impl IntoView {
                 .map_err(|error| error.to_string());
             #[cfg(target_arch = "wasm32")]
             let response = match response {
-                Ok(response) => render_panel_detail_chunk(PanelDetailPayload::Node(response)).await,
+                Ok(response) => {
+                    let view = render_panel_detail_chunk(PanelDetailPayload::Node(response)).await;
+                    if panel_request_is_current(
+                        generation,
+                        detail_generation.get(),
+                        &target,
+                        selected_target.get_untracked().as_ref(),
+                    ) {
+                        mount_panel_detail(NODE_DETAIL_CONTENT_ID, view)
+                    } else {
+                        Ok(())
+                    }
+                }
                 Err(error) => Err(error),
             };
             Some(LoadedPanel {
@@ -238,9 +262,17 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
             context: selection.context,
         })
     });
+    #[cfg(target_arch = "wasm32")]
+    let provider_generation = Rc::new(Cell::new(0_u64));
     let provider_context = LocalResource::new(move || {
         let request = selected_context.get();
         let graph_mode = graph_mode.clone();
+        #[cfg(target_arch = "wasm32")]
+        let (generation, provider_generation) = {
+            let generation = provider_generation.get().wrapping_add(1);
+            provider_generation.set(generation);
+            (generation, provider_generation.clone())
+        };
         async move {
             let request = request?;
             let response =
@@ -250,7 +282,18 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
             #[cfg(target_arch = "wasm32")]
             let response = match response {
                 Ok(response) => {
-                    render_panel_detail_chunk(PanelDetailPayload::Provider(response)).await
+                    let view =
+                        render_panel_detail_chunk(PanelDetailPayload::Provider(response)).await;
+                    if panel_request_is_current(
+                        generation,
+                        provider_generation.get(),
+                        &request,
+                        selected_context.get_untracked().as_ref(),
+                    ) {
+                        mount_panel_detail(PROVIDER_CONTEXT_CONTENT_ID, view)
+                    } else {
+                        Ok(())
+                    }
                 }
                 Err(error) => Err(error),
             };
@@ -351,6 +394,19 @@ where
     current
         .zip(loaded)
         .is_some_and(|(current, loaded)| &loaded.request == current && loaded.response.is_ok())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn panel_request_is_current<K>(
+    request_generation: u64,
+    current_generation: u64,
+    request: &K,
+    current: Option<&K>,
+) -> bool
+where
+    K: PartialEq,
+{
+    request_generation == current_generation && current == Some(request)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1762,6 +1818,21 @@ mod tests {
             Some("detail-node"),
             None,
         ));
+    }
+
+    #[test]
+    fn panel_mount_requires_the_latest_generation_and_selection() {
+        let current = "detail-current".to_owned();
+
+        assert!(panel_request_is_current(3, 3, &current, Some(&current)));
+        assert!(!panel_request_is_current(2, 3, &current, Some(&current)));
+        assert!(!panel_request_is_current(
+            3,
+            3,
+            &"detail-old".to_owned(),
+            Some(&current),
+        ));
+        assert!(!panel_request_is_current(3, 3, &current, None));
     }
 
     #[test]
