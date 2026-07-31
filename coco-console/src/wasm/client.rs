@@ -107,7 +107,7 @@ struct PreparedAnchorRange {
     request: AnchorRangeLayoutRequest,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct AnchorRangeLayoutRequest {
     source: Point,
     target: Point,
@@ -2611,40 +2611,62 @@ async fn render_anchor_range(
         graph.show_status("No detail nodes exist between the selected anchors.");
         return None;
     }
-    let prepared = match graph
-        .borrow()
-        .prepare_anchor_range(selection.clone(), paths.clone(), None)
-    {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => {
-            let mut graph = graph.borrow_mut();
-            let _ = graph.collapse_anchor_range();
-            graph.show_status("Anchor endpoints are outside the rendered graph.");
+    let mut prepared =
+        match graph
+            .borrow()
+            .prepare_anchor_range(selection.clone(), paths.clone(), None)
+        {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => {
+                let mut graph = graph.borrow_mut();
+                let _ = graph.collapse_anchor_range();
+                graph.show_status("Anchor endpoints are outside the rendered graph.");
+                return None;
+            }
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                graph
+                    .borrow()
+                    .show_status("Failed to prepare anchor details.");
+                return None;
+            }
+        };
+    loop {
+        let layout = layout_anchor_range_chunk(prepared.request.clone()).await;
+        let mut graph = graph.borrow_mut();
+        if graph.anchor_range_selection.as_ref() != Some(&selection) {
             return None;
         }
-        Err(error) => {
-            web_sys::console::error_1(&error);
-            graph
-                .borrow()
-                .show_status("Failed to prepare anchor details.");
-            return None;
+        let current_prepared =
+            match graph.prepare_anchor_range(selection.clone(), paths.clone(), None) {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) => {
+                    let _ = graph.collapse_anchor_range();
+                    graph.show_status("Anchor endpoints are outside the rendered graph.");
+                    return None;
+                }
+                Err(error) => {
+                    web_sys::console::error_1(&error);
+                    graph.show_status("Failed to prepare anchor details.");
+                    return None;
+                }
+            };
+        if current_prepared.request != prepared.request {
+            drop(graph);
+            prepared = current_prepared;
+            continue;
         }
-    };
-    let layout = layout_anchor_range_chunk(prepared.request.clone()).await;
-    let mut graph = graph.borrow_mut();
-    if graph.anchor_range_selection.as_ref() != Some(&selection) {
-        return None;
-    }
-    match graph.apply_anchor_range_layout(selection, paths, prepared, layout) {
-        Ok(focus) => {
-            graph.hide_status();
-            Some(focus)
-        }
-        Err(error) => {
-            web_sys::console::error_1(&error);
-            graph.show_status("Failed to render anchor details.");
-            None
-        }
+        return match graph.apply_anchor_range_layout(selection, paths, current_prepared, layout) {
+            Ok(focus) => {
+                graph.hide_status();
+                Some(focus)
+            }
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                graph.show_status("Failed to render anchor details.");
+                None
+            }
+        };
     }
 }
 
