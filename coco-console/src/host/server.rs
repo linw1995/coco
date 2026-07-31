@@ -45,17 +45,14 @@ use crate::host::web_graph_view::{
 
 const STYLE_CSS: &str = include_str!("style.css");
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.html");
+const COCO_CONSOLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console.js"));
+const COCO_CONSOLE_WASM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm"));
+const COCO_CONSOLE_WASM_BR: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm.br"));
+const COCO_CONSOLE_WASM_GZIP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pkg/coco_console_bg.wasm.gz"));
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
-
-struct ClientAsset {
-    path: &'static str,
-    content_type: &'static str,
-    identity: &'static [u8],
-    brotli: Option<&'static [u8]>,
-    gzip: Option<&'static [u8]>,
-}
-
-include!(concat!(env!("OUT_DIR"), "/client_assets.rs"));
 
 #[derive(Clone)]
 struct AppState<S> {
@@ -258,7 +255,8 @@ where
         .route("/api/node-detail", get(node_detail::<S>))
         .route("/api/provider-context", get(provider_context::<S>))
         .route("/events", get(event_stream::<S>))
-        .route("/pkg/{version}/{*asset}", get(client_asset))
+        .route("/pkg/{version}/coco_console.js", get(client_js))
+        .route("/pkg/{version}/coco_console_bg.wasm", get(client_wasm))
         .fallback(not_found)
         .with_state(state)
         .layer(middleware::from_fn(access_log))
@@ -748,22 +746,27 @@ where
     Sse::new(initial.chain(changes)).into_response()
 }
 
-async fn client_asset(
-    Path((version, path)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Response {
+async fn client_js(Path(version): Path<String>) -> Response {
     if version != CLIENT_ASSET_VERSION {
         return not_found().await;
     }
-    let Some(asset) = CLIENT_ASSETS.iter().find(|asset| asset.path == path) else {
-        return not_found().await;
-    };
+    immutable_response_with_body(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Body::from(COCO_CONSOLE_JS),
+    )
+}
 
-    let Some(encoding) = preferred_asset_encoding(asset, &headers) else {
+async fn client_wasm(Path(version): Path<String>, headers: HeaderMap) -> Response {
+    if version != CLIENT_ASSET_VERSION {
+        return not_found().await;
+    }
+
+    let Some(encoding) = preferred_wasm_encoding(&headers) else {
         let mut response = response_with_body(
             StatusCode::NOT_ACCEPTABLE,
             "text/plain; charset=utf-8",
-            Body::from("no acceptable asset representation"),
+            Body::from("no acceptable wasm representation"),
         );
         response
             .headers_mut()
@@ -772,14 +775,12 @@ async fn client_asset(
     };
     let mut response = immutable_response_with_body(
         StatusCode::OK,
-        asset.content_type,
-        Body::from(encoding.body(asset)),
+        "application/wasm",
+        Body::from(encoding.body()),
     );
-    if asset.brotli.is_some() || asset.gzip.is_some() {
-        response
-            .headers_mut()
-            .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    }
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     if let Some(value) = encoding.header_value() {
         response
             .headers_mut()
@@ -796,11 +797,11 @@ enum WasmEncoding {
 }
 
 impl WasmEncoding {
-    fn body(self, asset: &ClientAsset) -> &'static [u8] {
+    fn body(self) -> &'static [u8] {
         match self {
-            Self::Brotli => asset.brotli.unwrap_or(asset.identity),
-            Self::Gzip => asset.gzip.unwrap_or(asset.identity),
-            Self::Identity => asset.identity,
+            Self::Brotli => COCO_CONSOLE_WASM_BR,
+            Self::Gzip => COCO_CONSOLE_WASM_GZIP,
+            Self::Identity => COCO_CONSOLE_WASM,
         }
     }
 
@@ -813,17 +814,13 @@ impl WasmEncoding {
     }
 }
 
-fn preferred_asset_encoding(asset: &ClientAsset, headers: &HeaderMap) -> Option<WasmEncoding> {
+fn preferred_wasm_encoding(headers: &HeaderMap) -> Option<WasmEncoding> {
     if !headers.contains_key(header::ACCEPT_ENCODING) {
         return Some(WasmEncoding::Identity);
     }
 
-    let brotli_quality = asset
-        .brotli
-        .map_or(-1.0, |_| encoding_quality(headers, "br"));
-    let gzip_quality = asset
-        .gzip
-        .map_or(-1.0, |_| encoding_quality(headers, "gzip"));
+    let brotli_quality = encoding_quality(headers, "br");
+    let gzip_quality = encoding_quality(headers, "gzip");
     let identity_quality = identity_quality(headers);
     if brotli_quality > 0.0 && brotli_quality >= gzip_quality && brotli_quality >= identity_quality
     {
@@ -1120,13 +1117,6 @@ mod tests {
     use crate::ConsoleStore;
     use crate::host::web_graph_view::node_target_id;
 
-    fn client_asset_by_path(path: &str) -> &'static ClientAsset {
-        CLIENT_ASSETS
-            .iter()
-            .find(|asset| asset.path == path)
-            .expect("client asset should exist")
-    }
-
     struct RecordingToolUseInputLinkStore {
         targets: HashMap<String, String>,
         calls: std::sync::Mutex<Vec<String>>,
@@ -1260,15 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_assets_require_the_current_build_version() {
-        let js_asset = client_asset_by_path("coco_console.js");
-        let js = client_asset(
-            Path((
-                CLIENT_ASSET_VERSION.to_owned(),
-                "coco_console.js".to_owned(),
-            )),
-            HeaderMap::new(),
-        )
-        .await;
+        let js = client_js(Path(CLIENT_ASSET_VERSION.to_owned())).await;
         assert_eq!(js.status(), StatusCode::OK);
         assert_eq!(
             js.headers().get(header::CACHE_CONTROL).unwrap(),
@@ -1276,18 +1258,10 @@ mod tests {
         );
         assert_eq!(
             to_bytes(js.into_body(), usize::MAX).await.unwrap(),
-            js_asset.identity
+            COCO_CONSOLE_JS
         );
 
-        let wasm_asset = client_asset_by_path("coco_console_bg.wasm");
-        let wasm = client_asset(
-            Path((
-                CLIENT_ASSET_VERSION.to_owned(),
-                "coco_console_bg.wasm".to_owned(),
-            )),
-            HeaderMap::new(),
-        )
-        .await;
+        let wasm = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), HeaderMap::new()).await;
         assert_eq!(wasm.status(), StatusCode::OK);
         assert_eq!(
             wasm.headers().get(header::CACHE_CONTROL).unwrap(),
@@ -1297,25 +1271,17 @@ mod tests {
         assert!(!wasm.headers().contains_key(header::CONTENT_ENCODING));
         assert_eq!(
             to_bytes(wasm.into_body(), usize::MAX).await.unwrap(),
-            wasm_asset.identity
+            COCO_CONSOLE_WASM
         );
 
         assert_eq!(
-            client_asset(
-                Path(("stale-build".to_owned(), "coco_console.js".to_owned())),
-                HeaderMap::new(),
-            )
-            .await
-            .status(),
+            client_js(Path("stale-build".to_owned())).await.status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            client_asset(
-                Path(("stale-build".to_owned(), "coco_console_bg.wasm".to_owned(),)),
-                HeaderMap::new(),
-            )
-            .await
-            .status(),
+            client_wasm(Path("stale-build".to_owned()), HeaderMap::new())
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
     }
@@ -1327,22 +1293,14 @@ mod tests {
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("gzip, br"),
         );
-        let asset = client_asset_by_path("coco_console_bg.wasm");
-        let brotli = client_asset(
-            Path((
-                CLIENT_ASSET_VERSION.to_owned(),
-                "coco_console_bg.wasm".to_owned(),
-            )),
-            headers,
-        )
-        .await;
+        let brotli = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
         assert_eq!(
             brotli.headers().get(header::CONTENT_ENCODING).unwrap(),
             "br"
         );
         assert_eq!(
             to_bytes(brotli.into_body(), usize::MAX).await.unwrap(),
-            asset.brotli.unwrap()
+            COCO_CONSOLE_WASM_BR
         );
 
         let mut headers = HeaderMap::new();
@@ -1350,59 +1308,18 @@ mod tests {
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("br;q=0.2, gzip;q=0.8, identity;q=0.5"),
         );
-        let gzip = client_asset(
-            Path((
-                CLIENT_ASSET_VERSION.to_owned(),
-                "coco_console_bg.wasm".to_owned(),
-            )),
-            headers,
-        )
-        .await;
+        let gzip = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
         assert_eq!(
             gzip.headers().get(header::CONTENT_ENCODING).unwrap(),
             "gzip"
         );
         assert_eq!(
             to_bytes(gzip.into_body(), usize::MAX).await.unwrap(),
-            asset.gzip.unwrap()
+            COCO_CONSOLE_WASM_GZIP
         );
 
-        assert!(asset.brotli.unwrap().len() < asset.identity.len());
-        assert!(asset.gzip.unwrap().len() < asset.identity.len());
-    }
-
-    #[tokio::test]
-    async fn generated_client_assets_include_and_serve_lazy_chunks() {
-        let lazy_chunks = CLIENT_ASSETS
-            .iter()
-            .filter(|asset| asset.path.starts_with("split_") && asset.path.ends_with(".wasm"))
-            .collect::<Vec<_>>();
-        assert_eq!(lazy_chunks.len(), 2);
-
-        for asset in lazy_chunks {
-            assert!(asset.brotli.is_some());
-            assert!(asset.gzip.is_some());
-            let response = client_asset(
-                Path((CLIENT_ASSET_VERSION.to_owned(), asset.path.to_owned())),
-                HeaderMap::new(),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                response.headers().get(header::CONTENT_TYPE).unwrap(),
-                "application/wasm"
-            );
-            assert_eq!(
-                to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-                asset.identity
-            );
-        }
-
-        let manifest =
-            std::str::from_utf8(client_asset_by_path("__wasm_split_manifest.json").identity)
-                .unwrap();
-        assert!(manifest.contains("anchor_range"));
-        assert!(manifest.contains("panel_detail"));
+        assert!(COCO_CONSOLE_WASM_BR.len() < COCO_CONSOLE_WASM.len());
+        assert!(COCO_CONSOLE_WASM_GZIP.len() < COCO_CONSOLE_WASM.len());
     }
 
     #[test]
@@ -1413,10 +1330,7 @@ mod tests {
             HeaderValue::from_static("*;q=0.7, br;q=0, identity;q=0.2"),
         );
 
-        assert_eq!(
-            preferred_asset_encoding(client_asset_by_path("coco_console_bg.wasm"), &headers),
-            Some(WasmEncoding::Gzip)
-        );
+        assert_eq!(preferred_wasm_encoding(&headers), Some(WasmEncoding::Gzip));
     }
 
     #[tokio::test]
@@ -1427,7 +1341,7 @@ mod tests {
             HeaderValue::from_static("gzip;q=0.1, identity;q=1"),
         );
         assert_eq!(
-            preferred_asset_encoding(client_asset_by_path("coco_console_bg.wasm"), &headers),
+            preferred_wasm_encoding(&headers),
             Some(WasmEncoding::Identity)
         );
 
@@ -1435,28 +1349,15 @@ mod tests {
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("gzip ; q=1, identity;q=0"),
         );
-        assert_eq!(
-            preferred_asset_encoding(client_asset_by_path("coco_console_bg.wasm"), &headers),
-            Some(WasmEncoding::Gzip)
-        );
+        assert_eq!(preferred_wasm_encoding(&headers), Some(WasmEncoding::Gzip));
 
         headers.insert(
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("br;Q=0, gzip;q=0, identity;q=0"),
         );
-        assert_eq!(
-            preferred_asset_encoding(client_asset_by_path("coco_console_bg.wasm"), &headers),
-            None
-        );
+        assert_eq!(preferred_wasm_encoding(&headers), None);
 
-        let response = client_asset(
-            Path((
-                CLIENT_ASSET_VERSION.to_owned(),
-                "coco_console_bg.wasm".to_owned(),
-            )),
-            headers,
-        )
-        .await;
+        let response = client_wasm(Path(CLIENT_ASSET_VERSION.to_owned()), headers).await;
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
         assert_eq!(
             response.headers().get(header::VARY).unwrap(),

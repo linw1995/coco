@@ -1,7 +1,3 @@
-#[cfg(target_arch = "wasm32")]
-use std::cell::Cell;
-#[cfg(target_arch = "wasm32")]
-use std::rc::Rc;
 use std::sync::Arc;
 
 use coco_types::{
@@ -10,8 +6,6 @@ use coco_types::{
 };
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
 
 use crate::api::{
     AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
@@ -29,8 +23,6 @@ pub use client::{
 
 const NODE_TARGET_PREFIX: &str = "detail-";
 pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
-const NODE_DETAIL_CONTENT_ID: &str = "node-detail-content";
-const PROVIDER_CONTEXT_CONTENT_ID: &str = "provider-context-content";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PanelSelection {
@@ -65,65 +57,6 @@ struct ProviderContextRequest {
     target: String,
     context: Option<String>,
 }
-
-#[cfg(target_arch = "wasm32")]
-enum PanelDetailPayload {
-    Node(NodeDetailResponse),
-    Provider(ProviderContextResponse),
-}
-
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    static PANEL_DETAIL_MOUNTS: std::cell::RefCell<
-        std::collections::HashMap<&'static str, Box<dyn std::any::Any>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-#[cfg(all(target_arch = "wasm32", not(test)))]
-#[leptos::prelude::lazy(panel_detail)]
-fn render_panel_detail_chunk(payload: PanelDetailPayload) -> AnyView {
-    match payload {
-        PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
-        PanelDetailPayload::Provider(response) => {
-            view! { <ProviderContextContent response/> }.into_any()
-        }
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", test))]
-async fn render_panel_detail_chunk(payload: PanelDetailPayload) -> AnyView {
-    match payload {
-        PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
-        PanelDetailPayload::Provider(response) => {
-            view! { <ProviderContextContent response/> }.into_any()
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn mount_panel_detail(host_id: &'static str, view: AnyView) -> Result<(), String> {
-    let host = web_sys::window()
-        .and_then(|window| window.document())
-        .and_then(|document| document.get_element_by_id(host_id))
-        .ok_or_else(|| format!("panel detail host {host_id} is unavailable"))?
-        .dyn_into()
-        .map_err(|_| format!("panel detail host {host_id} is not an HTML element"))?;
-    let handle = leptos::mount::mount_to(host, move || view);
-    PANEL_DETAIL_MOUNTS.with(|mounts| {
-        mounts.borrow_mut().insert(host_id, Box::new(handle));
-    });
-    Ok(())
-}
-
-#[cfg(all(target_arch = "wasm32", not(test)))]
-fn preload_panel_detail_chunk() {
-    leptos::task::spawn_local(async {
-        __preload_render_panel_detail_chunk().await;
-    });
-}
-
-#[cfg(all(target_arch = "wasm32", test))]
-fn preload_panel_detail_chunk() {}
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
 async fn load_node_detail(target: String) -> Result<NodeDetailResponse, ServerFnError> {
@@ -174,39 +107,14 @@ fn NodeDetailPanelBody() -> impl IntoView {
     let selection = use_panel_selection();
     let graph_revision = use_graph_revision();
     let selected_target = Memo::new(move |_| selection.get().target);
-    #[cfg(target_arch = "wasm32")]
-    let detail_generation = Rc::new(Cell::new(0_u64));
     let detail = LocalResource::new(move || {
         graph_revision.track();
         let request = selected_target.get();
-        #[cfg(target_arch = "wasm32")]
-        let (generation, detail_generation) = {
-            let generation = detail_generation.get().wrapping_add(1);
-            detail_generation.set(generation);
-            (generation, detail_generation.clone())
-        };
         async move {
             let target = request?;
             let response = load_node_detail(target.clone())
                 .await
                 .map_err(|error| error.to_string());
-            #[cfg(target_arch = "wasm32")]
-            let response = match response {
-                Ok(response) => {
-                    let view = render_panel_detail_chunk(PanelDetailPayload::Node(response)).await;
-                    if panel_request_is_current(
-                        generation,
-                        detail_generation.get(),
-                        &target,
-                        selected_target.get_untracked().as_ref(),
-                    ) {
-                        mount_panel_detail(NODE_DETAIL_CONTENT_ID, view)
-                    } else {
-                        Ok(())
-                    }
-                }
-                Err(error) => Err(error),
-            };
             Some(LoadedPanel {
                 request: target,
                 response,
@@ -216,47 +124,16 @@ fn NodeDetailPanelBody() -> impl IntoView {
     #[cfg(target_arch = "wasm32")]
     Effect::new(move || {
         let current = selected_target.get();
-        if current.is_some() {
-            preload_panel_detail_chunk();
-        }
         let loaded = detail.get().flatten();
         if current_node_detail_is_loaded(current.as_deref(), loaded.as_ref()) {
             reveal_node_detail_on_mobile();
         }
     });
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        view! {
-            <div class="panel-content">
-                <div
-                    id=NODE_DETAIL_CONTENT_ID
-                    class="panel-content"
-                    hidden=true
-                ></div>
-                {move || node_detail_view(selected_target.get(), detail.get().flatten())}
-            </div>
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        view! {
-            <div class="panel-content">
-                <div
-                    id=NODE_DETAIL_CONTENT_ID
-                    class="panel-content"
-                    hidden=move || {
-                        let current = selected_target.get();
-                        let loaded = detail.get().flatten();
-                        !current_panel_content_is_rendered(
-                            current.as_ref(),
-                            loaded.as_ref(),
-                        )
-                    }
-                ></div>
-                {move || node_detail_view(selected_target.get(), detail.get().flatten())}
-            </div>
-        }
+    view! {
+        <div class="panel-content">
+            {move || node_detail_view(selected_target.get(), detail.get().flatten())}
+        </div>
     }
 }
 
@@ -275,50 +152,21 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
             context: selection.context,
         })
     });
-    #[cfg(target_arch = "wasm32")]
-    let provider_generation = Rc::new(Cell::new(0_u64));
     let provider_context = LocalResource::new(move || {
         let request = selected_context.get();
         let graph_mode = graph_mode.clone();
-        #[cfg(target_arch = "wasm32")]
-        let (generation, provider_generation) = {
-            let generation = provider_generation.get().wrapping_add(1);
-            provider_generation.set(generation);
-            (generation, provider_generation.clone())
-        };
         async move {
             let request = request?;
             let response =
                 load_provider_context(request.target.clone(), request.context.clone(), graph_mode)
                     .await
                     .map_err(|error| error.to_string());
-            #[cfg(target_arch = "wasm32")]
-            let response = match response {
-                Ok(response) => {
-                    let view =
-                        render_panel_detail_chunk(PanelDetailPayload::Provider(response)).await;
-                    if panel_request_is_current(
-                        generation,
-                        provider_generation.get(),
-                        &request,
-                        selected_context.get_untracked().as_ref(),
-                    ) {
-                        mount_panel_detail(PROVIDER_CONTEXT_CONTENT_ID, view)
-                    } else {
-                        Ok(())
-                    }
-                }
-                Err(error) => Err(error),
-            };
             Some(LoadedPanel { request, response })
         }
     });
     #[cfg(target_arch = "wasm32")]
     Effect::new(move || {
         let current = selected_context.get();
-        if current.is_some() {
-            preload_panel_detail_chunk();
-        }
         let loaded = provider_context.get().flatten();
         if loaded.is_some_and(|loaded| {
             Some(&loaded.request) == current.as_ref() && loaded.response.is_ok()
@@ -327,48 +175,15 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
         }
     });
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        view! {
-            <div class="panel-content">
-                <div
-                    id=PROVIDER_CONTEXT_CONTENT_ID
-                    class="panel-content"
-                    hidden=true
-                ></div>
-                {move || {
-                    provider_context_view(
-                        selected_context.get(),
-                        provider_context.get().flatten(),
-                    )
-                }}
-            </div>
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        view! {
-            <div class="panel-content">
-                <div
-                    id=PROVIDER_CONTEXT_CONTENT_ID
-                    class="panel-content"
-                    hidden=move || {
-                        let current = selected_context.get();
-                        let loaded = provider_context.get().flatten();
-                        !current_panel_content_is_rendered(
-                            current.as_ref(),
-                            loaded.as_ref(),
-                        )
-                    }
-                ></div>
-                {move || {
-                    provider_context_view(
-                        selected_context.get(),
-                        provider_context.get().flatten(),
-                    )
-                }}
-            </div>
-        }
+    view! {
+        <div class="panel-content">
+            {move || {
+                provider_context_view(
+                    selected_context.get(),
+                    provider_context.get().flatten(),
+                )
+            }}
+        </div>
     }
 }
 
@@ -387,103 +202,40 @@ fn use_graph_revision() -> RwSignal<u64> {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn current_node_detail_is_loaded<T>(
+fn current_node_detail_is_loaded(
     current: Option<&str>,
-    loaded: Option<&LoadedPanel<String, T>>,
+    loaded: Option<&LoadedPanel<String, NodeDetailResponse>>,
 ) -> bool {
     current
         .zip(loaded)
         .is_some_and(|(current, loaded)| loaded.request == current)
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
-fn current_panel_content_is_rendered<K, T>(
-    current: Option<&K>,
-    loaded: Option<&LoadedPanel<K, T>>,
-) -> bool
-where
-    K: PartialEq,
-{
-    current
-        .zip(loaded)
-        .is_some_and(|(current, loaded)| &loaded.request == current && loaded.response.is_ok())
-}
-
-#[cfg(any(target_arch = "wasm32", test))]
-fn panel_request_is_current<K>(
-    request_generation: u64,
-    current_generation: u64,
-    request: &K,
-    current: Option<&K>,
-) -> bool
-where
-    K: PartialEq,
-{
-    request_generation == current_generation && current == Some(request)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn node_detail_view(
     current: Option<String>,
     loaded: Option<LoadedPanel<String, NodeDetailResponse>>,
 ) -> AnyView {
-    let Some(current) = current else {
-        return view! { <NodeDetailDefault/> }.into_any();
-    };
-    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
-        return view! { <NodeDetailLoading/> }.into_any();
-    };
-    match loaded.response {
-        Ok(response) => view! { <NodeDetailContent response=response/> }.into_any(),
-        Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
+    match (current.as_ref(), loaded) {
+        (None, _) => view! { <NodeDetailDefault/> }.into_any(),
+        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
+            Ok(response) => view! { <NodeDetailContent response=response/> }.into_any(),
+            Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
+        },
+        _ => view! { <NodeDetailLoading/> }.into_any(),
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn node_detail_view(current: Option<String>, loaded: Option<LoadedPanel<String, ()>>) -> AnyView {
-    let Some(current) = current else {
-        return view! { <NodeDetailDefault/> }.into_any();
-    };
-    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
-        return view! { <NodeDetailLoading/> }.into_any();
-    };
-    match loaded.response {
-        Ok(()) => ().into_any(),
-        Err(error) => view! { <NodeDetailError error/> }.into_any(),
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn provider_context_view(
     current: Option<ProviderContextRequest>,
     loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
 ) -> AnyView {
-    let Some(current) = current else {
-        return view! { <ProviderContextDefault/> }.into_any();
-    };
-    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
-        return view! { <ProviderContextLoading/> }.into_any();
-    };
-    match loaded.response {
-        Ok(response) => view! { <ProviderContextContent response=response/> }.into_any(),
-        Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn provider_context_view(
-    current: Option<ProviderContextRequest>,
-    loaded: Option<LoadedPanel<ProviderContextRequest, ()>>,
-) -> AnyView {
-    let Some(current) = current else {
-        return view! { <ProviderContextDefault/> }.into_any();
-    };
-    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
-        return view! { <ProviderContextLoading/> }.into_any();
-    };
-    match loaded.response {
-        Ok(()) => ().into_any(),
-        Err(error) => view! { <ProviderContextError error/> }.into_any(),
+    match (current.as_ref(), loaded) {
+        (None, _) => view! { <ProviderContextDefault/> }.into_any(),
+        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
+            Ok(response) => view! { <ProviderContextContent response=response/> }.into_any(),
+            Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
+        },
+        _ => view! { <ProviderContextLoading/> }.into_any(),
     }
 }
 
@@ -1804,11 +1556,10 @@ mod tests {
                 target: "detail-node".to_owned(),
             }),
         };
-        let failed: LoadedPanel<String, NodeDetailResponse> = LoadedPanel {
+        let failed = LoadedPanel {
             request: "detail-node".to_owned(),
             response: Err("backend unavailable".to_owned()),
         };
-        let current = "detail-node".to_owned();
 
         assert!(current_node_detail_is_loaded(
             Some("detail-node"),
@@ -1822,38 +1573,12 @@ mod tests {
             Some("detail-node"),
             Some(&failed)
         ));
-        assert!(current_panel_content_is_rendered(
-            Some(&current),
-            Some(&found),
-        ));
-        assert!(!current_panel_content_is_rendered(
-            Some(&current),
-            Some(&failed),
-        ));
         assert!(!current_node_detail_is_loaded(
             Some("detail-other"),
             Some(&found)
         ));
         assert!(!current_node_detail_is_loaded(None, Some(&found)));
-        assert!(!current_node_detail_is_loaded::<NodeDetailResponse>(
-            Some("detail-node"),
-            None,
-        ));
-    }
-
-    #[test]
-    fn panel_mount_requires_the_latest_generation_and_selection() {
-        let current = "detail-current".to_owned();
-
-        assert!(panel_request_is_current(3, 3, &current, Some(&current)));
-        assert!(!panel_request_is_current(2, 3, &current, Some(&current)));
-        assert!(!panel_request_is_current(
-            3,
-            3,
-            &"detail-old".to_owned(),
-            Some(&current),
-        ));
-        assert!(!panel_request_is_current(3, 3, &current, None));
+        assert!(!current_node_detail_is_loaded(Some("detail-node"), None));
     }
 
     #[test]
@@ -1873,7 +1598,6 @@ mod tests {
         assert_eq!(provider.matches("<section").count(), 1);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn panel_results_ignore_responses_for_previous_selections() {
         let node = node_detail_view(
@@ -2583,56 +2307,6 @@ mod wasm_tests {
         );
 
         drop(mounted);
-        root.remove();
-    }
-
-    #[wasm_bindgen_test]
-    async fn graph_items_lazy_panel_views_mount_into_the_current_hosts() {
-        let window = web_sys::window().expect_throw("window should be available");
-        let document = window
-            .document()
-            .expect_throw("document should be available");
-        let root = document
-            .create_element("div")
-            .expect_throw("test root should be created");
-        root.set_inner_html(&format!(
-            r#"<div id="{NODE_DETAIL_CONTENT_ID}"></div><div id="{PROVIDER_CONTEXT_CONTENT_ID}"></div>"#,
-        ));
-        document
-            .body()
-            .expect_throw("document body should be available")
-            .append_child(&root)
-            .expect_throw("test root should be mounted");
-
-        let node_view =
-            render_panel_detail_chunk(PanelDetailPayload::Node(NodeDetailResponse::Missing {
-                target: "detail-node".to_owned(),
-            }))
-            .await;
-        mount_panel_detail(NODE_DETAIL_CONTENT_ID, node_view)
-            .expect_throw("node detail should mount");
-        let provider_view = render_panel_detail_chunk(PanelDetailPayload::Provider(
-            ProviderContextResponse::Missing {
-                target: "detail-provider".to_owned(),
-            },
-        ))
-        .await;
-        mount_panel_detail(PROVIDER_CONTEXT_CONTENT_ID, provider_view)
-            .expect_throw("provider context should mount");
-        next_task().await;
-
-        assert!(
-            root.text_content()
-                .unwrap_or_default()
-                .contains("detail-node")
-        );
-        assert!(
-            root.text_content()
-                .unwrap_or_default()
-                .contains("detail-provider")
-        );
-
-        PANEL_DETAIL_MOUNTS.with(|mounts| mounts.borrow_mut().clear());
         root.remove();
     }
 
