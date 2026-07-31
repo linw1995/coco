@@ -2560,9 +2560,19 @@ async fn load_and_expand_anchor_range(
     if graph.borrow().anchor_range_selection.as_ref() != Some(&selection) {
         return;
     }
-    let focus = match response {
+    if let Some(focus) = apply_anchor_range_response(graph.clone(), selection, response).await {
+        focus_anchor_range(graph, focus);
+    }
+}
+
+async fn apply_anchor_range_response(
+    graph: Rc<RefCell<VirtualGraph>>,
+    selection: AnchorRangeSelection,
+    response: Result<AnchorRangeResponse, String>,
+) -> Option<Point> {
+    match response {
         Ok(AnchorRangeResponse::Found { paths }) => {
-            render_anchor_range(graph.clone(), selection, paths).await
+            render_anchor_range(graph, selection, paths).await
         }
         Ok(AnchorRangeResponse::Missing) => {
             let mut graph = graph.borrow_mut();
@@ -2576,9 +2586,6 @@ async fn load_and_expand_anchor_range(
             graph.show_status(&format!("Failed to load anchor details: {error}"));
             None
         }
-    };
-    if let Some(focus) = focus {
-        focus_anchor_range(graph, focus);
     }
 }
 

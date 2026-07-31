@@ -427,25 +427,29 @@ fn node_detail_view(
     current: Option<String>,
     loaded: Option<LoadedPanel<String, NodeDetailResponse>>,
 ) -> AnyView {
-    match (current.as_ref(), loaded) {
-        (None, _) => view! { <NodeDetailDefault/> }.into_any(),
-        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => view! { <NodeDetailContent response=response/> }.into_any(),
-            Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
-        },
-        _ => view! { <NodeDetailLoading/> }.into_any(),
+    let Some(current) = current else {
+        return view! { <NodeDetailDefault/> }.into_any();
+    };
+    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
+        return view! { <NodeDetailLoading/> }.into_any();
+    };
+    match loaded.response {
+        Ok(response) => view! { <NodeDetailContent response=response/> }.into_any(),
+        Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 fn node_detail_view(current: Option<String>, loaded: Option<LoadedPanel<String, ()>>) -> AnyView {
-    match (current.as_ref(), loaded) {
-        (None, _) => view! { <NodeDetailDefault/> }.into_any(),
-        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(()) => ().into_any(),
-            Err(error) => view! { <NodeDetailError error/> }.into_any(),
-        },
-        _ => view! { <NodeDetailLoading/> }.into_any(),
+    let Some(current) = current else {
+        return view! { <NodeDetailDefault/> }.into_any();
+    };
+    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
+        return view! { <NodeDetailLoading/> }.into_any();
+    };
+    match loaded.response {
+        Ok(()) => ().into_any(),
+        Err(error) => view! { <NodeDetailError error/> }.into_any(),
     }
 }
 
@@ -454,13 +458,15 @@ fn provider_context_view(
     current: Option<ProviderContextRequest>,
     loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
 ) -> AnyView {
-    match (current.as_ref(), loaded) {
-        (None, _) => view! { <ProviderContextDefault/> }.into_any(),
-        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => view! { <ProviderContextContent response=response/> }.into_any(),
-            Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
-        },
-        _ => view! { <ProviderContextLoading/> }.into_any(),
+    let Some(current) = current else {
+        return view! { <ProviderContextDefault/> }.into_any();
+    };
+    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
+        return view! { <ProviderContextLoading/> }.into_any();
+    };
+    match loaded.response {
+        Ok(response) => view! { <ProviderContextContent response=response/> }.into_any(),
+        Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
     }
 }
 
@@ -469,13 +475,15 @@ fn provider_context_view(
     current: Option<ProviderContextRequest>,
     loaded: Option<LoadedPanel<ProviderContextRequest, ()>>,
 ) -> AnyView {
-    match (current.as_ref(), loaded) {
-        (None, _) => view! { <ProviderContextDefault/> }.into_any(),
-        (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(()) => ().into_any(),
-            Err(error) => view! { <ProviderContextError error/> }.into_any(),
-        },
-        _ => view! { <ProviderContextLoading/> }.into_any(),
+    let Some(current) = current else {
+        return view! { <ProviderContextDefault/> }.into_any();
+    };
+    let Some(loaded) = loaded.filter(|loaded| loaded.request == current) else {
+        return view! { <ProviderContextLoading/> }.into_any();
+    };
+    match loaded.response {
+        Ok(()) => ().into_any(),
+        Err(error) => view! { <ProviderContextError error/> }.into_any(),
     }
 }
 
