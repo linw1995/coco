@@ -115,8 +115,19 @@ struct AnchorRangeLayoutRequest {
     occupied_routes: Vec<GraphBezierRoute>,
 }
 
+#[cfg(not(test))]
 #[leptos::prelude::lazy(anchor_range)]
 fn layout_anchor_range_chunk(request: AnchorRangeLayoutRequest) -> AnchorRangeLayout {
+    layout_anchor_range(
+        request.source,
+        request.target,
+        request.paths,
+        &request.occupied_routes,
+    )
+}
+
+#[cfg(test)]
+async fn layout_anchor_range_chunk(request: AnchorRangeLayoutRequest) -> AnchorRangeLayout {
     layout_anchor_range(
         request.source,
         request.target,
@@ -2706,8 +2717,8 @@ fn focus_anchor_range(graph: Rc<RefCell<VirtualGraph>>, focus: Point) {
 }
 
 async fn refresh_expanded_anchor_range(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let Some((selection, paths, cached_source, cached_target, previous_transform, graph_version)) =
-        ({
+    loop {
+        let Some((selection, paths, cached_source, cached_target)) = ({
             let graph = graph.borrow();
             graph.anchor_range.as_ref().map(|expansion| {
                 (
@@ -2715,34 +2726,57 @@ async fn refresh_expanded_anchor_range(graph: Rc<RefCell<VirtualGraph>>) -> Resu
                     expansion.paths.clone(),
                     expansion.source,
                     expansion.target,
-                    expansion.transform,
-                    graph.version,
                 )
             })
-        })
-    else {
-        return Ok(());
-    };
-    let Some(prepared) = graph.borrow().prepare_anchor_range(
-        selection.clone(),
-        paths.clone(),
-        Some((cached_source, cached_target)),
-    )?
-    else {
-        return Ok(());
-    };
-    let layout = layout_anchor_range_chunk(prepared.request.clone()).await;
-    let mut graph = graph.borrow_mut();
-    if graph.version != graph_version || graph.anchor_range_selection.as_ref() != Some(&selection) {
-        return Ok(());
+        }) else {
+            return Ok(());
+        };
+        let Some(prepared) = graph.borrow().prepare_anchor_range(
+            selection.clone(),
+            paths,
+            Some((cached_source, cached_target)),
+        )?
+        else {
+            return Ok(());
+        };
+        let layout = layout_anchor_range_chunk(prepared.request.clone()).await;
+        let mut graph = graph.borrow_mut();
+        let Some((current_selection, current_paths, current_source, current_target, transform)) =
+            graph.anchor_range.as_ref().map(|expansion| {
+                (
+                    expansion.selection.clone(),
+                    expansion.paths.clone(),
+                    expansion.source,
+                    expansion.target,
+                    expansion.transform,
+                )
+            })
+        else {
+            return Ok(());
+        };
+        if current_selection != selection {
+            return Ok(());
+        }
+        let Some(current_prepared) = graph.prepare_anchor_range(
+            current_selection.clone(),
+            current_paths.clone(),
+            Some((current_source, current_target)),
+        )?
+        else {
+            return Ok(());
+        };
+        if current_prepared.request != prepared.request {
+            drop(graph);
+            continue;
+        }
+        return graph.apply_refreshed_anchor_range_layout(
+            current_selection,
+            current_paths,
+            current_prepared,
+            layout,
+            transform,
+        );
     }
-    graph.apply_refreshed_anchor_range_layout(
-        selection,
-        paths,
-        prepared,
-        layout,
-        previous_transform,
-    )
 }
 
 fn collapse_anchor_range(graph: Rc<RefCell<VirtualGraph>>) {

@@ -79,9 +79,19 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(test)))]
 #[leptos::prelude::lazy(panel_detail)]
 fn render_panel_detail_chunk(payload: PanelDetailPayload) -> AnyView {
+    match payload {
+        PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
+        PanelDetailPayload::Provider(response) => {
+            view! { <ProviderContextContent response/> }.into_any()
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", test))]
+async fn render_panel_detail_chunk(payload: PanelDetailPayload) -> AnyView {
     match payload {
         PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
         PanelDetailPayload::Provider(response) => {
@@ -105,12 +115,15 @@ fn mount_panel_detail(host_id: &'static str, view: AnyView) -> Result<(), String
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(test)))]
 fn preload_panel_detail_chunk() {
     leptos::task::spawn_local(async {
         __preload_render_panel_detail_chunk().await;
     });
 }
+
+#[cfg(all(target_arch = "wasm32", test))]
+fn preload_panel_detail_chunk() {}
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
 async fn load_node_detail(target: String) -> Result<NodeDetailResponse, ServerFnError> {
