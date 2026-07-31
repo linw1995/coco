@@ -100,6 +100,31 @@ struct ExpandedAnchorRange {
     transform: AnchorRangeTransform,
 }
 
+struct PreparedAnchorRange {
+    source: Point,
+    target: Point,
+    transform: AnchorRangeTransform,
+    request: AnchorRangeLayoutRequest,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AnchorRangeLayoutRequest {
+    source: Point,
+    target: Point,
+    paths: Vec<AnchorRangePath>,
+    occupied_routes: Vec<GraphBezierRoute>,
+}
+
+#[cfg_attr(not(test), leptos::prelude::lazy(anchor_range))]
+async fn layout_anchor_range_chunk(request: AnchorRangeLayoutRequest) -> AnchorRangeLayout {
+    layout_anchor_range(
+        request.source,
+        request.target,
+        request.paths,
+        &request.occupied_routes,
+    )
+}
+
 impl AnchorRangeSelection {
     fn matches(&self, edge: &GraphViewportEdge) -> bool {
         self.source == edge.source_id && self.target == edge.target_id && self.kind == edge.kind
@@ -413,7 +438,6 @@ impl VirtualGraph {
         self.rendered = RenderedKeys::new();
         self.apply_response_viewport(version, canvas, viewport)?;
         self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
-        self.refresh_anchor_range_geometry()?;
         self.sync_anchor_range()?;
         self.sync_svg_viewport();
         self.sync_selected_graph_node();
@@ -434,7 +458,6 @@ impl VirtualGraph {
         self.apply_response_viewport(version, canvas, viewport)?;
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
-        self.refresh_anchor_range_geometry()?;
         self.sync_anchor_range()?;
         self.sync_svg_viewport();
         self.sync_selected_graph_node();
@@ -607,15 +630,43 @@ impl VirtualGraph {
         self.upsert_graph_items(updated, false)
     }
 
-    fn expand_anchor_range(
-        &mut self,
+    fn prepare_anchor_range(
+        &self,
         selection: AnchorRangeSelection,
         paths: Vec<AnchorRangePath>,
-    ) -> Result<Option<Point>, JsValue> {
-        let Some(source) = self.rendered_node_point(&selection.source)? else {
-            return Ok(None);
+        fallback: Option<(Point, Point)>,
+    ) -> Result<Option<PreparedAnchorRange>, JsValue> {
+        let fallback_source = fallback.map(|(source, _)| source);
+        let fallback_target = fallback.map(|(_, target)| target);
+        let source = match self.rendered_node_point(&selection.source)? {
+            Some(source) => source,
+            None => {
+                let Some(source) = fallback_source else {
+                    return Ok(None);
+                };
+                source
+            }
         };
-        let Some(target) = self.rendered_node_point(&selection.target)? else {
+        let target = match self.rendered_node_point(&selection.target)? {
+            Some(target) => target,
+            None => {
+                let Some(target) = fallback_target else {
+                    return Ok(None);
+                };
+                target
+            }
+        };
+        self.prepare_anchor_range_with_points(selection, paths, source, Some(target))
+    }
+
+    fn prepare_anchor_range_with_points(
+        &self,
+        selection: AnchorRangeSelection,
+        paths: Vec<AnchorRangePath>,
+        source: Point,
+        target: Option<Point>,
+    ) -> Result<Option<PreparedAnchorRange>, JsValue> {
+        let Some(target) = target else {
             return Ok(None);
         };
         let transform = AnchorRangeTransform {
@@ -628,7 +679,26 @@ impl VirtualGraph {
             y: target.y,
         };
         let occupied_routes = self.anchor_range_occupied_routes(&selection, transform)?;
-        let layout = layout_anchor_range(source, expanded_target, paths.clone(), &occupied_routes);
+        Ok(Some(PreparedAnchorRange {
+            source,
+            target,
+            transform,
+            request: AnchorRangeLayoutRequest {
+                source,
+                target: expanded_target,
+                paths,
+                occupied_routes,
+            },
+        }))
+    }
+
+    fn apply_anchor_range_layout(
+        &mut self,
+        selection: AnchorRangeSelection,
+        paths: Vec<AnchorRangePath>,
+        prepared: PreparedAnchorRange,
+        layout: AnchorRangeLayout,
+    ) -> Result<Point, JsValue> {
         let focus = Point {
             x: layout.bounds.left.saturating_add(layout.bounds.right) / 2,
             y: layout.bounds.top.saturating_add(layout.bounds.bottom) / 2,
@@ -637,66 +707,45 @@ impl VirtualGraph {
         self.anchor_range = Some(ExpandedAnchorRange {
             selection,
             paths,
-            source,
-            target,
+            source: prepared.source,
+            target: prepared.target,
             layout,
-            transform,
+            transform: prepared.transform,
         });
         if let Some(base) = self.base_canvas {
             self.canvas = Some(self.expanded_canvas(base));
         }
         self.sync_anchor_range()?;
         self.apply_canvas()?;
-        Ok(Some(focus))
+        Ok(focus)
     }
 
-    fn refresh_anchor_range_geometry(&mut self) -> Result<(), JsValue> {
-        let Some((selection, paths, cached_source, cached_target, previous_transform)) =
-            self.anchor_range.as_ref().map(|expansion| {
-                (
-                    expansion.selection.clone(),
-                    expansion.paths.clone(),
-                    expansion.source,
-                    expansion.target,
-                    expansion.transform,
-                )
-            })
-        else {
-            return Ok(());
-        };
+    fn apply_refreshed_anchor_range_layout(
+        &mut self,
+        selection: AnchorRangeSelection,
+        paths: Vec<AnchorRangePath>,
+        prepared: PreparedAnchorRange,
+        layout: AnchorRangeLayout,
+        previous_transform: AnchorRangeTransform,
+    ) -> Result<(), JsValue> {
         let viewport = self.viewport;
         let rendered_viewport = self.rendered_viewport;
-        let source = self
-            .rendered_node_point(&selection.source)?
-            .unwrap_or(cached_source);
-        let target = self
-            .rendered_node_point(&selection.target)?
-            .unwrap_or(cached_target);
-        let transform = AnchorRangeTransform {
-            source_x: source.x,
-            target_x: target.x,
-            extra_width: anchor_range_extra_width(&paths),
-        };
-        let expanded_target = Point {
-            x: transform.transform_x(target.x),
-            y: target.y,
-        };
-        let occupied_routes = self.anchor_range_occupied_routes(&selection, transform)?;
         self.anchor_range = Some(ExpandedAnchorRange {
             selection,
-            layout: layout_anchor_range(source, expanded_target, paths.clone(), &occupied_routes),
+            layout,
             paths,
-            source,
-            target,
-            transform,
+            source: prepared.source,
+            target: prepared.target,
+            transform: prepared.transform,
         });
-        self.viewport = remap_expanded_viewport(viewport, previous_transform, transform);
+        self.viewport = remap_expanded_viewport(viewport, previous_transform, prepared.transform);
         self.rendered_viewport =
-            remap_expanded_viewport(rendered_viewport, previous_transform, transform);
+            remap_expanded_viewport(rendered_viewport, previous_transform, prepared.transform);
         if let Some(base) = self.base_canvas {
             self.canvas = Some(self.expanded_canvas(base));
         }
         self.clamp_viewport();
+        self.sync_anchor_range()?;
         self.apply_canvas()
     }
 
@@ -1531,9 +1580,13 @@ async fn render_full_viewport(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), Js
     let response =
         fetch_json::<GraphViewportResponse>(&window, &format!("/api/graph/viewport?{query}"))
             .await?;
-    let patch_needed = {
+    {
         let mut graph = graph.borrow_mut();
         graph.apply_full(response)?;
+    }
+    refresh_expanded_anchor_range(graph.clone()).await?;
+    let patch_needed = {
+        let graph = graph.borrow();
         !same_viewport(graph.rendered_viewport, graph.viewport)
     };
     if patch_needed {
@@ -1918,9 +1971,9 @@ async fn render_full_viewport_patch(
     let response =
         fetch_json::<GraphViewportResponse>(&input.window, &format!("/api/graph/viewport?{query}"))
             .await?;
-    let mut graph = graph.borrow_mut();
-    graph.apply_full(response)?;
-    Ok(finish_applied_viewport_patch(&mut graph))
+    graph.borrow_mut().apply_full(response)?;
+    refresh_expanded_anchor_range(graph.clone()).await?;
+    Ok(finish_applied_viewport_patch(&mut graph.borrow_mut()))
 }
 
 async fn render_diff_viewport_patch(
@@ -1934,9 +1987,9 @@ async fn render_diff_viewport_patch(
         &query,
     )
     .await?;
-    let mut graph = graph.borrow_mut();
-    graph.apply_diff(response)?;
-    Ok(finish_applied_viewport_patch(&mut graph))
+    graph.borrow_mut().apply_diff(response)?;
+    refresh_expanded_anchor_range(graph.clone()).await?;
+    Ok(finish_applied_viewport_patch(&mut graph.borrow_mut()))
 }
 
 fn viewport_patch_diff_query(graph: &VirtualGraph, current: ViewportState) -> String {
@@ -2093,7 +2146,7 @@ async fn handle_graph_items_success(
     match graph_items_refresh_action(graph.clone(), viewport) {
         VersionRefresh::Drop => {}
         VersionRefresh::Defer => delay_graph_items_retry(graph).await,
-        VersionRefresh::Apply => apply_graph_items_diff(graph, response),
+        VersionRefresh::Apply => apply_graph_items_diff(graph, response).await,
     }
 }
 
@@ -2110,13 +2163,23 @@ fn graph_items_refresh_action(
     )
 }
 
-fn apply_graph_items_diff(graph: Rc<RefCell<VirtualGraph>>, response: GraphViewportDiffResponse) {
-    let patch_needed = {
+async fn apply_graph_items_diff(
+    graph: Rc<RefCell<VirtualGraph>>,
+    response: GraphViewportDiffResponse,
+) {
+    {
         let mut graph = graph.borrow_mut();
         if let Err(error) = graph.apply_diff(response) {
             web_sys::console::error_1(&error);
             return;
         }
+    }
+    if let Err(error) = refresh_expanded_anchor_range(graph.clone()).await {
+        web_sys::console::error_1(&error);
+        return;
+    }
+    let patch_needed = {
+        let graph = graph.borrow();
         !same_viewport(graph.rendered_viewport, graph.viewport)
     };
     if patch_needed {
@@ -2408,31 +2471,31 @@ async fn load_and_expand_anchor_range(
     )
     .await
     .map_err(|error| error.to_string());
-    let focus = {
-        let mut graph = graph.borrow_mut();
-        if graph.anchor_range_selection.as_ref() != Some(&selection) {
-            return;
-        }
-        apply_anchor_range_response(&mut graph, selection, response)
-    };
-    if let Some(focus) = focus {
+    if graph.borrow().anchor_range_selection.as_ref() != Some(&selection) {
+        return;
+    }
+    if let Some(focus) = apply_anchor_range_response(graph.clone(), selection, response).await {
         focus_anchor_range(graph, focus);
     }
 }
 
-fn apply_anchor_range_response(
-    graph: &mut VirtualGraph,
+async fn apply_anchor_range_response(
+    graph: Rc<RefCell<VirtualGraph>>,
     selection: AnchorRangeSelection,
     response: Result<AnchorRangeResponse, String>,
 ) -> Option<Point> {
     match response {
-        Ok(AnchorRangeResponse::Found { paths }) => render_anchor_range(graph, selection, paths),
+        Ok(AnchorRangeResponse::Found { paths }) => {
+            render_anchor_range(graph, selection, paths).await
+        }
         Ok(AnchorRangeResponse::Missing) => {
+            let mut graph = graph.borrow_mut();
             let _ = graph.collapse_anchor_range();
             graph.show_status("The selected anchor relationship is no longer available.");
             None
         }
         Err(error) => {
+            let mut graph = graph.borrow_mut();
             let _ = graph.collapse_anchor_range();
             graph.show_status(&format!("Failed to load anchor details: {error}"));
             None
@@ -2440,39 +2503,72 @@ fn apply_anchor_range_response(
     }
 }
 
-fn render_anchor_range(
-    graph: &mut VirtualGraph,
+async fn render_anchor_range(
+    graph: Rc<RefCell<VirtualGraph>>,
     selection: AnchorRangeSelection,
     paths: Vec<crate::api::AnchorRangePath>,
 ) -> Option<Point> {
     if anchor_range_extra_width(&paths) == 0 {
+        let mut graph = graph.borrow_mut();
         let _ = graph.collapse_anchor_range();
         graph.show_status("No detail nodes exist between the selected anchors.");
         return None;
     }
-    render_anchor_range_paths(graph, selection, paths)
-}
-
-fn render_anchor_range_paths(
-    graph: &mut VirtualGraph,
-    selection: AnchorRangeSelection,
-    paths: Vec<crate::api::AnchorRangePath>,
-) -> Option<Point> {
-    match graph.expand_anchor_range(selection, paths) {
-        Ok(Some(focus)) => {
-            graph.hide_status();
-            Some(focus)
-        }
+    let prepared = graph
+        .borrow()
+        .prepare_anchor_range(selection.clone(), paths.clone(), None);
+    let mut prepared = match prepared {
+        Ok(Some(prepared)) => prepared,
         Ok(None) => {
+            let mut graph = graph.borrow_mut();
             let _ = graph.collapse_anchor_range();
             graph.show_status("Anchor endpoints are outside the rendered graph.");
-            None
+            return None;
         }
         Err(error) => {
             web_sys::console::error_1(&error);
-            graph.show_status("Failed to render anchor details.");
-            None
+            graph
+                .borrow()
+                .show_status("Failed to prepare anchor details.");
+            return None;
         }
+    };
+    loop {
+        let layout = layout_anchor_range_chunk(prepared.request.clone()).await;
+        let mut graph = graph.borrow_mut();
+        if graph.anchor_range_selection.as_ref() != Some(&selection) {
+            return None;
+        }
+        let current_prepared =
+            match graph.prepare_anchor_range(selection.clone(), paths.clone(), None) {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) => {
+                    let _ = graph.collapse_anchor_range();
+                    graph.show_status("Anchor endpoints are outside the rendered graph.");
+                    return None;
+                }
+                Err(error) => {
+                    web_sys::console::error_1(&error);
+                    graph.show_status("Failed to prepare anchor details.");
+                    return None;
+                }
+            };
+        if current_prepared.request != prepared.request {
+            drop(graph);
+            prepared = current_prepared;
+            continue;
+        }
+        return match graph.apply_anchor_range_layout(selection, paths, current_prepared, layout) {
+            Ok(focus) => {
+                graph.hide_status();
+                Some(focus)
+            }
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                graph.show_status("Failed to render anchor details.");
+                None
+            }
+        };
     }
 }
 
@@ -2485,6 +2581,69 @@ fn focus_anchor_range(graph: Rc<RefCell<VirtualGraph>>, focus: Point) {
         }
         center_viewport_on_graph_point(graph, focus);
     });
+}
+
+async fn refresh_expanded_anchor_range(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    loop {
+        let Some((selection, paths, cached_source, cached_target)) = ({
+            let graph = graph.borrow();
+            graph.anchor_range.as_ref().map(|expansion| {
+                (
+                    expansion.selection.clone(),
+                    expansion.paths.clone(),
+                    expansion.source,
+                    expansion.target,
+                )
+            })
+        }) else {
+            return Ok(());
+        };
+        let Some(prepared) = graph.borrow().prepare_anchor_range(
+            selection.clone(),
+            paths,
+            Some((cached_source, cached_target)),
+        )?
+        else {
+            return Ok(());
+        };
+        let layout = layout_anchor_range_chunk(prepared.request.clone()).await;
+        let mut graph = graph.borrow_mut();
+        let Some((current_selection, current_paths, current_source, current_target, transform)) =
+            graph.anchor_range.as_ref().map(|expansion| {
+                (
+                    expansion.selection.clone(),
+                    expansion.paths.clone(),
+                    expansion.source,
+                    expansion.target,
+                    expansion.transform,
+                )
+            })
+        else {
+            return Ok(());
+        };
+        if current_selection != selection {
+            return Ok(());
+        }
+        let Some(current_prepared) = graph.prepare_anchor_range(
+            current_selection.clone(),
+            current_paths.clone(),
+            Some((current_source, current_target)),
+        )?
+        else {
+            return Ok(());
+        };
+        if current_prepared.request != prepared.request {
+            drop(graph);
+            continue;
+        }
+        return graph.apply_refreshed_anchor_range_layout(
+            current_selection,
+            current_paths,
+            current_prepared,
+            layout,
+            transform,
+        );
+    }
 }
 
 fn collapse_anchor_range(graph: Rc<RefCell<VirtualGraph>>) {
@@ -3344,6 +3503,16 @@ mod tests {
         }
     }
 
+    async fn expand_test_anchor_range(
+        graph: Rc<RefCell<VirtualGraph>>,
+        selection: AnchorRangeSelection,
+        paths: Vec<AnchorRangePath>,
+    ) -> Option<Point> {
+        graph.borrow_mut().anchor_range_selection = Some(selection.clone());
+        apply_anchor_range_response(graph, selection, Ok(AnchorRangeResponse::Found { paths }))
+            .await
+    }
+
     #[wasm_bindgen_test]
     fn graph_items_node_label_limits_heads_and_character_count() {
         let mut node = graph_node("aaaaaaaa", 56, 56);
@@ -3359,8 +3528,8 @@ mod tests {
         assert_eq!(truncate_label("anything", 0), "");
     }
 
-    #[wasm_bindgen_test]
-    fn graph_items_expand_anchor_details_inside_the_svg_graph() {
+    #[wasm_bindgen_test(async)]
+    async fn graph_items_expand_anchor_details_inside_the_svg_graph() {
         let fixture = GraphFixture::new();
         let selection = AnchorRangeSelection {
             source: "source".to_owned(),
@@ -3395,24 +3564,22 @@ mod tests {
                     false,
                 )
                 .expect_throw("anchor graph items should render");
-            graph.anchor_range_selection = Some(selection.clone());
-            assert!(
-                apply_anchor_range_response(
-                    &mut graph,
-                    selection,
-                    Ok(AnchorRangeResponse::Found {
-                        paths: vec![crate::api::AnchorRangePath {
-                            nodes: vec![
-                                anchor_range_node("source", None),
-                                anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
-                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                            ],
-                        }],
-                    }),
-                )
-                .is_some()
-            );
         }
+        assert!(
+            expand_test_anchor_range(
+                fixture.graph.clone(),
+                selection,
+                vec![crate::api::AnchorRangePath {
+                    nodes: vec![
+                        anchor_range_node("source", None),
+                        anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                        anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                }],
+            )
+            .await
+            .is_some()
+        );
 
         let document = fixture.graph.borrow().document.clone();
         assert!(
@@ -3570,29 +3737,27 @@ mod tests {
                 .is_none()
         );
 
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        assert!(
+            expand_test_anchor_range(
+                fixture.graph.clone(),
+                selection,
+                vec![crate::api::AnchorRangePath {
+                    nodes: vec![
+                        anchor_range_node("source", None),
+                        anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                }],
+            )
+            .await
+            .is_none()
+        );
         {
-            let selection = AnchorRangeSelection {
-                source: "source".to_owned(),
-                target: "target".to_owned(),
-                kind: GraphViewportEdgeKind::Primary,
-            };
-            let mut graph = fixture.graph.borrow_mut();
-            graph.anchor_range_selection = Some(selection.clone());
-            assert!(
-                apply_anchor_range_response(
-                    &mut graph,
-                    selection,
-                    Ok(AnchorRangeResponse::Found {
-                        paths: vec![crate::api::AnchorRangePath {
-                            nodes: vec![
-                                anchor_range_node("source", None),
-                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                            ],
-                        }],
-                    }),
-                )
-                .is_none()
-            );
+            let graph = fixture.graph.borrow();
             assert!(graph.anchor_range_selection.is_none());
             assert!(graph.anchor_range.is_none());
         }
@@ -3605,30 +3770,28 @@ mod tests {
             Some("No detail nodes exist between the selected anchors.")
         );
 
+        let selection = AnchorRangeSelection {
+            source: "missing-source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        assert!(
+            expand_test_anchor_range(
+                fixture.graph.clone(),
+                selection,
+                vec![crate::api::AnchorRangePath {
+                    nodes: vec![
+                        anchor_range_node("missing-source", None),
+                        anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                        anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                }],
+            )
+            .await
+            .is_none()
+        );
         {
-            let selection = AnchorRangeSelection {
-                source: "missing-source".to_owned(),
-                target: "target".to_owned(),
-                kind: GraphViewportEdgeKind::Primary,
-            };
-            let mut graph = fixture.graph.borrow_mut();
-            graph.anchor_range_selection = Some(selection.clone());
-            assert!(
-                apply_anchor_range_response(
-                    &mut graph,
-                    selection,
-                    Ok(AnchorRangeResponse::Found {
-                        paths: vec![crate::api::AnchorRangePath {
-                            nodes: vec![
-                                anchor_range_node("missing-source", None),
-                                anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
-                                anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                            ],
-                        }],
-                    }),
-                )
-                .is_none()
-            );
+            let graph = fixture.graph.borrow();
             assert!(graph.anchor_range_selection.is_none());
             assert!(graph.anchor_range.is_none());
         }
@@ -3642,8 +3805,8 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
-    fn graph_items_shift_edges_when_an_endpoint_node_is_outside_the_viewport() {
+    #[wasm_bindgen_test(async)]
+    async fn graph_items_shift_edges_when_an_endpoint_node_is_outside_the_viewport() {
         let fixture = GraphFixture::new();
         let selection = AnchorRangeSelection {
             source: "source".to_owned(),
@@ -3680,20 +3843,20 @@ mod tests {
                     false,
                 )
                 .expect_throw("anchor graph items should render");
-            graph
-                .expand_anchor_range(
-                    selection,
-                    vec![AnchorRangePath {
-                        nodes: vec![
-                            anchor_range_node("source", None),
-                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
-                            anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                        ],
-                    }],
-                )
-                .expect_throw("anchor details should expand")
-                .expect_throw("anchor endpoints should be rendered");
         }
+        expand_test_anchor_range(
+            fixture.graph.clone(),
+            selection,
+            vec![AnchorRangePath {
+                nodes: vec![
+                    anchor_range_node("source", None),
+                    anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                    anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                ],
+            }],
+        )
+        .await
+        .expect_throw("anchor endpoints should be rendered");
 
         let edge = fixture
             .graph
@@ -3708,8 +3871,8 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
-    fn graph_items_insert_anchor_details_before_target_rank() {
+    #[wasm_bindgen_test(async)]
+    async fn graph_items_insert_anchor_details_before_target_rank() {
         let fixture = GraphFixture::new();
         let selection = AnchorRangeSelection {
             source: "source".to_owned(),
@@ -3737,20 +3900,20 @@ mod tests {
                     false,
                 )
                 .expect_throw("anchor graph nodes should render");
-            graph
-                .expand_anchor_range(
-                    selection,
-                    vec![AnchorRangePath {
-                        nodes: vec![
-                            anchor_range_node("source", None),
-                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Merge)),
-                            anchor_range_node("target", Some(GraphViewportEdgeKind::Merge)),
-                        ],
-                    }],
-                )
-                .expect_throw("merge details should expand")
-                .expect_throw("merge endpoints should be rendered");
         }
+        expand_test_anchor_range(
+            fixture.graph.clone(),
+            selection,
+            vec![AnchorRangePath {
+                nodes: vec![
+                    anchor_range_node("source", None),
+                    anchor_range_node("detail", Some(GraphViewportEdgeKind::Merge)),
+                    anchor_range_node("target", Some(GraphViewportEdgeKind::Merge)),
+                ],
+            }],
+        )
+        .await
+        .expect_throw("merge endpoints should be rendered");
 
         let document = fixture.graph.borrow().document.clone();
         let middle = document
@@ -3779,8 +3942,8 @@ mod tests {
         );
     }
 
-    #[wasm_bindgen_test]
-    fn graph_items_reflow_open_anchor_range_with_cached_or_current_endpoints() {
+    #[wasm_bindgen_test(async)]
+    async fn graph_items_reflow_open_anchor_range_with_cached_or_current_endpoints() {
         let fixture = GraphFixture::new();
         let initial_route = route((120, 80), (150, 80), (168, 80), (188, 80));
         let updated_route = route((140, 100), (170, 100), (216, 140), (236, 140));
@@ -3822,19 +3985,22 @@ mod tests {
                     ],
                 })
                 .expect_throw("initial anchor graph should render");
-            graph
-                .expand_anchor_range(
-                    selection,
-                    vec![AnchorRangePath {
-                        nodes: vec![
-                            anchor_range_node("source", None),
-                            anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
-                            anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
-                        ],
-                    }],
-                )
-                .expect_throw("anchor details should expand")
-                .expect_throw("anchor endpoints should be rendered");
+        }
+        expand_test_anchor_range(
+            fixture.graph.clone(),
+            selection,
+            vec![AnchorRangePath {
+                nodes: vec![
+                    anchor_range_node("source", None),
+                    anchor_range_node("detail", Some(GraphViewportEdgeKind::Primary)),
+                    anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                ],
+            }],
+        )
+        .await
+        .expect_throw("anchor endpoints should be rendered");
+        {
+            let mut graph = fixture.graph.borrow_mut();
             graph
                 .apply_diff(GraphViewportDiffResponse {
                     version: 2,
@@ -3870,6 +4036,9 @@ mod tests {
                 })
                 .expect_throw("anchor graph reflow should render");
         }
+        refresh_expanded_anchor_range(fixture.graph.clone())
+            .await
+            .expect_throw("anchor graph layout should refresh");
 
         let document = fixture.graph.borrow().document.clone();
         let detail = document
@@ -3939,8 +4108,11 @@ mod tests {
                     ],
                 })
                 .expect_throw("virtualized endpoints should preserve the open range");
-            assert!(graph.anchor_range.is_some());
         }
+        refresh_expanded_anchor_range(fixture.graph.clone())
+            .await
+            .expect_throw("cached anchor graph layout should refresh");
+        assert!(fixture.graph.borrow().anchor_range.is_some());
         assert!(
             document
                 .query_selector(".node-link[data-node-id=\"target\"]")
@@ -3990,6 +4162,12 @@ mod tests {
                     removed: Vec::new(),
                 })
                 .expect_throw("restored target should refresh the open range");
+        }
+        refresh_expanded_anchor_range(fixture.graph.clone())
+            .await
+            .expect_throw("restored anchor graph layout should refresh");
+        {
+            let graph = fixture.graph.borrow();
             assert_eq!(
                 graph.anchor_range.as_ref().map(|range| range.transform),
                 Some(AnchorRangeTransform {
@@ -3999,6 +4177,70 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_prepare_anchor_range_uses_current_target_with_cached_source() {
+        let fixture = GraphFixture::new();
+        let selection = AnchorRangeSelection {
+            source: "source".to_owned(),
+            target: "target".to_owned(),
+            kind: GraphViewportEdgeKind::Primary,
+        };
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .apply_full(GraphViewportResponse {
+                    version: 1,
+                    canvas: GraphCanvas {
+                        width: 480,
+                        height: 280,
+                    },
+                    viewport: viewport(),
+                    nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
+                    edges: Vec::new(),
+                })
+                .expect_throw("initial anchor graph should render");
+            graph
+                .apply_diff(GraphViewportDiffResponse {
+                    version: 2,
+                    canvas: GraphCanvas {
+                        width: 480,
+                        height: 280,
+                    },
+                    previous_viewport: viewport(),
+                    viewport: viewport(),
+                    added: GraphViewportItems::default(),
+                    updated: GraphViewportItems {
+                        nodes: vec![graph_node("target", 260, 140)],
+                        edges: Vec::new(),
+                    },
+                    removed: vec![GraphViewportRemovedItem {
+                        kind: crate::api::GraphViewportItemKind::Node,
+                        key: "node:source".to_owned(),
+                    }],
+                })
+                .expect_throw("source virtualization should preserve the current target");
+        }
+
+        let prepared = fixture
+            .graph
+            .borrow()
+            .prepare_anchor_range(
+                selection,
+                vec![AnchorRangePath {
+                    nodes: vec![
+                        anchor_range_node("source", None),
+                        anchor_range_node("target", Some(GraphViewportEdgeKind::Primary)),
+                    ],
+                }],
+                Some((Point { x: 100, y: 80 }, Point { x: 212, y: 80 })),
+            )
+            .expect_throw("anchor range preparation should succeed")
+            .expect_throw("cached source should keep the range available");
+
+        assert_eq!(prepared.source, Point { x: 100, y: 80 });
+        assert_eq!(prepared.target, Point { x: 260, y: 140 });
     }
 
     #[wasm_bindgen_test]
