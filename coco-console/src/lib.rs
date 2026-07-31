@@ -2,8 +2,6 @@ mod api;
 mod graph_render;
 mod panels;
 
-pub use graph_render::{GraphCanvas, GraphCanvasModel};
-
 #[allow(dead_code)]
 mod web_graph;
 
