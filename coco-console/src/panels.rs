@@ -60,6 +60,7 @@ struct ProviderContextRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LoadedProviderContext {
+    request: ProviderContextRequest,
     id: String,
     targets: Vec<String>,
 }
@@ -178,8 +179,8 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
 fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     let selection = use_panel_selection();
     let loaded_context = RwSignal::new(None::<LoadedProviderContext>);
-    let provider_request = Memo::new(move |previous| {
-        provider_context_request(selection.get(), loaded_context.get().as_ref(), previous)
+    let provider_request = Memo::new(move |_| {
+        provider_context_request(selection.get(), loaded_context.get().as_ref())
     });
     let provider_context = LocalResource::new(move || {
         let request = provider_request.get();
@@ -213,14 +214,13 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
 fn provider_context_request(
     selection: PanelSelection,
     loaded: Option<&LoadedProviderContext>,
-    previous: Option<&Option<ProviderContextRequest>>,
 ) -> Option<ProviderContextRequest> {
     let target = selection.target?;
-    if loaded.is_some_and(|loaded| {
-        selection.context.as_deref() == Some(loaded.id.as_str()) && loaded.targets.contains(&target)
-    }) && let Some(previous) = previous
+    if let Some(loaded) = loaded
+        && selection.context.as_deref() == Some(loaded.id.as_str())
+        && loaded.targets.contains(&target)
     {
-        return previous.clone();
+        return Some(loaded.request.clone());
     }
     Some(ProviderContextRequest {
         target,
@@ -231,7 +231,8 @@ fn provider_context_request(
 fn loaded_provider_context(
     loaded: Option<&LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
 ) -> Option<LoadedProviderContext> {
-    let ProviderContextResponse::Found { items } = loaded?.response.as_ref().ok()? else {
+    let loaded = loaded?;
+    let ProviderContextResponse::Found { items } = loaded.response.as_ref().ok()? else {
         return None;
     };
     let id = items.first()?.context_target.clone();
@@ -240,7 +241,11 @@ fn loaded_provider_context(
         .filter(|item| item.context_target == id)
         .map(|item| format!("{NODE_TARGET_PREFIX}{}", item.node.id))
         .collect();
-    Some(LoadedProviderContext { id, targets })
+    Some(LoadedProviderContext {
+        request: loaded.request.clone(),
+        id,
+        targets,
+    })
 }
 
 fn use_panel_selection() -> RwSignal<PanelSelection> {
@@ -1605,12 +1610,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_context_request_reuses_loaded_context_for_node_selection() {
-        let previous = Some(ProviderContextRequest {
+    fn provider_context_request_reuses_the_request_that_loaded_the_context() {
+        let cached_request = ProviderContextRequest {
             target: "detail-first".to_owned(),
             context: None,
-        });
+        };
         let loaded = LoadedProviderContext {
+            request: cached_request.clone(),
             id: "detail-root-context-branch".to_owned(),
             targets: vec!["detail-first".to_owned(), "detail-second".to_owned()],
         };
@@ -1618,27 +1624,25 @@ mod tests {
         assert_eq!(
             provider_context_request(
                 PanelSelection {
-                    target: Some("detail-second".to_owned()),
-                    context: Some(loaded.id.clone()),
-                },
-                Some(&loaded),
-                Some(&previous),
-            ),
-            previous
-        );
-        assert_eq!(
-            provider_context_request(
-                PanelSelection {
                     target: Some("detail-outside".to_owned()),
                     context: Some(loaded.id.clone()),
                 },
                 Some(&loaded),
-                Some(&previous),
             ),
             Some(ProviderContextRequest {
                 target: "detail-outside".to_owned(),
-                context: Some(loaded.id),
+                context: Some(loaded.id.clone()),
             })
+        );
+        assert_eq!(
+            provider_context_request(
+                PanelSelection {
+                    target: Some("detail-second".to_owned()),
+                    context: Some(loaded.id.clone()),
+                },
+                Some(&loaded),
+            ),
+            Some(cached_request)
         );
     }
 
@@ -1669,6 +1673,7 @@ mod tests {
         assert_eq!(
             loaded_provider_context(Some(&loaded)),
             Some(LoadedProviderContext {
+                request: loaded.request,
                 id: "detail-root-context-branch".to_owned(),
                 targets: vec!["detail-first".to_owned()],
             })
