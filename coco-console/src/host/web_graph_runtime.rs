@@ -2360,15 +2360,17 @@ mod tests {
 
     use coco_mem::{
         Anchor, BranchStore, Kind, MergeParent, NewNode, NewNodeContent, NodeStore, PromptAnchor,
-        Role, SqliteStore, ToolResult, ToolUse,
+        Role, SessionAnchor, SessionRole, SqliteStore, ToolResult, ToolUse,
     };
-    use diesel::Connection;
     use diesel::connection::SimpleConnection;
+    use diesel::sql_types::{Integer, Text};
     use diesel::sqlite::SqliteConnection;
+    use diesel::{Connection, RunQueryDsl};
     use tokio::time::timeout;
 
     use super::*;
     use crate::host::store::ConsoleStore;
+    use crate::host::web_graph_store::LAYOUT_VERSION;
 
     struct FuzzRng(u64);
 
@@ -3229,6 +3231,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v4_layout_rebuild_backfills_historical_provider_context() {
+        const PREVIOUS_LAYOUT_VERSION: u32 = 4;
+
+        assert_eq!(LAYOUT_VERSION, 5);
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let historical_session = append_session_anchor(&writer, &root, "historical").await;
+        let historical_anchor = append_anchor(
+            &writer,
+            &historical_session,
+            Vec::new(),
+            "historical prompt",
+        )
+        .await;
+        let current_session = append_session_anchor(&writer, &historical_anchor, "current").await;
+        let head = append_text(&writer, &current_session, "current context").await;
+        writer.fork("main", &head).await.unwrap();
+
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        assert!(
+            runtime
+                .provider_context_for_node(&historical_anchor, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let derived_path = runtime.store.path().to_owned();
+        drop(runtime);
+
+        let mut connection = SqliteConnection::establish(derived_path.to_str().unwrap()).unwrap();
+        diesel::sql_query("UPDATE web_graph_state SET layout_version = ?")
+            .bind::<Integer, _>(i32::try_from(PREVIOUS_LAYOUT_VERSION).unwrap())
+            .execute(&mut connection)
+            .unwrap();
+        diesel::sql_query("DELETE FROM web_graph_provider_contexts WHERE node_id = ?")
+            .bind::<Text, _>(&historical_anchor)
+            .execute(&mut connection)
+            .unwrap();
+        drop(connection);
+
+        let stale = WebGraphStore::open(writer.store_path()).await.unwrap();
+        assert_eq!(
+            stale.state().await.unwrap().unwrap().layout_version,
+            PREVIOUS_LAYOUT_VERSION
+        );
+        assert_eq!(
+            stale
+                .provider_context_selection(&historical_anchor, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            None
+        );
+        drop(stale);
+
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        let reset = runtime.store.state().await.unwrap().unwrap();
+        assert_eq!(reset.layout_version, LAYOUT_VERSION);
+        assert_eq!(reset.source_cursor, None);
+        runtime.catch_up().await.unwrap();
+
+        let selection = runtime
+            .provider_context_for_node(&historical_anchor, None)
+            .await
+            .unwrap()
+            .expect("historical provider context should be rebuilt");
+        let node_ids = selection
+            .context
+            .nodes
+            .iter()
+            .map(|node| node.node.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            node_ids,
+            [historical_anchor.as_str(), historical_session.as_str()]
+        );
+        assert!(
+            runtime
+                .node_points(ViewMode::Anchors, &[historical_anchor])
+                .await
+                .unwrap()
+                .contains_key(&selection.selected_id)
+        );
+    }
+
+    #[tokio::test]
     async fn restart_reflows_nodes_persisted_before_source_cursor_advances() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
@@ -4084,6 +4178,34 @@ mod tests {
                     PromptAnchor {
                         prompt: prompt.to_owned(),
                         attachments: Vec::new(),
+                    },
+                )),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn append_session_anchor(store: &impl NodeStore, parent: &str, prompt: &str) -> String {
+        store
+            .append(NewNode {
+                parent: parent.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::session(
+                    Vec::new(),
+                    SessionAnchor {
+                        role: SessionRole::Orchestrator,
+                        provider_profile: None,
+                        provider: Some("openai".to_owned()),
+                        model: "test-model".to_owned(),
+                        tools: Vec::new(),
+                        system_prompt: format!("{prompt} system prompt"),
+                        prompt: prompt.to_owned(),
+                        temperature: None,
+                        max_tokens: None,
+                        additional_params: None,
+                        enable_coco_shim: false,
+                        active_skill: None,
                     },
                 )),
             })
