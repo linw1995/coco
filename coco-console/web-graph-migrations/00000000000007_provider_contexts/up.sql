@@ -1,7 +1,7 @@
 CREATE TABLE web_graph_provider_branch_history (
     change_id BIGINT NOT NULL CHECK (change_id > 0),
     graph_revision BIGINT NOT NULL CHECK (graph_revision >= 0),
-    branch_name TEXT NOT NULL CHECK (length(branch_name) > 0),
+    branch_name TEXT NOT NULL,
     head_node_id TEXT CHECK (head_node_id IS NULL OR length(head_node_id) > 0),
     PRIMARY KEY (change_id, branch_name)
 );
@@ -10,7 +10,7 @@ CREATE INDEX web_graph_provider_branch_history_branch_change_idx
     ON web_graph_provider_branch_history(branch_name, change_id DESC);
 
 CREATE TABLE web_graph_provider_contexts (
-    branch_name TEXT NOT NULL CHECK (length(branch_name) > 0),
+    branch_name TEXT NOT NULL,
     branch_head_node_id TEXT NOT NULL CHECK (length(branch_head_node_id) > 0),
     context_id TEXT NOT NULL,
     head_created_at_seconds BIGINT,

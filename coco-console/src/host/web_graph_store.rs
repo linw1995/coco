@@ -594,10 +594,11 @@ impl WebGraphStore {
         use diesel_async::RunQueryDsl;
 
         if change_id <= 0 {
-            return Err(Error::InvalidValue {
+            return InvalidValueSnafu {
                 column: "web_graph_provider_branch_history.change_id",
                 value: change_id.to_string(),
-            });
+            }
+            .fail();
         }
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
@@ -3351,8 +3352,8 @@ mod tests {
                 node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
             }],
         };
-        let empty = ProviderContextBranchProjection {
-            branch: "empty".to_owned(),
+        let without_contexts = ProviderContextBranchProjection {
+            branch: String::new(),
             head_node_id: "a".to_owned(),
             contexts: Vec::new(),
         };
@@ -3360,7 +3361,7 @@ mod tests {
             .apply_provider_context_branches(
                 Revision::new(1),
                 Revision::new(2),
-                &[main.clone(), empty],
+                &[main.clone(), without_contexts],
                 &[],
             )
             .await
@@ -3375,14 +3376,14 @@ mod tests {
         assert_eq!(
             heads.value.projected_heads,
             BTreeMap::from([
-                ("empty".to_owned(), "a".to_owned()),
+                (String::new(), "a".to_owned()),
                 ("main".to_owned(), "c".to_owned()),
             ])
         );
         assert_eq!(
             heads.value.history_heads,
             BTreeMap::from([
-                ("empty".to_owned(), Some("a".to_owned())),
+                (String::new(), Some("a".to_owned())),
                 ("main".to_owned(), Some("c".to_owned())),
             ])
         );
@@ -3404,7 +3405,7 @@ mod tests {
                 Revision::new(2),
                 Revision::new(3),
                 &[],
-                &["empty".to_owned(), "main".to_owned()],
+                &[String::new(), "main".to_owned()],
             )
             .await
             .unwrap()
