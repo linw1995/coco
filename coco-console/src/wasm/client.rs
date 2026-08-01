@@ -3041,17 +3041,13 @@ fn detail_url(window: &Window, hash: &str) -> Result<String, JsValue> {
 
 fn detail_hash(selection: &PanelSelection) -> Option<String> {
     let target = selection.target.as_deref()?;
-    let target = encode_url_component(target);
+    let target = percent_encode(target);
     let context = selection
         .context
         .as_deref()
-        .map(|context| format!("?context={}", encode_url_component(context)))
+        .map(|context| format!("?context={}", percent_encode(context)))
         .unwrap_or_default();
     Some(format!("#{target}{context}"))
-}
-
-fn encode_url_component(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
