@@ -535,6 +535,7 @@ dependencies = [
  "js-sys",
  "leptos",
  "leptos_axum",
+ "send_wrapper",
  "serde",
  "serde_json",
  "sha2 0.11.0",

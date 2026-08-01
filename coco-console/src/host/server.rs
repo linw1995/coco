@@ -45,6 +45,7 @@ use crate::host::web_graph_view::{
 const STYLE_CSS: &str = include_str!("style.css");
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.html");
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT: usize = 16;
 
 struct ClientAsset {
     path: &'static str,
@@ -79,6 +80,12 @@ trait PanelDataSource: Send + Sync {
         context: Option<String>,
         graph_mode: String,
     ) -> Result<ProviderContextResponse>;
+
+    async fn provider_context_items(
+        &self,
+        node_ids: Vec<String>,
+        graph_mode: String,
+    ) -> Result<Vec<ProviderContextItem>>;
 }
 
 #[derive(Clone)]
@@ -119,6 +126,16 @@ impl PanelServerContext {
             .provider_context(target, context, graph_mode)
             .await
     }
+
+    pub async fn provider_context_items(
+        &self,
+        node_ids: Vec<String>,
+        graph_mode: String,
+    ) -> Result<Vec<ProviderContextItem>> {
+        self.source
+            .provider_context_items(node_ids, graph_mode)
+            .await
+    }
 }
 
 #[async_trait]
@@ -152,6 +169,14 @@ where
             view_mode_from_value(&graph_mode),
         )
         .await
+    }
+
+    async fn provider_context_items(
+        &self,
+        node_ids: Vec<String>,
+        graph_mode: String,
+    ) -> Result<Vec<ProviderContextItem>> {
+        load_provider_context_items(self, &node_ids, view_mode_from_value(&graph_mode)).await
     }
 }
 
@@ -691,30 +716,58 @@ where
         .provider_context_for_node(&node.id, context)
         .await?;
     let Some(selection) = selection else {
-        return Ok(ProviderContextResponse::Found { items: Vec::new() });
+        return Ok(ProviderContextResponse::Found {
+            context_target: context.unwrap_or_default().to_owned(),
+            selected_id: node.id,
+            node_ids: Vec::new(),
+            initial_items: Vec::new(),
+        });
     };
-    let node_ids = selection
-        .context
-        .nodes
+    let node_ids = selection.context.node_ids;
+    let initial_node_ids = initial_provider_context_node_ids(&node_ids, &selection.selected_id);
+    let initial_items = load_provider_context_items(state, &initial_node_ids, view_mode).await?;
+    Ok(ProviderContextResponse::Found {
+        context_target: selection.context.id,
+        selected_id: selection.selected_id,
+        node_ids,
+        initial_items,
+    })
+}
+
+fn initial_provider_context_node_ids(node_ids: &[String], selected_id: &str) -> Vec<String> {
+    let mut initial = node_ids
         .iter()
-        .map(|node| node.node.id.clone())
+        .take(PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT)
+        .cloned()
         .collect::<Vec<_>>();
-    let points = state.web_graph.node_points(view_mode, &node_ids).await?;
-    let items = selection
-        .context
-        .nodes
+    if !initial.iter().any(|node_id| node_id == selected_id)
+        && node_ids.iter().any(|node_id| node_id == selected_id)
+    {
+        initial.push(selected_id.to_owned());
+    }
+    initial
+}
+
+async fn load_provider_context_items<S>(
+    state: &AppState<S>,
+    node_ids: &[String],
+    view_mode: ViewMode,
+) -> Result<Vec<ProviderContextItem>>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let nodes = state.web_graph.provider_context_nodes(node_ids).await?;
+    let points = state.web_graph.node_points(view_mode, node_ids).await?;
+    Ok(nodes
         .into_iter()
         .map(|node| ProviderContextItem {
-            context_target: selection.context.id.clone(),
-            selected: node.node.id == selection.selected_id,
-            point: points.get(&node.node.id).map(|point| ApiPoint {
+            point: points.get(&node.id).map(|point| ApiPoint {
                 x: point.x,
                 y: point.y,
             }),
-            node: provider_context_node(node.node),
+            node: provider_context_node(node),
         })
-        .collect();
-    Ok(ProviderContextResponse::Found { items })
+        .collect())
 }
 
 fn provider_context_node(node: NodeView) -> ProviderContextNode {
@@ -1892,8 +1945,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let mut head_id = selected_id.clone();
+        for index in 0..20 {
+            head_id = store
+                .append(NewNode {
+                    parent: head_id,
+                    role: Role::LLM,
+                    metadata: None,
+                    kind: Kind::Text(format!("deferred provider context {index}")),
+                })
+                .await
+                .unwrap();
+        }
         store
-            .set_branch_head("main", &session_id, &selected_id)
+            .set_branch_head("main", &session_id, &head_id)
             .await
             .unwrap();
         let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
@@ -1913,24 +1978,61 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("\"content\":"));
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
-        let ProviderContextResponse::Found { items } = response else {
+        let ProviderContextResponse::Found {
+            selected_id: response_selected_id,
+            node_ids,
+            initial_items,
+            ..
+        } = response
+        else {
             panic!("provider context should be found");
         };
-        let selected = items
+        assert_eq!(response_selected_id, selected_id);
+        assert_eq!(node_ids.len(), 22);
+        assert_eq!(initial_items.len(), PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT + 1);
+        let selected = initial_items
             .iter()
-            .find(|item| item.selected)
+            .find(|item| item.node.id == selected_id)
             .expect("selected provider context item should exist");
         assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
+        let deferred_id = node_ids[PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT].clone();
+        assert!(!initial_items.iter().any(|item| item.node.id == deferred_id));
+        let deferred =
+            load_provider_context_items(&state, std::slice::from_ref(&deferred_id), ViewMode::All)
+                .await
+                .unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].node.id, deferred_id);
+        assert!(
+            !String::from_utf8_lossy(&body).contains(deferred[0].node.summary.as_str()),
+            "the initial response should not serialize deferred node details"
+        );
 
-        for target_ref in ["main", &selected_id[..16]] {
+        let request = Request::builder()
+            .uri(format!(
+                "/api/panels/provider-context-items?node_ids[0]={deferred_id}&graph_mode=all"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = panel_server_function(State(state.clone()), request).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let deferred_from_server_fn: Vec<ProviderContextItem> =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(deferred_from_server_fn, deferred);
+
+        for (target_ref, expected_selected_id) in [
+            ("main", head_id.as_str()),
+            (&selected_id[..16], selected_id.as_str()),
+        ] {
             let response =
                 load_provider_context(&state, &node_target_id(target_ref), None, ViewMode::All)
                     .await
                     .unwrap();
             assert!(matches!(
                 response,
-                ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+                ProviderContextResponse::Found { selected_id: response_selected_id, .. }
+                    if response_selected_id == expected_selected_id
             ));
         }
 
@@ -1946,7 +2048,8 @@ mod tests {
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         assert!(matches!(
             response,
-            ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+            ProviderContextResponse::Found { selected_id: response_selected_id, .. }
+                if response_selected_id == selected_id
         ));
     }
 

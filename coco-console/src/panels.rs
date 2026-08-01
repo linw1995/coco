@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use coco_types::{
     AnchorPayload, Kind, Node, PromptAttachment, SessionAnchor, SessionAnchorPatch,
@@ -67,7 +67,10 @@ struct LoadedProviderContext {
 
 enum PanelDetailPayload {
     Node(NodeDetailResponse),
-    Provider(ProviderContextResponse),
+    Provider {
+        response: ProviderContextResponse,
+        graph_mode: String,
+    },
 }
 
 #[cfg_attr(not(test), leptos::prelude::lazy(panel_detail))]
@@ -78,17 +81,21 @@ async fn render_panel_detail(payload: PanelDetailPayload) -> AnyView {
 fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
     match payload {
         PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
-        PanelDetailPayload::Provider(response) => {
-            view! { <LazyProviderContextContent response/> }.into_any()
-        }
+        PanelDetailPayload::Provider {
+            response,
+            graph_mode,
+        } => view! { <LazyProviderContextContent response graph_mode/> }.into_any(),
     }
 }
 
 #[component]
-fn LazyProviderContextContent(response: ProviderContextResponse) -> impl IntoView {
+fn LazyProviderContextContent(
+    response: ProviderContextResponse,
+    graph_mode: String,
+) -> impl IntoView {
     #[cfg(target_arch = "wasm32")]
     Effect::new(client::notify_provider_context_rendered);
-    view! { <ProviderContextContent response/> }
+    view! { <ProviderContextContent response graph_mode/> }
 }
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
@@ -126,6 +133,22 @@ async fn load_provider_context(
     let server = expect_context::<crate::host::PanelServerContext>();
     server
         .provider_context(target, context, graph_mode)
+        .await
+        .map_err(|error| ServerFnError::ServerError(error.to_string()))
+}
+
+#[server(
+    prefix = "/api/panels",
+    endpoint = "provider-context-items",
+    input = GetUrl
+)]
+async fn load_provider_context_items(
+    node_ids: Vec<String>,
+    graph_mode: String,
+) -> Result<Vec<ProviderContextItem>, ServerFnError> {
+    let server = expect_context::<crate::host::PanelServerContext>();
+    server
+        .provider_context_items(node_ids, graph_mode)
         .await
         .map_err(|error| ServerFnError::ServerError(error.to_string()))
 }
@@ -182,9 +205,10 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     let provider_request = Memo::new(move |_| {
         provider_context_request(selection.get(), loaded_context.get().as_ref())
     });
+    let resource_graph_mode = graph_mode.clone();
     let provider_context = LocalResource::new(move || {
         let request = provider_request.get();
-        let graph_mode = graph_mode.clone();
+        let graph_mode = resource_graph_mode.clone();
         async move {
             let request = request?;
             let response =
@@ -205,6 +229,7 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
                 provider_context_view(
                     provider_request.get(),
                     provider_context.get().flatten(),
+                    graph_mode.clone(),
                 )
             }}
         </div>
@@ -232,18 +257,24 @@ fn loaded_provider_context(
     loaded: Option<&LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
 ) -> Option<LoadedProviderContext> {
     let loaded = loaded?;
-    let ProviderContextResponse::Found { items } = loaded.response.as_ref().ok()? else {
+    let ProviderContextResponse::Found {
+        context_target,
+        node_ids,
+        ..
+    } = loaded.response.as_ref().ok()?
+    else {
         return None;
     };
-    let id = items.first()?.context_target.clone();
-    let targets = items
+    if node_ids.is_empty() {
+        return None;
+    }
+    let targets = node_ids
         .iter()
-        .filter(|item| item.context_target == id)
-        .map(|item| format!("{NODE_TARGET_PREFIX}{}", item.node.id))
+        .map(|node_id| format!("{NODE_TARGET_PREFIX}{node_id}"))
         .collect();
     Some(LoadedProviderContext {
         request: loaded.request.clone(),
-        id,
+        id: context_target.clone(),
         targets,
     })
 }
@@ -291,13 +322,16 @@ fn node_detail_view(
 fn provider_context_view(
     current: Option<ProviderContextRequest>,
     loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
+    graph_mode: String,
 ) -> AnyView {
     match (current.as_ref(), loaded) {
         (None, _) => view! { <ProviderContextDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => {
-                Suspend::new(render_panel_detail(PanelDetailPayload::Provider(response))).into_any()
-            }
+            Ok(response) => Suspend::new(render_panel_detail(PanelDetailPayload::Provider {
+                response,
+                graph_mode,
+            }))
+            .into_any(),
             Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
         },
         _ => view! { <ProviderContextLoading/> }.into_any(),
@@ -1424,15 +1458,27 @@ fn NodeDetailError(error: String) -> impl IntoView {
 }
 
 #[component]
-fn ProviderContextContent(response: ProviderContextResponse) -> AnyView {
+fn ProviderContextContent(response: ProviderContextResponse, graph_mode: String) -> AnyView {
     match response {
         ProviderContextResponse::Default => view! { <ProviderContextDefault/> }.into_any(),
         ProviderContextResponse::Missing { target } => {
             view! { <ProviderContextMissing target=target/> }.into_any()
         }
-        ProviderContextResponse::Found { items } => {
-            view! { <ProviderContextList items=items/> }.into_any()
+        ProviderContextResponse::Found {
+            context_target,
+            selected_id,
+            node_ids,
+            initial_items,
+        } => view! {
+            <ProviderContextList
+                context_target
+                selected_id
+                node_ids
+                initial_items
+                graph_mode
+            />
         }
+        .into_any(),
     }
 }
 
@@ -1457,8 +1503,14 @@ fn ProviderContextLoading() -> impl IntoView {
 }
 
 #[component]
-fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
-    if items.is_empty() {
+fn ProviderContextList(
+    context_target: String,
+    selected_id: String,
+    node_ids: Vec<String>,
+    initial_items: Vec<ProviderContextItem>,
+    graph_mode: String,
+) -> AnyView {
+    if node_ids.is_empty() {
         view! {
             <section class="provider-context-section">
                 <h2>"Provider Context"</h2>
@@ -1467,11 +1519,29 @@ fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
         }
         .into_any()
     } else {
+        let mut initial_items = initial_items
+            .into_iter()
+            .map(|item| (item.node.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
         view! {
             <section class="provider-context-section">
                 <h2>"Provider Context"</h2>
                 <ol class="provider-context-list">
-                    {items.into_iter().map(|item| view! { <ProviderContextRow item=item/> }).collect::<Vec<_>>()}
+                    {node_ids
+                        .into_iter()
+                        .map(|node_id| {
+                            let initial_item = initial_items.remove(&node_id);
+                            view! {
+                                <ProviderContextRow
+                                    context_target=context_target.clone()
+                                    selected=node_id == selected_id
+                                    node_id
+                                    initial_item
+                                    graph_mode=graph_mode.clone()
+                                />
+                            }
+                        })
+                        .collect::<Vec<_>>()}
                 </ol>
             </section>
         }
@@ -1480,11 +1550,89 @@ fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
 }
 
 #[component]
-fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
-    let visible = item.point.is_some();
-    let class = provider_context_node_class(visible, item.selected);
-    let node_target = format!("{NODE_TARGET_PREFIX}{}", item.node.id);
-    let target = format!("#{node_target}?context={}", item.context_target);
+fn ProviderContextRow(
+    context_target: String,
+    selected: bool,
+    node_id: String,
+    initial_item: Option<ProviderContextItem>,
+    graph_mode: String,
+) -> impl IntoView {
+    let row_ref = NodeRef::<leptos::html::Li>::new();
+    let item = RwSignal::new(initial_item);
+    let should_load = RwSignal::new(false);
+    #[cfg(target_arch = "wasm32")]
+    if item.get_untracked().is_none() {
+        client::load_provider_context_row_when_visible(row_ref, should_load);
+    }
+
+    let loaded_item = LocalResource::new({
+        let node_id = node_id.clone();
+        move || {
+            let should_load = should_load.get();
+            let node_id = node_id.clone();
+            let graph_mode = graph_mode.clone();
+            async move {
+                if !should_load || item.get_untracked().is_some() {
+                    return None;
+                }
+                Some(
+                    load_provider_context_items(vec![node_id], graph_mode)
+                        .await
+                        .map_err(|error| error.to_string()),
+                )
+            }
+        }
+    });
+    Effect::new(move || {
+        let Some(Some(Ok(items))) = loaded_item.get() else {
+            return;
+        };
+        if let Some(loaded) = items.into_iter().next() {
+            item.set(Some(loaded));
+            #[cfg(target_arch = "wasm32")]
+            client::notify_provider_context_rendered();
+        }
+    });
+
+    let class = move || {
+        provider_context_node_class(
+            item.with(|item| item.as_ref().is_some_and(|item| item.point.is_some())),
+            selected,
+        )
+    };
+    let content =
+        move || provider_context_row_content(&context_target, &node_id, selected, item.get());
+
+    view! {
+        <li node_ref=row_ref class=class>{content}</li>
+    }
+}
+
+fn provider_context_row_content(
+    context_target: &str,
+    node_id: &str,
+    selected: bool,
+    item: Option<ProviderContextItem>,
+) -> AnyView {
+    let node_target = format!("{NODE_TARGET_PREFIX}{node_id}");
+    let target = format!("#{node_target}?context={context_target}");
+    let Some(item) = item else {
+        return view! {
+            <a
+                class="provider-context-node-link provider-context-node-placeholder"
+                href=target
+                data-node-target=node_target
+                aria-current=selected.then_some("true")
+                aria-busy="true"
+            >
+                <div class="provider-context-node-head">
+                    <span>{provider_context_short_id(node_id)}</span>
+                </div>
+                <p>"Loading node summary..."</p>
+            </a>
+        }
+        .into_any();
+    };
     let graph_point = item
         .point
         .map(|point| {
@@ -1502,24 +1650,27 @@ fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
         .collect::<Vec<_>>();
 
     view! {
-        <li class=class>
-            <a
-                class="provider-context-node-link"
-                href=target
-                data-node-target=node_target
-                aria-current=item.selected.then_some("true")
-            >
-                {graph_point}
-                <div class="provider-context-node-head">
-                    <span>{item.node.short_id}</span>
-                    <span>{item.node.kind}</span>
-                    <span>{item.node.role}</span>
-                </div>
-                <time>{item.node.created_at}</time>
-                <p>{item.node.summary}</p>
-            </a>
-        </li>
+        <a
+            class="provider-context-node-link"
+            href=target
+            data-node-target=node_target
+            aria-current=selected.then_some("true")
+        >
+            {graph_point}
+            <div class="provider-context-node-head">
+                <span>{item.node.short_id}</span>
+                <span>{item.node.kind}</span>
+                <span>{item.node.role}</span>
+            </div>
+            <time>{item.node.created_at}</time>
+            <p>{item.node.summary}</p>
+        </a>
     }
+    .into_any()
+}
+
+fn provider_context_short_id(node_id: &str) -> String {
+    node_id.chars().take(12).collect()
 }
 
 fn provider_context_node_class(visible: bool, selected: bool) -> &'static str {
@@ -1654,8 +1805,10 @@ mod tests {
                 context: None,
             },
             response: Ok(ProviderContextResponse::Found {
-                items: vec![ProviderContextItem {
-                    context_target: "detail-root-context-branch".to_owned(),
+                context_target: "detail-root-context-branch".to_owned(),
+                selected_id: "first".to_owned(),
+                node_ids: vec!["first".to_owned()],
+                initial_items: vec![ProviderContextItem {
                     node: ProviderContextNode {
                         id: "first".to_owned(),
                         short_id: "first".to_owned(),
@@ -1664,7 +1817,6 @@ mod tests {
                         created_at: "2026-08-01T00:00:00Z".to_owned(),
                         summary: "First".to_owned(),
                     },
-                    selected: true,
                     point: None,
                 }],
             }),
@@ -1762,6 +1914,7 @@ mod tests {
                 },
                 response: Ok(ProviderContextResponse::Default),
             }),
+            "all".to_owned(),
         )
         .to_html();
 
@@ -1781,9 +1934,15 @@ mod tests {
             tool_input_json_highlights: Vec::new(),
         }))
         .to_html();
-        let provider = panel_detail_view(PanelDetailPayload::Provider(
-            ProviderContextResponse::Found { items: Vec::new() },
-        ))
+        let provider = panel_detail_view(PanelDetailPayload::Provider {
+            response: ProviderContextResponse::Found {
+                context_target: String::new(),
+                selected_id: String::new(),
+                node_ids: Vec::new(),
+                initial_items: Vec::new(),
+            },
+            graph_mode: "all".to_owned(),
+        })
         .to_html();
         let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
         let provider_error =
@@ -1796,6 +1955,41 @@ mod tests {
         assert!(node_error.contains("node failed"));
         assert!(provider_error.contains("Failed to load provider context."));
         assert!(provider_error.contains("provider failed"));
+    }
+
+    #[test]
+    fn provider_context_ssr_renders_initial_items_and_deferred_id_placeholders() {
+        let owner = Owner::new();
+        owner.set();
+        let initial_id = "11111111111111111111111111111111";
+        let deferred_id = "22222222222222222222222222222222";
+        let provider = view! {
+            <ProviderContextContent
+                graph_mode="all".to_owned()
+                response=ProviderContextResponse::Found {
+                    context_target: "detail-context".to_owned(),
+                    selected_id: initial_id.to_owned(),
+                    node_ids: vec![initial_id.to_owned(), deferred_id.to_owned()],
+                    initial_items: vec![ProviderContextItem {
+                        node: ProviderContextNode {
+                            id: initial_id.to_owned(),
+                            short_id: "111111111111".to_owned(),
+                            kind: "text".to_owned(),
+                            role: "user".to_owned(),
+                            created_at: "2026-08-01T00:00:00Z".to_owned(),
+                            summary: "Server-rendered summary".to_owned(),
+                        },
+                        point: None,
+                    }],
+                }
+            />
+        }
+        .to_html();
+
+        assert!(provider.contains("Server-rendered summary"));
+        assert!(provider.contains(deferred_id));
+        assert!(provider.contains("Loading node summary..."));
+        assert!(provider.contains("aria-busy=\"true\""));
     }
 
     #[test]

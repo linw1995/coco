@@ -4,6 +4,8 @@ use leptos::{
     ev,
     leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
 };
+use send_wrapper::SendWrapper;
+use wasm_bindgen::{JsCast, closure::Closure};
 
 const MOBILE_VIEWPORT_MAX_WIDTH: i32 = 1024;
 const GRAPH_REVISION_EVENT: &str = "coco-graph-revision";
@@ -27,6 +29,40 @@ pub fn subscribe_to_graph_revision(revision: RwSignal<u64>) {
         },
     );
     on_cleanup(move || listener.remove());
+}
+
+pub fn load_provider_context_row_when_visible(
+    row: NodeRef<leptos::html::Li>,
+    should_load: RwSignal<bool>,
+) {
+    Effect::new(move || {
+        let Some(row) = row.get() else {
+            return;
+        };
+        let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+            mark_provider_context_row_visible(&entries, should_load);
+        });
+        let Ok(observer) = web_sys::IntersectionObserver::new(callback.as_ref().unchecked_ref())
+        else {
+            should_load.set(true);
+            return;
+        };
+        observer.observe(&row);
+        let cleanup = SendWrapper::new((observer, callback));
+        on_cleanup(move || {
+            cleanup.0.disconnect();
+        });
+    });
+}
+
+fn mark_provider_context_row_visible(entries: &js_sys::Array, should_load: RwSignal<bool>) {
+    for entry in entries.iter() {
+        let entry = entry.unchecked_into::<web_sys::IntersectionObserverEntry>();
+        if entry.is_intersecting() {
+            should_load.set(true);
+            break;
+        }
+    }
 }
 
 fn current_panel_selection() -> PanelSelection {
@@ -97,6 +133,22 @@ mod tests {
         notify_graph_revision();
 
         assert_eq!(revision.get_untracked(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn provider_context_intersection_marks_the_row_for_loading() {
+        _ = any_spawner::Executor::init_wasm_bindgen();
+        let owner = Owner::new();
+        owner.set();
+        let should_load = RwSignal::new(false);
+        let entry = js_sys::Object::new();
+        js_sys::Reflect::set(&entry, &JsValue::from_str("isIntersecting"), &JsValue::TRUE)
+            .expect_throw("intersection state should be set");
+        let entries = js_sys::Array::of1(&entry);
+
+        mark_provider_context_row_visible(&entries, should_load);
+
+        assert!(should_load.get_untracked());
     }
 
     #[wasm_bindgen_test]
