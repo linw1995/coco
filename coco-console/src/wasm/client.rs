@@ -140,15 +140,10 @@ impl AnchorRangeSelection {
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
-    if let Some(window) = web_sys::window() {
-        match legacy_detail_url(&window) {
-            Ok(Some(url)) => match window.location().replace(&url) {
-                Ok(()) => return,
-                Err(error) => web_sys::console::error_1(&error),
-            },
-            Ok(None) => {}
-            Err(error) => web_sys::console::error_1(&error),
-        }
+    match redirect_legacy_detail_url() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => web_sys::console::error_1(&error),
     }
     leptos::mount::hydrate_islands();
     spawn_local(async {
@@ -156,6 +151,17 @@ pub fn hydrate() {
             web_sys::console::error_1(&error);
         }
     });
+}
+
+fn redirect_legacy_detail_url() -> Result<bool, JsValue> {
+    let Some(window) = web_sys::window() else {
+        return Ok(false);
+    };
+    let Some(url) = legacy_detail_url(&window)? else {
+        return Ok(false);
+    };
+    window.location().replace(&url)?;
+    Ok(true)
 }
 
 async fn run() -> Result<(), JsValue> {
