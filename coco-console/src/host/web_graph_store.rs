@@ -21,7 +21,7 @@ const DATABASE_FILE_NAME: &str = "web-graph.sqlite3";
 const WRITE_BATCH_SIZE: usize = 64;
 const MAX_READ_BATCH_SIZE: usize = 128;
 // This version covers every source-derived projection stored alongside the layouts.
-const LAYOUT_VERSION: u32 = 3;
+const LAYOUT_VERSION: u32 = 4;
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("web-graph-migrations");
 
 mod database;
