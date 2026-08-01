@@ -289,7 +289,7 @@ jobs:
 
       - name: Restore dependency source layer
         id: source_dependency_cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .container-source-cache/dependencies.tar.gz
           key: container-source-dependencies-v1-${{ steps.source_inspect.outputs.dependency_key }}
