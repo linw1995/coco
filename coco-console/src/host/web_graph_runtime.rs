@@ -3411,7 +3411,7 @@ mod tests {
         assert!(client_diff.removed.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn source_dirty_wakeup_persists_cursor_before_publishing_revision() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
@@ -3518,7 +3518,7 @@ mod tests {
         assert_eq!(second.current_revision(), committed_revision);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn batch_node_event_builds_every_missing_ancestor() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
