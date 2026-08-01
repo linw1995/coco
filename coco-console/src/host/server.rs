@@ -1382,7 +1382,7 @@ mod tests {
             .iter()
             .filter(|asset| asset.path.starts_with("split_") && asset.path.ends_with(".wasm"))
             .collect::<Vec<_>>();
-        assert_eq!(lazy_chunks.len(), 2);
+        assert_eq!(lazy_chunks.len(), 3);
 
         for asset in lazy_chunks {
             assert!(asset.brotli.is_some());
@@ -1434,7 +1434,8 @@ mod tests {
             std::str::from_utf8(client_asset_by_path("__wasm_split_manifest.json").identity)
                 .unwrap();
         assert!(manifest.contains("anchor_range"));
-        assert!(manifest.contains("panel_detail"));
+        assert!(manifest.contains("node_detail"));
+        assert!(manifest.contains("provider_context"));
     }
 
     #[test]

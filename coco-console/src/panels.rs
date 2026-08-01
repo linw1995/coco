@@ -65,23 +65,14 @@ struct LoadedProviderContext {
     targets: Vec<String>,
 }
 
-enum PanelDetailPayload {
-    Node(NodeDetailResponse),
-    Provider(ProviderContextResponse),
+#[cfg_attr(not(test), leptos::prelude::lazy(node_detail))]
+async fn render_node_detail(response: NodeDetailResponse) -> AnyView {
+    view! { <NodeDetailContent response/> }.into_any()
 }
 
-#[cfg_attr(not(test), leptos::prelude::lazy(panel_detail))]
-async fn render_panel_detail(payload: PanelDetailPayload) -> AnyView {
-    panel_detail_view(payload)
-}
-
-fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
-    match payload {
-        PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
-        PanelDetailPayload::Provider(response) => {
-            view! { <LazyProviderContextContent response/> }.into_any()
-        }
-    }
+#[cfg_attr(not(test), leptos::prelude::lazy(provider_context))]
+async fn render_provider_context(response: ProviderContextResponse) -> AnyView {
+    view! { <LazyProviderContextContent response/> }.into_any()
 }
 
 #[component]
@@ -182,8 +173,14 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     let provider_request = Memo::new(move |_| {
         provider_context_request(selection.get(), loaded_context.get().as_ref())
     });
+    #[cfg(all(target_arch = "wasm32", not(test)))]
+    let render_preload_started = std::cell::Cell::new(false);
     let provider_context = LocalResource::new(move || {
         let request = provider_request.get();
+        #[cfg(all(target_arch = "wasm32", not(test)))]
+        if request.is_some() && !render_preload_started.replace(true) {
+            let _ = leptos::prelude::lazy_preload!(render_provider_context);
+        }
         let graph_mode = graph_mode.clone();
         async move {
             let request = request?;
@@ -279,9 +276,7 @@ fn node_detail_view(
     match (current.as_ref(), loaded) {
         (None, _) => view! { <NodeDetailDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => {
-                Suspend::new(render_panel_detail(PanelDetailPayload::Node(response))).into_any()
-            }
+            Ok(response) => Suspend::new(render_node_detail(response)).into_any(),
             Err(error) => view! { <NodeDetailError error=error/> }.into_any(),
         },
         _ => view! { <NodeDetailLoading/> }.into_any(),
@@ -295,9 +290,7 @@ fn provider_context_view(
     match (current.as_ref(), loaded) {
         (None, _) => view! { <ProviderContextDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => {
-                Suspend::new(render_panel_detail(PanelDetailPayload::Provider(response))).into_any()
-            }
+            Ok(response) => Suspend::new(render_provider_context(response)).into_any(),
             Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
         },
         _ => view! { <ProviderContextLoading/> }.into_any(),
@@ -1771,19 +1764,23 @@ mod tests {
 
     #[test]
     fn panel_components_render_typed_success_and_error_states() {
-        let node = panel_detail_view(PanelDetailPayload::Node(NodeDetailResponse::Found {
-            node: Box::new(test_node(Kind::Text(
-                "<script>alert(1)</script>".to_owned(),
-            ))),
-            markdown_documents: Vec::new(),
-            tool_use_input_links: Vec::new(),
-            tool_input_shell_highlights: Vec::new(),
-            tool_input_json_highlights: Vec::new(),
-        }))
+        let node = view! {
+            <NodeDetailContent response=NodeDetailResponse::Found {
+                node: Box::new(test_node(Kind::Text(
+                    "<script>alert(1)</script>".to_owned(),
+                ))),
+                markdown_documents: Vec::new(),
+                tool_use_input_links: Vec::new(),
+                tool_input_shell_highlights: Vec::new(),
+                tool_input_json_highlights: Vec::new(),
+            }/>
+        }
         .to_html();
-        let provider = panel_detail_view(PanelDetailPayload::Provider(
-            ProviderContextResponse::Found { items: Vec::new() },
-        ))
+        let provider = view! {
+            <ProviderContextContent response=ProviderContextResponse::Found {
+                items: Vec::new(),
+            }/>
+        }
         .to_html();
         let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
         let provider_error =
