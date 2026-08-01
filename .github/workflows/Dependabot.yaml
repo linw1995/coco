@@ -40,6 +40,7 @@ jobs:
             const allowed = files.every(({ filename }) =>
               filename === "Cargo.lock" ||
               filename === "Cargo.toml" ||
+              filename === "THIRD_PARTY_NOTICES.html" ||
               filename.endsWith("/Cargo.toml")
             );
             if (!allowed) {
@@ -49,7 +50,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.ref }}
 
       - uses: ./.github/actions/setup-nix
         with:
@@ -63,10 +64,15 @@ jobs:
       - name: Commit third-party notices
         id: commit
         env:
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           if git diff --quiet -- THIRD_PARTY_NOTICES.html; then
-            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            if [[ "$(git rev-parse HEAD)" != "${EVENT_HEAD_SHA}" ]]; then
+              echo "dispatch=true" >> "${GITHUB_OUTPUT}"
+            else
+              echo "dispatch=false" >> "${GITHUB_OUTPUT}"
+            fi
             exit 0
           fi
 
@@ -75,10 +81,10 @@ jobs:
           git add THIRD_PARTY_NOTICES.html
           git commit -m "Update third-party notices"
           git push origin "HEAD:${HEAD_REF}"
-          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          echo "dispatch=true" >> "${GITHUB_OUTPUT}"
 
       - name: Run CI for the updated commit
-        if: steps.commit.outputs.changed == 'true'
+        if: steps.commit.outputs.dispatch == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
