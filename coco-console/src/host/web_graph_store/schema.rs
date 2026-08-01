@@ -72,6 +72,27 @@ diesel::table! {
 }
 
 diesel::table! {
+    web_graph_provider_branch_history (change_id, branch_name) {
+        change_id -> BigInt,
+        graph_revision -> BigInt,
+        branch_name -> Text,
+        head_node_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    web_graph_provider_contexts (branch_name, context_id, ordinal) {
+        branch_name -> Text,
+        branch_head_node_id -> Text,
+        context_id -> Text,
+        head_created_at_seconds -> Nullable<BigInt>,
+        head_created_at_nanoseconds -> Nullable<Integer>,
+        ordinal -> BigInt,
+        node_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     web_graph_nodes (node_id) {
         node_id -> Text,
     }
@@ -133,6 +154,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     web_graph_node_spatial_index,
     web_graph_node_spatial_items,
     web_graph_nodes,
+    web_graph_provider_branch_history,
+    web_graph_provider_contexts,
     web_graph_route_spatial_index,
     web_graph_route_spatial_items,
     web_graph_state,

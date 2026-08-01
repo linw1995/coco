@@ -39,8 +39,7 @@ use crate::api::{
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
-    NodeView, ViewMode, node_id_from_target, provider_context_for_node, tool_use_input_links,
-    write_stdin_session_ids,
+    NodeView, ViewMode, node_id_from_target, tool_use_input_links, write_stdin_session_ids,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -687,7 +686,10 @@ where
         }
         Err(source) => return Err(source).context(StoreSnafu),
     };
-    let selection = provider_context_for_node(&state.store, &node.id, context).await?;
+    let selection = state
+        .web_graph
+        .provider_context_for_node(&node.id, context)
+        .await?;
     let Some(selection) = selection else {
         return Ok(ProviderContextResponse::Found { items: Vec::new() });
     };
@@ -1920,6 +1922,17 @@ mod tests {
             .expect("selected provider context item should exist");
         assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
+
+        for target_ref in ["main", &selected_id[..16]] {
+            let response =
+                load_provider_context(&state, &node_target_id(target_ref), None, ViewMode::All)
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                response,
+                ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+            ));
+        }
 
         let request = Request::builder()
             .uri(format!(

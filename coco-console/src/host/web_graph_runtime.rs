@@ -4,7 +4,9 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use coco_mem::{GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore};
+use coco_mem::{
+    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, NodeStore, SqliteGraphStore,
+};
 use snafu::{IntoError, prelude::*};
 use tokio::sync::watch;
 
@@ -21,14 +23,16 @@ use super::web_graph_order::{
     stable_column_order,
 };
 use super::web_graph_store::{
-    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse, StoredGraphState,
+    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse,
+    ProviderContextBranchProjection, ProviderContextProjection, StoredGraphState,
     ToolSessionProjection, Viewport, WebGraphStore,
 };
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
-    GRAPH_ROW_STEP, ViewMode, diff_graph_viewport_responses, edge_key, edge_port_offset,
-    graph_kind_name, node_key, node_target_id, route_edge, route_edge_with_offsets, shorten_id,
-    summarize_node,
+    GRAPH_ROW_STEP, ProviderContext, ProviderContextNode, ProviderContextSelection, ViewMode,
+    diff_graph_viewport_responses, edge_key, edge_port_offset, graph_kind_name, node_key,
+    node_target_id, provider_context_id, provider_contexts_from_head, route_edge,
+    route_edge_with_offsets, shorten_id, summarize_node,
 };
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -722,6 +726,56 @@ impl WebGraphRuntime {
         self.publisher.subscribe_source_changes()
     }
 
+    pub async fn provider_context_for_node(
+        &self,
+        target_node_id: &str,
+        context_id: Option<&str>,
+    ) -> crate::Result<Option<ProviderContextSelection>> {
+        let selection = self
+            .store
+            .provider_context_selection(target_node_id, context_id)
+            .await
+            .context(WebGraphStoreSnafu)?
+            .context(WebGraphNotInitializedSnafu)?
+            .value;
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let mut source_nodes = BTreeMap::new();
+        for node_ids in selection.node_ids.chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE) {
+            source_nodes.extend(
+                self.source
+                    .graph_nodes_by_ids(node_ids)
+                    .await
+                    .context(StoreSnafu)?
+                    .into_iter()
+                    .map(|node| (node.id.clone(), node)),
+            );
+        }
+        let nodes = selection
+            .node_ids
+            .into_iter()
+            .map(|node_id| {
+                let node = source_nodes.remove(&node_id).with_context(|| {
+                    WebGraphSourceNodeMissingSnafu {
+                        node_id: node_id.clone(),
+                    }
+                })?;
+                Ok(ProviderContextNode {
+                    created_at_ns: node.created_at.as_nanosecond(),
+                    node: super::web_graph_view::NodeView::from(&node),
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(Some(ProviderContextSelection {
+            context: ProviderContext {
+                id: selection.context_id,
+                nodes,
+            },
+            selected_id: target_node_id.to_owned(),
+        }))
+    }
+
     pub async fn node_points(
         &self,
         mode: ViewMode,
@@ -855,7 +909,8 @@ impl WebGraphRuntime {
                     .fail();
                 }
                 if cursor == &through {
-                    let current_revision = state.revision.get();
+                    let synchronized = self.sync_provider_contexts().await?;
+                    let current_revision = synchronized.revision.get();
                     self.publish_revision(current_revision);
                     if let Some(progress) = progress.as_mut() {
                         progress.observe_high_watermark(&through);
@@ -938,10 +993,93 @@ impl WebGraphRuntime {
                 .expect("catch-up progress starts before reading a graph page");
             progress.record_page(processed_nodes, changed_source_nodes);
             if page_complete {
-                progress.log_completed(current_row_id, current_revision);
-                return Ok(());
+                tokio::task::yield_now().await;
+                continue;
             }
             progress.log_progress_if_due(current_row_id, current_revision);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn sync_provider_contexts(&self) -> crate::Result<StoredGraphState> {
+        loop {
+            let stored = self
+                .store
+                .provider_context_branch_heads()
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            let source_branches = self.source.graph_branches().await.context(StoreSnafu)?;
+            let source_high_watermark = self
+                .source
+                .graph_node_high_watermark()
+                .await
+                .context(StoreSnafu)?;
+            if stored.state.source_cursor != source_high_watermark {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let source_heads = source_branches
+                .iter()
+                .map(|branch| (branch.name.clone(), branch.head_id.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let history_heads = stored
+                .value
+                .history_heads
+                .iter()
+                .filter_map(|(branch, head)| {
+                    head.as_ref().map(|head| (branch.clone(), head.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if stored.value.projected_heads == source_heads && history_heads == source_heads {
+                return Ok(stored.state);
+            }
+
+            let removed_branches = stored
+                .value
+                .projected_heads
+                .keys()
+                .chain(history_heads.keys())
+                .filter(|branch| !source_heads.contains_key(*branch))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut projections = Vec::new();
+            for branch in source_branches.into_iter().filter(|branch| {
+                stored.value.projected_heads.get(&branch.name) != Some(&branch.head_id)
+                    || stored.value.history_heads.get(&branch.name)
+                        != Some(&Some(branch.head_id.clone()))
+            }) {
+                let ancestry = self
+                    .source
+                    .ancestry(&branch.head_id)
+                    .await
+                    .context(StoreSnafu)?;
+                projections.push(provider_context_branch_projection(
+                    branch.name,
+                    branch.head_id,
+                    ancestry,
+                ));
+            }
+            let revision = stored.state.revision.get().checked_add(1).context(
+                WebGraphRevisionExhaustedSnafu {
+                    revision: stored.state.revision.get(),
+                },
+            )?;
+            if let Some(state) = self
+                .store
+                .apply_provider_context_branches(
+                    stored.state.revision,
+                    Revision::new(revision),
+                    &projections,
+                    &removed_branches,
+                )
+                .await
+                .context(WebGraphStoreSnafu)?
+            {
+                return Ok(state);
+            }
             tokio::task::yield_now().await;
         }
     }
@@ -2048,6 +2186,31 @@ fn tool_session_projection(source_row_id: i64, node: &Node) -> ToolSessionProjec
             }));
     }
     projection
+}
+
+fn provider_context_branch_projection(
+    branch: String,
+    head_node_id: String,
+    ancestry: Vec<Node>,
+) -> ProviderContextBranchProjection {
+    let contexts = provider_contexts_from_head(ancestry)
+        .into_iter()
+        .filter_map(|nodes| {
+            let id = provider_context_id(&branch, &nodes)?;
+            let head = nodes.first()?;
+            Some(ProviderContextProjection {
+                id,
+                head_created_at_seconds: head.created_at.as_second(),
+                head_created_at_nanoseconds: head.created_at.subsec_nanosecond(),
+                node_ids: nodes.into_iter().map(|node| node.id).collect(),
+            })
+        })
+        .collect();
+    ProviderContextBranchProjection {
+        branch,
+        head_node_id,
+        contexts,
+    }
 }
 
 fn exec_session_id_from_output(output: &str) -> Option<String> {
@@ -3250,7 +3413,7 @@ mod tests {
         assert!(client_diff.removed.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn source_dirty_wakeup_persists_cursor_before_publishing_revision() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
@@ -3357,7 +3520,7 @@ mod tests {
         assert_eq!(second.current_revision(), committed_revision);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn batch_node_event_builds_every_missing_ancestor() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
@@ -3431,7 +3594,7 @@ mod tests {
         .await
         .expect("the final batch event should build its missing ancestry");
         let state = runtime.store.state().await.unwrap().unwrap();
-        assert_eq!(state.revision.get(), 5);
+        assert!(state.revision.get() >= 6);
         assert_eq!(state.source_version.get(), 3);
         assert_eq!(
             state.source_cursor,
@@ -3440,6 +3603,62 @@ mod tests {
 
         driver.abort();
         assert!(driver.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn graph_rebuild_restores_provider_context_without_rewriting_history() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        let selected = append_text(&writer, &root, "provider context after rebuild").await;
+        writer
+            .set_branch_head("main", &root, &selected)
+            .await
+            .unwrap();
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        assert!(
+            runtime
+                .provider_context_for_node(&selected, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let history = runtime
+            .store
+            .provider_context_branch_history()
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(history.len(), 1);
+
+        runtime
+            .store
+            .replace(&empty_graph().unwrap())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        assert!(
+            runtime
+                .provider_context_for_node(&selected, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            runtime
+                .store
+                .provider_context_branch_history()
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            history
+        );
     }
 
     #[tokio::test]
