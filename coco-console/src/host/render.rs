@@ -174,6 +174,7 @@ mod tests {
         assert!(page.contains("data-viewport-x=\"1120\""));
         assert!(page.contains("data-canvas-width=\"2400\""));
         assert!(page.contains("viewBox=\"1120 0 1280 720\""));
+        assert!(page.contains("preserveAspectRatio=\"xMaxYMin meet\""));
         assert!(page.contains("width=\"2400\" height=\"900\""));
         assert!(page.contains("data-node-id=\"latest\""));
         assert!(page.contains("data-render-key=\"edge:latest\""));
