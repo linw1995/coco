@@ -1,4 +1,4 @@
-use super::{NODE_DETAIL_PANEL_ID, PanelSelection};
+use super::{NODE_DETAIL_PANEL_ID, NODE_TARGET_PREFIX, PanelSelection};
 use leptos::prelude::*;
 use leptos::{
     ev,
@@ -101,13 +101,26 @@ fn reveal_node_detail(document: web_sys::Document, viewport_width: i32) {
 
 pub fn notify_provider_context_rendered() {
     request_animation_frame(|| {
-        let Ok(event) = web_sys::Event::new(PROVIDER_CONTEXT_RENDERED_EVENT) else {
-            return;
-        };
-        if let Some(window) = web_sys::window() {
-            let _ = window.dispatch_event(&event);
+        dispatch_provider_context_rendered();
+    });
+}
+
+pub fn notify_selected_provider_context_row_rendered(node_id: &str) {
+    let target = format!("{NODE_TARGET_PREFIX}{node_id}");
+    request_animation_frame(move || {
+        if current_panel_selection().target.as_deref() == Some(target.as_str()) {
+            dispatch_provider_context_rendered();
         }
     });
+}
+
+fn dispatch_provider_context_rendered() {
+    let Ok(event) = web_sys::Event::new(PROVIDER_CONTEXT_RENDERED_EVENT) else {
+        return;
+    };
+    if let Some(window) = web_sys::window() {
+        let _ = window.dispatch_event(&event);
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +162,45 @@ mod tests {
         mark_provider_context_row_visible(&entries, should_load);
 
         assert!(should_load.get_untracked());
+    }
+
+    #[wasm_bindgen_test]
+    async fn deferred_provider_context_only_notifies_for_the_selected_row() {
+        let window = web_sys::window().expect_throw("window should be available");
+        window
+            .location()
+            .set_hash("#detail-selected?context=detail-context")
+            .expect_throw("selection hash should be set");
+        let notifications = Rc::new(Cell::new(0_u32));
+        let callback_notifications = Rc::clone(&notifications);
+        let callback = Closure::<dyn FnMut()>::new(move || {
+            callback_notifications.set(callback_notifications.get() + 1);
+        });
+        window
+            .add_event_listener_with_callback(
+                PROVIDER_CONTEXT_RENDERED_EVENT,
+                callback.as_ref().unchecked_ref(),
+            )
+            .expect_throw("provider context listener should be installed");
+
+        notify_selected_provider_context_row_rendered("other");
+        next_animation_frame().await;
+        assert_eq!(notifications.get(), 0);
+
+        notify_selected_provider_context_row_rendered("selected");
+        next_animation_frame().await;
+        assert_eq!(notifications.get(), 1);
+
+        window
+            .remove_event_listener_with_callback(
+                PROVIDER_CONTEXT_RENDERED_EVENT,
+                callback.as_ref().unchecked_ref(),
+            )
+            .expect_throw("provider context listener should be removed");
+        window
+            .location()
+            .set_hash("")
+            .expect_throw("selection hash should be cleared");
     }
 
     #[wasm_bindgen_test]

@@ -1,9 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use coco_types::{
     AnchorPayload, Kind, Node, PromptAttachment, SessionAnchor, SessionAnchorPatch,
     SkillInvocationAnchor, SkillInvocationMode, Tool, ToolResult, ToolUse,
 };
+#[cfg(target_arch = "wasm32")]
+use leptos::leptos_dom::helpers::set_timeout;
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
 
@@ -22,6 +24,7 @@ pub use client::{
 };
 
 const NODE_TARGET_PREFIX: &str = "detail-";
+const MAX_PROVIDER_CONTEXT_LOAD_RETRIES: u8 = 3;
 pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1560,6 +1563,8 @@ fn ProviderContextRow(
     let row_ref = NodeRef::<leptos::html::Li>::new();
     let item = RwSignal::new(initial_item);
     let should_load = RwSignal::new(false);
+    let retry_attempt = RwSignal::new(0_u8);
+    let load_error = RwSignal::new(None::<String>);
     #[cfg(target_arch = "wasm32")]
     if item.get_untracked().is_none() {
         client::load_provider_context_row_when_visible(row_ref, should_load);
@@ -1569,6 +1574,7 @@ fn ProviderContextRow(
         let node_id = node_id.clone();
         move || {
             let should_load = should_load.get();
+            retry_attempt.track();
             let node_id = node_id.clone();
             let graph_mode = graph_mode.clone();
             async move {
@@ -1583,14 +1589,28 @@ fn ProviderContextRow(
             }
         }
     });
+    #[cfg(target_arch = "wasm32")]
+    let rendered_node_id = node_id.clone();
     Effect::new(move || {
-        let Some(Some(Ok(items))) = loaded_item.get() else {
+        let Some(Some(result)) = loaded_item.get() else {
             return;
         };
-        if let Some(loaded) = items.into_iter().next() {
-            item.set(Some(loaded));
-            #[cfg(target_arch = "wasm32")]
-            client::notify_provider_context_rendered();
+        match result {
+            Ok(items) => {
+                if let Some(loaded) = items.into_iter().next() {
+                    load_error.set(None);
+                    item.set(Some(loaded));
+                    #[cfg(target_arch = "wasm32")]
+                    client::notify_selected_provider_context_row_rendered(&rendered_node_id);
+                }
+            }
+            Err(error) => {
+                load_error.set(Some(error));
+                #[cfg(target_arch = "wasm32")]
+                if let Some(delay) = provider_context_retry_delay(retry_attempt.get_untracked()) {
+                    set_timeout(move || retry_attempt.update(|attempt| *attempt += 1), delay);
+                }
+            }
         }
     });
 
@@ -1600,8 +1620,18 @@ fn ProviderContextRow(
             selected,
         )
     };
-    let content =
-        move || provider_context_row_content(&context_target, &node_id, selected, item.get());
+    let content = move || {
+        let failed = load_error.with(Option::is_some);
+        let retrying = failed && provider_context_retry_delay(retry_attempt.get()).is_some();
+        provider_context_row_content(
+            &context_target,
+            &node_id,
+            selected,
+            item.get(),
+            failed,
+            retrying,
+        )
+    };
 
     view! {
         <li node_ref=row_ref class=class>{content}</li>
@@ -1613,22 +1643,29 @@ fn provider_context_row_content(
     node_id: &str,
     selected: bool,
     item: Option<ProviderContextItem>,
+    failed: bool,
+    retrying: bool,
 ) -> AnyView {
     let node_target = format!("{NODE_TARGET_PREFIX}{node_id}");
     let target = format!("#{node_target}?context={context_target}");
     let Some(item) = item else {
+        let message = match (failed, retrying) {
+            (true, true) => "Retrying node summary...",
+            (true, false) => "Failed to load node summary.",
+            (false, _) => "Loading node summary...",
+        };
         return view! {
             <a
                 class="provider-context-node-link provider-context-node-placeholder"
                 href=target
                 data-node-target=node_target
                 aria-current=selected.then_some("true")
-                aria-busy="true"
+                aria-busy=(!failed || retrying).then_some("true")
             >
                 <div class="provider-context-node-head">
                     <span>{provider_context_short_id(node_id)}</span>
                 </div>
-                <p>"Loading node summary..."</p>
+                <p>{message}</p>
             </a>
         }
         .into_any();
@@ -1667,6 +1704,10 @@ fn provider_context_row_content(
         </a>
     }
     .into_any()
+}
+
+fn provider_context_retry_delay(attempt: u8) -> Option<Duration> {
+    (attempt < MAX_PROVIDER_CONTEXT_LOAD_RETRIES).then(|| Duration::from_millis(250_u64 << attempt))
 }
 
 fn provider_context_short_id(node_id: &str) -> String {
@@ -1990,6 +2031,33 @@ mod tests {
         assert!(provider.contains(deferred_id));
         assert!(provider.contains("Loading node summary..."));
         assert!(provider.contains("aria-busy=\"true\""));
+    }
+
+    #[test]
+    fn provider_context_deferred_load_retries_are_bounded() {
+        assert_eq!(
+            (0..=MAX_PROVIDER_CONTEXT_LOAD_RETRIES)
+                .map(provider_context_retry_delay)
+                .collect::<Vec<_>>(),
+            [
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(500)),
+                Some(Duration::from_secs(1)),
+                None,
+            ]
+        );
+
+        let failed = provider_context_row_content(
+            "detail-context",
+            "deferred-node",
+            false,
+            None,
+            true,
+            false,
+        )
+        .to_html();
+        assert!(failed.contains("Failed to load node summary."));
+        assert!(!failed.contains("aria-busy=\"true\""));
     }
 
     #[test]
