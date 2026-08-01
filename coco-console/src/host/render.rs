@@ -3,7 +3,9 @@ use leptos::{html::HtmlElement, prelude::*};
 use crate::api::GraphViewportResponse;
 use crate::graph_render::{GraphCanvas, GraphCanvasModel};
 use crate::host::web_graph_view::ViewMode;
-use crate::panels::{NODE_DETAIL_PANEL_ID, NodeDetailPanel, ProviderContextPanel};
+use crate::panels::{
+    InitialProviderContext, NODE_DETAIL_PANEL_ID, NodeDetailPanel, ProviderContextPanel,
+};
 
 use super::CLIENT_ASSET_VERSION;
 
@@ -13,8 +15,12 @@ __PENDING_RESOURCES=[];\
 __RESOURCE_RESOLVERS=[];\
 __INCOMPLETE_CHUNKS=[];";
 
-pub fn render_index_page(mode: ViewMode, viewport: &GraphViewportResponse) -> String {
-    render_document(render_root(mode, viewport))
+pub fn render_index_page(
+    mode: ViewMode,
+    viewport: &GraphViewportResponse,
+    initial_provider_context: Option<InitialProviderContext>,
+) -> String {
+    render_document(render_root(mode, viewport, initial_provider_context))
 }
 
 fn render_document(root: AnyView) -> String {
@@ -39,12 +45,19 @@ fn render_document(root: AnyView) -> String {
     format!("<!doctype html>{}", rendered.to_html())
 }
 
-fn render_root(mode: ViewMode, viewport: &GraphViewportResponse) -> AnyView {
+fn render_root(
+    mode: ViewMode,
+    viewport: &GraphViewportResponse,
+    initial_provider_context: Option<InitialProviderContext>,
+) -> AnyView {
     let revision = viewport.version;
     let stats = format!("{} / revision {}", mode.label(), revision);
     let graph_mode = mode.as_query_value().to_owned();
     let graph = GraphCanvasModel::new(mode == ViewMode::Anchors, viewport);
-    let provider_context_panel = view! { <ProviderContextPanel graph_mode=graph_mode/> }.into_any();
+    let provider_context_panel = view! {
+        <ProviderContextPanel graph_mode=graph_mode initial=initial_provider_context/>
+    }
+    .into_any();
     let node_detail_panel = view! { <NodeDetailPanel/> }.into_any();
     view! {
         <main
@@ -166,7 +179,7 @@ mod tests {
                 },
             }],
         };
-        let page = render_index_page(ViewMode::All, &viewport);
+        let page = render_index_page(ViewMode::All, &viewport, None);
 
         assert!(page.contains("data-version=\"7\""));
         assert!(page.contains("data-graph-mode=\"all\""));

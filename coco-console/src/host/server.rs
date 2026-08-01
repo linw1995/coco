@@ -78,7 +78,6 @@ trait PanelDataSource: Send + Sync {
         &self,
         target: String,
         context: Option<String>,
-        graph_mode: String,
     ) -> Result<ProviderContextResponse>;
 
     async fn provider_context_items(
@@ -120,11 +119,8 @@ impl PanelServerContext {
         &self,
         target: String,
         context: Option<String>,
-        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
-        self.source
-            .provider_context(target, context, graph_mode)
-            .await
+        self.source.provider_context(target, context).await
     }
 
     pub async fn provider_context_items(
@@ -160,15 +156,8 @@ where
         &self,
         target: String,
         context: Option<String>,
-        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
-        load_provider_context(
-            self,
-            &target,
-            context.as_deref(),
-            view_mode_from_value(&graph_mode),
-        )
-        .await
+        load_provider_context(self, &target, context.as_deref()).await
     }
 
     async fn provider_context_items(
@@ -325,12 +314,16 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = view_mode_from_query(&query);
-    match state
+    let viewport = state
         .web_graph
-        .rightmost_viewport(mode, GraphViewportRequest::default())
-        .await
-    {
-        Ok(viewport) => html_response(render_index_page(mode, &viewport)),
+        .rightmost_viewport(mode, GraphViewportRequest::default());
+    let initial_provider_context = async {
+        let target = query.get("target")?;
+        Some(load_initial_provider_context(&state, target, query.get("context"), mode).await)
+    };
+    let (viewport, initial_provider_context) = tokio::join!(viewport, initial_provider_context);
+    match viewport {
+        Ok(viewport) => html_response(render_index_page(mode, &viewport, initial_provider_context)),
         Err(error) => plain_error(error.to_string()),
     }
 }
@@ -675,14 +668,7 @@ where
     let Some(target) = query.get("target") else {
         return json_response(&ProviderContextResponse::Default, "provider context");
     };
-    match load_provider_context(
-        &state,
-        target,
-        query.get("context"),
-        view_mode_from_query(&query),
-    )
-    .await
-    {
+    match load_provider_context(&state, target, query.get("context")).await {
         Ok(response) => json_response(&response, "provider context"),
         Err(error) => plain_error(error.to_string()),
     }
@@ -692,7 +678,6 @@ async fn load_provider_context<S>(
     state: &AppState<S>,
     target: &str,
     context: Option<&str>,
-    view_mode: ViewMode,
 ) -> Result<ProviderContextResponse>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -720,18 +705,50 @@ where
             context_target: context.unwrap_or_default().to_owned(),
             selected_id: node.id,
             node_ids: Vec::new(),
-            initial_items: Vec::new(),
         });
     };
-    let node_ids = selection.context.node_ids;
-    let initial_node_ids = initial_provider_context_node_ids(&node_ids, &selection.selected_id);
-    let initial_items = load_provider_context_items(state, &initial_node_ids, view_mode).await?;
     Ok(ProviderContextResponse::Found {
         context_target: selection.context.id,
         selected_id: selection.selected_id,
-        node_ids,
-        initial_items,
+        node_ids: selection.context.node_ids,
     })
+}
+
+async fn load_initial_provider_context<S>(
+    state: &AppState<S>,
+    target: &str,
+    context: Option<&str>,
+    view_mode: ViewMode,
+) -> crate::panels::InitialProviderContext
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let loaded = async {
+        let response = load_provider_context(state, target, context).await?;
+        let items = match &response {
+            ProviderContextResponse::Found {
+                selected_id,
+                node_ids,
+                ..
+            } => {
+                let node_ids = initial_provider_context_node_ids(node_ids, selected_id);
+                load_provider_context_items(state, &node_ids, view_mode).await?
+            }
+            _ => Vec::new(),
+        };
+        Ok::<_, crate::Error>((response, items))
+    }
+    .await;
+    let (response, items) = match loaded {
+        Ok((response, items)) => (Ok(response), items),
+        Err(error) => (Err(error.to_string()), Vec::new()),
+    };
+    crate::panels::InitialProviderContext {
+        target: target.to_owned(),
+        context: context.map(str::to_owned),
+        response,
+        items,
+    }
 }
 
 fn initial_provider_context_node_ids(node_ids: &[String], selected_id: &str) -> Vec<String> {
@@ -1977,11 +1994,11 @@ mod tests {
         .await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("\"content\":"));
+        assert!(!String::from_utf8_lossy(&body).contains("initial_items"));
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         let ProviderContextResponse::Found {
             selected_id: response_selected_id,
             node_ids,
-            initial_items,
             ..
         } = response
         else {
@@ -1989,15 +2006,25 @@ mod tests {
         };
         assert_eq!(response_selected_id, selected_id);
         assert_eq!(node_ids.len(), 22);
-        assert_eq!(initial_items.len(), PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT + 1);
-        let selected = initial_items
+        assert!(!String::from_utf8_lossy(&body).contains("provider context selection"));
+
+        let initial = load_initial_provider_context(
+            &state,
+            &node_target_id(&selected_id),
+            None,
+            ViewMode::All,
+        )
+        .await;
+        assert_eq!(initial.items.len(), PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT + 1);
+        let selected = initial
+            .items
             .iter()
             .find(|item| item.node.id == selected_id)
             .expect("selected provider context item should exist");
         assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
         let deferred_id = node_ids[PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT].clone();
-        assert!(!initial_items.iter().any(|item| item.node.id == deferred_id));
+        assert!(!initial.items.iter().any(|item| item.node.id == deferred_id));
         let deferred =
             load_provider_context_items(&state, std::slice::from_ref(&deferred_id), ViewMode::All)
                 .await
@@ -2008,6 +2035,21 @@ mod tests {
             !String::from_utf8_lossy(&body).contains(deferred[0].node.summary.as_str()),
             "the initial response should not serialize deferred node details"
         );
+
+        let index = index_page(
+            State(state.clone()),
+            RawQuery(Some(format!(
+                "mode=all&target={}",
+                node_target_id(&selected_id)
+            ))),
+        )
+        .await;
+        let index_body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
+        let index_body = String::from_utf8(index_body.to_vec()).unwrap();
+        assert!(index_body.contains("provider context selection"));
+        assert!(index_body.contains(&deferred_id));
+        assert!(index_body.contains("Loading node summary..."));
+        assert!(!index_body.contains("Select a node to inspect its provider context."));
 
         let request = Request::builder()
             .uri(format!(
@@ -2025,10 +2067,9 @@ mod tests {
             ("main", head_id.as_str()),
             (&selected_id[..16], selected_id.as_str()),
         ] {
-            let response =
-                load_provider_context(&state, &node_target_id(target_ref), None, ViewMode::All)
-                    .await
-                    .unwrap();
+            let response = load_provider_context(&state, &node_target_id(target_ref), None)
+                .await
+                .unwrap();
             assert!(matches!(
                 response,
                 ProviderContextResponse::Found { selected_id: response_selected_id, .. }
@@ -2038,7 +2079,7 @@ mod tests {
 
         let request = Request::builder()
             .uri(format!(
-                "/api/panels/provider-context?target={}&graph_mode=all",
+                "/api/panels/provider-context?target={}",
                 node_target_id(&selected_id)
             ))
             .body(Body::empty())

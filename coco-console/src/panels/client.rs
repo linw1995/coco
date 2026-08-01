@@ -66,7 +66,14 @@ fn mark_provider_context_row_visible(entries: &js_sys::Array, should_load: RwSig
 }
 
 fn current_panel_selection() -> PanelSelection {
-    PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
+    let selection = PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default());
+    if selection.target.is_some() {
+        return selection;
+    }
+    let query = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .unwrap_or_default();
+    PanelSelection::from_query(&query)
 }
 
 pub fn reveal_node_detail_on_mobile() {

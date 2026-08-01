@@ -150,6 +150,7 @@ pub fn hydrate() {
 
 async fn run() -> Result<(), JsValue> {
     let graph = setup_graph()?;
+    sync_initial_detail_url(&graph.borrow().window)?;
     render_full_viewport(graph.clone()).await?;
     install_graph_events_or_log(graph.clone());
     focus_selected_node_in_graph(graph);
@@ -2836,7 +2837,11 @@ fn install_hashchange_node_selection_listener(
 ) -> Result<(), JsValue> {
     let selection_graph = graph.clone();
     let selection_window = graph.borrow().window.clone();
+    let event_window = selection_window.clone();
     let selection_closure = Closure::<dyn FnMut()>::new(move || {
+        if let Err(error) = sync_detail_query(&event_window) {
+            web_sys::console::error_1(&error);
+        }
         focus_selected_node_in_graph(selection_graph.clone());
     });
     selection_window.add_event_listener_with_callback(
@@ -2933,14 +2938,80 @@ fn same_detail_target(current_hash: &str, next_hash: &str) -> bool {
 }
 
 fn update_detail_hash(window: &Window, hash: &str) -> Result<bool, JsValue> {
-    if window.location().hash()? == hash {
+    let hash_changed = window.location().hash()? != hash;
+    let url = detail_url(window, hash)?;
+    let current_url = format!(
+        "{}{}",
+        window.location().search()?,
+        window.location().hash()?
+    );
+    if current_url == url {
         return Ok(false);
     }
     window
         .history()?
-        .push_state_with_url(&JsValue::NULL, "", Some(hash))?;
-    window.dispatch_event(&web_sys::Event::new("hashchange")?)?;
-    Ok(true)
+        .push_state_with_url(&JsValue::NULL, "", Some(&url))?;
+    if hash_changed {
+        window.dispatch_event(&web_sys::Event::new("hashchange")?)?;
+    }
+    Ok(hash_changed)
+}
+
+fn sync_detail_query(window: &Window) -> Result<(), JsValue> {
+    let hash = window.location().hash()?;
+    sync_detail_url(window, &hash)
+}
+
+fn sync_initial_detail_url(window: &Window) -> Result<(), JsValue> {
+    let hash = window.location().hash()?;
+    if PanelSelection::from_hash(&hash).target.is_some() {
+        return sync_detail_url(window, &hash);
+    }
+    let selection = PanelSelection::from_query(&window.location().search()?);
+    let Some(target) = selection.target else {
+        return sync_detail_url(window, &hash);
+    };
+    let context = selection
+        .context
+        .map(|context| format!("?context={context}"))
+        .unwrap_or_default();
+    sync_detail_url(window, &format!("#{target}{context}"))
+}
+
+fn sync_detail_url(window: &Window, hash: &str) -> Result<(), JsValue> {
+    let url = detail_url(window, hash)?;
+    let current_url = format!(
+        "{}{}",
+        window.location().search()?,
+        window.location().hash()?
+    );
+    if current_url != url {
+        window
+            .history()?
+            .replace_state_with_url(&JsValue::NULL, "", Some(&url))?;
+    }
+    Ok(())
+}
+
+fn detail_url(window: &Window, hash: &str) -> Result<String, JsValue> {
+    let selection = PanelSelection::from_hash(hash);
+    let search = window.location().search()?;
+    let mut parts = search
+        .trim_start_matches('?')
+        .split('&')
+        .filter(|part| {
+            !part.is_empty() && !part.starts_with("target=") && !part.starts_with("context=")
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if let Some(target) = selection.target {
+        parts.push(format!("target={target}"));
+    }
+    if let Some(context) = selection.context {
+        parts.push(format!("context={context}"));
+    }
+    let search = (!parts.is_empty()).then(|| format!("?{}", parts.join("&")));
+    Ok(format!("{}{hash}", search.unwrap_or_default()))
 }
 
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
@@ -3075,7 +3146,12 @@ fn selected_node_target(window: &Window) -> Option<String> {
 }
 
 fn selected_panel_selection(window: &Window) -> PanelSelection {
-    PanelSelection::from_hash(&window.location().hash().unwrap_or_default())
+    let selection = PanelSelection::from_hash(&window.location().hash().unwrap_or_default());
+    if selection.target.is_some() {
+        selection
+    } else {
+        PanelSelection::from_query(&window.location().search().unwrap_or_default())
+    }
 }
 
 fn pan_from_wheel(graph: &mut VirtualGraph, event: &WheelEvent) {
@@ -3370,6 +3446,7 @@ mod tests {
                 let _ = storage.remove_item(VIEWPORT_KEY);
             }
             let _ = window.location().set_hash("");
+            sync_detail_query(&window).expect_throw("selection query should reset");
             let document = window
                 .document()
                 .expect_throw("document should be available");
@@ -3452,6 +3529,7 @@ mod tests {
                 let _ = storage.remove_item(VIEWPORT_KEY);
             }
             let _ = window.location().set_hash("");
+            let _ = sync_detail_query(&window);
             self.root.remove();
         }
     }
@@ -4204,6 +4282,31 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_initial_query_becomes_the_canonical_detail_hash() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("?mode=all&target=detail-aaaaaaaa&context=detail-context"),
+            )
+            .expect_throw("initial query should be set");
+
+        sync_initial_detail_url(&window).expect_throw("initial detail URL should canonicalize");
+
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-aaaaaaaa?context=detail-context"
+        );
+        let selection = selected_panel_selection(&window);
+        assert_eq!(selection.target.as_deref(), Some("detail-aaaaaaaa"));
+        assert_eq!(selection.context.as_deref(), Some("detail-context"));
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_detail_navigation_uses_history_and_one_refresh_trigger() {
         let fixture = GraphFixture::new();
         let window = fixture.graph.borrow().window.clone();
@@ -4215,6 +4318,13 @@ mod tests {
         assert_eq!(
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa"
+        );
+        assert!(
+            window
+                .location()
+                .search()
+                .expect_throw("search should exist")
+                .contains("target=detail-aaaaaaaa")
         );
         assert!(
             !update_detail_hash(&window, "#detail-aaaaaaaa")
@@ -4241,6 +4351,12 @@ mod tests {
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa?context=detail-context"
         );
+        let search = window
+            .location()
+            .search()
+            .expect_throw("search should exist");
+        assert!(search.contains("target=detail-aaaaaaaa"));
+        assert!(search.contains("context=detail-context"));
         assert!(
             update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-other")
                 .expect_throw("provider context hash should be set")

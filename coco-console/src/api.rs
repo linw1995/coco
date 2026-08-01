@@ -193,7 +193,6 @@ pub enum ProviderContextResponse {
         context_target: String,
         selected_id: String,
         node_ids: Vec<String>,
-        initial_items: Vec<ProviderContextItem>,
     },
 }
 

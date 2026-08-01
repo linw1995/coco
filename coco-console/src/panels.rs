@@ -8,6 +8,7 @@ use coco_types::{
 use leptos::leptos_dom::helpers::set_timeout;
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
+use serde::{Deserialize, Serialize};
 
 use crate::api::{
     AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
@@ -33,6 +34,14 @@ pub struct PanelSelection {
     pub context: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InitialProviderContext {
+    pub target: String,
+    pub context: Option<String>,
+    pub response: Result<ProviderContextResponse, String>,
+    pub items: Vec<ProviderContextItem>,
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 impl PanelSelection {
     pub fn from_hash(hash: &str) -> Self {
@@ -44,6 +53,17 @@ impl PanelSelection {
             .starts_with(NODE_TARGET_PREFIX)
             .then(|| target.to_owned());
         let context = query.and_then(provider_context_target);
+
+        Self { target, context }
+    }
+
+    pub fn from_query(query: &str) -> Self {
+        let query = query.strip_prefix('?').unwrap_or(query);
+        let target = query.split('&').find_map(|part| {
+            let (name, value) = part.split_once('=')?;
+            (name == "target" && value.starts_with(NODE_TARGET_PREFIX)).then(|| value.to_owned())
+        });
+        let context = provider_context_target(query);
 
         Self { target, context }
     }
@@ -62,6 +82,12 @@ struct ProviderContextRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderContextPayload {
+    response: ProviderContextResponse,
+    items: Vec<ProviderContextItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LoadedProviderContext {
     request: ProviderContextRequest,
     id: String,
@@ -71,7 +97,7 @@ struct LoadedProviderContext {
 enum PanelDetailPayload {
     Node(NodeDetailResponse),
     Provider {
-        response: ProviderContextResponse,
+        payload: ProviderContextPayload,
         graph_mode: String,
     },
 }
@@ -85,20 +111,20 @@ fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
     match payload {
         PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
         PanelDetailPayload::Provider {
-            response,
+            payload,
             graph_mode,
-        } => view! { <LazyProviderContextContent response graph_mode/> }.into_any(),
+        } => view! { <LazyProviderContextContent payload graph_mode/> }.into_any(),
     }
 }
 
 #[component]
 fn LazyProviderContextContent(
-    response: ProviderContextResponse,
+    payload: ProviderContextPayload,
     graph_mode: String,
 ) -> impl IntoView {
     #[cfg(target_arch = "wasm32")]
     Effect::new(client::notify_provider_context_rendered);
-    view! { <ProviderContextContent response graph_mode/> }
+    view! { <ProviderContextContent payload graph_mode/> }
 }
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
@@ -131,11 +157,10 @@ pub async fn load_anchor_range(
 async fn load_provider_context(
     target: String,
     context: Option<String>,
-    graph_mode: String,
 ) -> Result<ProviderContextResponse, ServerFnError> {
     let server = expect_context::<crate::host::PanelServerContext>();
     server
-        .provider_context(target, context, graph_mode)
+        .provider_context(target, context)
         .await
         .map_err(|error| ServerFnError::ServerError(error.to_string()))
 }
@@ -163,7 +188,7 @@ pub fn NodeDetailPanel() -> impl IntoView {
 
 #[component]
 fn NodeDetailPanelBody() -> impl IntoView {
-    let selection = use_panel_selection();
+    let selection = use_panel_selection(PanelSelection::default());
     let graph_revision = use_graph_revision();
     let selected_target = Memo::new(move |_| selection.get().target);
     let detail = LocalResource::new(move || {
@@ -197,34 +222,76 @@ fn NodeDetailPanelBody() -> impl IntoView {
 }
 
 #[island]
-pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
-    view! { <ProviderContextPanelBody graph_mode/> }
+pub fn ProviderContextPanel(
+    graph_mode: String,
+    initial: Option<InitialProviderContext>,
+) -> impl IntoView {
+    view! { <ProviderContextPanelBody graph_mode initial/> }
 }
 
 #[component]
-fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
-    let selection = use_panel_selection();
-    let loaded_context = RwSignal::new(None::<LoadedProviderContext>);
+fn ProviderContextPanelBody(
+    graph_mode: String,
+    initial: Option<InitialProviderContext>,
+) -> impl IntoView {
+    let initial_request = initial.as_ref().map(|initial| ProviderContextRequest {
+        target: initial.target.clone(),
+        context: initial.context.clone(),
+    });
+    let initial_loaded = initial.map(|initial| LoadedPanel {
+        request: ProviderContextRequest {
+            target: initial.target,
+            context: initial.context,
+        },
+        response: initial.response.map(|response| ProviderContextPayload {
+            response,
+            items: initial.items,
+        }),
+    });
+    let selection = use_panel_selection(PanelSelection {
+        target: initial_request
+            .as_ref()
+            .map(|request| request.target.clone()),
+        context: initial_request
+            .as_ref()
+            .and_then(|request| request.context.clone()),
+    });
+    let loaded_context = RwSignal::new(loaded_provider_context(initial_loaded.as_ref()));
     let provider_request = Memo::new(move |_| {
         provider_context_request(selection.get(), loaded_context.get().as_ref())
     });
-    let resource_graph_mode = graph_mode.clone();
+    let pending_initial_request = RwSignal::new(initial_request);
+    let initial_for_resource = initial_loaded.clone();
     let provider_context = LocalResource::new(move || {
         let request = provider_request.get();
-        let graph_mode = resource_graph_mode.clone();
+        let initial = (pending_initial_request.get_untracked() == request)
+            .then(|| initial_for_resource.clone())
+            .flatten();
+        if initial.is_some() {
+            pending_initial_request.set(None);
+        }
         async move {
             let request = request?;
-            let response =
-                load_provider_context(request.target.clone(), request.context.clone(), graph_mode)
-                    .await
-                    .map_err(|error| error.to_string());
-            Some(LoadedPanel { request, response })
+            if let Some(initial) = initial {
+                return Some(initial);
+            }
+            let response = load_provider_context(request.target.clone(), request.context.clone())
+                .await
+                .map_err(|error| error.to_string());
+            Some(LoadedPanel {
+                request,
+                response: response.map(|response| ProviderContextPayload {
+                    response,
+                    items: Vec::new(),
+                }),
+            })
         }
     });
     Effect::new(move || {
-        loaded_context.set(loaded_provider_context(
-            provider_context.get().flatten().as_ref(),
-        ));
+        let loaded = provider_context.get().flatten();
+        if loaded.is_some() {
+            loaded_context.set(loaded_provider_context(loaded.as_ref()));
+        }
     });
     view! {
         <div class="panel-content">
@@ -232,6 +299,7 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
                 provider_context_view(
                     provider_request.get(),
                     provider_context.get().flatten(),
+                    initial_loaded.clone(),
                     graph_mode.clone(),
                 )
             }}
@@ -257,14 +325,14 @@ fn provider_context_request(
 }
 
 fn loaded_provider_context(
-    loaded: Option<&LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
+    loaded: Option<&LoadedPanel<ProviderContextRequest, ProviderContextPayload>>,
 ) -> Option<LoadedProviderContext> {
     let loaded = loaded?;
     let ProviderContextResponse::Found {
         context_target,
         node_ids,
         ..
-    } = loaded.response.as_ref().ok()?
+    } = &loaded.response.as_ref().ok()?.response
     else {
         return None;
     };
@@ -282,8 +350,8 @@ fn loaded_provider_context(
     })
 }
 
-fn use_panel_selection() -> RwSignal<PanelSelection> {
-    let selection = RwSignal::new(PanelSelection::default());
+fn use_panel_selection(initial: PanelSelection) -> RwSignal<PanelSelection> {
+    let selection = RwSignal::new(initial);
     #[cfg(target_arch = "wasm32")]
     client::subscribe_to_panel_selection(selection);
     selection
@@ -324,14 +392,28 @@ fn node_detail_view(
 
 fn provider_context_view(
     current: Option<ProviderContextRequest>,
-    loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
+    loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextPayload>>,
+    initial: Option<LoadedPanel<ProviderContextRequest, ProviderContextPayload>>,
     graph_mode: String,
 ) -> AnyView {
+    let loaded = match (loaded, initial) {
+        (Some(mut loaded), Some(initial)) if loaded.request == initial.request => {
+            if let (Ok(loaded), Ok(initial)) = (&mut loaded.response, initial.response)
+                && loaded.items.is_empty()
+            {
+                loaded.items = initial.items;
+            }
+            Some(loaded)
+        }
+        (Some(loaded), _) => Some(loaded),
+        (None, Some(initial)) if current.as_ref() == Some(&initial.request) => Some(initial),
+        (None, _) => None,
+    };
     match (current.as_ref(), loaded) {
         (None, _) => view! { <ProviderContextDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => Suspend::new(render_panel_detail(PanelDetailPayload::Provider {
-                response,
+            Ok(payload) => Suspend::new(render_panel_detail(PanelDetailPayload::Provider {
+                payload,
                 graph_mode,
             }))
             .into_any(),
@@ -1461,8 +1543,8 @@ fn NodeDetailError(error: String) -> impl IntoView {
 }
 
 #[component]
-fn ProviderContextContent(response: ProviderContextResponse, graph_mode: String) -> AnyView {
-    match response {
+fn ProviderContextContent(payload: ProviderContextPayload, graph_mode: String) -> AnyView {
+    match payload.response {
         ProviderContextResponse::Default => view! { <ProviderContextDefault/> }.into_any(),
         ProviderContextResponse::Missing { target } => {
             view! { <ProviderContextMissing target=target/> }.into_any()
@@ -1471,13 +1553,12 @@ fn ProviderContextContent(response: ProviderContextResponse, graph_mode: String)
             context_target,
             selected_id,
             node_ids,
-            initial_items,
         } => view! {
             <ProviderContextList
                 context_target
                 selected_id
                 node_ids
-                initial_items
+                initial_items=payload.items
                 graph_mode
             />
         }
@@ -1790,6 +1871,15 @@ mod tests {
                 context: Some("detail-context".to_owned()),
             }
         );
+        assert_eq!(
+            PanelSelection::from_query(
+                "?mode=all&target=detail-node&context=detail-context&ignored=value"
+            ),
+            PanelSelection {
+                target: Some("detail-node".to_owned()),
+                context: Some("detail-context".to_owned()),
+            }
+        );
     }
 
     #[test]
@@ -1799,6 +1889,10 @@ mod tests {
             PanelSelection::default()
         );
         assert_eq!(PanelSelection::from_hash(""), PanelSelection::default());
+        assert_eq!(
+            PanelSelection::from_query("?target=section&context=invalid"),
+            PanelSelection::default()
+        );
     }
 
     #[test]
@@ -1845,11 +1939,13 @@ mod tests {
                 target: "detail-first".to_owned(),
                 context: None,
             },
-            response: Ok(ProviderContextResponse::Found {
-                context_target: "detail-root-context-branch".to_owned(),
-                selected_id: "first".to_owned(),
-                node_ids: vec!["first".to_owned()],
-                initial_items: vec![ProviderContextItem {
+            response: Ok(ProviderContextPayload {
+                response: ProviderContextResponse::Found {
+                    context_target: "detail-root-context-branch".to_owned(),
+                    selected_id: "first".to_owned(),
+                    node_ids: vec!["first".to_owned()],
+                },
+                items: vec![ProviderContextItem {
                     node: ProviderContextNode {
                         id: "first".to_owned(),
                         short_id: "first".to_owned(),
@@ -1919,7 +2015,10 @@ mod tests {
     #[test]
     fn panel_islands_render_independent_server_fallbacks() {
         let node = view! { <NodeDetailPanel/> }.to_html();
-        let provider = view! { <ProviderContextPanel graph_mode="all".to_owned()/> }.to_html();
+        let provider = view! {
+            <ProviderContextPanel graph_mode="all".to_owned() initial=None/>
+        }
+        .to_html();
 
         assert!(node.contains("leptos-island"));
         assert!(node.contains("panel-content"));
@@ -1953,8 +2052,12 @@ mod tests {
                     target: "detail-old".to_owned(),
                     context: None,
                 },
-                response: Ok(ProviderContextResponse::Default),
+                response: Ok(ProviderContextPayload {
+                    response: ProviderContextResponse::Default,
+                    items: Vec::new(),
+                }),
             }),
+            None,
             "all".to_owned(),
         )
         .to_html();
@@ -1976,11 +2079,13 @@ mod tests {
         }))
         .to_html();
         let provider = panel_detail_view(PanelDetailPayload::Provider {
-            response: ProviderContextResponse::Found {
-                context_target: String::new(),
-                selected_id: String::new(),
-                node_ids: Vec::new(),
-                initial_items: Vec::new(),
+            payload: ProviderContextPayload {
+                response: ProviderContextResponse::Found {
+                    context_target: String::new(),
+                    selected_id: String::new(),
+                    node_ids: Vec::new(),
+                },
+                items: Vec::new(),
             },
             graph_mode: "all".to_owned(),
         })
@@ -2007,11 +2112,13 @@ mod tests {
         let provider = view! {
             <ProviderContextContent
                 graph_mode="all".to_owned()
-                response=ProviderContextResponse::Found {
-                    context_target: "detail-context".to_owned(),
-                    selected_id: initial_id.to_owned(),
-                    node_ids: vec![initial_id.to_owned(), deferred_id.to_owned()],
-                    initial_items: vec![ProviderContextItem {
+                payload=ProviderContextPayload {
+                    response: ProviderContextResponse::Found {
+                        context_target: "detail-context".to_owned(),
+                        selected_id: initial_id.to_owned(),
+                        node_ids: vec![initial_id.to_owned(), deferred_id.to_owned()],
+                    },
+                    items: vec![ProviderContextItem {
                         node: ProviderContextNode {
                             id: initial_id.to_owned(),
                             short_id: "111111111111".to_owned(),
@@ -2723,8 +2830,8 @@ mod wasm_tests {
             .location()
             .set_hash("detail-node")
             .expect_throw("initial hash should be set");
-        let node_selection = use_panel_selection();
-        let context_selection = use_panel_selection();
+        let node_selection = use_panel_selection(PanelSelection::default());
+        let context_selection = use_panel_selection(PanelSelection::default());
         let loaded_selection = LocalResource::new(move || {
             let selection = node_selection.get();
             async move { selection }
