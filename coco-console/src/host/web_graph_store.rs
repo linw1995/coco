@@ -700,9 +700,7 @@ impl WebGraphStore {
         connection
             .immediate_transaction::<_, TransactionError, _>(async |connection| {
                 let Some(state) = load_state(connection).await? else {
-                    return Err(TransactionError::Operation(Error::NotInitialized {
-                        path: path.clone(),
-                    }));
+                    return Err(NotInitializedSnafu { path: path.clone() }.build().into());
                 };
                 if state.revision != expected_revision {
                     return Ok(None);
