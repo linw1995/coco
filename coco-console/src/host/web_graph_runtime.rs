@@ -3305,15 +3305,9 @@ mod tests {
             .await
             .unwrap()
             .expect("historical provider context should be rebuilt");
-        let node_ids = selection
-            .context
-            .nodes
-            .iter()
-            .map(|node| node.node.id.as_str())
-            .collect::<Vec<_>>();
         assert_eq!(
-            node_ids,
-            [historical_anchor.as_str(), historical_session.as_str()]
+            selection.context.node_ids,
+            [historical_anchor.clone(), historical_session]
         );
         assert!(
             runtime
