@@ -1,0 +1,2 @@
+DROP TABLE web_graph_provider_contexts;
+DROP TABLE web_graph_provider_branch_history;
