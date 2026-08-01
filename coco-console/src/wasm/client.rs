@@ -140,6 +140,16 @@ impl AnchorRangeSelection {
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
+    if let Some(window) = web_sys::window() {
+        match legacy_detail_url(&window) {
+            Ok(Some(url)) => match window.location().replace(&url) {
+                Ok(()) => return,
+                Err(error) => web_sys::console::error_1(&error),
+            },
+            Ok(None) => {}
+            Err(error) => web_sys::console::error_1(&error),
+        }
+    }
     leptos::mount::hydrate_islands();
     spawn_local(async {
         if let Err(error) = run().await {
@@ -2962,6 +2972,19 @@ fn sync_detail_query(window: &Window) -> Result<(), JsValue> {
     sync_detail_url(window, &hash)
 }
 
+fn legacy_detail_url(window: &Window) -> Result<Option<String>, JsValue> {
+    let hash = window.location().hash()?;
+    let hash_selection = PanelSelection::from_hash(&hash);
+    if hash_selection.target.is_none() {
+        return Ok(None);
+    }
+    let query_selection = PanelSelection::from_query(&window.location().search()?);
+    if query_selection == hash_selection {
+        return Ok(None);
+    }
+    detail_url(window, &hash).map(Some)
+}
+
 fn sync_initial_detail_url(window: &Window) -> Result<(), JsValue> {
     let hash = window.location().hash()?;
     if PanelSelection::from_hash(&hash).target.is_some() {
@@ -4279,6 +4302,34 @@ mod tests {
 
         assert_eq!(prepared.source, Point { x: 100, y: 80 });
         assert_eq!(prepared.target, Point { x: 260, y: 140 });
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_legacy_hash_requires_a_canonical_document_request() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .location()
+            .set_hash("detail-aaaaaaaa?context=detail-context")
+            .expect_throw("legacy hash should be set");
+
+        let canonical = legacy_detail_url(&window)
+            .expect_throw("legacy URL should parse")
+            .expect_throw("legacy URL should require a redirect");
+        assert!(canonical.contains("target=detail-aaaaaaaa"));
+        assert!(canonical.contains("context=detail-context"));
+        assert!(canonical.ends_with("#detail-aaaaaaaa?context=detail-context"));
+
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(&JsValue::NULL, "", Some(&canonical))
+            .expect_throw("canonical URL should be set");
+        assert!(
+            legacy_detail_url(&window)
+                .expect_throw("canonical URL should parse")
+                .is_none()
+        );
     }
 
     #[wasm_bindgen_test]
