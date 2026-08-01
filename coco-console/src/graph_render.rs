@@ -153,6 +153,7 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
                 role="img"
                 aria-label="CoCo node graph"
                 viewBox=format!("{viewport_x} {viewport_y} {viewport_width} {viewport_height}")
+                preserveAspectRatio="xMaxYMin meet"
                 width="100%"
                 height="100%"
             >
