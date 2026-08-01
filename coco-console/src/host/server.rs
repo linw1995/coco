@@ -2048,7 +2048,7 @@ mod tests {
         let index_body = String::from_utf8(index_body.to_vec()).unwrap();
         assert!(index_body.contains("provider context selection"));
         assert!(index_body.contains(&deferred_id));
-        assert!(index_body.contains("Loading node summary..."));
+        assert!(index_body.contains("Scroll to load node summary..."));
         assert!(!index_body.contains("Select a node to inspect its provider context."));
 
         let request = Request::builder()

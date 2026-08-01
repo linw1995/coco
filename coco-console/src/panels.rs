@@ -96,10 +96,6 @@ struct LoadedProviderContext {
 
 enum PanelDetailPayload {
     Node(NodeDetailResponse),
-    Provider {
-        payload: ProviderContextPayload,
-        graph_mode: String,
-    },
 }
 
 #[cfg_attr(not(test), leptos::prelude::lazy(panel_detail))]
@@ -110,21 +106,7 @@ async fn render_panel_detail(payload: PanelDetailPayload) -> AnyView {
 fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
     match payload {
         PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
-        PanelDetailPayload::Provider {
-            payload,
-            graph_mode,
-        } => view! { <LazyProviderContextContent payload graph_mode/> }.into_any(),
     }
-}
-
-#[component]
-fn LazyProviderContextContent(
-    payload: ProviderContextPayload,
-    graph_mode: String,
-) -> impl IntoView {
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(client::notify_provider_context_rendered);
-    view! { <ProviderContextContent payload graph_mode/> }
 }
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
@@ -412,11 +394,7 @@ fn provider_context_view(
     match (current.as_ref(), loaded) {
         (None, _) => view! { <ProviderContextDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(payload) => Suspend::new(render_panel_detail(PanelDetailPayload::Provider {
-                payload,
-                graph_mode,
-            }))
-            .into_any(),
+            Ok(payload) => view! { <ProviderContextContent payload graph_mode/> }.into_any(),
             Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
         },
         _ => view! { <ProviderContextLoading/> }.into_any(),
@@ -1544,6 +1522,8 @@ fn NodeDetailError(error: String) -> impl IntoView {
 
 #[component]
 fn ProviderContextContent(payload: ProviderContextPayload, graph_mode: String) -> AnyView {
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(client::notify_provider_context_rendered);
     match payload.response {
         ProviderContextResponse::Default => view! { <ProviderContextDefault/> }.into_any(),
         ProviderContextResponse::Missing { target } => {
@@ -1603,12 +1583,13 @@ fn ProviderContextList(
         }
         .into_any()
     } else {
+        let scroll_root = NodeRef::<leptos::html::Section>::new();
         let mut initial_items = initial_items
             .into_iter()
             .map(|item| (item.node.id.clone(), item))
             .collect::<BTreeMap<_, _>>();
         view! {
-            <section class="provider-context-section">
+            <section node_ref=scroll_root class="provider-context-section">
                 <h2>"Provider Context"</h2>
                 <ol class="provider-context-list">
                     {node_ids
@@ -1621,6 +1602,7 @@ fn ProviderContextList(
                                     selected=node_id == selected_id
                                     node_id
                                     initial_item
+                                    scroll_root
                                     graph_mode=graph_mode.clone()
                                 />
                             }
@@ -1639,16 +1621,19 @@ fn ProviderContextRow(
     selected: bool,
     node_id: String,
     initial_item: Option<ProviderContextItem>,
+    scroll_root: NodeRef<leptos::html::Section>,
     graph_mode: String,
 ) -> impl IntoView {
     let row_ref = NodeRef::<leptos::html::Li>::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = scroll_root;
     let item = RwSignal::new(initial_item);
     let should_load = RwSignal::new(false);
     let retry_attempt = RwSignal::new(0_u8);
     let load_error = RwSignal::new(None::<String>);
     #[cfg(target_arch = "wasm32")]
     if item.get_untracked().is_none() {
-        client::load_provider_context_row_when_visible(row_ref, should_load);
+        client::load_provider_context_row_when_visible(row_ref, scroll_root, should_load);
     }
 
     let loaded_item = LocalResource::new({
@@ -1709,6 +1694,7 @@ fn ProviderContextRow(
             &node_id,
             selected,
             item.get(),
+            should_load.get(),
             failed,
             retrying,
         )
@@ -1724,16 +1710,18 @@ fn provider_context_row_content(
     node_id: &str,
     selected: bool,
     item: Option<ProviderContextItem>,
+    requested: bool,
     failed: bool,
     retrying: bool,
 ) -> AnyView {
     let node_target = format!("{NODE_TARGET_PREFIX}{node_id}");
     let target = format!("#{node_target}?context={context_target}");
     let Some(item) = item else {
-        let message = match (failed, retrying) {
-            (true, true) => "Retrying node summary...",
-            (true, false) => "Failed to load node summary.",
-            (false, _) => "Loading node summary...",
+        let message = match (requested, failed, retrying) {
+            (_, true, true) => "Retrying node summary...",
+            (_, true, false) => "Failed to load node summary.",
+            (true, false, _) => "Loading node summary...",
+            (false, false, _) => "Scroll to load node summary...",
         };
         return view! {
             <a
@@ -2078,17 +2066,17 @@ mod tests {
             tool_input_json_highlights: Vec::new(),
         }))
         .to_html();
-        let provider = panel_detail_view(PanelDetailPayload::Provider {
-            payload: ProviderContextPayload {
+        let provider = view! { <ProviderContextContent
+            payload=ProviderContextPayload {
                 response: ProviderContextResponse::Found {
                     context_target: String::new(),
                     selected_id: String::new(),
                     node_ids: Vec::new(),
                 },
                 items: Vec::new(),
-            },
-            graph_mode: "all".to_owned(),
-        })
+            }
+            graph_mode="all".to_owned()
+        /> }
         .to_html();
         let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
         let provider_error =
@@ -2136,7 +2124,7 @@ mod tests {
 
         assert!(provider.contains("Server-rendered summary"));
         assert!(provider.contains(deferred_id));
-        assert!(provider.contains("Loading node summary..."));
+        assert!(provider.contains("Scroll to load node summary..."));
         assert!(provider.contains("aria-busy=\"true\""));
     }
 
@@ -2159,6 +2147,7 @@ mod tests {
             "deferred-node",
             false,
             None,
+            true,
             true,
             false,
         )
@@ -2697,6 +2686,7 @@ mod tests {
 mod wasm_tests {
     use super::*;
 
+    use crate::api::ProviderContextNode;
     use any_spawner::Executor;
     use js_sys::Promise;
     use leptos::leptos_dom::helpers::request_animation_frame;
@@ -2705,6 +2695,105 @@ mod wasm_tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn graph_items_provider_context_scroll_loads_a_deferred_row() {
+        _ = Executor::init_wasm_bindgen();
+        let window = web_sys::window().expect_throw("window should be available");
+        let document = window
+            .document()
+            .expect_throw("document should be available");
+        let root = document
+            .create_element("div")
+            .expect_throw("test root should be created")
+            .unchecked_into::<web_sys::HtmlElement>();
+        root.set_id("provider-context-scroll-test");
+        let style = document
+            .create_element("style")
+            .expect_throw("test style should be created");
+        style.set_text_content(Some(
+            "#provider-context-scroll-test .provider-context-section { display: block; height: 48px; overflow-y: auto; }\
+             #provider-context-scroll-test .provider-context-node { height: 48px; }",
+        ));
+        document
+            .body()
+            .expect_throw("document body should be available")
+            .append_child(&style)
+            .expect_throw("test style should be mounted");
+        document
+            .body()
+            .expect_throw("document body should be available")
+            .append_child(&root)
+            .expect_throw("test root should be mounted");
+        let node_ids = (0..4)
+            .map(|index| format!("node-{index}"))
+            .collect::<Vec<_>>();
+        let initial_items = node_ids[..3]
+            .iter()
+            .map(|node_id| ProviderContextItem {
+                node: ProviderContextNode {
+                    id: node_id.clone(),
+                    short_id: node_id.clone(),
+                    kind: "text".to_owned(),
+                    role: "user".to_owned(),
+                    created_at: "2026-08-01T00:00:00Z".to_owned(),
+                    summary: format!("Summary for {node_id}"),
+                },
+                point: None,
+            })
+            .collect();
+        let mounted = leptos::mount::mount_to(root.clone(), move || {
+            view! {
+                <ProviderContextContent
+                    graph_mode="all".to_owned()
+                    payload=ProviderContextPayload {
+                        response: ProviderContextResponse::Found {
+                            context_target: "detail-context".to_owned(),
+                            selected_id: "node-0".to_owned(),
+                            node_ids,
+                        },
+                        items: initial_items,
+                    }
+                />
+            }
+        });
+        next_animation_frame().await;
+        next_animation_frame().await;
+
+        let section = root
+            .query_selector(".provider-context-section")
+            .expect_throw("provider context query should succeed")
+            .expect_throw("provider context should be rendered")
+            .unchecked_into::<web_sys::HtmlElement>();
+        let deferred = root
+            .query_selector(".provider-context-node:last-child")
+            .expect_throw("deferred row query should succeed")
+            .expect_throw("deferred row should be rendered");
+        assert!(
+            deferred
+                .text_content()
+                .unwrap_or_default()
+                .contains("Scroll to load node summary...")
+        );
+
+        section.set_scroll_top(section.scroll_height());
+        section
+            .dispatch_event(&web_sys::Event::new("scroll").expect_throw("event should build"))
+            .expect_throw("scroll should dispatch");
+        for _ in 0..4 {
+            next_animation_frame().await;
+        }
+        assert!(
+            !deferred
+                .text_content()
+                .unwrap_or_default()
+                .contains("Scroll to load node summary...")
+        );
+
+        drop(mounted);
+        root.remove();
+        style.remove();
+    }
 
     #[wasm_bindgen_test]
     async fn graph_items_tool_input_switches_between_list_and_raw_json() {

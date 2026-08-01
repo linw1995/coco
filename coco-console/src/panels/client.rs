@@ -33,17 +33,25 @@ pub fn subscribe_to_graph_revision(revision: RwSignal<u64>) {
 
 pub fn load_provider_context_row_when_visible(
     row: NodeRef<leptos::html::Li>,
+    scroll_root: NodeRef<leptos::html::Section>,
     should_load: RwSignal<bool>,
 ) {
     Effect::new(move || {
         let Some(row) = row.get() else {
             return;
         };
+        let Some(scroll_root) = scroll_root.get() else {
+            return;
+        };
         let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
             mark_provider_context_row_visible(&entries, should_load);
         });
-        let Ok(observer) = web_sys::IntersectionObserver::new(callback.as_ref().unchecked_ref())
-        else {
+        let options = web_sys::IntersectionObserverInit::new();
+        options.set_root(Some(&scroll_root));
+        let Ok(observer) = web_sys::IntersectionObserver::new_with_options(
+            callback.as_ref().unchecked_ref(),
+            &options,
+        ) else {
             should_load.set(true);
             return;
         };

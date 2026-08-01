@@ -67,6 +67,7 @@ web-sys = { version = "=0.3.94", features = [
   "History",
   "IntersectionObserver",
   "IntersectionObserverEntry",
+  "IntersectionObserverInit",
   "KeyboardEvent",
   "KeyboardEventInit",
   "MessageEvent",
