@@ -39,8 +39,8 @@ use crate::api::{
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
-    NodeView, ViewMode, node_id_from_target, provider_context_for_node, tool_use_input_links,
-    write_stdin_session_ids,
+    NodeView, ProviderContextNode as ProviderContextViewNode, ViewMode, node_id_from_target,
+    tool_use_input_links, write_stdin_session_ids,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -678,16 +678,15 @@ where
             target: target.to_owned(),
         });
     };
-    let node = match state.store.get_node(node_id).await {
-        Ok(node) => node,
-        Err(error) if is_missing_node(&error) => {
-            return Ok(ProviderContextResponse::Missing {
-                target: target.to_owned(),
-            });
-        }
-        Err(source) => return Err(source).context(StoreSnafu),
-    };
-    let selection = provider_context_for_node(&state.store, &node.id, context).await?;
+    if !state.web_graph.contains_node(node_id).await? {
+        return Ok(ProviderContextResponse::Missing {
+            target: target.to_owned(),
+        });
+    }
+    let selection = state
+        .web_graph
+        .provider_context_for_node(node_id, context)
+        .await?;
     let Some(selection) = selection else {
         return Ok(ProviderContextResponse::Found { items: Vec::new() });
     };
@@ -695,7 +694,7 @@ where
         .context
         .nodes
         .iter()
-        .map(|node| node.node.id.clone())
+        .map(|node| node.id.clone())
         .collect::<Vec<_>>();
     let points = state.web_graph.node_points(view_mode, &node_ids).await?;
     let items = selection
@@ -704,18 +703,18 @@ where
         .into_iter()
         .map(|node| ProviderContextItem {
             context_target: selection.context.id.clone(),
-            selected: node.node.id == selection.selected_id,
-            point: points.get(&node.node.id).map(|point| ApiPoint {
+            selected: node.id == selection.selected_id,
+            point: points.get(&node.id).map(|point| ApiPoint {
                 x: point.x,
                 y: point.y,
             }),
-            node: provider_context_node(node.node),
+            node: provider_context_node(node),
         })
         .collect();
     Ok(ProviderContextResponse::Found { items })
 }
 
-fn provider_context_node(node: NodeView) -> ProviderContextNode {
+fn provider_context_node(node: ProviderContextViewNode) -> ProviderContextNode {
     ProviderContextNode {
         id: node.id,
         short_id: node.short_id,
@@ -1929,12 +1928,62 @@ mod tests {
             ))
             .body(Body::empty())
             .unwrap();
-        let response = panel_server_function(State(state), request).await;
+        let response = panel_server_function(State(state.clone()), request).await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         assert!(matches!(
             response,
             ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+        ));
+
+        state
+            .store
+            .set_branch_head("main", &selected_id, &session_id)
+            .await
+            .unwrap();
+        state.web_graph.catch_up().await.unwrap();
+        assert!(matches!(
+            load_provider_context(
+                &state,
+                &node_target_id(&selected_id),
+                None,
+                ViewMode::All,
+            )
+            .await
+            .unwrap(),
+            ProviderContextResponse::Found { items } if items.is_empty()
+        ));
+
+        state
+            .store
+            .set_branch_head("main", &session_id, &selected_id)
+            .await
+            .unwrap();
+        state.web_graph.catch_up().await.unwrap();
+        assert!(matches!(
+            load_provider_context(
+                &state,
+                &node_target_id(&selected_id),
+                None,
+                ViewMode::All,
+            )
+            .await
+            .unwrap(),
+            ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+        ));
+
+        state.store.delete_branch("main").await.unwrap();
+        state.web_graph.catch_up().await.unwrap();
+        assert!(matches!(
+            load_provider_context(
+                &state,
+                &node_target_id(&selected_id),
+                None,
+                ViewMode::All,
+            )
+            .await
+            .unwrap(),
+            ProviderContextResponse::Found { items } if items.is_empty()
         ));
     }
 

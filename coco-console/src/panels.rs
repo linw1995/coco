@@ -169,6 +169,7 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
 #[component]
 fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     let selection = use_panel_selection();
+    let graph_revision = use_graph_revision();
     let loaded_context = RwSignal::new(None::<LoadedProviderContext>);
     let provider_request = Memo::new(move |_| {
         provider_context_request(selection.get(), loaded_context.get().as_ref())
@@ -176,6 +177,7 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     #[cfg(all(target_arch = "wasm32", not(test)))]
     let render_preload_started = std::cell::Cell::new(false);
     let provider_context = LocalResource::new(move || {
+        graph_revision.track();
         let request = provider_request.get();
         #[cfg(all(target_arch = "wasm32", not(test)))]
         if request.is_some() && !render_preload_started.replace(true) {

@@ -4,7 +4,9 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use coco_mem::{GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, SqliteGraphStore};
+use coco_mem::{
+    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, NodeStore, SqliteGraphStore,
+};
 use snafu::{IntoError, prelude::*};
 use tokio::sync::watch;
 
@@ -21,14 +23,16 @@ use super::web_graph_order::{
     stable_column_order,
 };
 use super::web_graph_store::{
-    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse, StoredGraphState,
-    ToolSessionProjection, Viewport, WebGraphStore,
+    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse,
+    ProviderContextBranchProjection, ProviderContextProjectedNode, ProviderContextProjection,
+    StoredGraphState, ToolSessionProjection, Viewport, WebGraphStore,
 };
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
-    GRAPH_ROW_STEP, ViewMode, diff_graph_viewport_responses, edge_key, edge_port_offset,
-    graph_kind_name, node_key, node_target_id, route_edge, route_edge_with_offsets, shorten_id,
-    summarize_node,
+    GRAPH_ROW_STEP, ProviderContext, ProviderContextNode, ProviderContextSelection, ViewMode,
+    diff_graph_viewport_responses, edge_key, edge_port_offset, graph_kind_name, node_key,
+    node_target_id, provider_context_id, provider_contexts_from_head, route_edge,
+    route_edge_with_offsets, shorten_id, summarize_node,
 };
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -722,6 +726,49 @@ impl WebGraphRuntime {
         self.publisher.subscribe_source_changes()
     }
 
+    pub async fn contains_node(&self, node_id: &str) -> crate::Result<bool> {
+        self.store
+            .contains_node(node_id)
+            .await
+            .context(WebGraphStoreSnafu)
+    }
+
+    pub async fn provider_context_for_node(
+        &self,
+        target_node_id: &str,
+        context_id: Option<&str>,
+    ) -> crate::Result<Option<ProviderContextSelection>> {
+        let selection = self
+            .store
+            .provider_context_selection(target_node_id, context_id)
+            .await
+            .context(WebGraphStoreSnafu)?
+            .context(WebGraphNotInitializedSnafu)?
+            .value;
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let nodes = selection
+            .nodes
+            .into_iter()
+            .map(|node| ProviderContextNode {
+                id: node.id,
+                short_id: node.short_id,
+                kind: node.kind,
+                role: node.role,
+                created_at: node.created_at,
+                summary: node.summary,
+            })
+            .collect();
+        Ok(Some(ProviderContextSelection {
+            context: ProviderContext {
+                id: selection.context_id,
+                nodes,
+            },
+            selected_id: target_node_id.to_owned(),
+        }))
+    }
+
     pub async fn node_points(
         &self,
         mode: ViewMode,
@@ -855,7 +902,11 @@ impl WebGraphRuntime {
                     .fail();
                 }
                 if cursor == &through {
-                    let current_revision = state.revision.get();
+                    let Some(finalized) = self.sync_provider_contexts().await? else {
+                        tokio::task::yield_now().await;
+                        continue;
+                    };
+                    let current_revision = finalized.revision.get();
                     self.publish_revision(current_revision);
                     if let Some(progress) = progress.as_mut() {
                         progress.observe_high_watermark(&through);
@@ -938,10 +989,92 @@ impl WebGraphRuntime {
                 .expect("catch-up progress starts before reading a graph page");
             progress.record_page(processed_nodes, changed_source_nodes);
             if page_complete {
-                progress.log_completed(current_row_id, current_revision);
-                return Ok(());
+                tokio::task::yield_now().await;
+                continue;
             }
             progress.log_progress_if_due(current_row_id, current_revision);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn sync_provider_contexts(&self) -> crate::Result<Option<StoredGraphState>> {
+        loop {
+            let stored = self
+                .store
+                .provider_context_branch_heads()
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            let source_branches = self.source.graph_branches().await.context(StoreSnafu)?;
+            let source_high_watermark = self
+                .source
+                .graph_node_high_watermark()
+                .await
+                .context(StoreSnafu)?;
+            if stored.state.source_cursor != source_high_watermark {
+                return Ok(None);
+            }
+            let source_heads = source_branches
+                .iter()
+                .map(|branch| (branch.name.clone(), branch.head_id.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let history_heads = stored
+                .value
+                .history_heads
+                .iter()
+                .filter_map(|(branch, head)| {
+                    head.as_ref().map(|head| (branch.clone(), head.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if stored.value.current_heads == source_heads && history_heads == source_heads {
+                return Ok(Some(stored.state));
+            }
+
+            let removed_branches = stored
+                .value
+                .current_heads
+                .keys()
+                .chain(history_heads.keys())
+                .filter(|branch| !source_heads.contains_key(*branch))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut projections = Vec::new();
+            for branch in source_branches.into_iter().filter(|branch| {
+                stored.value.current_heads.get(&branch.name) != Some(&branch.head_id)
+                    || stored.value.history_heads.get(&branch.name)
+                        != Some(&Some(branch.head_id.clone()))
+            }) {
+                let ancestry = self
+                    .source
+                    .ancestry(&branch.head_id)
+                    .await
+                    .context(StoreSnafu)?;
+                projections.push(provider_context_branch_projection(
+                    branch.name,
+                    branch.head_id,
+                    ancestry,
+                ));
+            }
+            let revision = stored.state.revision.get().checked_add(1).context(
+                WebGraphRevisionExhaustedSnafu {
+                    revision: stored.state.revision.get(),
+                },
+            )?;
+            if let Some(state) = self
+                .store
+                .apply_provider_context_branches(
+                    stored.state.revision,
+                    Revision::new(revision),
+                    &projections,
+                    &removed_branches,
+                )
+                .await
+                .context(WebGraphStoreSnafu)?
+            {
+                return Ok(Some(state));
+            }
             tokio::task::yield_now().await;
         }
     }
@@ -2048,6 +2181,41 @@ fn tool_session_projection(source_row_id: i64, node: &Node) -> ToolSessionProjec
             }));
     }
     projection
+}
+
+fn provider_context_branch_projection(
+    branch: String,
+    head_node_id: String,
+    ancestry: Vec<Node>,
+) -> ProviderContextBranchProjection {
+    let contexts = provider_contexts_from_head(ancestry)
+        .into_iter()
+        .filter_map(|nodes| {
+            let id = provider_context_id(&branch, &nodes)?;
+            let head = nodes.first()?;
+            Some(ProviderContextProjection {
+                id,
+                head_created_at_seconds: head.created_at.as_second(),
+                head_created_at_nanoseconds: head.created_at.subsec_nanosecond(),
+                nodes: nodes
+                    .into_iter()
+                    .map(|node| ProviderContextProjectedNode {
+                        id: node.id.clone(),
+                        short_id: shorten_id(&node.id),
+                        kind: graph_kind_name(&node).to_owned(),
+                        role: format!("{:?}", node.role),
+                        created_at: node.created_at.to_string(),
+                        summary: summarize_node(&node),
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+    ProviderContextBranchProjection {
+        branch,
+        head_node_id,
+        contexts,
+    }
 }
 
 fn exec_session_id_from_output(output: &str) -> Option<String> {
@@ -3431,7 +3599,7 @@ mod tests {
         .await
         .expect("the final batch event should build its missing ancestry");
         let state = runtime.store.state().await.unwrap().unwrap();
-        assert_eq!(state.revision.get(), 5);
+        assert_eq!(state.revision.get(), 6);
         assert_eq!(state.source_version.get(), 3);
         assert_eq!(
             state.source_cursor,
