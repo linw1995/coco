@@ -88,7 +88,7 @@ pub struct ProviderContextSelection {
     pub selected_id: String,
 }
 
-pub(super) fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
+pub fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
     let mut contexts = Vec::new();
     let mut current = Vec::new();
     let mut previous_is_skill_invocation = false;
@@ -126,7 +126,7 @@ fn is_provider_context_start(node: &Node) -> bool {
     )
 }
 
-pub(super) fn provider_context_id(branch: &str, context: &[Node]) -> Option<String> {
+pub fn provider_context_id(branch: &str, context: &[Node]) -> Option<String> {
     Some(format!(
         "{}-context-{}",
         node_target_id(&context.last()?.id),
