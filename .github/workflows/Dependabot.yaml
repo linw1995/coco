@@ -1,0 +1,85 @@
+name: "Update Dependabot Notices"
+
+on:
+  pull_request_target:
+    types:
+      - "opened"
+      - "reopened"
+      - "synchronize"
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "**/Cargo.toml"
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: "dependabot-notices-${{ github.event.pull_request.number }}"
+  cancel-in-progress: true
+
+jobs:
+  update:
+    if: >-
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate changed files
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+            const allowed = files.every(({ filename }) =>
+              filename === "Cargo.lock" ||
+              filename === "Cargo.toml" ||
+              filename.endsWith("/Cargo.toml")
+            );
+            if (!allowed) {
+              core.setFailed("Dependabot PR contains files outside Cargo manifests and lockfiles");
+            }
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          dev-shell: ci-lint
+
+      - name: Generate third-party notices
+        run: |
+          nix develop .#ci-lint --command cargo fetch --locked
+          nix develop .#ci-lint --command bash scripts/generate-third-party-notices.sh
+
+      - name: Commit third-party notices
+        id: commit
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if git diff --quiet -- THIRD_PARTY_NOTICES.html; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add THIRD_PARTY_NOTICES.html
+          git commit -m "Update third-party notices"
+          git push origin "HEAD:${HEAD_REF}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Run CI for the updated commit
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: gh workflow run CI.yaml --ref "${HEAD_REF}"
