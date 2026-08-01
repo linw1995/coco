@@ -38,7 +38,7 @@ pub struct PanelSelection {
 pub struct InitialProviderContext {
     pub target: String,
     pub context: Option<String>,
-    pub response: Result<ProviderContextResponse, String>,
+    pub response: ProviderContextResponse,
     pub items: Vec<ProviderContextItem>,
 }
 
@@ -49,9 +49,8 @@ impl PanelSelection {
         let (target, query) = hash
             .split_once('?')
             .map_or((hash, None), |(target, query)| (target, Some(query)));
-        let target = target
-            .starts_with(NODE_TARGET_PREFIX)
-            .then(|| target.to_owned());
+        let target = decode_url_component(target);
+        let target = target.starts_with(NODE_TARGET_PREFIX).then_some(target);
         let context = query.and_then(provider_context_target);
 
         Self { target, context }
@@ -59,10 +58,8 @@ impl PanelSelection {
 
     pub fn from_query(query: &str) -> Self {
         let query = query.strip_prefix('?').unwrap_or(query);
-        let target = query.split('&').find_map(|part| {
-            let (name, value) = part.split_once('=')?;
-            (name == "target" && value.starts_with(NODE_TARGET_PREFIX)).then(|| value.to_owned())
-        });
+        let target =
+            query_parameter(query, "target").filter(|value| value.starts_with(NODE_TARGET_PREFIX));
         let context = provider_context_target(query);
 
         Self { target, context }
@@ -225,8 +222,8 @@ fn ProviderContextPanelBody(
             target: initial.target,
             context: initial.context,
         },
-        response: initial.response.map(|response| ProviderContextPayload {
-            response,
+        response: Ok(ProviderContextPayload {
+            response: initial.response,
             items: initial.items,
         }),
     });
@@ -1816,10 +1813,48 @@ fn ProviderContextError(error: String) -> impl IntoView {
 
 #[cfg(any(target_arch = "wasm32", test))]
 fn provider_context_target(query: &str) -> Option<String> {
-    query.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
-        (name == "context" && value.starts_with(NODE_TARGET_PREFIX)).then(|| value.to_owned())
-    })
+    query_parameter(query, "context").filter(|value| value.starts_with(NODE_TARGET_PREFIX))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn query_parameter(query: &str, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_url_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(byte) = decode_hex_pair(bytes[index + 1], bytes[index + 2])
+        {
+            decoded.push(byte);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some(decode_hex_digit(high)? << 4 | decode_hex_digit(low)?)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1866,6 +1901,20 @@ mod tests {
             PanelSelection {
                 target: Some("detail-node".to_owned()),
                 context: Some("detail-context".to_owned()),
+            }
+        );
+        assert_eq!(
+            PanelSelection::from_hash("#detail-my%20branch?context=detail-root%20branch"),
+            PanelSelection {
+                target: Some("detail-my branch".to_owned()),
+                context: Some("detail-root branch".to_owned()),
+            }
+        );
+        assert_eq!(
+            PanelSelection::from_query("?target=detail-my+branch&context=detail-root%20branch"),
+            PanelSelection {
+                target: Some("detail-my branch".to_owned()),
+                context: Some("detail-root branch".to_owned()),
             }
         );
     }

@@ -548,6 +548,7 @@ dependencies = [
  "tree-sitter-highlight",
  "tree-sitter-json",
  "tree-sitter-md",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

@@ -3019,21 +3019,20 @@ fn sync_detail_url(window: &Window, hash: &str) -> Result<(), JsValue> {
 fn detail_url(window: &Window, hash: &str) -> Result<String, JsValue> {
     let selection = PanelSelection::from_hash(hash);
     let search = window.location().search()?;
-    let mut parts = search
-        .trim_start_matches('?')
-        .split('&')
-        .filter(|part| {
-            !part.is_empty() && !part.starts_with("target=") && !part.starts_with("context=")
-        })
-        .map(str::to_owned)
+    let mut parts = url::form_urlencoded::parse(search.trim_start_matches('?').as_bytes())
+        .filter(|(name, _)| name != "target" && name != "context")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
     if let Some(target) = selection.target {
-        parts.push(format!("target={target}"));
+        parts.push(("target".to_owned(), target));
     }
     if let Some(context) = selection.context {
-        parts.push(format!("context={context}"));
+        parts.push(("context".to_owned(), context));
     }
-    let search = (!parts.is_empty()).then(|| format!("?{}", parts.join("&")));
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(parts);
+    let search = serializer.finish();
+    let search = (!search.is_empty()).then(|| format!("?{search}"));
     Ok(format!("{}{hash}", search.unwrap_or_default()))
 }
 
@@ -4330,6 +4329,24 @@ mod tests {
                 .expect_throw("canonical URL should parse")
                 .is_none()
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_canonical_detail_query_encodes_decoded_selection_values() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .location()
+            .set_hash("detail-my%20branch?context=detail-root%20branch")
+            .expect_throw("encoded selection hash should be set");
+
+        let canonical = legacy_detail_url(&window)
+            .expect_throw("encoded selection URL should parse")
+            .expect_throw("encoded selection URL should require a redirect");
+
+        assert!(canonical.contains("target=detail-my+branch"));
+        assert!(canonical.contains("context=detail-root+branch"));
+        assert!(canonical.ends_with("#detail-my%20branch?context=detail-root%20branch"));
     }
 
     #[wasm_bindgen_test]

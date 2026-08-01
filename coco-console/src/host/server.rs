@@ -318,10 +318,21 @@ where
         .web_graph
         .rightmost_viewport(mode, GraphViewportRequest::default());
     let initial_provider_context = async {
-        let target = query.get("target")?;
-        Some(load_initial_provider_context(&state, target, query.get("context"), mode).await)
+        let Some(target) = query.get("target") else {
+            return Ok(None);
+        };
+        load_initial_provider_context(&state, target, query.get("context"), mode)
+            .await
+            .map(Some)
     };
     let (viewport, initial_provider_context) = tokio::join!(viewport, initial_provider_context);
+    let initial_provider_context = match initial_provider_context {
+        Ok(initial) => initial,
+        Err(error) => {
+            tracing::warn!(%error, "failed to preload provider context");
+            None
+        }
+    };
     match viewport {
         Ok(viewport) => html_response(render_index_page(mode, &viewport, initial_provider_context)),
         Err(error) => plain_error(error.to_string()),
@@ -719,36 +730,28 @@ async fn load_initial_provider_context<S>(
     target: &str,
     context: Option<&str>,
     view_mode: ViewMode,
-) -> crate::panels::InitialProviderContext
+) -> Result<crate::panels::InitialProviderContext>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let loaded = async {
-        let response = load_provider_context(state, target, context).await?;
-        let items = match &response {
-            ProviderContextResponse::Found {
-                selected_id,
-                node_ids,
-                ..
-            } => {
-                let node_ids = initial_provider_context_node_ids(node_ids, selected_id);
-                load_provider_context_items(state, &node_ids, view_mode).await?
-            }
-            _ => Vec::new(),
-        };
-        Ok::<_, crate::Error>((response, items))
-    }
-    .await;
-    let (response, items) = match loaded {
-        Ok((response, items)) => (Ok(response), items),
-        Err(error) => (Err(error.to_string()), Vec::new()),
+    let response = load_provider_context(state, target, context).await?;
+    let items = match &response {
+        ProviderContextResponse::Found {
+            selected_id,
+            node_ids,
+            ..
+        } => {
+            let node_ids = initial_provider_context_node_ids(node_ids, selected_id);
+            load_provider_context_items(state, &node_ids, view_mode).await?
+        }
+        _ => Vec::new(),
     };
-    crate::panels::InitialProviderContext {
+    Ok(crate::panels::InitialProviderContext {
         target: target.to_owned(),
         context: context.map(str::to_owned),
         response,
         items,
-    }
+    })
 }
 
 fn initial_provider_context_node_ids(node_ids: &[String], selected_id: &str) -> Vec<String> {
@@ -1014,46 +1017,9 @@ impl QueryParams {
 
 fn parse_query(query: &str) -> QueryParams {
     QueryParams {
-        pairs: query
-            .split('&')
-            .filter(|part| !part.is_empty())
-            .filter_map(|part| {
-                let (key, value) = part.split_once('=')?;
-                Some((percent_decode(key), percent_decode(value)))
-            })
+        pairs: url::form_urlencoded::parse(query.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect(),
-    }
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let Some(byte) = decode_hex_pair(bytes[index + 1], bytes[index + 2])
-        {
-            decoded.push(byte);
-            index += 3;
-            continue;
-        }
-        decoded.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-fn decode_hex_pair(high: u8, low: u8) -> Option<u8> {
-    Some(decode_hex_digit(high)? << 4 | decode_hex_digit(low)?)
-}
-
-fn decode_hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
     }
 }
 
@@ -1234,9 +1200,11 @@ mod tests {
 
     #[test]
     fn query_parser_decodes_repeated_values() {
-        let query = parse_query("mode=all&known_node=node%3Aa&known_node=node%3Ab");
+        let query =
+            parse_query("mode=all&target=detail-my+branch&known_node=node%3Aa&known_node=node%3Ab");
 
         assert_eq!(view_mode_from_query(&query), ViewMode::All);
+        assert_eq!(query.get("target"), Some("detail-my branch"));
         assert_eq!(query.get_all("known_node"), ["node:a", "node:b"]);
     }
 
@@ -1252,7 +1220,7 @@ mod tests {
 
     #[test]
     fn malformed_percent_encoding_is_preserved() {
-        assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
+        assert_eq!(parse_query("target=a%2Gb").get("target"), Some("a%2Gb"));
     }
 
     #[test]
@@ -2015,6 +1983,7 @@ mod tests {
             ViewMode::All,
         )
         .await;
+        let initial = initial.unwrap();
         assert_eq!(initial.items.len(), PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT + 1);
         let selected = initial
             .items
