@@ -1911,6 +1911,13 @@ mod tests {
             }
         );
         assert_eq!(
+            PanelSelection::from_hash("#detail-feature%3Fx?context=detail-root%26y"),
+            PanelSelection {
+                target: Some("detail-feature?x".to_owned()),
+                context: Some("detail-root&y".to_owned()),
+            }
+        );
+        assert_eq!(
             PanelSelection::from_query("?target=detail-my+branch&context=detail-root%20branch"),
             PanelSelection {
                 target: Some("detail-my branch".to_owned()),

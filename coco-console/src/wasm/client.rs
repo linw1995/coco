@@ -2992,19 +2992,15 @@ fn legacy_detail_url(window: &Window) -> Result<Option<String>, JsValue> {
 }
 
 fn sync_initial_detail_url(window: &Window) -> Result<(), JsValue> {
-    let hash = window.location().hash()?;
-    if PanelSelection::from_hash(&hash).target.is_some() {
-        return sync_detail_url(window, &hash);
+    let current_hash = window.location().hash()?;
+    if PanelSelection::from_hash(&current_hash).target.is_some() {
+        return sync_detail_url(window, &current_hash);
     }
     let selection = PanelSelection::from_query(&window.location().search()?);
-    let Some(target) = selection.target else {
-        return sync_detail_url(window, &hash);
+    let Some(hash) = detail_hash(&selection) else {
+        return sync_detail_url(window, &current_hash);
     };
-    let context = selection
-        .context
-        .map(|context| format!("?context={context}"))
-        .unwrap_or_default();
-    sync_detail_url(window, &format!("#{target}{context}"))
+    sync_detail_url(window, &hash)
 }
 
 fn sync_detail_url(window: &Window, hash: &str) -> Result<(), JsValue> {
@@ -3029,17 +3025,33 @@ fn detail_url(window: &Window, hash: &str) -> Result<String, JsValue> {
         .filter(|(name, _)| name != "target" && name != "context")
         .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
-    if let Some(target) = selection.target {
-        parts.push(("target".to_owned(), target));
+    if let Some(target) = &selection.target {
+        parts.push(("target".to_owned(), target.clone()));
     }
-    if let Some(context) = selection.context {
-        parts.push(("context".to_owned(), context));
+    if let Some(context) = &selection.context {
+        parts.push(("context".to_owned(), context.clone()));
     }
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.extend_pairs(parts);
     let search = serializer.finish();
     let search = (!search.is_empty()).then(|| format!("?{search}"));
+    let hash = detail_hash(&selection).unwrap_or_else(|| hash.to_owned());
     Ok(format!("{}{hash}", search.unwrap_or_default()))
+}
+
+fn detail_hash(selection: &PanelSelection) -> Option<String> {
+    let target = selection.target.as_deref()?;
+    let target = encode_url_component(target);
+    let context = selection
+        .context
+        .as_deref()
+        .map(|context| format!("?context={}", encode_url_component(context)))
+        .unwrap_or_default();
+    Some(format!("#{target}{context}"))
+}
+
+fn encode_url_component(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
@@ -4378,6 +4390,31 @@ mod tests {
         let selection = selected_panel_selection(&window);
         assert_eq!(selection.target.as_deref(), Some("detail-aaaaaaaa"));
         assert_eq!(selection.context.as_deref(), Some("detail-context"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_initial_query_encodes_reserved_detail_hash_delimiters() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("?target=detail-feature%3Fx&context=detail-root%26y"),
+            )
+            .expect_throw("encoded initial query should be set");
+
+        sync_initial_detail_url(&window).expect_throw("initial detail URL should canonicalize");
+
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-feature%3Fx?context=detail-root%26y"
+        );
+        let selection = selected_panel_selection(&window);
+        assert_eq!(selection.target.as_deref(), Some("detail-feature?x"));
+        assert_eq!(selection.context.as_deref(), Some("detail-root&y"));
     }
 
     #[wasm_bindgen_test]
