@@ -726,13 +726,6 @@ impl WebGraphRuntime {
         self.publisher.subscribe_source_changes()
     }
 
-    pub async fn contains_node(&self, node_id: &str) -> crate::Result<bool> {
-        self.store
-            .contains_node(node_id)
-            .await
-            .context(WebGraphStoreSnafu)
-    }
-
     pub async fn provider_context_for_node(
         &self,
         target_node_id: &str,

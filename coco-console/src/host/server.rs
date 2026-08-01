@@ -678,14 +678,18 @@ where
             target: target.to_owned(),
         });
     };
-    if !state.web_graph.contains_node(node_id).await? {
-        return Ok(ProviderContextResponse::Missing {
-            target: target.to_owned(),
-        });
-    }
+    let node = match state.store.get_node(node_id).await {
+        Ok(node) => node,
+        Err(error) if is_missing_node(&error) => {
+            return Ok(ProviderContextResponse::Missing {
+                target: target.to_owned(),
+            });
+        }
+        Err(source) => return Err(source).context(StoreSnafu),
+    };
     let selection = state
         .web_graph
-        .provider_context_for_node(node_id, context)
+        .provider_context_for_node(&node.id, context)
         .await?;
     let Some(selection) = selection else {
         return Ok(ProviderContextResponse::Found { items: Vec::new() });
@@ -1920,6 +1924,20 @@ mod tests {
             .expect("selected provider context item should exist");
         assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
+        for node_ref in ["main", &selected_id[..16]] {
+            assert!(matches!(
+                load_provider_context(
+                    &state,
+                    &node_target_id(node_ref),
+                    None,
+                    ViewMode::All,
+                )
+                .await
+                .unwrap(),
+                ProviderContextResponse::Found { items }
+                    if items.iter().any(|item| item.selected)
+            ));
+        }
 
         let request = Request::builder()
             .uri(format!(

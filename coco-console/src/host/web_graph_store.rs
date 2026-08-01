@@ -201,16 +201,6 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
-    pub async fn contains_node(&self, node_id: &str) -> Result<bool> {
-        let path = self.path.clone();
-        let node_id = node_id.to_owned();
-        let mut connection = self.database.acquire().await?;
-        let node_id = NodeId::new(node_id).map_err(|source| Error::InvalidGraph { source })?;
-        topology_node_exists(&mut connection, &node_id)
-            .await
-            .map_err(|error| error.into_store_error(path))
-    }
-
     pub async fn canvas(&self, kind: LayoutKind) -> Result<Option<GraphRead<Canvas>>> {
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
