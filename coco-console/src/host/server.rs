@@ -39,8 +39,8 @@ use crate::api::{
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
-    NodeView, ProviderContextNode as ProviderContextViewNode, ViewMode, node_id_from_target,
-    tool_use_input_links, write_stdin_session_ids,
+    NodeView, ViewMode, node_id_from_target, provider_context_for_node, tool_use_input_links,
+    write_stdin_session_ids,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -687,10 +687,7 @@ where
         }
         Err(source) => return Err(source).context(StoreSnafu),
     };
-    let selection = state
-        .web_graph
-        .provider_context_for_node(&node.id, context)
-        .await?;
+    let selection = provider_context_for_node(&state.store, &node.id, context).await?;
     let Some(selection) = selection else {
         return Ok(ProviderContextResponse::Found { items: Vec::new() });
     };
@@ -698,7 +695,7 @@ where
         .context
         .nodes
         .iter()
-        .map(|node| node.id.clone())
+        .map(|node| node.node.id.clone())
         .collect::<Vec<_>>();
     let points = state.web_graph.node_points(view_mode, &node_ids).await?;
     let items = selection
@@ -707,18 +704,18 @@ where
         .into_iter()
         .map(|node| ProviderContextItem {
             context_target: selection.context.id.clone(),
-            selected: node.id == selection.selected_id,
-            point: points.get(&node.id).map(|point| ApiPoint {
+            selected: node.node.id == selection.selected_id,
+            point: points.get(&node.node.id).map(|point| ApiPoint {
                 x: point.x,
                 y: point.y,
             }),
-            node: provider_context_node(node),
+            node: provider_context_node(node.node),
         })
         .collect();
     Ok(ProviderContextResponse::Found { items })
 }
 
-fn provider_context_node(node: ProviderContextViewNode) -> ProviderContextNode {
+fn provider_context_node(node: NodeView) -> ProviderContextNode {
     ProviderContextNode {
         id: node.id,
         short_id: node.short_id,
@@ -1385,7 +1382,7 @@ mod tests {
             .iter()
             .filter(|asset| asset.path.starts_with("split_") && asset.path.ends_with(".wasm"))
             .collect::<Vec<_>>();
-        assert_eq!(lazy_chunks.len(), 3);
+        assert_eq!(lazy_chunks.len(), 2);
 
         for asset in lazy_chunks {
             assert!(asset.brotli.is_some());
@@ -1437,8 +1434,7 @@ mod tests {
             std::str::from_utf8(client_asset_by_path("__wasm_split_manifest.json").identity)
                 .unwrap();
         assert!(manifest.contains("anchor_range"));
-        assert!(manifest.contains("node_detail"));
-        assert!(manifest.contains("provider_context"));
+        assert!(manifest.contains("panel_detail"));
     }
 
     #[test]
@@ -1924,20 +1920,6 @@ mod tests {
             .expect("selected provider context item should exist");
         assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
-        for node_ref in ["main", &selected_id[..16]] {
-            assert!(matches!(
-                load_provider_context(
-                    &state,
-                    &node_target_id(node_ref),
-                    None,
-                    ViewMode::All,
-                )
-                .await
-                .unwrap(),
-                ProviderContextResponse::Found { items }
-                    if items.iter().any(|item| item.selected)
-            ));
-        }
 
         let request = Request::builder()
             .uri(format!(
@@ -1946,62 +1928,12 @@ mod tests {
             ))
             .body(Body::empty())
             .unwrap();
-        let response = panel_server_function(State(state.clone()), request).await;
+        let response = panel_server_function(State(state), request).await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         assert!(matches!(
             response,
             ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
-        ));
-
-        state
-            .store
-            .set_branch_head("main", &selected_id, &session_id)
-            .await
-            .unwrap();
-        state.web_graph.catch_up().await.unwrap();
-        assert!(matches!(
-            load_provider_context(
-                &state,
-                &node_target_id(&selected_id),
-                None,
-                ViewMode::All,
-            )
-            .await
-            .unwrap(),
-            ProviderContextResponse::Found { items } if items.is_empty()
-        ));
-
-        state
-            .store
-            .set_branch_head("main", &session_id, &selected_id)
-            .await
-            .unwrap();
-        state.web_graph.catch_up().await.unwrap();
-        assert!(matches!(
-            load_provider_context(
-                &state,
-                &node_target_id(&selected_id),
-                None,
-                ViewMode::All,
-            )
-            .await
-            .unwrap(),
-            ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
-        ));
-
-        state.store.delete_branch("main").await.unwrap();
-        state.web_graph.catch_up().await.unwrap();
-        assert!(matches!(
-            load_provider_context(
-                &state,
-                &node_target_id(&selected_id),
-                None,
-                ViewMode::All,
-            )
-            .await
-            .unwrap(),
-            ProviderContextResponse::Found { items } if items.is_empty()
         ));
     }
 

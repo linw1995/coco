@@ -1,6 +1,0 @@
-DROP TABLE web_graph_provider_context_nodes;
-DROP TABLE web_graph_provider_nodes;
-DROP TABLE web_graph_provider_contexts;
-DROP TABLE web_graph_provider_branches;
-DROP TABLE web_graph_provider_branch_history;
-DROP TABLE web_graph_provider_branch_history_changes;

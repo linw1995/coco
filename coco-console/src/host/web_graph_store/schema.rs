@@ -72,56 +72,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    web_graph_provider_branch_history (change_id, branch_name) {
-        change_id -> BigInt,
-        branch_name -> Text,
-        head_node_id -> Nullable<Text>,
-    }
-}
-
-diesel::table! {
-    web_graph_provider_branch_history_changes (change_id) {
-        change_id -> BigInt,
-        graph_revision -> BigInt,
-    }
-}
-
-diesel::table! {
-    web_graph_provider_branches (branch_name) {
-        branch_name -> Text,
-        head_node_id -> Text,
-    }
-}
-
-diesel::table! {
-    web_graph_provider_context_nodes (context_id, ordinal) {
-        context_id -> Text,
-        ordinal -> BigInt,
-        node_id -> Text,
-    }
-}
-
-diesel::table! {
-    web_graph_provider_contexts (context_id) {
-        context_id -> Text,
-        branch_name -> Text,
-        head_created_at_seconds -> BigInt,
-        head_created_at_nanoseconds -> Integer,
-    }
-}
-
-diesel::table! {
-    web_graph_provider_nodes (node_id) {
-        node_id -> Text,
-        short_id -> Text,
-        kind -> Text,
-        role -> Text,
-        created_at -> Text,
-        summary -> Text,
-    }
-}
-
-diesel::table! {
     web_graph_nodes (node_id) {
         node_id -> Text,
     }
@@ -173,11 +123,6 @@ diesel::table! {
 diesel::joinable!(web_graph_edge_routes -> web_graph_layouts (layout_kind));
 diesel::joinable!(web_graph_node_placements -> web_graph_layouts (layout_kind));
 diesel::joinable!(web_graph_node_placements -> web_graph_nodes (node_id));
-diesel::joinable!(web_graph_provider_branch_history -> web_graph_provider_branch_history_changes (change_id));
-diesel::joinable!(web_graph_provider_context_nodes -> web_graph_provider_contexts (context_id));
-diesel::joinable!(web_graph_provider_context_nodes -> web_graph_provider_nodes (node_id));
-diesel::joinable!(web_graph_provider_contexts -> web_graph_provider_branches (branch_name));
-diesel::joinable!(web_graph_provider_nodes -> web_graph_nodes (node_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     web_graph_edge_routes,
@@ -188,12 +133,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     web_graph_node_spatial_index,
     web_graph_node_spatial_items,
     web_graph_nodes,
-    web_graph_provider_branch_history,
-    web_graph_provider_branch_history_changes,
-    web_graph_provider_branches,
-    web_graph_provider_context_nodes,
-    web_graph_provider_contexts,
-    web_graph_provider_nodes,
     web_graph_route_spatial_index,
     web_graph_route_spatial_items,
     web_graph_state,

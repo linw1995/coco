@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use coco_mem::{Anchor, AnchorPayload, Kind, Node, SessionAnchor, ToolResult, ToolUse};
+use coco_mem::{
+    Anchor, AnchorPayload, BranchStore, Kind, Node, NodeStore, SessionAnchor, SessionStore,
+    ToolResult, ToolUse,
+};
 use serde::{Deserialize, Serialize};
+use snafu::prelude::*;
 
 use crate::api::{
     GRAPH_SOURCE_PORT_OFFSET_X, GRAPH_TARGET_PORT_OFFSET_X, GraphViewportDiffResponse,
@@ -10,6 +14,8 @@ use crate::api::{
 };
 use crate::host::api::GraphViewportKnownItems;
 use crate::web_graph::{BezierRoute, Point};
+
+use super::error::StoreSnafu;
 
 pub const GRAPH_PADDING: i32 = 56;
 pub const GRAPH_RANK_STEP: i32 = 112;
@@ -74,12 +80,8 @@ pub struct ProviderContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderContextNode {
-    pub id: String,
-    pub short_id: String,
-    pub kind: String,
-    pub role: String,
-    pub created_at: String,
-    pub summary: String,
+    pub node: NodeView,
+    pub created_at_ns: i128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +90,69 @@ pub struct ProviderContextSelection {
     pub selected_id: String,
 }
 
-pub fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
+pub async fn provider_context_for_node(
+    store: &(impl BranchStore + NodeStore + SessionStore),
+    target_node_id: &str,
+    context_id: Option<&str>,
+) -> crate::Result<Option<ProviderContextSelection>> {
+    let mut branches = store
+        .list_session_states()
+        .await
+        .context(StoreSnafu)?
+        .into_keys()
+        .collect::<Vec<_>>();
+    branches.sort();
+
+    let mut contexts = HashMap::<String, ProviderContext>::new();
+    for branch in branches {
+        let head_id = store.get_branch_head(&branch).await.context(StoreSnafu)?;
+        let ancestry = store.ancestry(&head_id).await.context(StoreSnafu)?;
+        for nodes in provider_contexts_from_head(ancestry) {
+            let Some(id) = provider_context_id(&branch, &nodes) else {
+                continue;
+            };
+            if context_id.is_some_and(|selected| selected != id)
+                || !nodes.iter().any(|node| node.id == target_node_id)
+            {
+                continue;
+            }
+            contexts
+                .entry(id.clone())
+                .or_insert_with(|| ProviderContext {
+                    id,
+                    nodes: nodes
+                        .iter()
+                        .map(|node| ProviderContextNode {
+                            node: NodeView::from(node),
+                            created_at_ns: node.created_at.as_nanosecond(),
+                        })
+                        .collect(),
+                });
+        }
+    }
+
+    let mut contexts = contexts.into_values().collect::<Vec<_>>();
+    contexts.sort_by(|left, right| {
+        context_head_time_ns(left)
+            .cmp(&context_head_time_ns(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(contexts.into_iter().find_map(|context| {
+        let selected_id = context
+            .nodes
+            .iter()
+            .find(|node| node.node.id == target_node_id)?
+            .node
+            .id
+            .clone();
+        Some(ProviderContextSelection {
+            context,
+            selected_id,
+        })
+    }))
+}
+
+fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
     let mut contexts = Vec::new();
     let mut current = Vec::new();
     let mut previous_is_skill_invocation = false;
@@ -126,12 +190,20 @@ fn is_provider_context_start(node: &Node) -> bool {
     )
 }
 
-pub fn provider_context_id(branch: &str, context: &[Node]) -> Option<String> {
+fn provider_context_id(branch: &str, context: &[Node]) -> Option<String> {
     Some(format!(
         "{}-context-{}",
         node_target_id(&context.last()?.id),
         stable_token(branch)
     ))
+}
+
+fn context_head_time_ns(context: &ProviderContext) -> i128 {
+    context
+        .nodes
+        .first()
+        .map(|node| node.created_at_ns)
+        .unwrap_or_default()
 }
 
 fn stable_token(value: &str) -> String {

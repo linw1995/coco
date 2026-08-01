@@ -30,8 +30,19 @@ impl<S> ConsoleStore<S> {
         &self.publisher
     }
 
-    fn notify_source_if_ok<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
+    fn notify_node_if_ok(&self, result: StoreResult<String>) -> StoreResult<String> {
         if result.is_ok() {
+            self.publisher.mark_source_dirty();
+        }
+        result
+    }
+
+    fn notify_node_if_created(
+        &self,
+        node_created: bool,
+        result: StoreResult<String>,
+    ) -> StoreResult<String> {
+        if node_created && result.is_ok() {
             self.publisher.mark_source_dirty();
         }
         result
@@ -48,7 +59,7 @@ where
     }
 
     async fn append(&self, node: NewNode) -> StoreResult<String> {
-        self.notify_source_if_ok(self.inner.append(node).await)
+        self.notify_node_if_ok(self.inner.append(node).await)
     }
 
     async fn ancestry(&self, head_ref: &str) -> StoreResult<Vec<Node>> {
@@ -74,7 +85,7 @@ where
     S: BranchStore + Sync,
 {
     async fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String> {
-        self.notify_source_if_ok(self.inner.fork(name, from_ref).await)
+        self.inner.fork(name, from_ref).await
     }
 
     async fn get_branch_head(&self, name: &str) -> StoreResult<String> {
@@ -82,7 +93,7 @@ where
     }
 
     async fn delete_branch(&self, name: &str) -> StoreResult<()> {
-        self.notify_source_if_ok(self.inner.delete_branch(name).await)
+        self.inner.delete_branch(name).await
     }
 
     async fn set_branch_head(
@@ -91,11 +102,9 @@ where
         expected_old_head: &str,
         new_head: &str,
     ) -> StoreResult<()> {
-        let result = self
-            .inner
+        self.inner
             .set_branch_head(name, expected_old_head, new_head)
-            .await;
-        self.notify_source_if_ok(result)
+            .await
     }
 
     async fn append_nodes_and_set_branch_head(
@@ -105,7 +114,9 @@ where
         parent: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_source_if_ok(
+        let node_created = !nodes.is_empty();
+        self.notify_node_if_created(
+            node_created,
             self.inner
                 .append_nodes_and_set_branch_head(name, expected_old_head, parent, nodes)
                 .await,
@@ -120,7 +131,9 @@ where
         new_head: &str,
         nodes: Vec<NewNodeContent>,
     ) -> StoreResult<String> {
-        self.notify_source_if_ok(
+        let node_created = !nodes.is_empty();
+        self.notify_node_if_created(
+            node_created,
             self.inner
                 .append_nodes_and_set_branch_head_to(
                     name,
@@ -137,11 +150,12 @@ where
         &self,
         update: BranchAppendSessionState,
     ) -> StoreResult<String> {
+        let node_created = !update.nodes.is_empty();
         let result = self
             .inner
             .append_nodes_and_set_branch_head_with_session_state(update)
             .await;
-        self.notify_source_if_ok(result)
+        self.notify_node_if_created(node_created, result)
     }
 }
 
@@ -168,7 +182,7 @@ where
     }
 
     async fn rebase_session(&self, name: &str, patch: &SessionAnchorPatch) -> StoreResult<String> {
-        self.notify_source_if_ok(self.inner.rebase_session(name, patch).await)
+        self.notify_node_if_ok(self.inner.rebase_session(name, patch).await)
     }
 
     async fn handoff_session(
@@ -177,7 +191,7 @@ where
         patch: &SessionAnchorPatch,
         prompt: &str,
     ) -> StoreResult<String> {
-        self.notify_source_if_ok(self.inner.handoff_session(name, patch, prompt).await)
+        self.notify_node_if_ok(self.inner.handoff_session(name, patch, prompt).await)
     }
 }
 
@@ -376,7 +390,7 @@ mod tests {
     use coco_mem::{Kind, Role, SqliteStore};
 
     #[tokio::test]
-    async fn node_and_branch_changes_mark_the_graph_source_dirty() {
+    async fn only_node_creation_marks_the_graph_source_dirty() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let mut source_changes = publisher.subscribe_source_changes();
@@ -403,8 +417,6 @@ mod tests {
         store.submit_job("main", &root).await.unwrap();
         store.set_branch_head("main", &root, &child).await.unwrap();
 
-        assert_eq!(*source_changes.borrow_and_update(), 3);
-        store.delete_branch("main").await.unwrap();
-        assert_eq!(*source_changes.borrow(), 4);
+        assert_eq!(*source_changes.borrow(), 1);
     }
 }
