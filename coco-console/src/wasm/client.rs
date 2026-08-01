@@ -2947,6 +2947,9 @@ fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
     let point = {
         let graph = graph.borrow();
         graph.sync_selected_graph_node();
+        if let Err(error) = sync_selected_provider_context_node(&graph.window, &graph.document) {
+            web_sys::console::error_1(&error);
+        }
         let transform = graph
             .anchor_range
             .as_ref()
@@ -2982,6 +2985,31 @@ fn sync_selected_graph_node(window: &Window, document: &Document) -> Result<(), 
         let is_selected = node.get_attribute("data-node-target").as_deref() == selected.as_deref();
         node.class_list()
             .toggle_with_force("node-link-selected", is_selected)?;
+    }
+    Ok(())
+}
+
+fn sync_selected_provider_context_node(
+    window: &Window,
+    document: &Document,
+) -> Result<(), JsValue> {
+    let selected = selected_node_target(window);
+    let links = document.query_selector_all(".provider-context-node-link[data-node-target]")?;
+    for index in 0..links.length() {
+        let link = links
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let is_selected = link.get_attribute("data-node-target").as_deref() == selected.as_deref();
+        if let Some(row) = link.closest(".provider-context-node")? {
+            row.class_list()
+                .toggle_with_force("selected", is_selected)?;
+        }
+        if is_selected {
+            link.set_attribute("aria-current", "true")?;
+        } else {
+            link.remove_attribute("aria-current")?;
+        }
     }
     Ok(())
 }
@@ -4217,6 +4245,62 @@ mod tests {
             update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-other")
                 .expect_throw("provider context hash should be set")
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_provider_context_selection_tracks_the_hash_without_rerendering() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        let row = document
+            .create_element("li")
+            .expect_throw("provider context row should be created");
+        row.set_class_name("provider-context-node selected");
+        let link = document
+            .create_element("a")
+            .expect_throw("provider context link should be created");
+        link.set_class_name("provider-context-node-link");
+        link.set_attribute("data-node-target", "detail-bbbbbbbb")
+            .expect_throw("provider context target should be set");
+        link.set_attribute("aria-current", "true")
+            .expect_throw("provider context selection should be set");
+        row.append_child(&link)
+            .expect_throw("provider context link should be mounted");
+        fixture
+            .root
+            .append_child(&row)
+            .expect_throw("provider context row should be mounted");
+        fixture
+            .graph
+            .borrow()
+            .window
+            .location()
+            .set_hash("detail-aaaaaaaa")
+            .expect_throw("selection hash should be set");
+
+        sync_selected_provider_context_node(
+            &fixture.graph.borrow().window,
+            &fixture.graph.borrow().document,
+        )
+        .expect_throw("provider context selection should sync");
+
+        assert!(!row.class_list().contains("selected"));
+        assert_eq!(link.get_attribute("aria-current"), None);
+
+        fixture
+            .graph
+            .borrow()
+            .window
+            .location()
+            .set_hash("detail-bbbbbbbb")
+            .expect_throw("selection hash should be updated");
+        sync_selected_provider_context_node(
+            &fixture.graph.borrow().window,
+            &fixture.graph.borrow().document,
+        )
+        .expect_throw("provider context selection should sync");
+
+        assert!(row.class_list().contains("selected"));
+        assert_eq!(link.get_attribute("aria-current").as_deref(), Some("true"));
     }
 
     #[wasm_bindgen_test]

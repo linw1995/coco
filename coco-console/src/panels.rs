@@ -58,6 +58,12 @@ struct ProviderContextRequest {
     context: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadedProviderContext {
+    id: String,
+    targets: Vec<String>,
+}
+
 enum PanelDetailPayload {
     Node(NodeDetailResponse),
     Provider(ProviderContextResponse),
@@ -171,15 +177,12 @@ pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
 #[component]
 fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
     let selection = use_panel_selection();
-    let selected_context = Memo::new(move |_| {
-        let selection = selection.get();
-        selection.target.map(|target| ProviderContextRequest {
-            target,
-            context: selection.context,
-        })
+    let loaded_context = RwSignal::new(None::<LoadedProviderContext>);
+    let provider_request = Memo::new(move |previous| {
+        provider_context_request(selection.get(), loaded_context.get().as_ref(), previous)
     });
     let provider_context = LocalResource::new(move || {
-        let request = selected_context.get();
+        let request = provider_request.get();
         let graph_mode = graph_mode.clone();
         async move {
             let request = request?;
@@ -190,16 +193,54 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
             Some(LoadedPanel { request, response })
         }
     });
+    Effect::new(move || {
+        loaded_context.set(loaded_provider_context(
+            provider_context.get().flatten().as_ref(),
+        ));
+    });
     view! {
         <div class="panel-content">
             {move || {
                 provider_context_view(
-                    selected_context.get(),
+                    provider_request.get(),
                     provider_context.get().flatten(),
                 )
             }}
         </div>
     }
+}
+
+fn provider_context_request(
+    selection: PanelSelection,
+    loaded: Option<&LoadedProviderContext>,
+    previous: Option<&Option<ProviderContextRequest>>,
+) -> Option<ProviderContextRequest> {
+    let target = selection.target?;
+    if loaded.is_some_and(|loaded| {
+        selection.context.as_deref() == Some(loaded.id.as_str()) && loaded.targets.contains(&target)
+    }) && let Some(previous) = previous
+    {
+        return previous.clone();
+    }
+    Some(ProviderContextRequest {
+        target,
+        context: selection.context,
+    })
+}
+
+fn loaded_provider_context(
+    loaded: Option<&LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
+) -> Option<LoadedProviderContext> {
+    let ProviderContextResponse::Found { items } = loaded?.response.as_ref().ok()? else {
+        return None;
+    };
+    let id = items.first()?.context_target.clone();
+    let targets = items
+        .iter()
+        .filter(|item| item.context_target == id)
+        .map(|item| format!("{NODE_TARGET_PREFIX}{}", item.node.id))
+        .collect();
+    Some(LoadedProviderContext { id, targets })
 }
 
 fn use_panel_selection() -> RwSignal<PanelSelection> {
@@ -1457,7 +1498,12 @@ fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
 
     view! {
         <li class=class>
-            <a class="provider-context-node-link" href=target>
+            <a
+                class="provider-context-node-link"
+                href=target
+                data-node-target=node_target
+                aria-current=item.selected.then_some("true")
+            >
                 {graph_point}
                 <div class="provider-context-node-head">
                     <span>{item.node.short_id}</span>
@@ -1523,6 +1569,7 @@ fn test_json_range(source: &str, text: &str, kind: JsonHighlightKind) -> JsonHig
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ProviderContextNode;
     use coco_types::{Anchor, PromptAnchor, SessionRole, SkillResultAnchor};
 
     fn test_node(kind: Kind) -> Node {
@@ -1555,6 +1602,77 @@ mod tests {
             PanelSelection::default()
         );
         assert_eq!(PanelSelection::from_hash(""), PanelSelection::default());
+    }
+
+    #[test]
+    fn provider_context_request_reuses_loaded_context_for_node_selection() {
+        let previous = Some(ProviderContextRequest {
+            target: "detail-first".to_owned(),
+            context: None,
+        });
+        let loaded = LoadedProviderContext {
+            id: "detail-root-context-branch".to_owned(),
+            targets: vec!["detail-first".to_owned(), "detail-second".to_owned()],
+        };
+
+        assert_eq!(
+            provider_context_request(
+                PanelSelection {
+                    target: Some("detail-second".to_owned()),
+                    context: Some(loaded.id.clone()),
+                },
+                Some(&loaded),
+                Some(&previous),
+            ),
+            previous
+        );
+        assert_eq!(
+            provider_context_request(
+                PanelSelection {
+                    target: Some("detail-outside".to_owned()),
+                    context: Some(loaded.id.clone()),
+                },
+                Some(&loaded),
+                Some(&previous),
+            ),
+            Some(ProviderContextRequest {
+                target: "detail-outside".to_owned(),
+                context: Some(loaded.id),
+            })
+        );
+    }
+
+    #[test]
+    fn loaded_provider_context_tracks_its_id_and_node_targets() {
+        let loaded = LoadedPanel {
+            request: ProviderContextRequest {
+                target: "detail-first".to_owned(),
+                context: None,
+            },
+            response: Ok(ProviderContextResponse::Found {
+                items: vec![ProviderContextItem {
+                    context_target: "detail-root-context-branch".to_owned(),
+                    node: ProviderContextNode {
+                        id: "first".to_owned(),
+                        short_id: "first".to_owned(),
+                        kind: "text".to_owned(),
+                        role: "assistant".to_owned(),
+                        created_at: "2026-08-01T00:00:00Z".to_owned(),
+                        summary: "First".to_owned(),
+                    },
+                    selected: true,
+                    point: None,
+                }],
+            }),
+        };
+
+        assert_eq!(
+            loaded_provider_context(Some(&loaded)),
+            Some(LoadedProviderContext {
+                id: "detail-root-context-branch".to_owned(),
+                targets: vec!["detail-first".to_owned()],
+            })
+        );
     }
 
     #[test]
