@@ -1077,19 +1077,33 @@ impl WebGraphRuntime {
                     && split_parents.insert(source_node.parent.clone())
                     && let Some(parent) = context_projections.get(&source_node.parent)
                 {
-                    context_splits.extend(children.iter().map(|child_id| ProviderContextSplit {
-                        start_node_id: child_id.clone(),
-                        previous_context_id: parent.context_id.clone(),
-                        context_id: provider_context_id(child_id),
+                    context_splits.extend(children.iter().map(|child_id| {
+                        (
+                            parent.source_row_id,
+                            ProviderContextSplit {
+                                start_node_id: child_id.clone(),
+                                previous_context_id: parent.context_id.clone(),
+                                context_id: provider_context_id(child_id),
+                            },
+                        )
                     }));
                 }
                 context_projections.insert(source_node.id.clone(), projection.clone());
                 new_context_projections.push(projection);
             }
         }
-        // Source rows are parent-first, so reverse the discovered splits to keep
-        // an outer split from changing the context expected by a nested split.
-        context_splits.reverse();
+        // Parent rows precede descendant rows, so this orders nested splits from
+        // the inside out regardless of how their new siblings reached this batch.
+        context_splits.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.start_node_id.cmp(&right.1.start_node_id))
+        });
+        let context_splits = context_splits
+            .into_iter()
+            .map(|(_, split)| split)
+            .collect::<Vec<_>>();
         self.store
             .apply_provider_context_node_projections(&new_context_projections, &context_splits)
             .await
@@ -4008,6 +4022,43 @@ mod tests {
             nested_alternate_context.context.previous_id,
             Some(outer_context_id)
         );
+        let alternate_context = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
+            .await
+            .unwrap()
+            .expect("the outer alternate branch should remain selectable");
+        assert_eq!(
+            alternate_context.context.node_ids,
+            [alternate, first, session]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_orders_nested_splits_by_ancestry() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "nested split order").await;
+        let first = append_text(&writer, &session, "first").await;
+        let second = append_text(&writer, &first, "second").await;
+        let tail = append_text(&writer, &second, "tail").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let nested_alternate = append_text(&writer, &second, "nested alternate").await;
+        let alternate = append_text(&writer, &first, "outer alternate").await;
+        runtime.catch_up().await.unwrap();
+
+        let outer_context_id = provider_context_id(&second);
+        for node_id in [&tail, &nested_alternate] {
+            let context = runtime
+                .provider_context_for_node(&second, Some(&provider_context_id(node_id)))
+                .await
+                .unwrap()
+                .expect("the nested branch should receive its own context");
+            assert_eq!(context.context.previous_id, Some(outer_context_id.clone()));
+        }
         let alternate_context = runtime
             .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
             .await
