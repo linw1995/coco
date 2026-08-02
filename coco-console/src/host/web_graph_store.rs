@@ -1752,12 +1752,50 @@ default_head(node_id, context_id, previous_node_id) AS (
     WHERE query_input.context_id IS NULL
       AND context.node_id = query_input.target_node_id
 ),
-explicit_head(node_id, context_id, previous_node_id) AS (
+explicit_target_path(node_id, context_id, previous_node_id, source_row_id) AS (
+    SELECT
+        context.node_id,
+        context.context_id,
+        context.previous_node_id,
+        context.source_row_id
+    FROM web_graph_provider_context_nodes AS context
+    CROSS JOIN query_input
+    WHERE query_input.context_id IS NOT NULL
+      AND query_input.target_node_id <> ''
+      AND context.node_id = query_input.target_node_id
+      AND context.context_id = query_input.context_id
+
+    UNION ALL
+
+    SELECT
+        child.node_id,
+        child.context_id,
+        child.previous_node_id,
+        child.source_row_id
+    FROM web_graph_provider_context_nodes AS child
+    JOIN explicit_target_path AS path ON child.previous_node_id = path.node_id
+    CROSS JOIN query_input
+    WHERE child.context_id = query_input.context_id
+),
+explicit_target_head(node_id, context_id, previous_node_id) AS (
+    SELECT node_id, context_id, previous_node_id
+    FROM explicit_target_path
+    ORDER BY source_row_id DESC, node_id DESC
+    LIMIT 1
+),
+explicit_latest_head(node_id, context_id, previous_node_id) AS (
     SELECT context.node_id, context.context_id, context.previous_node_id
     FROM web_graph_provider_context_nodes AS context
     JOIN query_input ON query_input.context_id = context.context_id
+    WHERE query_input.target_node_id = ''
+       OR NOT EXISTS (SELECT 1 FROM explicit_target_path)
     ORDER BY context.source_row_id DESC, context.node_id DESC
     LIMIT 1
+),
+explicit_head(node_id, context_id, previous_node_id) AS (
+    SELECT node_id, context_id, previous_node_id FROM explicit_target_head
+    UNION ALL
+    SELECT node_id, context_id, previous_node_id FROM explicit_latest_head
 ),
 selected_head(node_id, context_id, previous_node_id) AS (
     SELECT node_id, context_id, previous_node_id FROM default_head

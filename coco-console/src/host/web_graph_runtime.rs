@@ -4068,8 +4068,17 @@ mod tests {
             .await
             .unwrap()
             .expect("skill context should be indexed");
-        assert_eq!(context.context.node_ids, [head, invocation, session]);
+        assert_eq!(
+            context.context.node_ids,
+            [head, invocation, session.clone()]
+        );
         assert!(!context.context.node_ids.contains(&launcher));
+        let launcher_context = runtime
+            .provider_context_for_node(&launcher, Some(&provider_context_id(&session)))
+            .await
+            .unwrap()
+            .expect("the skipped launcher should remain addressable");
+        assert_eq!(launcher_context.context.node_ids, [launcher, session]);
     }
 
     #[tokio::test]
