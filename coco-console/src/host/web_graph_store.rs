@@ -1752,12 +1752,33 @@ const PROVIDER_CONTEXT_SELECTION_QUERY: &str = r#"
 WITH RECURSIVE query_input(target_node_id, context_id) AS (
     VALUES (?, ?)
 ),
-default_head(node_id, context_id, previous_node_id) AS (
-    SELECT context.node_id, context.context_id, context.previous_node_id
+default_target_path(node_id, context_id, previous_node_id, source_row_id) AS (
+    SELECT
+        context.node_id,
+        context.context_id,
+        context.previous_node_id,
+        context.source_row_id
     FROM web_graph_provider_context_nodes AS context
     CROSS JOIN query_input
     WHERE query_input.context_id IS NULL
       AND context.node_id = query_input.target_node_id
+
+    UNION ALL
+
+    SELECT
+        child.node_id,
+        child.context_id,
+        child.previous_node_id,
+        child.source_row_id
+    FROM web_graph_provider_context_nodes AS child
+    JOIN default_target_path AS path ON child.previous_node_id = path.node_id
+    WHERE child.context_id = path.context_id
+),
+default_head(node_id, context_id, previous_node_id) AS (
+    SELECT node_id, context_id, previous_node_id
+    FROM default_target_path
+    ORDER BY source_row_id DESC, node_id DESC
+    LIMIT 1
 ),
 explicit_target_path(node_id, context_id, previous_node_id, source_row_id) AS (
     SELECT
@@ -3701,7 +3722,7 @@ mod tests {
                 context_id: context_id.clone(),
                 previous_context_id: None,
                 selected_node_id: "b".to_owned(),
-                node_ids: ["b", "a"].map(str::to_owned).to_vec(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
                 branches: vec![
                     ProviderContextBranch {
                         branch: String::new(),

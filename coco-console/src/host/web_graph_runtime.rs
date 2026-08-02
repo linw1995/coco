@@ -3887,6 +3887,16 @@ mod tests {
         let second = append_text(&writer, &first, "second context node").await;
         let tail = append_text(&writer, &second, "linear context tail").await;
         runtime.catch_up().await.unwrap();
+        let focused = runtime
+            .provider_context_for_node(&first, None)
+            .await
+            .unwrap()
+            .expect("focus should not truncate the current context");
+        assert_eq!(
+            focused.context.node_ids,
+            [tail.clone(), second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(focused.selected_id, first);
         let linear = runtime
             .provider_context_for_node(&first, Some(&provider_context_id(&session)))
             .await
