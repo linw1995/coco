@@ -240,10 +240,12 @@ fn ProviderContextPanelBody(
     let provider_request = Memo::new(move |_| {
         provider_context_request(selection.get(), loaded_context.get().as_ref())
     });
+    let graph_revision = use_graph_revision();
     let pending_initial_request = RwSignal::new(initial_request);
     let initial_for_resource = initial_loaded.clone();
     let resource_graph_mode = graph_mode.clone();
     let provider_context = LocalResource::new(move || {
+        graph_revision.track();
         let request = provider_request.get();
         let initial = (pending_initial_request.get_untracked() == request)
             .then(|| initial_for_resource.clone())
