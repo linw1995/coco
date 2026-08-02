@@ -90,6 +90,7 @@ pub struct ProviderContextNodeProjection {
     pub context_id: String,
     pub previous_context_id: Option<String>,
     pub previous_node_id: Option<String>,
+    pub source_parent_node_id: String,
     pub is_tool_use: bool,
 }
 
@@ -746,6 +747,9 @@ impl WebGraphStore {
                             )),
                             web_graph_provider_context_nodes::previous_node_id
                                 .eq(excluded(web_graph_provider_context_nodes::previous_node_id)),
+                            web_graph_provider_context_nodes::source_parent_node_id.eq(excluded(
+                                web_graph_provider_context_nodes::source_parent_node_id,
+                            )),
                             web_graph_provider_context_nodes::is_tool_use
                                 .eq(excluded(web_graph_provider_context_nodes::is_tool_use)),
                         ))
@@ -974,6 +978,7 @@ struct ProviderContextNodeRow {
     context_id: String,
     previous_context_id: Option<String>,
     previous_node_id: Option<String>,
+    source_parent_node_id: String,
     is_tool_use: bool,
 }
 
@@ -985,6 +990,7 @@ impl From<ProviderContextNodeRow> for ProviderContextNodeProjection {
             context_id: row.context_id,
             previous_context_id: row.previous_context_id,
             previous_node_id: row.previous_node_id,
+            source_parent_node_id: row.source_parent_node_id,
             is_tool_use: row.is_tool_use,
         }
     }
@@ -998,6 +1004,7 @@ impl From<ProviderContextNodeProjection> for ProviderContextNodeRow {
             context_id: projection.context_id,
             previous_context_id: projection.previous_context_id,
             previous_node_id: projection.previous_node_id,
+            source_parent_node_id: projection.source_parent_node_id,
             is_tool_use: projection.is_tool_use,
         }
     }
@@ -1926,7 +1933,7 @@ segment(node_id) AS (
 
     SELECT child.node_id
     FROM web_graph_provider_context_nodes AS child
-    JOIN segment ON segment.node_id = child.previous_node_id
+    JOIN segment ON segment.node_id = child.source_parent_node_id
     CROSS JOIN split
     WHERE child.context_id = split.previous_context_id
 )
@@ -1940,7 +1947,7 @@ SET
         WHEN node_id = (SELECT start_node_id FROM split)
             THEN (SELECT previous_context_id FROM split)
         WHEN previous_context_id = (SELECT previous_context_id FROM split)
-          AND previous_node_id IN segment
+          AND source_parent_node_id IN segment
           AND context_id <> (SELECT previous_context_id FROM split)
             THEN (SELECT context_id FROM split)
         ELSE previous_context_id
@@ -1948,7 +1955,7 @@ SET
 WHERE node_id IN segment
    OR (
        previous_context_id = (SELECT previous_context_id FROM split)
-       AND previous_node_id IN segment
+       AND source_parent_node_id IN segment
        AND context_id <> (SELECT previous_context_id FROM split)
    )
 "#;
@@ -3638,6 +3645,7 @@ mod tests {
                 context_id: context_id.clone(),
                 previous_context_id: None,
                 previous_node_id: None,
+                source_parent_node_id: "root".to_owned(),
                 is_tool_use: false,
             },
             ProviderContextNodeProjection {
@@ -3646,6 +3654,7 @@ mod tests {
                 context_id: context_id.clone(),
                 previous_context_id: None,
                 previous_node_id: Some("a".to_owned()),
+                source_parent_node_id: "a".to_owned(),
                 is_tool_use: false,
             },
             ProviderContextNodeProjection {
@@ -3654,6 +3663,7 @@ mod tests {
                 context_id: context_id.clone(),
                 previous_context_id: None,
                 previous_node_id: Some("b".to_owned()),
+                source_parent_node_id: "b".to_owned(),
                 is_tool_use: false,
             },
         ];
@@ -3897,6 +3907,7 @@ mod tests {
                         context_id: root_context_id.clone(),
                         previous_context_id: None,
                         previous_node_id: None,
+                        source_parent_node_id: "root".to_owned(),
                         is_tool_use: false,
                     },
                     ProviderContextNodeProjection {
@@ -3905,6 +3916,7 @@ mod tests {
                         context_id: root_context_id.clone(),
                         previous_context_id: None,
                         previous_node_id: Some("a".to_owned()),
+                        source_parent_node_id: "a".to_owned(),
                         is_tool_use: false,
                     },
                     ProviderContextNodeProjection {
@@ -3913,6 +3925,7 @@ mod tests {
                         context_id: nested_context_id.clone(),
                         previous_context_id: Some(root_context_id.clone()),
                         previous_node_id: Some("b".to_owned()),
+                        source_parent_node_id: "b".to_owned(),
                         is_tool_use: false,
                     },
                 ],

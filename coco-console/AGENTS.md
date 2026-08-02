@@ -27,3 +27,6 @@
 - Preserve both `previous_node_id` and `previous_context_id`: the former restores
   the exact provider node path, while the latter records context-level lineage
   across forks.
+- Preserve `source_parent_node_id` separately for structural suffix updates.
+  Provider paths may intentionally skip launcher nodes, so `previous_node_id`
+  must not be used as the source-tree parent relation.

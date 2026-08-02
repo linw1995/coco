@@ -87,6 +87,7 @@ diesel::table! {
         context_id -> Text,
         previous_context_id -> Nullable<Text>,
         previous_node_id -> Nullable<Text>,
+        source_parent_node_id -> Text,
         is_tool_use -> Bool,
     }
 }

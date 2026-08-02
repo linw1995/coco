@@ -2319,6 +2319,7 @@ fn provider_context_node_projection(
         context_id,
         previous_context_id,
         previous_node_id,
+        source_parent_node_id: node.parent.clone(),
         is_tool_use: node.kind.as_tool_uses().is_some(),
     }))
 }
@@ -4070,7 +4071,7 @@ mod tests {
             .expect("skill context should be indexed");
         assert_eq!(
             context.context.node_ids,
-            [head, invocation, session.clone()]
+            [head.clone(), invocation.clone(), session.clone()]
         );
         assert!(!context.context.node_ids.contains(&launcher));
         let launcher_context = runtime
@@ -4078,6 +4079,32 @@ mod tests {
             .await
             .unwrap()
             .expect("the skipped launcher should remain addressable");
+        assert_eq!(
+            launcher_context.context.node_ids,
+            [launcher.clone(), session.clone()]
+        );
+
+        append_text(&writer, &session, "alternate context").await;
+        runtime.catch_up().await.unwrap();
+        let branch_context_id = provider_context_id(&launcher);
+        let context = runtime
+            .provider_context_for_node(&session, Some(&branch_context_id))
+            .await
+            .unwrap()
+            .expect("the launcher branch should remain indexed after a late fork");
+        assert_eq!(
+            context.context.node_ids,
+            [head, invocation, session.clone()]
+        );
+        assert_eq!(
+            context.context.previous_id,
+            Some(provider_context_id(&session))
+        );
+        let launcher_context = runtime
+            .provider_context_for_node(&launcher, Some(&branch_context_id))
+            .await
+            .unwrap()
+            .expect("the skipped launcher should remain addressable after a late fork");
         assert_eq!(launcher_context.context.node_ids, [launcher, session]);
     }
 
