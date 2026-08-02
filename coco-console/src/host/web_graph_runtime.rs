@@ -25,12 +25,12 @@ use super::web_graph_order::{
 };
 use super::web_graph_store::{
     Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse, ProviderBranchProjection,
-    ProviderContextNodeProjection, StoredGraphState, ToolSessionProjection, Viewport,
-    WebGraphStore,
+    ProviderContextNodeProjection, ProviderContextSplit, StoredGraphState, ToolSessionProjection,
+    Viewport, WebGraphStore,
 };
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
-    GRAPH_ROW_STEP, ProviderContext, ProviderContextSelection, ViewMode,
+    GRAPH_ROW_STEP, ProviderContext, ProviderContextBranch, ProviderContextSelection, ViewMode,
     diff_graph_viewport_responses, edge_key, edge_port_offset, graph_kind_name,
     is_provider_context_start, is_skill_invocation_anchor, node_key, node_target_id,
     provider_context_id, route_edge, route_edge_with_offsets, shorten_id, summarize_node,
@@ -751,10 +751,27 @@ impl WebGraphRuntime {
         Ok(Some(ProviderContextSelection {
             context: ProviderContext {
                 id: selection.context_id,
+                previous_id: selection.previous_context_id,
                 node_ids: selection.node_ids,
+                branches: selection
+                    .branches
+                    .into_iter()
+                    .map(|branch| ProviderContextBranch {
+                        name: branch.branch,
+                        head_node_id: branch.head_node_id,
+                        context_id: branch.context_id,
+                    })
+                    .collect(),
             },
-            selected_id: target_node_id.to_owned(),
+            selected_id: selection.selected_node_id,
         }))
+    }
+
+    pub async fn provider_context_by_id(
+        &self,
+        context_id: &str,
+    ) -> crate::Result<Option<ProviderContextSelection>> {
+        self.provider_context_for_node("", Some(context_id)).await
     }
 
     pub async fn provider_context_nodes(
@@ -1031,18 +1048,47 @@ impl WebGraphRuntime {
                 .apply_tool_session_projection(&projection)
                 .await
                 .context(WebGraphStoreSnafu)?;
+        }
+        let primary_children = self
+            .source
+            .graph_primary_child_ids(&parent_ids)
+            .await
+            .context(StoreSnafu)?;
+        let mut split_parents = BTreeSet::new();
+        let mut context_splits = Vec::new();
+        for entry in entries {
+            let source_node = source_nodes.get(&entry.node_id).with_context(|| {
+                WebGraphSourceNodeMissingSnafu {
+                    node_id: entry.node_id.clone(),
+                }
+            })?;
+            let fork_children = primary_children
+                .get(&source_node.parent)
+                .filter(|children| children.len() > 1);
+            let starts_branch = fork_children.is_some();
             if let Some(projection) = provider_context_node_projection(
                 entry.row_id,
                 source_node,
                 context_projections.get(&source_node.parent),
                 root_id,
+                starts_branch,
             )? {
+                if let Some(children) = fork_children
+                    && split_parents.insert(source_node.parent.clone())
+                    && let Some(parent) = context_projections.get(&source_node.parent)
+                {
+                    context_splits.extend(children.iter().map(|child_id| ProviderContextSplit {
+                        start_node_id: child_id.clone(),
+                        previous_context_id: parent.context_id.clone(),
+                        context_id: provider_context_id(child_id),
+                    }));
+                }
                 context_projections.insert(source_node.id.clone(), projection.clone());
                 new_context_projections.push(projection);
             }
         }
         self.store
-            .apply_provider_context_node_projections(&new_context_projections)
+            .apply_provider_context_node_projections(&new_context_projections, &context_splits)
             .await
             .context(WebGraphStoreSnafu)?;
         Ok(result)
@@ -2231,28 +2277,44 @@ fn provider_context_node_projection(
     node: &Node,
     parent: Option<&ProviderContextNodeProjection>,
     root_id: &str,
+    starts_branch: bool,
 ) -> crate::Result<Option<ProviderContextNodeProjection>> {
     if node.is_root() {
         return Ok(None);
     }
     let is_context_start = is_provider_context_start(node);
-    let previous_node_id = if is_context_start || node.parent == root_id {
-        None
-    } else {
-        let parent = parent.with_context(|| WebGraphProviderContextParentMissingSnafu {
-            node_id: node.id.clone(),
-            parent_id: node.parent.clone(),
-        })?;
+    let parent = (!is_context_start && node.parent != root_id)
+        .then(|| {
+            parent.with_context(|| WebGraphProviderContextParentMissingSnafu {
+                node_id: node.id.clone(),
+                parent_id: node.parent.clone(),
+            })
+        })
+        .transpose()?;
+    let previous_node_id = if let Some(parent) = parent {
         if is_skill_invocation_anchor(node) && parent.is_tool_use {
             parent.previous_node_id.clone()
         } else {
             Some(parent.node_id.clone())
         }
+    } else {
+        None
     };
+    let context_id = if starts_branch {
+        provider_context_id(&node.id)
+    } else {
+        parent
+            .map(|parent| parent.context_id.clone())
+            .unwrap_or_else(|| provider_context_id(&node.id))
+    };
+    let previous_context_id = starts_branch
+        .then(|| parent.map(|parent| parent.context_id.clone()))
+        .flatten();
     Ok(Some(ProviderContextNodeProjection {
         node_id: node.id.clone(),
         source_row_id,
-        context_id: provider_context_id(&node.id),
+        context_id,
+        previous_context_id,
         previous_node_id,
         is_tool_use: node.kind.as_tool_uses().is_some(),
     }))
@@ -3277,10 +3339,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v5_layout_rebuild_backfills_historical_provider_context() {
-        const PREVIOUS_LAYOUT_VERSION: u32 = 5;
+    async fn v6_layout_rebuild_backfills_historical_provider_context() {
+        const PREVIOUS_LAYOUT_VERSION: u32 = 6;
 
-        assert_eq!(LAYOUT_VERSION, 6);
+        assert_eq!(LAYOUT_VERSION, 7);
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let historical_session = append_session_anchor(&writer, &root, "historical").await;
@@ -3314,7 +3376,7 @@ mod tests {
             .bind::<Integer, _>(i32::try_from(PREVIOUS_LAYOUT_VERSION).unwrap())
             .execute(&mut connection)
             .unwrap();
-        diesel::sql_query("DELETE FROM web_graph_provider_contexts WHERE node_id = ?")
+        diesel::sql_query("DELETE FROM web_graph_provider_context_nodes WHERE node_id = ?")
             .bind::<Text, _>(&historical_anchor)
             .execute(&mut connection)
             .unwrap();
@@ -3815,8 +3877,23 @@ mod tests {
             first_context.context.node_ids,
             [first.clone(), session.clone()]
         );
+        assert_eq!(first_context.context.id, provider_context_id(&session));
+        assert_eq!(first_context.context.previous_id, None);
 
         let second = append_text(&writer, &first, "second context node").await;
+        let tail = append_text(&writer, &second, "linear context tail").await;
+        runtime.catch_up().await.unwrap();
+        let linear = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&session)))
+            .await
+            .unwrap()
+            .expect("linear growth should keep the current context id");
+        assert_eq!(
+            linear.context.node_ids,
+            [tail.clone(), second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(linear.context.id, provider_context_id(&session));
+
         let alternate = append_text(&writer, &first, "alternate context node").await;
         runtime.catch_up().await.unwrap();
         let latest = runtime
@@ -3825,6 +3902,7 @@ mod tests {
             .unwrap()
             .expect("the original context head should remain addressable");
         assert_eq!(latest.context.node_ids, [first.clone(), session.clone()]);
+        assert_eq!(latest.context.id, provider_context_id(&session));
         let switched = runtime
             .provider_context_for_node(&first, Some(&provider_context_id(&second)))
             .await
@@ -3832,7 +3910,12 @@ mod tests {
             .expect("an explicit descendant context should expand the selected branch");
         assert_eq!(
             switched.context.node_ids,
-            [second.clone(), first.clone(), session.clone()]
+            [tail.clone(), second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(switched.context.id, provider_context_id(&second));
+        assert_eq!(
+            switched.context.previous_id,
+            Some(provider_context_id(&session))
         );
         let alternate_context = runtime
             .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
@@ -3841,10 +3924,19 @@ mod tests {
             .expect("an alternate branch context should remain selectable");
         assert_eq!(
             alternate_context.context.node_ids,
-            [alternate, first.clone(), session.clone()]
+            [alternate.clone(), first.clone(), session.clone()]
         );
+        assert_eq!(
+            alternate_context.context.id,
+            provider_context_id(&alternate)
+        );
+        assert_eq!(
+            alternate_context.context.previous_id,
+            Some(provider_context_id(&session))
+        );
+        assert_ne!(switched.context.id, alternate_context.context.id);
 
-        writer.fork("main", &second).await.unwrap();
+        writer.fork("main", &tail).await.unwrap();
         runtime.catch_up().await.unwrap();
         writer.delete_branch("main").await.unwrap();
         runtime.catch_up().await.unwrap();
@@ -3914,7 +4006,7 @@ mod tests {
 
         runtime.catch_up().await.unwrap();
         let context = runtime
-            .provider_context_for_node(&session, Some(&provider_context_id(&head)))
+            .provider_context_for_node(&session, Some(&provider_context_id(&session)))
             .await
             .unwrap()
             .expect("skill context should be indexed");

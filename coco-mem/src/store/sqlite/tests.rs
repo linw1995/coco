@@ -954,6 +954,8 @@ async fn graph_child_ids_page_is_stable_across_high_fan_out_and_relation_kinds()
                 .unwrap(),
         );
     }
+    let mut expected_primary_ids = expected_ids.clone();
+    expected_primary_ids.sort();
     let merge_child = store
         .append(rich_session_anchor_node(
             &alternate_parent,
@@ -1025,6 +1027,14 @@ async fn graph_child_ids_page_is_stable_across_high_fan_out_and_relation_kinds()
     let graph = SqliteGraphStore::open_read_only(store.store_path())
         .await
         .unwrap();
+    assert_eq!(
+        graph
+            .graph_primary_child_ids(std::slice::from_ref(&root))
+            .await
+            .unwrap()
+            .remove(&root),
+        Some(expected_primary_ids)
+    );
     let page_size = NonZeroUsize::new(17).unwrap();
     let mut cursor = None;
     let mut actual = Vec::new();

@@ -33,13 +33,14 @@ use super::render::render_index_page;
 use crate::Result;
 use crate::api::{
     AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdgeKind,
-    NodeDetailResponse, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
-    ProviderContextResponse, ToolUseInputLink,
+    NodeDetailResponse, Point as ApiPoint, ProviderContextBranch, ProviderContextItem,
+    ProviderContextNode, ProviderContextResponse, ToolUseInputLink,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
-    NodeView, ViewMode, node_id_from_target, tool_use_input_links, write_stdin_session_ids,
+    NodeView, ProviderContextSelection, ViewMode, node_id_from_target, tool_use_input_links,
+    write_stdin_session_ids,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -676,10 +677,14 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let Some(target) = query.get("target") else {
+    let response = if let Some(target) = query.get("target") {
+        load_provider_context(&state, target, query.get("context")).await
+    } else if let Some(context) = query.get("context") {
+        load_provider_context_by_id(&state, context).await
+    } else {
         return json_response(&ProviderContextResponse::Default, "provider context");
     };
-    match load_provider_context(&state, target, query.get("context")).await {
+    match response {
         Ok(response) => json_response(&response, "provider context"),
         Err(error) => plain_error(error.to_string()),
     }
@@ -714,15 +719,53 @@ where
     let Some(selection) = selection else {
         return Ok(ProviderContextResponse::Found {
             context_target: context.unwrap_or_default().to_owned(),
+            previous_context_target: None,
             selected_id: node.id,
             node_ids: Vec::new(),
+            branches: Vec::new(),
         });
     };
-    Ok(ProviderContextResponse::Found {
+    Ok(found_provider_context(selection))
+}
+
+async fn load_provider_context_by_id<S>(
+    state: &AppState<S>,
+    context_id: &str,
+) -> Result<ProviderContextResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    state
+        .web_graph
+        .provider_context_by_id(context_id)
+        .await
+        .map(|selection| {
+            selection.map_or_else(
+                || ProviderContextResponse::Missing {
+                    target: context_id.to_owned(),
+                },
+                found_provider_context,
+            )
+        })
+}
+
+fn found_provider_context(selection: ProviderContextSelection) -> ProviderContextResponse {
+    ProviderContextResponse::Found {
         context_target: selection.context.id,
+        previous_context_target: selection.context.previous_id,
         selected_id: selection.selected_id,
         node_ids: selection.context.node_ids,
-    })
+        branches: selection
+            .context
+            .branches
+            .into_iter()
+            .map(|branch| ProviderContextBranch {
+                name: branch.name,
+                head_node_id: branch.head_node_id,
+                context_target: branch.context_id,
+            })
+            .collect(),
+    }
 }
 
 async fn load_initial_provider_context<S>(
@@ -1951,7 +1994,7 @@ mod tests {
             .unwrap();
         web_graph.catch_up().await.unwrap();
         let state = AppState { store, web_graph };
-        let context_id = provider_context_id(&head_id);
+        let context_id = provider_context_id(&session_id);
 
         let response = provider_context(
             State(state.clone()),
@@ -1968,6 +2011,7 @@ mod tests {
         let ProviderContextResponse::Found {
             selected_id: response_selected_id,
             node_ids,
+            branches,
             ..
         } = response
         else {
@@ -1975,7 +2019,38 @@ mod tests {
         };
         assert_eq!(response_selected_id, selected_id);
         assert_eq!(node_ids.len(), 22);
+        assert_eq!(
+            branches,
+            [ProviderContextBranch {
+                name: "main".to_owned(),
+                head_node_id: head_id.clone(),
+                context_target: context_id.clone(),
+            }]
+        );
         assert!(!String::from_utf8_lossy(&body).contains("provider context selection"));
+
+        let response = provider_context(
+            State(state.clone()),
+            RawQuery(Some(format!("context={context_id}"))),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
+        let ProviderContextResponse::Found {
+            context_target,
+            previous_context_target,
+            selected_id: response_selected_id,
+            node_ids,
+            branches,
+        } = response
+        else {
+            panic!("provider context should be found by context ID");
+        };
+        assert_eq!(context_target, context_id);
+        assert_eq!(previous_context_target, None);
+        assert_eq!(response_selected_id, head_id);
+        assert_eq!(node_ids.len(), 22);
+        assert_eq!(branches.len(), 1);
 
         let initial = load_initial_provider_context(
             &state,

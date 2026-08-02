@@ -69,7 +69,16 @@ impl From<&Node> for NodeView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderContext {
     pub id: String,
+    pub previous_id: Option<String>,
     pub node_ids: Vec<String>,
+    pub branches: Vec<ProviderContextBranch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContextBranch {
+    pub name: String,
+    pub head_node_id: String,
+    pub context_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -81,10 +81,11 @@ diesel::table! {
 }
 
 diesel::table! {
-    web_graph_provider_contexts (node_id) {
+    web_graph_provider_context_nodes (node_id) {
         node_id -> Text,
         source_row_id -> BigInt,
         context_id -> Text,
+        previous_context_id -> Nullable<Text>,
         previous_node_id -> Nullable<Text>,
         is_tool_use -> Bool,
     }
@@ -153,7 +154,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     web_graph_node_spatial_items,
     web_graph_nodes,
     web_graph_provider_branch_history,
-    web_graph_provider_contexts,
+    web_graph_provider_context_nodes,
     web_graph_route_spatial_index,
     web_graph_route_spatial_items,
     web_graph_state,

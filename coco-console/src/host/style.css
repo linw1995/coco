@@ -1253,6 +1253,28 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   overflow-wrap: anywhere;
 }
 
+.provider-context-branches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.provider-context-branch {
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  color: #cbd5e1;
+  font-size: 0.68rem;
+  padding: 0.18rem 0.48rem;
+  text-decoration: none;
+}
+
+.provider-context-branch:hover,
+.provider-context-branch[aria-current="true"] {
+  background: rgba(34, 211, 238, 0.12);
+  border-color: rgba(34, 211, 238, 0.62);
+  color: #cffafe;
+}
+
 .provider-context-list {
   display: grid;
   gap: 0;

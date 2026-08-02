@@ -15,3 +15,15 @@
 - Keep durable event history, such as provider branch history, outside the
   projection reset unless the history schema or semantics explicitly require a
   migration.
+
+## Provider Context Projection
+
+- Keep one provider-context mapping row per source node. Do not materialize a
+  full context snapshot for every leaf because linear growth would create
+  quadratic storage.
+- Reuse a context id along a linear segment. When a node gains multiple primary
+  children, assign each outgoing segment a distinct context id and reassign any
+  previously projected suffix in place.
+- Preserve both `previous_node_id` and `previous_context_id`: the former restores
+  the exact provider node path, while the latter records context-level lineage
+  across forks.

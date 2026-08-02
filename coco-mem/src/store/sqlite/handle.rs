@@ -32,7 +32,7 @@ use crate::error::{
     CorruptedStoreSnafu, GraphReadBatchTooLargeSnafu, QuerySqliteStoreSnafu,
     StorePathIsNotDirectorySnafu, StoreReadOnlySnafu, WriteStoreDirectorySnafu,
 };
-use crate::schema::branches;
+use crate::schema::{branches, nodes};
 use crate::store::ProcessShareableStore;
 use crate::{Kind, Node, Role};
 
@@ -322,6 +322,31 @@ impl SqliteGraphStore {
         ensure_graph_read_batch_size(ids.len())?;
         let mut connection = self.connect().await?;
         load_nodes_by_exact_ids(&mut connection, &self.database_path, ids).await
+    }
+
+    pub async fn graph_primary_child_ids(
+        &self,
+        parent_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        ensure_graph_read_batch_size(parent_ids.len())?;
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut connection = self.connect().await?;
+        let rows = nodes::table
+            .filter(nodes::parent_id.eq_any(parent_ids))
+            .select((nodes::parent_id, nodes::id))
+            .order((nodes::parent_id.asc(), nodes::id.asc()))
+            .load::<(String, String)>(&mut connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: self.database_path.clone(),
+            })?;
+        let mut children = HashMap::<String, Vec<String>>::new();
+        for (parent_id, child_id) in rows {
+            children.entry(parent_id).or_default().push(child_id);
+        }
+        Ok(children)
     }
 
     pub async fn graph_node_records_by_ids(&self, ids: &[String]) -> Result<Vec<GraphNodeRecord>> {
