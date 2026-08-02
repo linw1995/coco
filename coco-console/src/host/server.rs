@@ -45,6 +45,7 @@ use crate::host::web_graph_view::{
 const STYLE_CSS: &str = include_str!("style.css");
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES.html");
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT: usize = 16;
 
 struct ClientAsset {
     path: &'static str,
@@ -77,8 +78,13 @@ trait PanelDataSource: Send + Sync {
         &self,
         target: String,
         context: Option<String>,
-        graph_mode: String,
     ) -> Result<ProviderContextResponse>;
+
+    async fn provider_context_items(
+        &self,
+        node_ids: Vec<String>,
+        graph_mode: String,
+    ) -> Result<Vec<ProviderContextItem>>;
 }
 
 #[derive(Clone)]
@@ -113,10 +119,17 @@ impl PanelServerContext {
         &self,
         target: String,
         context: Option<String>,
-        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
+        self.source.provider_context(target, context).await
+    }
+
+    pub async fn provider_context_items(
+        &self,
+        node_ids: Vec<String>,
+        graph_mode: String,
+    ) -> Result<Vec<ProviderContextItem>> {
         self.source
-            .provider_context(target, context, graph_mode)
+            .provider_context_items(node_ids, graph_mode)
             .await
     }
 }
@@ -143,15 +156,16 @@ where
         &self,
         target: String,
         context: Option<String>,
-        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
-        load_provider_context(
-            self,
-            &target,
-            context.as_deref(),
-            view_mode_from_value(&graph_mode),
-        )
-        .await
+        load_provider_context(self, &target, context.as_deref()).await
+    }
+
+    async fn provider_context_items(
+        &self,
+        node_ids: Vec<String>,
+        graph_mode: String,
+    ) -> Result<Vec<ProviderContextItem>> {
+        load_provider_context_items(self, &node_ids, view_mode_from_value(&graph_mode)).await
     }
 }
 
@@ -300,12 +314,27 @@ where
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
     let mode = view_mode_from_query(&query);
-    match state
+    let viewport = state
         .web_graph
-        .rightmost_viewport(mode, GraphViewportRequest::default())
-        .await
-    {
-        Ok(viewport) => html_response(render_index_page(mode, &viewport)),
+        .rightmost_viewport(mode, GraphViewportRequest::default());
+    let initial_provider_context = async {
+        let Some(target) = query.get("target") else {
+            return Ok(None);
+        };
+        load_initial_provider_context(&state, target, query.get("context"), mode)
+            .await
+            .map(Some)
+    };
+    let (viewport, initial_provider_context) = tokio::join!(viewport, initial_provider_context);
+    let initial_provider_context = match initial_provider_context {
+        Ok(initial) => initial,
+        Err(error) => {
+            tracing::warn!(%error, "failed to preload provider context");
+            None
+        }
+    };
+    match viewport {
+        Ok(viewport) => html_response(render_index_page(mode, &viewport, initial_provider_context)),
         Err(error) => plain_error(error.to_string()),
     }
 }
@@ -650,14 +679,7 @@ where
     let Some(target) = query.get("target") else {
         return json_response(&ProviderContextResponse::Default, "provider context");
     };
-    match load_provider_context(
-        &state,
-        target,
-        query.get("context"),
-        view_mode_from_query(&query),
-    )
-    .await
-    {
+    match load_provider_context(&state, target, query.get("context")).await {
         Ok(response) => json_response(&response, "provider context"),
         Err(error) => plain_error(error.to_string()),
     }
@@ -667,7 +689,6 @@ async fn load_provider_context<S>(
     state: &AppState<S>,
     target: &str,
     context: Option<&str>,
-    view_mode: ViewMode,
 ) -> Result<ProviderContextResponse>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -691,30 +712,82 @@ where
         .provider_context_for_node(&node.id, context)
         .await?;
     let Some(selection) = selection else {
-        return Ok(ProviderContextResponse::Found { items: Vec::new() });
+        return Ok(ProviderContextResponse::Found {
+            context_target: context.unwrap_or_default().to_owned(),
+            selected_id: node.id,
+            node_ids: Vec::new(),
+        });
     };
-    let node_ids = selection
-        .context
-        .nodes
+    Ok(ProviderContextResponse::Found {
+        context_target: selection.context.id,
+        selected_id: selection.selected_id,
+        node_ids: selection.context.node_ids,
+    })
+}
+
+async fn load_initial_provider_context<S>(
+    state: &AppState<S>,
+    target: &str,
+    context: Option<&str>,
+    view_mode: ViewMode,
+) -> Result<crate::panels::InitialProviderContext>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let response = load_provider_context(state, target, context).await?;
+    let items = match &response {
+        ProviderContextResponse::Found {
+            selected_id,
+            node_ids,
+            ..
+        } => {
+            let node_ids = initial_provider_context_node_ids(node_ids, selected_id);
+            load_provider_context_items(state, &node_ids, view_mode).await?
+        }
+        _ => Vec::new(),
+    };
+    Ok(crate::panels::InitialProviderContext {
+        target: target.to_owned(),
+        context: context.map(str::to_owned),
+        response,
+        items,
+    })
+}
+
+fn initial_provider_context_node_ids(node_ids: &[String], selected_id: &str) -> Vec<String> {
+    let mut initial = node_ids
         .iter()
-        .map(|node| node.node.id.clone())
+        .take(PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT)
+        .cloned()
         .collect::<Vec<_>>();
-    let points = state.web_graph.node_points(view_mode, &node_ids).await?;
-    let items = selection
-        .context
-        .nodes
+    if !initial.iter().any(|node_id| node_id == selected_id)
+        && node_ids.iter().any(|node_id| node_id == selected_id)
+    {
+        initial.push(selected_id.to_owned());
+    }
+    initial
+}
+
+async fn load_provider_context_items<S>(
+    state: &AppState<S>,
+    node_ids: &[String],
+    view_mode: ViewMode,
+) -> Result<Vec<ProviderContextItem>>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let nodes = state.web_graph.provider_context_nodes(node_ids).await?;
+    let points = state.web_graph.node_points(view_mode, node_ids).await?;
+    Ok(nodes
         .into_iter()
         .map(|node| ProviderContextItem {
-            context_target: selection.context.id.clone(),
-            selected: node.node.id == selection.selected_id,
-            point: points.get(&node.node.id).map(|point| ApiPoint {
+            point: points.get(&node.id).map(|point| ApiPoint {
                 x: point.x,
                 y: point.y,
             }),
-            node: provider_context_node(node.node),
+            node: provider_context_node(node),
         })
-        .collect();
-    Ok(ProviderContextResponse::Found { items })
+        .collect())
 }
 
 fn provider_context_node(node: NodeView) -> ProviderContextNode {
@@ -944,46 +1017,9 @@ impl QueryParams {
 
 fn parse_query(query: &str) -> QueryParams {
     QueryParams {
-        pairs: query
-            .split('&')
-            .filter(|part| !part.is_empty())
-            .filter_map(|part| {
-                let (key, value) = part.split_once('=')?;
-                Some((percent_decode(key), percent_decode(value)))
-            })
+        pairs: url::form_urlencoded::parse(query.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect(),
-    }
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let Some(byte) = decode_hex_pair(bytes[index + 1], bytes[index + 2])
-        {
-            decoded.push(byte);
-            index += 3;
-            continue;
-        }
-        decoded.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-fn decode_hex_pair(high: u8, low: u8) -> Option<u8> {
-    Some(decode_hex_digit(high)? << 4 | decode_hex_digit(low)?)
-}
-
-fn decode_hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
     }
 }
 
@@ -1164,9 +1200,11 @@ mod tests {
 
     #[test]
     fn query_parser_decodes_repeated_values() {
-        let query = parse_query("mode=all&known_node=node%3Aa&known_node=node%3Ab");
+        let query =
+            parse_query("mode=all&target=detail-my+branch&known_node=node%3Aa&known_node=node%3Ab");
 
         assert_eq!(view_mode_from_query(&query), ViewMode::All);
+        assert_eq!(query.get("target"), Some("detail-my branch"));
         assert_eq!(query.get_all("known_node"), ["node:a", "node:b"]);
     }
 
@@ -1182,7 +1220,7 @@ mod tests {
 
     #[test]
     fn malformed_percent_encoding_is_preserved() {
-        assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
+        assert_eq!(parse_query("target=a%2Gb").get("target"), Some("a%2Gb"));
     }
 
     #[test]
@@ -1892,8 +1930,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let mut head_id = selected_id.clone();
+        for index in 0..20 {
+            head_id = store
+                .append(NewNode {
+                    parent: head_id,
+                    role: Role::LLM,
+                    metadata: None,
+                    kind: Kind::Text(format!("deferred provider context {index}")),
+                })
+                .await
+                .unwrap();
+        }
         store
-            .set_branch_head("main", &session_id, &selected_id)
+            .set_branch_head("main", &session_id, &head_id)
             .await
             .unwrap();
         let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
@@ -1912,31 +1962,93 @@ mod tests {
         .await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("\"content\":"));
+        assert!(!String::from_utf8_lossy(&body).contains("initial_items"));
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
-        let ProviderContextResponse::Found { items } = response else {
+        let ProviderContextResponse::Found {
+            selected_id: response_selected_id,
+            node_ids,
+            ..
+        } = response
+        else {
             panic!("provider context should be found");
         };
-        let selected = items
+        assert_eq!(response_selected_id, selected_id);
+        assert_eq!(node_ids.len(), 22);
+        assert!(!String::from_utf8_lossy(&body).contains("provider context selection"));
+
+        let initial = load_initial_provider_context(
+            &state,
+            &node_target_id(&selected_id),
+            None,
+            ViewMode::All,
+        )
+        .await;
+        let initial = initial.unwrap();
+        assert_eq!(initial.items.len(), PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT + 1);
+        let selected = initial
+            .items
             .iter()
-            .find(|item| item.selected)
+            .find(|item| item.node.id == selected_id)
             .expect("selected provider context item should exist");
         assert_eq!(selected.node.summary, "provider context selection");
         assert!(selected.point.is_some());
+        let deferred_id = node_ids[PROVIDER_CONTEXT_INITIAL_ITEM_LIMIT].clone();
+        assert!(!initial.items.iter().any(|item| item.node.id == deferred_id));
+        let deferred =
+            load_provider_context_items(&state, std::slice::from_ref(&deferred_id), ViewMode::All)
+                .await
+                .unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].node.id, deferred_id);
+        assert!(
+            !String::from_utf8_lossy(&body).contains(deferred[0].node.summary.as_str()),
+            "the initial response should not serialize deferred node details"
+        );
 
-        for target_ref in ["main", &selected_id[..16]] {
-            let response =
-                load_provider_context(&state, &node_target_id(target_ref), None, ViewMode::All)
-                    .await
-                    .unwrap();
+        let index = index_page(
+            State(state.clone()),
+            RawQuery(Some(format!(
+                "mode=all&target={}",
+                node_target_id(&selected_id)
+            ))),
+        )
+        .await;
+        let index_body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
+        let index_body = String::from_utf8(index_body.to_vec()).unwrap();
+        assert!(index_body.contains("provider context selection"));
+        assert!(index_body.contains(&deferred_id));
+        assert!(index_body.contains("Scroll to load node summary..."));
+        assert!(!index_body.contains("Select a node to inspect its provider context."));
+
+        let request = Request::builder()
+            .uri(format!(
+                "/api/panels/provider-context-items?node_ids[0]={deferred_id}&graph_mode=all"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = panel_server_function(State(state.clone()), request).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let deferred_from_server_fn: Vec<ProviderContextItem> =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(deferred_from_server_fn, deferred);
+
+        for (target_ref, expected_selected_id) in [
+            ("main", head_id.as_str()),
+            (&selected_id[..16], selected_id.as_str()),
+        ] {
+            let response = load_provider_context(&state, &node_target_id(target_ref), None)
+                .await
+                .unwrap();
             assert!(matches!(
                 response,
-                ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+                ProviderContextResponse::Found { selected_id: response_selected_id, .. }
+                    if response_selected_id == expected_selected_id
             ));
         }
 
         let request = Request::builder()
             .uri(format!(
-                "/api/panels/provider-context?target={}&graph_mode=all",
+                "/api/panels/provider-context?target={}",
                 node_target_id(&selected_id)
             ))
             .body(Body::empty())
@@ -1946,7 +2058,8 @@ mod tests {
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         assert!(matches!(
             response,
-            ProviderContextResponse::Found { items } if items.iter().any(|item| item.selected)
+            ProviderContextResponse::Found { selected_id: response_selected_id, .. }
+                if response_selected_id == selected_id
         ));
     }
 

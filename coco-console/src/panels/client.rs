@@ -1,9 +1,11 @@
-use super::{NODE_DETAIL_PANEL_ID, PanelSelection};
+use super::{NODE_DETAIL_PANEL_ID, NODE_TARGET_PREFIX, PanelSelection};
 use leptos::prelude::*;
 use leptos::{
     ev,
     leptos_dom::helpers::{location_hash, request_animation_frame, window_event_listener},
 };
+use send_wrapper::SendWrapper;
+use wasm_bindgen::{JsCast, closure::Closure};
 
 const MOBILE_VIEWPORT_MAX_WIDTH: i32 = 1024;
 const GRAPH_REVISION_EVENT: &str = "coco-graph-revision";
@@ -29,8 +31,57 @@ pub fn subscribe_to_graph_revision(revision: RwSignal<u64>) {
     on_cleanup(move || listener.remove());
 }
 
+pub fn load_provider_context_row_when_visible(
+    row: NodeRef<leptos::html::Li>,
+    scroll_root: NodeRef<leptos::html::Section>,
+    should_load: RwSignal<bool>,
+) {
+    Effect::new(move || {
+        let Some(row) = row.get() else {
+            return;
+        };
+        let Some(scroll_root) = scroll_root.get() else {
+            return;
+        };
+        let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+            mark_provider_context_row_visible(&entries, should_load);
+        });
+        let options = web_sys::IntersectionObserverInit::new();
+        options.set_root(Some(&scroll_root));
+        let Ok(observer) = web_sys::IntersectionObserver::new_with_options(
+            callback.as_ref().unchecked_ref(),
+            &options,
+        ) else {
+            should_load.set(true);
+            return;
+        };
+        observer.observe(&row);
+        let cleanup = SendWrapper::new((observer, callback));
+        on_cleanup(move || {
+            cleanup.0.disconnect();
+        });
+    });
+}
+
+fn mark_provider_context_row_visible(entries: &js_sys::Array, should_load: RwSignal<bool>) {
+    for entry in entries.iter() {
+        let entry = entry.unchecked_into::<web_sys::IntersectionObserverEntry>();
+        if entry.is_intersecting() {
+            should_load.set(true);
+            break;
+        }
+    }
+}
+
 fn current_panel_selection() -> PanelSelection {
-    PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default())
+    let selection = PanelSelection::from_hash(location_hash().as_deref().unwrap_or_default());
+    if selection.target.is_some() {
+        return selection;
+    }
+    let query = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .unwrap_or_default();
+    PanelSelection::from_query(&query)
 }
 
 pub fn reveal_node_detail_on_mobile() {
@@ -65,13 +116,26 @@ fn reveal_node_detail(document: web_sys::Document, viewport_width: i32) {
 
 pub fn notify_provider_context_rendered() {
     request_animation_frame(|| {
-        let Ok(event) = web_sys::Event::new(PROVIDER_CONTEXT_RENDERED_EVENT) else {
-            return;
-        };
-        if let Some(window) = web_sys::window() {
-            let _ = window.dispatch_event(&event);
+        dispatch_provider_context_rendered();
+    });
+}
+
+pub fn notify_selected_provider_context_row_rendered(node_id: &str) {
+    let target = format!("{NODE_TARGET_PREFIX}{node_id}");
+    request_animation_frame(move || {
+        if current_panel_selection().target.as_deref() == Some(target.as_str()) {
+            dispatch_provider_context_rendered();
         }
     });
+}
+
+fn dispatch_provider_context_rendered() {
+    let Ok(event) = web_sys::Event::new(PROVIDER_CONTEXT_RENDERED_EVENT) else {
+        return;
+    };
+    if let Some(window) = web_sys::window() {
+        let _ = window.dispatch_event(&event);
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +161,61 @@ mod tests {
         notify_graph_revision();
 
         assert_eq!(revision.get_untracked(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn provider_context_intersection_marks_the_row_for_loading() {
+        _ = any_spawner::Executor::init_wasm_bindgen();
+        let owner = Owner::new();
+        owner.set();
+        let should_load = RwSignal::new(false);
+        let entry = js_sys::Object::new();
+        js_sys::Reflect::set(&entry, &JsValue::from_str("isIntersecting"), &JsValue::TRUE)
+            .expect_throw("intersection state should be set");
+        let entries = js_sys::Array::of1(&entry);
+
+        mark_provider_context_row_visible(&entries, should_load);
+
+        assert!(should_load.get_untracked());
+    }
+
+    #[wasm_bindgen_test]
+    async fn deferred_provider_context_only_notifies_for_the_selected_row() {
+        let window = web_sys::window().expect_throw("window should be available");
+        window
+            .location()
+            .set_hash("#detail-selected?context=detail-context")
+            .expect_throw("selection hash should be set");
+        let notifications = Rc::new(Cell::new(0_u32));
+        let callback_notifications = Rc::clone(&notifications);
+        let callback = Closure::<dyn FnMut()>::new(move || {
+            callback_notifications.set(callback_notifications.get() + 1);
+        });
+        window
+            .add_event_listener_with_callback(
+                PROVIDER_CONTEXT_RENDERED_EVENT,
+                callback.as_ref().unchecked_ref(),
+            )
+            .expect_throw("provider context listener should be installed");
+
+        notify_selected_provider_context_row_rendered("other");
+        next_animation_frame().await;
+        assert_eq!(notifications.get(), 0);
+
+        notify_selected_provider_context_row_rendered("selected");
+        next_animation_frame().await;
+        assert_eq!(notifications.get(), 1);
+
+        window
+            .remove_event_listener_with_callback(
+                PROVIDER_CONTEXT_RENDERED_EVENT,
+                callback.as_ref().unchecked_ref(),
+            )
+            .expect_throw("provider context listener should be removed");
+        window
+            .location()
+            .set_hash("")
+            .expect_throw("selection hash should be cleared");
     }
 
     #[wasm_bindgen_test]

@@ -29,7 +29,7 @@ use super::web_graph_store::{
 };
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
-    GRAPH_ROW_STEP, ProviderContext, ProviderContextNode, ProviderContextSelection, ViewMode,
+    GRAPH_ROW_STEP, ProviderContext, ProviderContextSelection, ViewMode,
     diff_graph_viewport_responses, edge_key, edge_port_offset, graph_kind_name, node_key,
     node_target_id, provider_context_id, provider_contexts_from_head, route_edge,
     route_edge_with_offsets, shorten_id, summarize_node,
@@ -741,8 +741,21 @@ impl WebGraphRuntime {
         let Some(selection) = selection else {
             return Ok(None);
         };
+        Ok(Some(ProviderContextSelection {
+            context: ProviderContext {
+                id: selection.context_id,
+                node_ids: selection.node_ids,
+            },
+            selected_id: target_node_id.to_owned(),
+        }))
+    }
+
+    pub async fn provider_context_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> crate::Result<Vec<super::web_graph_view::NodeView>> {
         let mut source_nodes = BTreeMap::new();
-        for node_ids in selection.node_ids.chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE) {
+        for node_ids in node_ids.chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE) {
             source_nodes.extend(
                 self.source
                     .graph_nodes_by_ids(node_ids)
@@ -752,28 +765,17 @@ impl WebGraphRuntime {
                     .map(|node| (node.id.clone(), node)),
             );
         }
-        let nodes = selection
-            .node_ids
-            .into_iter()
+        node_ids
+            .iter()
             .map(|node_id| {
-                let node = source_nodes.remove(&node_id).with_context(|| {
+                let node = source_nodes.remove(node_id).with_context(|| {
                     WebGraphSourceNodeMissingSnafu {
                         node_id: node_id.clone(),
                     }
                 })?;
-                Ok(ProviderContextNode {
-                    created_at_ns: node.created_at.as_nanosecond(),
-                    node: super::web_graph_view::NodeView::from(&node),
-                })
+                Ok(super::web_graph_view::NodeView::from(&node))
             })
-            .collect::<crate::Result<Vec<_>>>()?;
-        Ok(Some(ProviderContextSelection {
-            context: ProviderContext {
-                id: selection.context_id,
-                nodes,
-            },
-            selected_id: target_node_id.to_owned(),
-        }))
+            .collect()
     }
 
     pub async fn node_points(
@@ -3303,15 +3305,9 @@ mod tests {
             .await
             .unwrap()
             .expect("historical provider context should be rebuilt");
-        let node_ids = selection
-            .context
-            .nodes
-            .iter()
-            .map(|node| node.node.id.as_str())
-            .collect::<Vec<_>>();
         assert_eq!(
-            node_ids,
-            [historical_anchor.as_str(), historical_session.as_str()]
+            selection.context.node_ids,
+            [historical_anchor.clone(), historical_session]
         );
         assert!(
             runtime

@@ -168,9 +168,7 @@ pub enum AnchorRangeResponse {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderContextItem {
-    pub context_target: String,
     pub node: ProviderContextNode,
-    pub selected: bool,
     pub point: Option<Point>,
 }
 
@@ -188,8 +186,14 @@ pub struct ProviderContextNode {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProviderContextResponse {
     Default,
-    Missing { target: String },
-    Found { items: Vec<ProviderContextItem> },
+    Missing {
+        target: String,
+    },
+    Found {
+        context_target: String,
+        selected_id: String,
+        node_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

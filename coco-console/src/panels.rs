@@ -1,11 +1,14 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use coco_types::{
     AnchorPayload, Kind, Node, PromptAttachment, SessionAnchor, SessionAnchorPatch,
     SkillInvocationAnchor, SkillInvocationMode, Tool, ToolResult, ToolUse,
 };
+#[cfg(target_arch = "wasm32")]
+use leptos::leptos_dom::helpers::set_timeout;
 use leptos::prelude::*;
 use leptos::server_fn::codec::GetUrl;
+use serde::{Deserialize, Serialize};
 
 use crate::api::{
     AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
@@ -22,12 +25,21 @@ pub use client::{
 };
 
 const NODE_TARGET_PREFIX: &str = "detail-";
+const MAX_PROVIDER_CONTEXT_LOAD_RETRIES: u8 = 3;
 pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PanelSelection {
     pub target: Option<String>,
     pub context: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InitialProviderContext {
+    pub target: String,
+    pub context: Option<String>,
+    pub response: ProviderContextResponse,
+    pub items: Vec<ProviderContextItem>,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -37,10 +49,18 @@ impl PanelSelection {
         let (target, query) = hash
             .split_once('?')
             .map_or((hash, None), |(target, query)| (target, Some(query)));
-        let target = target
-            .starts_with(NODE_TARGET_PREFIX)
-            .then(|| target.to_owned());
+        let target = decode_url_component(target);
+        let target = target.starts_with(NODE_TARGET_PREFIX).then_some(target);
         let context = query.and_then(provider_context_target);
+
+        Self { target, context }
+    }
+
+    pub fn from_query(query: &str) -> Self {
+        let query = query.strip_prefix('?').unwrap_or(query);
+        let target =
+            query_parameter(query, "target").filter(|value| value.starts_with(NODE_TARGET_PREFIX));
+        let context = provider_context_target(query);
 
         Self { target, context }
     }
@@ -59,6 +79,12 @@ struct ProviderContextRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderContextPayload {
+    response: ProviderContextResponse,
+    items: Vec<ProviderContextItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LoadedProviderContext {
     request: ProviderContextRequest,
     id: String,
@@ -67,7 +93,6 @@ struct LoadedProviderContext {
 
 enum PanelDetailPayload {
     Node(NodeDetailResponse),
-    Provider(ProviderContextResponse),
 }
 
 #[cfg_attr(not(test), leptos::prelude::lazy(panel_detail))]
@@ -78,17 +103,7 @@ async fn render_panel_detail(payload: PanelDetailPayload) -> AnyView {
 fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
     match payload {
         PanelDetailPayload::Node(response) => view! { <NodeDetailContent response/> }.into_any(),
-        PanelDetailPayload::Provider(response) => {
-            view! { <LazyProviderContextContent response/> }.into_any()
-        }
     }
-}
-
-#[component]
-fn LazyProviderContextContent(response: ProviderContextResponse) -> impl IntoView {
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(client::notify_provider_context_rendered);
-    view! { <ProviderContextContent response/> }
 }
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
@@ -121,11 +136,26 @@ pub async fn load_anchor_range(
 async fn load_provider_context(
     target: String,
     context: Option<String>,
-    graph_mode: String,
 ) -> Result<ProviderContextResponse, ServerFnError> {
     let server = expect_context::<crate::host::PanelServerContext>();
     server
-        .provider_context(target, context, graph_mode)
+        .provider_context(target, context)
+        .await
+        .map_err(|error| ServerFnError::ServerError(error.to_string()))
+}
+
+#[server(
+    prefix = "/api/panels",
+    endpoint = "provider-context-items",
+    input = GetUrl
+)]
+async fn load_provider_context_items(
+    node_ids: Vec<String>,
+    graph_mode: String,
+) -> Result<Vec<ProviderContextItem>, ServerFnError> {
+    let server = expect_context::<crate::host::PanelServerContext>();
+    server
+        .provider_context_items(node_ids, graph_mode)
         .await
         .map_err(|error| ServerFnError::ServerError(error.to_string()))
 }
@@ -137,7 +167,7 @@ pub fn NodeDetailPanel() -> impl IntoView {
 
 #[component]
 fn NodeDetailPanelBody() -> impl IntoView {
-    let selection = use_panel_selection();
+    let selection = use_panel_selection(PanelSelection::default());
     let graph_revision = use_graph_revision();
     let selected_target = Memo::new(move |_| selection.get().target);
     let detail = LocalResource::new(move || {
@@ -171,33 +201,76 @@ fn NodeDetailPanelBody() -> impl IntoView {
 }
 
 #[island]
-pub fn ProviderContextPanel(graph_mode: String) -> impl IntoView {
-    view! { <ProviderContextPanelBody graph_mode/> }
+pub fn ProviderContextPanel(
+    graph_mode: String,
+    initial: Option<InitialProviderContext>,
+) -> impl IntoView {
+    view! { <ProviderContextPanelBody graph_mode initial/> }
 }
 
 #[component]
-fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
-    let selection = use_panel_selection();
-    let loaded_context = RwSignal::new(None::<LoadedProviderContext>);
+fn ProviderContextPanelBody(
+    graph_mode: String,
+    initial: Option<InitialProviderContext>,
+) -> impl IntoView {
+    let initial_request = initial.as_ref().map(|initial| ProviderContextRequest {
+        target: initial.target.clone(),
+        context: initial.context.clone(),
+    });
+    let initial_loaded = initial.map(|initial| LoadedPanel {
+        request: ProviderContextRequest {
+            target: initial.target,
+            context: initial.context,
+        },
+        response: Ok(ProviderContextPayload {
+            response: initial.response,
+            items: initial.items,
+        }),
+    });
+    let selection = use_panel_selection(PanelSelection {
+        target: initial_request
+            .as_ref()
+            .map(|request| request.target.clone()),
+        context: initial_request
+            .as_ref()
+            .and_then(|request| request.context.clone()),
+    });
+    let loaded_context = RwSignal::new(loaded_provider_context(initial_loaded.as_ref()));
     let provider_request = Memo::new(move |_| {
         provider_context_request(selection.get(), loaded_context.get().as_ref())
     });
+    let pending_initial_request = RwSignal::new(initial_request);
+    let initial_for_resource = initial_loaded.clone();
     let provider_context = LocalResource::new(move || {
         let request = provider_request.get();
-        let graph_mode = graph_mode.clone();
+        let initial = (pending_initial_request.get_untracked() == request)
+            .then(|| initial_for_resource.clone())
+            .flatten();
+        if initial.is_some() {
+            pending_initial_request.set(None);
+        }
         async move {
             let request = request?;
-            let response =
-                load_provider_context(request.target.clone(), request.context.clone(), graph_mode)
-                    .await
-                    .map_err(|error| error.to_string());
-            Some(LoadedPanel { request, response })
+            if let Some(initial) = initial {
+                return Some(initial);
+            }
+            let response = load_provider_context(request.target.clone(), request.context.clone())
+                .await
+                .map_err(|error| error.to_string());
+            Some(LoadedPanel {
+                request,
+                response: response.map(|response| ProviderContextPayload {
+                    response,
+                    items: Vec::new(),
+                }),
+            })
         }
     });
     Effect::new(move || {
-        loaded_context.set(loaded_provider_context(
-            provider_context.get().flatten().as_ref(),
-        ));
+        let loaded = provider_context.get().flatten();
+        if loaded.is_some() {
+            loaded_context.set(loaded_provider_context(loaded.as_ref()));
+        }
     });
     view! {
         <div class="panel-content">
@@ -205,6 +278,8 @@ fn ProviderContextPanelBody(graph_mode: String) -> impl IntoView {
                 provider_context_view(
                     provider_request.get(),
                     provider_context.get().flatten(),
+                    initial_loaded.clone(),
+                    graph_mode.clone(),
                 )
             }}
         </div>
@@ -229,27 +304,33 @@ fn provider_context_request(
 }
 
 fn loaded_provider_context(
-    loaded: Option<&LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
+    loaded: Option<&LoadedPanel<ProviderContextRequest, ProviderContextPayload>>,
 ) -> Option<LoadedProviderContext> {
     let loaded = loaded?;
-    let ProviderContextResponse::Found { items } = loaded.response.as_ref().ok()? else {
+    let ProviderContextResponse::Found {
+        context_target,
+        node_ids,
+        ..
+    } = &loaded.response.as_ref().ok()?.response
+    else {
         return None;
     };
-    let id = items.first()?.context_target.clone();
-    let targets = items
+    if node_ids.is_empty() {
+        return None;
+    }
+    let targets = node_ids
         .iter()
-        .filter(|item| item.context_target == id)
-        .map(|item| format!("{NODE_TARGET_PREFIX}{}", item.node.id))
+        .map(|node_id| format!("{NODE_TARGET_PREFIX}{node_id}"))
         .collect();
     Some(LoadedProviderContext {
         request: loaded.request.clone(),
-        id,
+        id: context_target.clone(),
         targets,
     })
 }
 
-fn use_panel_selection() -> RwSignal<PanelSelection> {
-    let selection = RwSignal::new(PanelSelection::default());
+fn use_panel_selection(initial: PanelSelection) -> RwSignal<PanelSelection> {
+    let selection = RwSignal::new(initial);
     #[cfg(target_arch = "wasm32")]
     client::subscribe_to_panel_selection(selection);
     selection
@@ -290,14 +371,27 @@ fn node_detail_view(
 
 fn provider_context_view(
     current: Option<ProviderContextRequest>,
-    loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextResponse>>,
+    loaded: Option<LoadedPanel<ProviderContextRequest, ProviderContextPayload>>,
+    initial: Option<LoadedPanel<ProviderContextRequest, ProviderContextPayload>>,
+    graph_mode: String,
 ) -> AnyView {
+    let loaded = match (loaded, initial) {
+        (Some(mut loaded), Some(initial)) if loaded.request == initial.request => {
+            if let (Ok(loaded), Ok(initial)) = (&mut loaded.response, initial.response)
+                && loaded.items.is_empty()
+            {
+                loaded.items = initial.items;
+            }
+            Some(loaded)
+        }
+        (Some(loaded), _) => Some(loaded),
+        (None, Some(initial)) if current.as_ref() == Some(&initial.request) => Some(initial),
+        (None, _) => None,
+    };
     match (current.as_ref(), loaded) {
         (None, _) => view! { <ProviderContextDefault/> }.into_any(),
         (Some(current), Some(loaded)) if &loaded.request == current => match loaded.response {
-            Ok(response) => {
-                Suspend::new(render_panel_detail(PanelDetailPayload::Provider(response))).into_any()
-            }
+            Ok(payload) => view! { <ProviderContextContent payload graph_mode/> }.into_any(),
             Err(error) => view! { <ProviderContextError error=error/> }.into_any(),
         },
         _ => view! { <ProviderContextLoading/> }.into_any(),
@@ -1424,15 +1518,28 @@ fn NodeDetailError(error: String) -> impl IntoView {
 }
 
 #[component]
-fn ProviderContextContent(response: ProviderContextResponse) -> AnyView {
-    match response {
+fn ProviderContextContent(payload: ProviderContextPayload, graph_mode: String) -> AnyView {
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(client::notify_provider_context_rendered);
+    match payload.response {
         ProviderContextResponse::Default => view! { <ProviderContextDefault/> }.into_any(),
         ProviderContextResponse::Missing { target } => {
             view! { <ProviderContextMissing target=target/> }.into_any()
         }
-        ProviderContextResponse::Found { items } => {
-            view! { <ProviderContextList items=items/> }.into_any()
+        ProviderContextResponse::Found {
+            context_target,
+            selected_id,
+            node_ids,
+        } => view! {
+            <ProviderContextList
+                context_target
+                selected_id
+                node_ids
+                initial_items=payload.items
+                graph_mode
+            />
         }
+        .into_any(),
     }
 }
 
@@ -1457,8 +1564,14 @@ fn ProviderContextLoading() -> impl IntoView {
 }
 
 #[component]
-fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
-    if items.is_empty() {
+fn ProviderContextList(
+    context_target: String,
+    selected_id: String,
+    node_ids: Vec<String>,
+    initial_items: Vec<ProviderContextItem>,
+    graph_mode: String,
+) -> AnyView {
+    if node_ids.is_empty() {
         view! {
             <section class="provider-context-section">
                 <h2>"Provider Context"</h2>
@@ -1467,11 +1580,31 @@ fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
         }
         .into_any()
     } else {
+        let scroll_root = NodeRef::<leptos::html::Section>::new();
+        let mut initial_items = initial_items
+            .into_iter()
+            .map(|item| (item.node.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
         view! {
-            <section class="provider-context-section">
+            <section node_ref=scroll_root class="provider-context-section">
                 <h2>"Provider Context"</h2>
                 <ol class="provider-context-list">
-                    {items.into_iter().map(|item| view! { <ProviderContextRow item=item/> }).collect::<Vec<_>>()}
+                    {node_ids
+                        .into_iter()
+                        .map(|node_id| {
+                            let initial_item = initial_items.remove(&node_id);
+                            view! {
+                                <ProviderContextRow
+                                    context_target=context_target.clone()
+                                    selected=node_id == selected_id
+                                    node_id
+                                    initial_item
+                                    scroll_root
+                                    graph_mode=graph_mode.clone()
+                                />
+                            }
+                        })
+                        .collect::<Vec<_>>()}
                 </ol>
             </section>
         }
@@ -1480,11 +1613,129 @@ fn ProviderContextList(items: Vec<ProviderContextItem>) -> AnyView {
 }
 
 #[component]
-fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
-    let visible = item.point.is_some();
-    let class = provider_context_node_class(visible, item.selected);
-    let node_target = format!("{NODE_TARGET_PREFIX}{}", item.node.id);
-    let target = format!("#{node_target}?context={}", item.context_target);
+fn ProviderContextRow(
+    context_target: String,
+    selected: bool,
+    node_id: String,
+    initial_item: Option<ProviderContextItem>,
+    scroll_root: NodeRef<leptos::html::Section>,
+    graph_mode: String,
+) -> impl IntoView {
+    let row_ref = NodeRef::<leptos::html::Li>::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = scroll_root;
+    let item = RwSignal::new(initial_item);
+    let should_load = RwSignal::new(false);
+    let retry_attempt = RwSignal::new(0_u8);
+    let load_error = RwSignal::new(None::<String>);
+    #[cfg(target_arch = "wasm32")]
+    if item.get_untracked().is_none() {
+        client::load_provider_context_row_when_visible(row_ref, scroll_root, should_load);
+    }
+
+    let loaded_item = LocalResource::new({
+        let node_id = node_id.clone();
+        move || {
+            let should_load = should_load.get();
+            retry_attempt.track();
+            let node_id = node_id.clone();
+            let graph_mode = graph_mode.clone();
+            async move {
+                if !should_load || item.get_untracked().is_some() {
+                    return None;
+                }
+                Some(
+                    load_provider_context_items(vec![node_id], graph_mode)
+                        .await
+                        .map_err(|error| error.to_string()),
+                )
+            }
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    let rendered_node_id = node_id.clone();
+    Effect::new(move || {
+        let Some(Some(result)) = loaded_item.get() else {
+            return;
+        };
+        match result {
+            Ok(items) => {
+                if let Some(loaded) = items.into_iter().next() {
+                    load_error.set(None);
+                    item.set(Some(loaded));
+                    #[cfg(target_arch = "wasm32")]
+                    client::notify_selected_provider_context_row_rendered(&rendered_node_id);
+                }
+            }
+            Err(error) => {
+                load_error.set(Some(error));
+                #[cfg(target_arch = "wasm32")]
+                if let Some(delay) = provider_context_retry_delay(retry_attempt.get_untracked()) {
+                    set_timeout(move || retry_attempt.update(|attempt| *attempt += 1), delay);
+                }
+            }
+        }
+    });
+
+    let class = move || {
+        provider_context_node_class(
+            item.with(|item| item.as_ref().is_some_and(|item| item.point.is_some())),
+            selected,
+        )
+    };
+    let content = move || {
+        let failed = load_error.with(Option::is_some);
+        let retrying = failed && provider_context_retry_delay(retry_attempt.get()).is_some();
+        provider_context_row_content(
+            &context_target,
+            &node_id,
+            selected,
+            item.get(),
+            should_load.get(),
+            failed,
+            retrying,
+        )
+    };
+
+    view! {
+        <li node_ref=row_ref class=class>{content}</li>
+    }
+}
+
+fn provider_context_row_content(
+    context_target: &str,
+    node_id: &str,
+    selected: bool,
+    item: Option<ProviderContextItem>,
+    requested: bool,
+    failed: bool,
+    retrying: bool,
+) -> AnyView {
+    let node_target = format!("{NODE_TARGET_PREFIX}{node_id}");
+    let target = format!("#{node_target}?context={context_target}");
+    let Some(item) = item else {
+        let message = match (requested, failed, retrying) {
+            (_, true, true) => "Retrying node summary...",
+            (_, true, false) => "Failed to load node summary.",
+            (true, false, _) => "Loading node summary...",
+            (false, false, _) => "Scroll to load node summary...",
+        };
+        return view! {
+            <a
+                class="provider-context-node-link provider-context-node-placeholder"
+                href=target
+                data-node-target=node_target
+                aria-current=selected.then_some("true")
+                aria-busy=(!failed || retrying).then_some("true")
+            >
+                <div class="provider-context-node-head">
+                    <span>{provider_context_short_id(node_id)}</span>
+                </div>
+                <p>{message}</p>
+            </a>
+        }
+        .into_any();
+    };
     let graph_point = item
         .point
         .map(|point| {
@@ -1502,24 +1753,31 @@ fn ProviderContextRow(item: ProviderContextItem) -> impl IntoView {
         .collect::<Vec<_>>();
 
     view! {
-        <li class=class>
-            <a
-                class="provider-context-node-link"
-                href=target
-                data-node-target=node_target
-                aria-current=item.selected.then_some("true")
-            >
-                {graph_point}
-                <div class="provider-context-node-head">
-                    <span>{item.node.short_id}</span>
-                    <span>{item.node.kind}</span>
-                    <span>{item.node.role}</span>
-                </div>
-                <time>{item.node.created_at}</time>
-                <p>{item.node.summary}</p>
-            </a>
-        </li>
+        <a
+            class="provider-context-node-link"
+            href=target
+            data-node-target=node_target
+            aria-current=selected.then_some("true")
+        >
+            {graph_point}
+            <div class="provider-context-node-head">
+                <span>{item.node.short_id}</span>
+                <span>{item.node.kind}</span>
+                <span>{item.node.role}</span>
+            </div>
+            <time>{item.node.created_at}</time>
+            <p>{item.node.summary}</p>
+        </a>
     }
+    .into_any()
+}
+
+fn provider_context_retry_delay(attempt: u8) -> Option<Duration> {
+    (attempt < MAX_PROVIDER_CONTEXT_LOAD_RETRIES).then(|| Duration::from_millis(250_u64 << attempt))
+}
+
+fn provider_context_short_id(node_id: &str) -> String {
+    node_id.chars().take(12).collect()
 }
 
 fn provider_context_node_class(visible: bool, selected: bool) -> &'static str {
@@ -1555,10 +1813,48 @@ fn ProviderContextError(error: String) -> impl IntoView {
 
 #[cfg(any(target_arch = "wasm32", test))]
 fn provider_context_target(query: &str) -> Option<String> {
-    query.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
-        (name == "context" && value.starts_with(NODE_TARGET_PREFIX)).then(|| value.to_owned())
-    })
+    query_parameter(query, "context").filter(|value| value.starts_with(NODE_TARGET_PREFIX))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn query_parameter(query: &str, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_url_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(byte) = decode_hex_pair(bytes[index + 1], bytes[index + 2])
+        {
+            decoded.push(byte);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some(decode_hex_digit(high)? << 4 | decode_hex_digit(low)?)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1598,6 +1894,36 @@ mod tests {
                 context: Some("detail-context".to_owned()),
             }
         );
+        assert_eq!(
+            PanelSelection::from_query(
+                "?mode=all&target=detail-node&context=detail-context&ignored=value"
+            ),
+            PanelSelection {
+                target: Some("detail-node".to_owned()),
+                context: Some("detail-context".to_owned()),
+            }
+        );
+        assert_eq!(
+            PanelSelection::from_hash("#detail-my%20branch?context=detail-root%20branch"),
+            PanelSelection {
+                target: Some("detail-my branch".to_owned()),
+                context: Some("detail-root branch".to_owned()),
+            }
+        );
+        assert_eq!(
+            PanelSelection::from_hash("#detail-feature%3Fx?context=detail-root%26y"),
+            PanelSelection {
+                target: Some("detail-feature?x".to_owned()),
+                context: Some("detail-root&y".to_owned()),
+            }
+        );
+        assert_eq!(
+            PanelSelection::from_query("?target=detail-my+branch&context=detail-root%20branch"),
+            PanelSelection {
+                target: Some("detail-my branch".to_owned()),
+                context: Some("detail-root branch".to_owned()),
+            }
+        );
     }
 
     #[test]
@@ -1607,6 +1933,10 @@ mod tests {
             PanelSelection::default()
         );
         assert_eq!(PanelSelection::from_hash(""), PanelSelection::default());
+        assert_eq!(
+            PanelSelection::from_query("?target=section&context=invalid"),
+            PanelSelection::default()
+        );
     }
 
     #[test]
@@ -1653,9 +1983,13 @@ mod tests {
                 target: "detail-first".to_owned(),
                 context: None,
             },
-            response: Ok(ProviderContextResponse::Found {
-                items: vec![ProviderContextItem {
+            response: Ok(ProviderContextPayload {
+                response: ProviderContextResponse::Found {
                     context_target: "detail-root-context-branch".to_owned(),
+                    selected_id: "first".to_owned(),
+                    node_ids: vec!["first".to_owned()],
+                },
+                items: vec![ProviderContextItem {
                     node: ProviderContextNode {
                         id: "first".to_owned(),
                         short_id: "first".to_owned(),
@@ -1664,7 +1998,6 @@ mod tests {
                         created_at: "2026-08-01T00:00:00Z".to_owned(),
                         summary: "First".to_owned(),
                     },
-                    selected: true,
                     point: None,
                 }],
             }),
@@ -1726,7 +2059,10 @@ mod tests {
     #[test]
     fn panel_islands_render_independent_server_fallbacks() {
         let node = view! { <NodeDetailPanel/> }.to_html();
-        let provider = view! { <ProviderContextPanel graph_mode="all".to_owned()/> }.to_html();
+        let provider = view! {
+            <ProviderContextPanel graph_mode="all".to_owned() initial=None/>
+        }
+        .to_html();
 
         assert!(node.contains("leptos-island"));
         assert!(node.contains("panel-content"));
@@ -1760,8 +2096,13 @@ mod tests {
                     target: "detail-old".to_owned(),
                     context: None,
                 },
-                response: Ok(ProviderContextResponse::Default),
+                response: Ok(ProviderContextPayload {
+                    response: ProviderContextResponse::Default,
+                    items: Vec::new(),
+                }),
             }),
+            None,
+            "all".to_owned(),
         )
         .to_html();
 
@@ -1781,9 +2122,17 @@ mod tests {
             tool_input_json_highlights: Vec::new(),
         }))
         .to_html();
-        let provider = panel_detail_view(PanelDetailPayload::Provider(
-            ProviderContextResponse::Found { items: Vec::new() },
-        ))
+        let provider = view! { <ProviderContextContent
+            payload=ProviderContextPayload {
+                response: ProviderContextResponse::Found {
+                    context_target: String::new(),
+                    selected_id: String::new(),
+                    node_ids: Vec::new(),
+                },
+                items: Vec::new(),
+            }
+            graph_mode="all".to_owned()
+        /> }
         .to_html();
         let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
         let provider_error =
@@ -1796,6 +2145,71 @@ mod tests {
         assert!(node_error.contains("node failed"));
         assert!(provider_error.contains("Failed to load provider context."));
         assert!(provider_error.contains("provider failed"));
+    }
+
+    #[test]
+    fn provider_context_ssr_renders_initial_items_and_deferred_id_placeholders() {
+        let owner = Owner::new();
+        owner.set();
+        let initial_id = "11111111111111111111111111111111";
+        let deferred_id = "22222222222222222222222222222222";
+        let provider = view! {
+            <ProviderContextContent
+                graph_mode="all".to_owned()
+                payload=ProviderContextPayload {
+                    response: ProviderContextResponse::Found {
+                        context_target: "detail-context".to_owned(),
+                        selected_id: initial_id.to_owned(),
+                        node_ids: vec![initial_id.to_owned(), deferred_id.to_owned()],
+                    },
+                    items: vec![ProviderContextItem {
+                        node: ProviderContextNode {
+                            id: initial_id.to_owned(),
+                            short_id: "111111111111".to_owned(),
+                            kind: "text".to_owned(),
+                            role: "user".to_owned(),
+                            created_at: "2026-08-01T00:00:00Z".to_owned(),
+                            summary: "Server-rendered summary".to_owned(),
+                        },
+                        point: None,
+                    }],
+                }
+            />
+        }
+        .to_html();
+
+        assert!(provider.contains("Server-rendered summary"));
+        assert!(provider.contains(deferred_id));
+        assert!(provider.contains("Scroll to load node summary..."));
+        assert!(provider.contains("aria-busy=\"true\""));
+    }
+
+    #[test]
+    fn provider_context_deferred_load_retries_are_bounded() {
+        assert_eq!(
+            (0..=MAX_PROVIDER_CONTEXT_LOAD_RETRIES)
+                .map(provider_context_retry_delay)
+                .collect::<Vec<_>>(),
+            [
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(500)),
+                Some(Duration::from_secs(1)),
+                None,
+            ]
+        );
+
+        let failed = provider_context_row_content(
+            "detail-context",
+            "deferred-node",
+            false,
+            None,
+            true,
+            true,
+            false,
+        )
+        .to_html();
+        assert!(failed.contains("Failed to load node summary."));
+        assert!(!failed.contains("aria-busy=\"true\""));
     }
 
     #[test]
@@ -2328,6 +2742,7 @@ mod tests {
 mod wasm_tests {
     use super::*;
 
+    use crate::api::ProviderContextNode;
     use any_spawner::Executor;
     use js_sys::Promise;
     use leptos::leptos_dom::helpers::request_animation_frame;
@@ -2336,6 +2751,105 @@ mod wasm_tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn graph_items_provider_context_scroll_loads_a_deferred_row() {
+        _ = Executor::init_wasm_bindgen();
+        let window = web_sys::window().expect_throw("window should be available");
+        let document = window
+            .document()
+            .expect_throw("document should be available");
+        let root = document
+            .create_element("div")
+            .expect_throw("test root should be created")
+            .unchecked_into::<web_sys::HtmlElement>();
+        root.set_id("provider-context-scroll-test");
+        let style = document
+            .create_element("style")
+            .expect_throw("test style should be created");
+        style.set_text_content(Some(
+            "#provider-context-scroll-test .provider-context-section { display: block; height: 48px; overflow-y: auto; }\
+             #provider-context-scroll-test .provider-context-node { height: 48px; }",
+        ));
+        document
+            .body()
+            .expect_throw("document body should be available")
+            .append_child(&style)
+            .expect_throw("test style should be mounted");
+        document
+            .body()
+            .expect_throw("document body should be available")
+            .append_child(&root)
+            .expect_throw("test root should be mounted");
+        let node_ids = (0..4)
+            .map(|index| format!("node-{index}"))
+            .collect::<Vec<_>>();
+        let initial_items = node_ids[..3]
+            .iter()
+            .map(|node_id| ProviderContextItem {
+                node: ProviderContextNode {
+                    id: node_id.clone(),
+                    short_id: node_id.clone(),
+                    kind: "text".to_owned(),
+                    role: "user".to_owned(),
+                    created_at: "2026-08-01T00:00:00Z".to_owned(),
+                    summary: format!("Summary for {node_id}"),
+                },
+                point: None,
+            })
+            .collect();
+        let mounted = leptos::mount::mount_to(root.clone(), move || {
+            view! {
+                <ProviderContextContent
+                    graph_mode="all".to_owned()
+                    payload=ProviderContextPayload {
+                        response: ProviderContextResponse::Found {
+                            context_target: "detail-context".to_owned(),
+                            selected_id: "node-0".to_owned(),
+                            node_ids,
+                        },
+                        items: initial_items,
+                    }
+                />
+            }
+        });
+        next_animation_frame().await;
+        next_animation_frame().await;
+
+        let section = root
+            .query_selector(".provider-context-section")
+            .expect_throw("provider context query should succeed")
+            .expect_throw("provider context should be rendered")
+            .unchecked_into::<web_sys::HtmlElement>();
+        let deferred = root
+            .query_selector(".provider-context-node:last-child")
+            .expect_throw("deferred row query should succeed")
+            .expect_throw("deferred row should be rendered");
+        assert!(
+            deferred
+                .text_content()
+                .unwrap_or_default()
+                .contains("Scroll to load node summary...")
+        );
+
+        section.set_scroll_top(section.scroll_height());
+        section
+            .dispatch_event(&web_sys::Event::new("scroll").expect_throw("event should build"))
+            .expect_throw("scroll should dispatch");
+        for _ in 0..4 {
+            next_animation_frame().await;
+        }
+        assert!(
+            !deferred
+                .text_content()
+                .unwrap_or_default()
+                .contains("Scroll to load node summary...")
+        );
+
+        drop(mounted);
+        root.remove();
+        style.remove();
+    }
 
     #[wasm_bindgen_test]
     async fn graph_items_tool_input_switches_between_list_and_raw_json() {
@@ -2461,8 +2975,8 @@ mod wasm_tests {
             .location()
             .set_hash("detail-node")
             .expect_throw("initial hash should be set");
-        let node_selection = use_panel_selection();
-        let context_selection = use_panel_selection();
+        let node_selection = use_panel_selection(PanelSelection::default());
+        let context_selection = use_panel_selection(PanelSelection::default());
         let loaded_selection = LocalResource::new(move || {
             let selection = node_selection.get();
             async move { selection }

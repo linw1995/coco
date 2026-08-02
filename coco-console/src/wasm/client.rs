@@ -140,6 +140,11 @@ impl AnchorRangeSelection {
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
+    match redirect_legacy_detail_url() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => web_sys::console::error_1(&error),
+    }
     leptos::mount::hydrate_islands();
     spawn_local(async {
         if let Err(error) = run().await {
@@ -148,8 +153,20 @@ pub fn hydrate() {
     });
 }
 
+fn redirect_legacy_detail_url() -> Result<bool, JsValue> {
+    let Some(window) = web_sys::window() else {
+        return Ok(false);
+    };
+    let Some(url) = legacy_detail_url(&window)? else {
+        return Ok(false);
+    };
+    window.location().replace(&url)?;
+    Ok(true)
+}
+
 async fn run() -> Result<(), JsValue> {
     let graph = setup_graph()?;
+    sync_initial_detail_url(&graph.borrow().window)?;
     render_full_viewport(graph.clone()).await?;
     install_graph_events_or_log(graph.clone());
     focus_selected_node_in_graph(graph);
@@ -2836,7 +2853,11 @@ fn install_hashchange_node_selection_listener(
 ) -> Result<(), JsValue> {
     let selection_graph = graph.clone();
     let selection_window = graph.borrow().window.clone();
+    let event_window = selection_window.clone();
     let selection_closure = Closure::<dyn FnMut()>::new(move || {
+        if let Err(error) = sync_detail_query(&event_window) {
+            web_sys::console::error_1(&error);
+        }
         focus_selected_node_in_graph(selection_graph.clone());
     });
     selection_window.add_event_listener_with_callback(
@@ -2933,14 +2954,100 @@ fn same_detail_target(current_hash: &str, next_hash: &str) -> bool {
 }
 
 fn update_detail_hash(window: &Window, hash: &str) -> Result<bool, JsValue> {
-    if window.location().hash()? == hash {
+    let hash_changed = window.location().hash()? != hash;
+    let url = detail_url(window, hash)?;
+    let current_url = format!(
+        "{}{}",
+        window.location().search()?,
+        window.location().hash()?
+    );
+    if current_url == url {
         return Ok(false);
     }
     window
         .history()?
-        .push_state_with_url(&JsValue::NULL, "", Some(hash))?;
-    window.dispatch_event(&web_sys::Event::new("hashchange")?)?;
-    Ok(true)
+        .push_state_with_url(&JsValue::NULL, "", Some(&url))?;
+    if hash_changed {
+        window.dispatch_event(&web_sys::Event::new("hashchange")?)?;
+    }
+    Ok(hash_changed)
+}
+
+fn sync_detail_query(window: &Window) -> Result<(), JsValue> {
+    let hash = window.location().hash()?;
+    sync_detail_url(window, &hash)
+}
+
+fn legacy_detail_url(window: &Window) -> Result<Option<String>, JsValue> {
+    let hash = window.location().hash()?;
+    let hash_selection = PanelSelection::from_hash(&hash);
+    if hash_selection.target.is_none() {
+        return Ok(None);
+    }
+    let query_selection = PanelSelection::from_query(&window.location().search()?);
+    if query_selection == hash_selection {
+        return Ok(None);
+    }
+    detail_url(window, &hash).map(Some)
+}
+
+fn sync_initial_detail_url(window: &Window) -> Result<(), JsValue> {
+    let current_hash = window.location().hash()?;
+    if PanelSelection::from_hash(&current_hash).target.is_some() {
+        return sync_detail_url(window, &current_hash);
+    }
+    let selection = PanelSelection::from_query(&window.location().search()?);
+    let Some(hash) = detail_hash(&selection) else {
+        return sync_detail_url(window, &current_hash);
+    };
+    sync_detail_url(window, &hash)
+}
+
+fn sync_detail_url(window: &Window, hash: &str) -> Result<(), JsValue> {
+    let url = detail_url(window, hash)?;
+    let current_url = format!(
+        "{}{}",
+        window.location().search()?,
+        window.location().hash()?
+    );
+    if current_url != url {
+        window
+            .history()?
+            .replace_state_with_url(&JsValue::NULL, "", Some(&url))?;
+    }
+    Ok(())
+}
+
+fn detail_url(window: &Window, hash: &str) -> Result<String, JsValue> {
+    let selection = PanelSelection::from_hash(hash);
+    let search = window.location().search()?;
+    let mut parts = url::form_urlencoded::parse(search.trim_start_matches('?').as_bytes())
+        .filter(|(name, _)| name != "target" && name != "context")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if let Some(target) = &selection.target {
+        parts.push(("target".to_owned(), target.clone()));
+    }
+    if let Some(context) = &selection.context {
+        parts.push(("context".to_owned(), context.clone()));
+    }
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(parts);
+    let search = serializer.finish();
+    let search = (!search.is_empty()).then(|| format!("?{search}"));
+    let hash = detail_hash(&selection).unwrap_or_else(|| hash.to_owned());
+    Ok(format!("{}{hash}", search.unwrap_or_default()))
+}
+
+fn detail_hash(selection: &PanelSelection) -> Option<String> {
+    let target = selection.target.as_deref()?;
+    let target = percent_encode(target);
+    let context = selection
+        .context
+        .as_deref()
+        .map(|context| format!("?context={}", percent_encode(context)))
+        .unwrap_or_default();
+    Some(format!("#{target}{context}"))
 }
 
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
@@ -3075,7 +3182,12 @@ fn selected_node_target(window: &Window) -> Option<String> {
 }
 
 fn selected_panel_selection(window: &Window) -> PanelSelection {
-    PanelSelection::from_hash(&window.location().hash().unwrap_or_default())
+    let selection = PanelSelection::from_hash(&window.location().hash().unwrap_or_default());
+    if selection.target.is_some() {
+        selection
+    } else {
+        PanelSelection::from_query(&window.location().search().unwrap_or_default())
+    }
 }
 
 fn pan_from_wheel(graph: &mut VirtualGraph, event: &WheelEvent) {
@@ -3370,6 +3482,7 @@ mod tests {
                 let _ = storage.remove_item(VIEWPORT_KEY);
             }
             let _ = window.location().set_hash("");
+            sync_detail_query(&window).expect_throw("selection query should reset");
             let document = window
                 .document()
                 .expect_throw("document should be available");
@@ -3452,6 +3565,7 @@ mod tests {
                 let _ = storage.remove_item(VIEWPORT_KEY);
             }
             let _ = window.location().set_hash("");
+            let _ = sync_detail_query(&window);
             self.root.remove();
         }
     }
@@ -4204,6 +4318,102 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_legacy_hash_requires_a_canonical_document_request() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .location()
+            .set_hash("detail-aaaaaaaa?context=detail-context")
+            .expect_throw("legacy hash should be set");
+
+        let canonical = legacy_detail_url(&window)
+            .expect_throw("legacy URL should parse")
+            .expect_throw("legacy URL should require a redirect");
+        assert!(canonical.contains("target=detail-aaaaaaaa"));
+        assert!(canonical.contains("context=detail-context"));
+        assert!(canonical.ends_with("#detail-aaaaaaaa?context=detail-context"));
+
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(&JsValue::NULL, "", Some(&canonical))
+            .expect_throw("canonical URL should be set");
+        assert!(
+            legacy_detail_url(&window)
+                .expect_throw("canonical URL should parse")
+                .is_none()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_canonical_detail_query_encodes_decoded_selection_values() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .location()
+            .set_hash("detail-my%20branch?context=detail-root%20branch")
+            .expect_throw("encoded selection hash should be set");
+
+        let canonical = legacy_detail_url(&window)
+            .expect_throw("encoded selection URL should parse")
+            .expect_throw("encoded selection URL should require a redirect");
+
+        assert!(canonical.contains("target=detail-my+branch"));
+        assert!(canonical.contains("context=detail-root+branch"));
+        assert!(canonical.ends_with("#detail-my%20branch?context=detail-root%20branch"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_initial_query_becomes_the_canonical_detail_hash() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("?mode=all&target=detail-aaaaaaaa&context=detail-context"),
+            )
+            .expect_throw("initial query should be set");
+
+        sync_initial_detail_url(&window).expect_throw("initial detail URL should canonicalize");
+
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-aaaaaaaa?context=detail-context"
+        );
+        let selection = selected_panel_selection(&window);
+        assert_eq!(selection.target.as_deref(), Some("detail-aaaaaaaa"));
+        assert_eq!(selection.context.as_deref(), Some("detail-context"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_initial_query_encodes_reserved_detail_hash_delimiters() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("?target=detail-feature%3Fx&context=detail-root%26y"),
+            )
+            .expect_throw("encoded initial query should be set");
+
+        sync_initial_detail_url(&window).expect_throw("initial detail URL should canonicalize");
+
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-feature%3Fx?context=detail-root%26y"
+        );
+        let selection = selected_panel_selection(&window);
+        assert_eq!(selection.target.as_deref(), Some("detail-feature?x"));
+        assert_eq!(selection.context.as_deref(), Some("detail-root&y"));
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_detail_navigation_uses_history_and_one_refresh_trigger() {
         let fixture = GraphFixture::new();
         let window = fixture.graph.borrow().window.clone();
@@ -4215,6 +4425,13 @@ mod tests {
         assert_eq!(
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa"
+        );
+        assert!(
+            window
+                .location()
+                .search()
+                .expect_throw("search should exist")
+                .contains("target=detail-aaaaaaaa")
         );
         assert!(
             !update_detail_hash(&window, "#detail-aaaaaaaa")
@@ -4241,6 +4458,12 @@ mod tests {
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa?context=detail-context"
         );
+        let search = window
+            .location()
+            .search()
+            .expect_throw("search should exist");
+        assert!(search.contains("target=detail-aaaaaaaa"));
+        assert!(search.contains("context=detail-context"));
         assert!(
             update_detail_hash(&window, "#detail-aaaaaaaa?context=detail-other")
                 .expect_throw("provider context hash should be set")

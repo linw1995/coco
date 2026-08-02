@@ -14,6 +14,7 @@ coco-types = { path = "../coco-types" }
 # Serialization shared by host and wasm builds.
 serde.workspace = true
 serde_json.workspace = true
+url.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Workspace crates.
@@ -47,6 +48,7 @@ snafu.workspace = true
 # Wasm bindings.
 js-sys = "=0.3.94"
 leptos = { workspace = true, features = ["hydrate", "islands"] }
+send_wrapper = "0.6.0"
 wasm-bindgen = "=0.2.117"
 wasm-bindgen-futures = "=0.4.67"
 
@@ -64,6 +66,9 @@ web-sys = { version = "=0.3.94", features = [
   "EventTarget",
   "HtmlElement",
   "History",
+  "IntersectionObserver",
+  "IntersectionObserverEntry",
+  "IntersectionObserverInit",
   "KeyboardEvent",
   "KeyboardEventInit",
   "MessageEvent",
