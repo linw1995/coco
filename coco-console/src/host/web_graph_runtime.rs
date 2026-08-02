@@ -1087,6 +1087,9 @@ impl WebGraphRuntime {
                 new_context_projections.push(projection);
             }
         }
+        // Source rows are parent-first, so reverse the discovered splits to keep
+        // an outer split from changing the context expected by a nested split.
+        context_splits.reverse();
         self.store
             .apply_provider_context_node_projections(&new_context_projections, &context_splits)
             .await
@@ -3947,6 +3950,61 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "deleting a branch must not delete node provider context"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_applies_same_batch_nested_splits_descendant_first() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "nested splits").await;
+        let first = append_text(&writer, &session, "first").await;
+        let second = append_text(&writer, &first, "second").await;
+        let tail = append_text(&writer, &second, "tail").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let alternate = append_text(&writer, &first, "outer alternate").await;
+        let nested_alternate = append_text(&writer, &second, "nested alternate").await;
+        runtime.catch_up().await.unwrap();
+
+        let outer_context_id = provider_context_id(&second);
+        let tail_context = runtime
+            .provider_context_for_node(&second, Some(&provider_context_id(&tail)))
+            .await
+            .unwrap()
+            .expect("the existing nested branch should receive its own context");
+        assert_eq!(
+            tail_context.context.node_ids,
+            [tail, second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(
+            tail_context.context.previous_id,
+            Some(outer_context_id.clone())
+        );
+        let nested_alternate_context = runtime
+            .provider_context_for_node(&second, Some(&provider_context_id(&nested_alternate)))
+            .await
+            .unwrap()
+            .expect("the new nested branch should receive its own context");
+        assert_eq!(
+            nested_alternate_context.context.node_ids,
+            [nested_alternate, second, first.clone(), session.clone()]
+        );
+        assert_eq!(
+            nested_alternate_context.context.previous_id,
+            Some(outer_context_id)
+        );
+        let alternate_context = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
+            .await
+            .unwrap()
+            .expect("the outer alternate branch should remain selectable");
+        assert_eq!(
+            alternate_context.context.node_ids,
+            [alternate, first, session]
         );
     }
 
