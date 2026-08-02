@@ -82,6 +82,12 @@ struct EnsureResult {
     added_nodes: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct SourceProjectionResult {
+    changed_source_nodes: u64,
+    nodes_to_reflow: Vec<String>,
+}
+
 enum ReflowStep {
     ExpandRoutes(BTreeMap<EdgeId, RoutedEdge>),
     ExpandColumns(BTreeSet<i32>),
@@ -951,60 +957,10 @@ impl WebGraphRuntime {
             let mut changed_source_nodes = 0_u64;
             let mut nodes_to_reflow = Vec::new();
             for entries in page.entries.chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE) {
-                let node_ids = entries
-                    .iter()
-                    .map(|entry| entry.node_id.clone())
-                    .collect::<Vec<_>>();
-                let source_nodes = self
-                    .source
-                    .graph_nodes_by_ids(&node_ids)
-                    .await
-                    .context(StoreSnafu)?
-                    .into_iter()
-                    .map(|node| (node.id.clone(), node))
-                    .collect::<BTreeMap<_, _>>();
-                let parent_ids = source_nodes
-                    .values()
-                    .filter(|node| !node.parent.is_empty())
-                    .map(|node| node.parent.clone())
-                    .collect::<Vec<_>>();
-                let mut context_projections = self
-                    .store
-                    .provider_context_node_projections(&parent_ids)
-                    .await
-                    .context(WebGraphStoreSnafu)?;
-                let mut new_context_projections = Vec::new();
-                for entry in entries {
-                    let result = self.ensure_source_node(entry).await?;
-                    if result.changed {
-                        changed_source_nodes = changed_source_nodes.saturating_add(1);
-                    }
-                    nodes_to_reflow.extend(result.added_nodes);
-                    nodes_to_reflow.push(entry.node_id.clone());
-                    let source_node = source_nodes.get(&entry.node_id).with_context(|| {
-                        WebGraphSourceNodeMissingSnafu {
-                            node_id: entry.node_id.clone(),
-                        }
-                    })?;
-                    let projection = tool_session_projection(entry.row_id, source_node);
-                    self.store
-                        .apply_tool_session_projection(&projection)
-                        .await
-                        .context(WebGraphStoreSnafu)?;
-                    if let Some(projection) = provider_context_node_projection(
-                        entry.row_id,
-                        source_node,
-                        context_projections.get(&source_node.parent),
-                        &root_id,
-                    )? {
-                        context_projections.insert(source_node.id.clone(), projection.clone());
-                        new_context_projections.push(projection);
-                    }
-                }
-                self.store
-                    .apply_provider_context_node_projections(&new_context_projections)
-                    .await
-                    .context(WebGraphStoreSnafu)?;
+                let projected = self.process_source_entries(entries, &root_id).await?;
+                changed_source_nodes =
+                    changed_source_nodes.saturating_add(projected.changed_source_nodes);
+                nodes_to_reflow.extend(projected.nodes_to_reflow);
             }
             let page_cursor = page
                 .entries
@@ -1027,6 +983,69 @@ impl WebGraphRuntime {
             progress.log_progress_if_due(current_row_id, current_revision);
             tokio::task::yield_now().await;
         }
+    }
+
+    async fn process_source_entries(
+        &self,
+        entries: &[GraphNodeCursor],
+        root_id: &str,
+    ) -> crate::Result<SourceProjectionResult> {
+        let node_ids = entries
+            .iter()
+            .map(|entry| entry.node_id.clone())
+            .collect::<Vec<_>>();
+        let source_nodes = self
+            .source
+            .graph_nodes_by_ids(&node_ids)
+            .await
+            .context(StoreSnafu)?
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let parent_ids = source_nodes
+            .values()
+            .filter(|node| !node.parent.is_empty())
+            .map(|node| node.parent.clone())
+            .collect::<Vec<_>>();
+        let mut context_projections = self
+            .store
+            .provider_context_node_projections(&parent_ids)
+            .await
+            .context(WebGraphStoreSnafu)?;
+        let mut new_context_projections = Vec::new();
+        let mut result = SourceProjectionResult::default();
+        for entry in entries {
+            let ensured = self.ensure_source_node(entry).await?;
+            result.changed_source_nodes = result
+                .changed_source_nodes
+                .saturating_add(u64::from(ensured.changed));
+            result.nodes_to_reflow.extend(ensured.added_nodes);
+            result.nodes_to_reflow.push(entry.node_id.clone());
+            let source_node = source_nodes.get(&entry.node_id).with_context(|| {
+                WebGraphSourceNodeMissingSnafu {
+                    node_id: entry.node_id.clone(),
+                }
+            })?;
+            let projection = tool_session_projection(entry.row_id, source_node);
+            self.store
+                .apply_tool_session_projection(&projection)
+                .await
+                .context(WebGraphStoreSnafu)?;
+            if let Some(projection) = provider_context_node_projection(
+                entry.row_id,
+                source_node,
+                context_projections.get(&source_node.parent),
+                root_id,
+            )? {
+                context_projections.insert(source_node.id.clone(), projection.clone());
+                new_context_projections.push(projection);
+            }
+        }
+        self.store
+            .apply_provider_context_node_projections(&new_context_projections)
+            .await
+            .context(WebGraphStoreSnafu)?;
+        Ok(result)
     }
 
     async fn sync_provider_branch_history(&self) -> crate::Result<StoredGraphState> {
