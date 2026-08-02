@@ -136,10 +136,11 @@ pub async fn load_anchor_range(
 async fn load_provider_context(
     target: String,
     context: Option<String>,
+    graph_mode: String,
 ) -> Result<ProviderContextResponse, ServerFnError> {
     let server = expect_context::<crate::host::PanelServerContext>();
     server
-        .provider_context(target, context)
+        .provider_context(target, context, graph_mode)
         .await
         .map_err(|error| ServerFnError::ServerError(error.to_string()))
 }
@@ -241,6 +242,7 @@ fn ProviderContextPanelBody(
     });
     let pending_initial_request = RwSignal::new(initial_request);
     let initial_for_resource = initial_loaded.clone();
+    let resource_graph_mode = graph_mode.clone();
     let provider_context = LocalResource::new(move || {
         let request = provider_request.get();
         let initial = (pending_initial_request.get_untracked() == request)
@@ -249,14 +251,16 @@ fn ProviderContextPanelBody(
         if initial.is_some() {
             pending_initial_request.set(None);
         }
+        let graph_mode = resource_graph_mode.clone();
         async move {
             let request = request?;
             if let Some(initial) = initial {
                 return Some(initial);
             }
-            let response = load_provider_context(request.target.clone(), request.context.clone())
-                .await
-                .map_err(|error| error.to_string());
+            let response =
+                load_provider_context(request.target.clone(), request.context.clone(), graph_mode)
+                    .await
+                    .map_err(|error| error.to_string());
             Some(LoadedPanel {
                 request,
                 response: response.map(|response| ProviderContextPayload {

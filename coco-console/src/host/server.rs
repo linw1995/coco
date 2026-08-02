@@ -79,6 +79,7 @@ trait PanelDataSource: Send + Sync {
         &self,
         target: String,
         context: Option<String>,
+        graph_mode: String,
     ) -> Result<ProviderContextResponse>;
 
     async fn provider_context_items(
@@ -120,8 +121,11 @@ impl PanelServerContext {
         &self,
         target: String,
         context: Option<String>,
+        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
-        self.source.provider_context(target, context).await
+        self.source
+            .provider_context(target, context, graph_mode)
+            .await
     }
 
     pub async fn provider_context_items(
@@ -157,8 +161,15 @@ where
         &self,
         target: String,
         context: Option<String>,
+        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
-        load_provider_context(self, &target, context.as_deref()).await
+        load_provider_context(
+            self,
+            &target,
+            context.as_deref(),
+            view_mode_from_value(&graph_mode),
+        )
+        .await
     }
 
     async fn provider_context_items(
@@ -677,10 +688,11 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
+    let view_mode = view_mode_from_query(&query);
     let response = if let Some(target) = query.get("target") {
-        load_provider_context(&state, target, query.get("context")).await
+        load_provider_context(&state, target, query.get("context"), view_mode).await
     } else if let Some(context) = query.get("context") {
-        load_provider_context_by_id(&state, context).await
+        load_provider_context_by_id(&state, context, view_mode).await
     } else {
         return json_response(&ProviderContextResponse::Default, "provider context");
     };
@@ -694,6 +706,7 @@ async fn load_provider_context<S>(
     state: &AppState<S>,
     target: &str,
     context: Option<&str>,
+    view_mode: ViewMode,
 ) -> Result<ProviderContextResponse>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -725,36 +738,44 @@ where
             branches: Vec::new(),
         });
     };
-    Ok(found_provider_context(selection))
+    found_provider_context(state, selection, view_mode).await
 }
 
 async fn load_provider_context_by_id<S>(
     state: &AppState<S>,
     context_id: &str,
+    view_mode: ViewMode,
 ) -> Result<ProviderContextResponse>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    state
-        .web_graph
-        .provider_context_by_id(context_id)
-        .await
-        .map(|selection| {
-            selection.map_or_else(
-                || ProviderContextResponse::Missing {
-                    target: context_id.to_owned(),
-                },
-                found_provider_context,
-            )
-        })
+    let selection = state.web_graph.provider_context_by_id(context_id).await?;
+    let Some(selection) = selection else {
+        return Ok(ProviderContextResponse::Missing {
+            target: context_id.to_owned(),
+        });
+    };
+    found_provider_context(state, selection, view_mode).await
 }
 
-fn found_provider_context(selection: ProviderContextSelection) -> ProviderContextResponse {
-    ProviderContextResponse::Found {
+async fn found_provider_context<S>(
+    state: &AppState<S>,
+    selection: ProviderContextSelection,
+    view_mode: ViewMode,
+) -> Result<ProviderContextResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let mut node_ids = selection.context.node_ids;
+    if view_mode == ViewMode::Anchors {
+        let points = state.web_graph.node_points(view_mode, &node_ids).await?;
+        node_ids.retain(|node_id| points.contains_key(node_id));
+    }
+    Ok(ProviderContextResponse::Found {
         context_target: selection.context.id,
         previous_context_target: selection.context.previous_id,
         selected_id: selection.selected_id,
-        node_ids: selection.context.node_ids,
+        node_ids,
         branches: selection
             .context
             .branches
@@ -765,7 +786,7 @@ fn found_provider_context(selection: ProviderContextSelection) -> ProviderContex
                 context_target: branch.context_id,
             })
             .collect(),
-    }
+    })
 }
 
 async fn load_initial_provider_context<S>(
@@ -777,7 +798,7 @@ async fn load_initial_provider_context<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let response = load_provider_context(state, target, context).await?;
+    let response = load_provider_context(state, target, context, view_mode).await?;
     let items = match &response {
         ProviderContextResponse::Found {
             selected_id,
@@ -2031,7 +2052,7 @@ mod tests {
 
         let response = provider_context(
             State(state.clone()),
-            RawQuery(Some(format!("context={context_id}"))),
+            RawQuery(Some(format!("context={context_id}&mode=all"))),
         )
         .await;
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -2051,6 +2072,49 @@ mod tests {
         assert_eq!(response_selected_id, head_id);
         assert_eq!(node_ids.len(), 22);
         assert_eq!(branches.len(), 1);
+
+        let response = provider_context(
+            State(state.clone()),
+            RawQuery(Some(format!(
+                "target={}&context={context_id}&mode=anchors",
+                node_target_id(&selected_id),
+            ))),
+        )
+        .await;
+        let anchors_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let anchors_response: ProviderContextResponse =
+            serde_json::from_slice(&anchors_body).unwrap();
+        let ProviderContextResponse::Found {
+            selected_id: response_selected_id,
+            node_ids: anchors_node_ids,
+            ..
+        } = anchors_response
+        else {
+            panic!("provider context should be found in anchors mode");
+        };
+        assert_eq!(response_selected_id, selected_id);
+        assert_eq!(
+            anchors_node_ids.as_slice(),
+            std::slice::from_ref(&session_id)
+        );
+
+        let initial = load_initial_provider_context(
+            &state,
+            &node_target_id(&selected_id),
+            Some(&context_id),
+            ViewMode::Anchors,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            initial
+                .items
+                .iter()
+                .map(|item| item.node.id.as_str())
+                .collect::<Vec<_>>(),
+            [session_id.as_str()]
+        );
+        assert!(initial.items[0].point.is_some());
 
         let initial = load_initial_provider_context(
             &state,
@@ -2112,9 +2176,10 @@ mod tests {
             ("main", head_id.as_str()),
             (&selected_id[..16], selected_id.as_str()),
         ] {
-            let response = load_provider_context(&state, &node_target_id(target_ref), None)
-                .await
-                .unwrap();
+            let response =
+                load_provider_context(&state, &node_target_id(target_ref), None, ViewMode::All)
+                    .await
+                    .unwrap();
             assert!(matches!(
                 response,
                 ProviderContextResponse::Found { selected_id: response_selected_id, .. }
@@ -2124,7 +2189,23 @@ mod tests {
 
         let request = Request::builder()
             .uri(format!(
-                "/api/panels/provider-context?target={}&context={context_id}",
+                "/api/panels/provider-context?target={}&context={context_id}&graph_mode=all",
+                node_target_id(&selected_id),
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = panel_server_function(State(state.clone()), request).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            response,
+            ProviderContextResponse::Found { selected_id: response_selected_id, .. }
+                if response_selected_id == selected_id
+        ));
+
+        let request = Request::builder()
+            .uri(format!(
+                "/api/panels/provider-context?target={}&context={context_id}&graph_mode=anchors",
                 node_target_id(&selected_id),
             ))
             .body(Body::empty())
@@ -2134,8 +2215,8 @@ mod tests {
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         assert!(matches!(
             response,
-            ProviderContextResponse::Found { selected_id: response_selected_id, .. }
-                if response_selected_id == selected_id
+            ProviderContextResponse::Found { node_ids, .. }
+                if node_ids.as_slice() == std::slice::from_ref(&session_id)
         ));
     }
 
