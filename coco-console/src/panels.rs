@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{
     AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
-    MarkdownDocument, MarkdownNode, NodeDetailResponse, ProviderContextItem,
+    MarkdownDocument, MarkdownNode, NodeDetailResponse, ProviderContextBranch, ProviderContextItem,
     ProviderContextResponse, ShellHighlightKind, ShellHighlightToken, ToolInputJsonHighlight,
     ToolInputShellHighlight, ToolUseInputLink,
 };
@@ -136,10 +136,11 @@ pub async fn load_anchor_range(
 async fn load_provider_context(
     target: String,
     context: Option<String>,
+    graph_mode: String,
 ) -> Result<ProviderContextResponse, ServerFnError> {
     let server = expect_context::<crate::host::PanelServerContext>();
     server
-        .provider_context(target, context)
+        .provider_context(target, context, graph_mode)
         .await
         .map_err(|error| ServerFnError::ServerError(error.to_string()))
 }
@@ -239,9 +240,12 @@ fn ProviderContextPanelBody(
     let provider_request = Memo::new(move |_| {
         provider_context_request(selection.get(), loaded_context.get().as_ref())
     });
+    let graph_revision = use_graph_revision();
     let pending_initial_request = RwSignal::new(initial_request);
     let initial_for_resource = initial_loaded.clone();
+    let resource_graph_mode = graph_mode.clone();
     let provider_context = LocalResource::new(move || {
+        graph_revision.track();
         let request = provider_request.get();
         let initial = (pending_initial_request.get_untracked() == request)
             .then(|| initial_for_resource.clone())
@@ -249,14 +253,16 @@ fn ProviderContextPanelBody(
         if initial.is_some() {
             pending_initial_request.set(None);
         }
+        let graph_mode = resource_graph_mode.clone();
         async move {
             let request = request?;
             if let Some(initial) = initial {
                 return Some(initial);
             }
-            let response = load_provider_context(request.target.clone(), request.context.clone())
-                .await
-                .map_err(|error| error.to_string());
+            let response =
+                load_provider_context(request.target.clone(), request.context.clone(), graph_mode)
+                    .await
+                    .map_err(|error| error.to_string());
             Some(LoadedPanel {
                 request,
                 response: response.map(|response| ProviderContextPayload {
@@ -1530,11 +1536,14 @@ fn ProviderContextContent(payload: ProviderContextPayload, graph_mode: String) -
             context_target,
             selected_id,
             node_ids,
+            branches,
+            ..
         } => view! {
             <ProviderContextList
                 context_target
                 selected_id
                 node_ids
+                branches
                 initial_items=payload.items
                 graph_mode
             />
@@ -1568,6 +1577,7 @@ fn ProviderContextList(
     context_target: String,
     selected_id: String,
     node_ids: Vec<String>,
+    branches: Vec<ProviderContextBranch>,
     initial_items: Vec<ProviderContextItem>,
     graph_mode: String,
 ) -> AnyView {
@@ -1588,6 +1598,10 @@ fn ProviderContextList(
         view! {
             <section node_ref=scroll_root class="provider-context-section">
                 <h2>"Provider Context"</h2>
+                <ProviderContextBranches
+                    selected_id=selected_id.clone()
+                    branches
+                />
                 <ol class="provider-context-list">
                     {node_ids
                         .into_iter()
@@ -1610,6 +1624,37 @@ fn ProviderContextList(
         }
         .into_any()
     }
+}
+
+#[component]
+fn ProviderContextBranches(
+    selected_id: String,
+    branches: Vec<ProviderContextBranch>,
+) -> impl IntoView {
+    let links = branches
+        .into_iter()
+        .map(|branch| {
+            let active = branch.head_node_id == selected_id;
+            let label = if branch.name.is_empty() {
+                "(default)".to_owned()
+            } else {
+                branch.name
+            };
+            let href = format!("#{NODE_TARGET_PREFIX}{}", branch.head_node_id);
+            view! {
+                <a
+                    class="provider-context-branch"
+                    href=href
+                    title=branch.head_node_id
+                    data-context-target=branch.context_target
+                    aria-current=active.then_some("true")
+                >
+                    {label}
+                </a>
+            }
+        })
+        .collect::<Vec<_>>();
+    (!links.is_empty()).then(|| view! { <nav class="provider-context-branches">{links}</nav> })
 }
 
 #[component]
@@ -1724,6 +1769,7 @@ fn provider_context_row_content(
             <a
                 class="provider-context-node-link provider-context-node-placeholder"
                 href=target
+                data-node-id=node_id.to_owned()
                 data-node-target=node_target
                 aria-current=selected.then_some("true")
                 aria-busy=(!failed || retrying).then_some("true")
@@ -1756,6 +1802,7 @@ fn provider_context_row_content(
         <a
             class="provider-context-node-link"
             href=target
+            data-node-id=node_id.to_owned()
             data-node-target=node_target
             aria-current=selected.then_some("true")
         >
@@ -1986,8 +2033,10 @@ mod tests {
             response: Ok(ProviderContextPayload {
                 response: ProviderContextResponse::Found {
                     context_target: "detail-root-context-branch".to_owned(),
+                    previous_context_target: None,
                     selected_id: "first".to_owned(),
                     node_ids: vec!["first".to_owned()],
+                    branches: Vec::new(),
                 },
                 items: vec![ProviderContextItem {
                     node: ProviderContextNode {
@@ -2126,8 +2175,10 @@ mod tests {
             payload=ProviderContextPayload {
                 response: ProviderContextResponse::Found {
                     context_target: String::new(),
+                    previous_context_target: None,
                     selected_id: String::new(),
                     node_ids: Vec::new(),
+                    branches: Vec::new(),
                 },
                 items: Vec::new(),
             }
@@ -2159,8 +2210,14 @@ mod tests {
                 payload=ProviderContextPayload {
                     response: ProviderContextResponse::Found {
                         context_target: "detail-context".to_owned(),
+                        previous_context_target: None,
                         selected_id: initial_id.to_owned(),
                         node_ids: vec![initial_id.to_owned(), deferred_id.to_owned()],
+                        branches: vec![ProviderContextBranch {
+                            name: "main".to_owned(),
+                            head_node_id: deferred_id.to_owned(),
+                            context_target: "detail-main-context".to_owned(),
+                        }],
                     },
                     items: vec![ProviderContextItem {
                         node: ProviderContextNode {
@@ -2179,6 +2236,8 @@ mod tests {
         .to_html();
 
         assert!(provider.contains("Server-rendered summary"));
+        assert!(provider.contains("provider-context-branch"));
+        assert!(provider.contains(&format!("#detail-{deferred_id}")));
         assert!(provider.contains(deferred_id));
         assert!(provider.contains("Scroll to load node summary..."));
         assert!(provider.contains("aria-busy=\"true\""));
@@ -2805,8 +2864,10 @@ mod wasm_tests {
                     payload=ProviderContextPayload {
                         response: ProviderContextResponse::Found {
                             context_target: "detail-context".to_owned(),
+                            previous_context_target: None,
                             selected_id: "node-0".to_owned(),
                             node_ids,
+                            branches: Vec::new(),
                         },
                         items: initial_items,
                     }

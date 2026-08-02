@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::str::{FromStr, Split};
 
@@ -613,6 +613,9 @@ impl VirtualGraph {
 
     fn sync_selected_graph_node(&self) {
         if let Err(error) = sync_selected_graph_node(&self.window, &self.document) {
+            web_sys::console::error_1(&error);
+        }
+        if let Err(error) = sync_provider_context_graph_path(&self.document) {
             web_sys::console::error_1(&error);
         }
     }
@@ -3121,6 +3124,55 @@ fn sync_selected_provider_context_node(
     Ok(())
 }
 
+fn sync_provider_context_graph_path(document: &Document) -> Result<(), JsValue> {
+    let context_links = document
+        .query_selector_all(".provider-context-node-link[data-node-id][data-node-target]")?;
+    let mut context_node_ids = BTreeSet::new();
+    for index in 0..context_links.length() {
+        let link = context_links
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let Some(node_id) = link.get_attribute("data-node-id") else {
+            continue;
+        };
+        context_node_ids.insert(node_id);
+    }
+
+    let graph_nodes = document.query_selector_all(".node-link[data-node-id]")?;
+    for index in 0..graph_nodes.length() {
+        let node = graph_nodes
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let is_in_context = node
+            .get_attribute("data-node-id")
+            .is_some_and(|node_id| context_node_ids.contains(&node_id));
+        node.class_list()
+            .toggle_with_force("provider-context-path-node", is_in_context)?;
+    }
+
+    let graph_edges = document.query_selector_all(".edge[data-source-id][data-target-id]")?;
+    for index in 0..graph_edges.length() {
+        let edge = graph_edges
+            .item(index)
+            .expect("query selector index should exist")
+            .unchecked_into::<Element>();
+        let is_primary = edge.get_attribute("data-edge-kind").as_deref()
+            == Some(GraphViewportEdgeKind::Primary.key_part());
+        let endpoints = edge
+            .get_attribute("data-source-id")
+            .zip(edge.get_attribute("data-target-id"));
+        let is_in_context = is_primary
+            && endpoints.is_some_and(|(source_id, target_id)| {
+                context_node_ids.contains(&source_id) && context_node_ids.contains(&target_id)
+            });
+        edge.class_list()
+            .toggle_with_force("provider-context-path-edge", is_in_context)?;
+    }
+    Ok(())
+}
+
 fn selected_graph_focus_point(
     window: &Window,
     document: &Document,
@@ -4524,6 +4576,114 @@ mod tests {
 
         assert!(row.class_list().contains("selected"));
         assert_eq!(link.get_attribute("aria-current").as_deref(), Some("true"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_highlight_the_rendered_provider_context_path() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .upsert_graph_items(
+                    GraphViewportItems {
+                        nodes: vec![
+                            graph_node("a", 80, 80),
+                            graph_node("b", 180, 80),
+                            graph_node("c", 280, 80),
+                        ],
+                        edges: vec![
+                            graph_edge(
+                                GraphViewportEdgeKind::Primary,
+                                "a",
+                                "b",
+                                route((100, 80), (120, 80), (140, 80), (160, 80)),
+                            ),
+                            graph_edge(
+                                GraphViewportEdgeKind::Primary,
+                                "b",
+                                "c",
+                                route((200, 80), (220, 80), (240, 80), (260, 80)),
+                            ),
+                            graph_edge(
+                                GraphViewportEdgeKind::Merge,
+                                "a",
+                                "c",
+                                route((100, 80), (140, 40), (220, 40), (260, 80)),
+                            ),
+                        ],
+                    },
+                    false,
+                )
+                .expect_throw("graph items should render");
+        }
+        let document = fixture.graph.borrow().document.clone();
+        let mut context_links = Vec::new();
+        for node_id in ["c", "b", "a"] {
+            let link = document
+                .create_element("a")
+                .expect_throw("provider context link should be created");
+            link.set_class_name("provider-context-node-link");
+            link.set_attribute("data-node-id", node_id)
+                .expect_throw("provider context node id should be set");
+            link.set_attribute("data-node-target", &format!("detail-{node_id}"))
+                .expect_throw("provider context target should be set");
+            fixture
+                .root
+                .append_child(&link)
+                .expect_throw("provider context link should be mounted");
+            context_links.push(link);
+        }
+
+        sync_provider_context_graph_path(&document)
+            .expect_throw("provider context graph path should sync");
+
+        for node_id in ["a", "b", "c"] {
+            let node = document
+                .query_selector(&format!(".node-link[data-node-id=\"{node_id}\"]"))
+                .expect_throw("graph node query should succeed")
+                .expect_throw("graph node should exist");
+            assert!(node.class_list().contains("provider-context-path-node"));
+        }
+        for (source_id, target_id) in [("a", "b"), ("b", "c")] {
+            let edge = document
+                .query_selector(&format!(
+                    ".edge[data-source-id=\"{source_id}\"][data-target-id=\"{target_id}\"]"
+                ))
+                .expect_throw("graph edge query should succeed")
+                .expect_throw("graph edge should exist");
+            assert!(edge.class_list().contains("provider-context-path-edge"));
+        }
+        let merge_edge = document
+            .query_selector(".edge.merge-parent[data-source-id=\"a\"][data-target-id=\"c\"]")
+            .expect_throw("merge graph edge query should succeed")
+            .expect_throw("merge graph edge should exist");
+        assert!(
+            !merge_edge
+                .class_list()
+                .contains("provider-context-path-edge")
+        );
+
+        context_links[0].remove();
+        sync_provider_context_graph_path(&document)
+            .expect_throw("shortened provider context graph path should sync");
+        let removed_node = document
+            .query_selector(".node-link[data-node-id=\"c\"]")
+            .expect_throw("removed graph node query should succeed")
+            .expect_throw("removed graph node should exist");
+        assert!(
+            !removed_node
+                .class_list()
+                .contains("provider-context-path-node")
+        );
+        let removed_edge = document
+            .query_selector(".edge[data-source-id=\"b\"][data-target-id=\"c\"]")
+            .expect_throw("removed graph edge query should succeed")
+            .expect_throw("removed graph edge should exist");
+        assert!(
+            !removed_edge
+                .class_list()
+                .contains("provider-context-path-edge")
+        );
     }
 
     #[wasm_bindgen_test]

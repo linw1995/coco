@@ -33,13 +33,14 @@ use super::render::render_index_page;
 use crate::Result;
 use crate::api::{
     AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdgeKind,
-    NodeDetailResponse, Point as ApiPoint, ProviderContextItem, ProviderContextNode,
-    ProviderContextResponse, ToolUseInputLink,
+    NodeDetailResponse, Point as ApiPoint, ProviderContextBranch, ProviderContextItem,
+    ProviderContextNode, ProviderContextResponse, ToolUseInputLink,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
 use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
-    NodeView, ViewMode, node_id_from_target, tool_use_input_links, write_stdin_session_ids,
+    NodeView, ProviderContextSelection, ViewMode, node_id_from_target, tool_use_input_links,
+    write_stdin_session_ids,
 };
 
 const STYLE_CSS: &str = include_str!("style.css");
@@ -78,6 +79,7 @@ trait PanelDataSource: Send + Sync {
         &self,
         target: String,
         context: Option<String>,
+        graph_mode: String,
     ) -> Result<ProviderContextResponse>;
 
     async fn provider_context_items(
@@ -119,8 +121,11 @@ impl PanelServerContext {
         &self,
         target: String,
         context: Option<String>,
+        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
-        self.source.provider_context(target, context).await
+        self.source
+            .provider_context(target, context, graph_mode)
+            .await
     }
 
     pub async fn provider_context_items(
@@ -156,8 +161,15 @@ where
         &self,
         target: String,
         context: Option<String>,
+        graph_mode: String,
     ) -> Result<ProviderContextResponse> {
-        load_provider_context(self, &target, context.as_deref()).await
+        load_provider_context(
+            self,
+            &target,
+            context.as_deref(),
+            view_mode_from_value(&graph_mode),
+        )
+        .await
     }
 
     async fn provider_context_items(
@@ -676,10 +688,15 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let query = parse_query(query.as_deref().unwrap_or_default());
-    let Some(target) = query.get("target") else {
+    let view_mode = view_mode_from_query(&query);
+    let response = if let Some(target) = query.get("target") {
+        load_provider_context(&state, target, query.get("context"), view_mode).await
+    } else if let Some(context) = query.get("context") {
+        load_provider_context_by_id(&state, context, view_mode).await
+    } else {
         return json_response(&ProviderContextResponse::Default, "provider context");
     };
-    match load_provider_context(&state, target, query.get("context")).await {
+    match response {
         Ok(response) => json_response(&response, "provider context"),
         Err(error) => plain_error(error.to_string()),
     }
@@ -689,6 +706,7 @@ async fn load_provider_context<S>(
     state: &AppState<S>,
     target: &str,
     context: Option<&str>,
+    view_mode: ViewMode,
 ) -> Result<ProviderContextResponse>
 where
     S: Store + Clone + Send + Sync + 'static,
@@ -714,14 +732,60 @@ where
     let Some(selection) = selection else {
         return Ok(ProviderContextResponse::Found {
             context_target: context.unwrap_or_default().to_owned(),
+            previous_context_target: None,
             selected_id: node.id,
             node_ids: Vec::new(),
+            branches: Vec::new(),
         });
     };
+    found_provider_context(state, selection, view_mode).await
+}
+
+async fn load_provider_context_by_id<S>(
+    state: &AppState<S>,
+    context_id: &str,
+    view_mode: ViewMode,
+) -> Result<ProviderContextResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let selection = state.web_graph.provider_context_by_id(context_id).await?;
+    let Some(selection) = selection else {
+        return Ok(ProviderContextResponse::Missing {
+            target: context_id.to_owned(),
+        });
+    };
+    found_provider_context(state, selection, view_mode).await
+}
+
+async fn found_provider_context<S>(
+    state: &AppState<S>,
+    selection: ProviderContextSelection,
+    view_mode: ViewMode,
+) -> Result<ProviderContextResponse>
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let mut node_ids = selection.context.node_ids;
+    if view_mode == ViewMode::Anchors {
+        let points = state.web_graph.node_points(view_mode, &node_ids).await?;
+        node_ids.retain(|node_id| points.contains_key(node_id));
+    }
     Ok(ProviderContextResponse::Found {
         context_target: selection.context.id,
+        previous_context_target: selection.context.previous_id,
         selected_id: selection.selected_id,
-        node_ids: selection.context.node_ids,
+        node_ids,
+        branches: selection
+            .context
+            .branches
+            .into_iter()
+            .map(|branch| ProviderContextBranch {
+                name: branch.name,
+                head_node_id: branch.head_node_id,
+                context_target: branch.context_id,
+            })
+            .collect(),
     })
 }
 
@@ -734,7 +798,7 @@ async fn load_initial_provider_context<S>(
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    let response = load_provider_context(state, target, context).await?;
+    let response = load_provider_context(state, target, context, view_mode).await?;
     let items = match &response {
         ProviderContextResponse::Found {
             selected_id,
@@ -1161,7 +1225,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::ConsoleStore;
-    use crate::host::web_graph_view::node_target_id;
+    use crate::host::web_graph_view::{node_target_id, provider_context_id};
 
     fn client_asset_by_path(path: &str) -> &'static ClientAsset {
         CLIENT_ASSETS
@@ -1951,12 +2015,13 @@ mod tests {
             .unwrap();
         web_graph.catch_up().await.unwrap();
         let state = AppState { store, web_graph };
+        let context_id = provider_context_id(&session_id);
 
         let response = provider_context(
             State(state.clone()),
             RawQuery(Some(format!(
-                "target={}&mode=all",
-                node_target_id(&selected_id)
+                "target={}&context={context_id}&mode=all",
+                node_target_id(&selected_id),
             ))),
         )
         .await;
@@ -1967,6 +2032,7 @@ mod tests {
         let ProviderContextResponse::Found {
             selected_id: response_selected_id,
             node_ids,
+            branches,
             ..
         } = response
         else {
@@ -1974,12 +2040,86 @@ mod tests {
         };
         assert_eq!(response_selected_id, selected_id);
         assert_eq!(node_ids.len(), 22);
+        assert_eq!(
+            branches,
+            [ProviderContextBranch {
+                name: "main".to_owned(),
+                head_node_id: head_id.clone(),
+                context_target: context_id.clone(),
+            }]
+        );
         assert!(!String::from_utf8_lossy(&body).contains("provider context selection"));
+
+        let response = provider_context(
+            State(state.clone()),
+            RawQuery(Some(format!("context={context_id}&mode=all"))),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
+        let ProviderContextResponse::Found {
+            context_target,
+            previous_context_target,
+            selected_id: response_selected_id,
+            node_ids,
+            branches,
+        } = response
+        else {
+            panic!("provider context should be found by context ID");
+        };
+        assert_eq!(context_target, context_id);
+        assert_eq!(previous_context_target, None);
+        assert_eq!(response_selected_id, head_id);
+        assert_eq!(node_ids.len(), 22);
+        assert_eq!(branches.len(), 1);
+
+        let response = provider_context(
+            State(state.clone()),
+            RawQuery(Some(format!(
+                "target={}&context={context_id}&mode=anchors",
+                node_target_id(&selected_id),
+            ))),
+        )
+        .await;
+        let anchors_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let anchors_response: ProviderContextResponse =
+            serde_json::from_slice(&anchors_body).unwrap();
+        let ProviderContextResponse::Found {
+            selected_id: response_selected_id,
+            node_ids: anchors_node_ids,
+            ..
+        } = anchors_response
+        else {
+            panic!("provider context should be found in anchors mode");
+        };
+        assert_eq!(response_selected_id, selected_id);
+        assert_eq!(
+            anchors_node_ids.as_slice(),
+            std::slice::from_ref(&session_id)
+        );
 
         let initial = load_initial_provider_context(
             &state,
             &node_target_id(&selected_id),
-            None,
+            Some(&context_id),
+            ViewMode::Anchors,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            initial
+                .items
+                .iter()
+                .map(|item| item.node.id.as_str())
+                .collect::<Vec<_>>(),
+            [session_id.as_str()]
+        );
+        assert!(initial.items[0].point.is_some());
+
+        let initial = load_initial_provider_context(
+            &state,
+            &node_target_id(&selected_id),
+            Some(&context_id),
             ViewMode::All,
         )
         .await;
@@ -2008,8 +2148,8 @@ mod tests {
         let index = index_page(
             State(state.clone()),
             RawQuery(Some(format!(
-                "mode=all&target={}",
-                node_target_id(&selected_id)
+                "mode=all&target={}&context={context_id}",
+                node_target_id(&selected_id),
             ))),
         )
         .await;
@@ -2036,9 +2176,10 @@ mod tests {
             ("main", head_id.as_str()),
             (&selected_id[..16], selected_id.as_str()),
         ] {
-            let response = load_provider_context(&state, &node_target_id(target_ref), None)
-                .await
-                .unwrap();
+            let response =
+                load_provider_context(&state, &node_target_id(target_ref), None, ViewMode::All)
+                    .await
+                    .unwrap();
             assert!(matches!(
                 response,
                 ProviderContextResponse::Found { selected_id: response_selected_id, .. }
@@ -2048,8 +2189,24 @@ mod tests {
 
         let request = Request::builder()
             .uri(format!(
-                "/api/panels/provider-context?target={}",
-                node_target_id(&selected_id)
+                "/api/panels/provider-context?target={}&context={context_id}&graph_mode=all",
+                node_target_id(&selected_id),
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = panel_server_function(State(state.clone()), request).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(
+            response,
+            ProviderContextResponse::Found { selected_id: response_selected_id, .. }
+                if response_selected_id == selected_id
+        ));
+
+        let request = Request::builder()
+            .uri(format!(
+                "/api/panels/provider-context?target={}&context={context_id}&graph_mode=anchors",
+                node_target_id(&selected_id),
             ))
             .body(Body::empty())
             .unwrap();
@@ -2058,8 +2215,8 @@ mod tests {
         let response: ProviderContextResponse = serde_json::from_slice(&body).unwrap();
         assert!(matches!(
             response,
-            ProviderContextResponse::Found { selected_id: response_selected_id, .. }
-                if response_selected_id == selected_id
+            ProviderContextResponse::Found { node_ids, .. }
+                if node_ids.as_slice() == std::slice::from_ref(&session_id)
         ));
     }
 

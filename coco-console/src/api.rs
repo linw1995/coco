@@ -183,6 +183,13 @@ pub struct ProviderContextNode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderContextBranch {
+    pub name: String,
+    pub head_node_id: String,
+    pub context_target: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProviderContextResponse {
     Default,
@@ -191,8 +198,10 @@ pub enum ProviderContextResponse {
     },
     Found {
         context_target: String,
+        previous_context_target: Option<String>,
         selected_id: String,
         node_ids: Vec<String>,
+        branches: Vec<ProviderContextBranch>,
     },
 }
 

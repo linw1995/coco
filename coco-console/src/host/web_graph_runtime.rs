@@ -12,7 +12,8 @@ use tokio::sync::watch;
 
 use super::error::{
     JoinWebGraphReflowSnafu, StoreSnafu, WebGraphModelSnafu, WebGraphNotInitializedSnafu,
-    WebGraphOrderSnafu, WebGraphParentPlacementMissingSnafu, WebGraphRevisionExhaustedSnafu,
+    WebGraphOrderSnafu, WebGraphParentPlacementMissingSnafu,
+    WebGraphProviderContextParentMissingSnafu, WebGraphRevisionExhaustedSnafu,
     WebGraphSourceCursorMismatchSnafu, WebGraphSourceCursorRegressedSnafu,
     WebGraphSourceCursorStalledSnafu, WebGraphSourceNodeMissingSnafu,
     WebGraphSourceVersionExhaustedSnafu, WebGraphStoreSnafu,
@@ -23,16 +24,16 @@ use super::web_graph_order::{
     stable_column_order,
 };
 use super::web_graph_store::{
-    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse,
-    ProviderContextBranchProjection, ProviderContextProjection, StoredGraphState,
-    ToolSessionProjection, Viewport, WebGraphStore,
+    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse, ProviderBranchProjection,
+    ProviderContextNodeProjection, ProviderContextSplit, StoredGraphState, ToolSessionProjection,
+    Viewport, WebGraphStore,
 };
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
-    GRAPH_ROW_STEP, ProviderContext, ProviderContextSelection, ViewMode,
-    diff_graph_viewport_responses, edge_key, edge_port_offset, graph_kind_name, node_key,
-    node_target_id, provider_context_id, provider_contexts_from_head, route_edge,
-    route_edge_with_offsets, shorten_id, summarize_node,
+    GRAPH_ROW_STEP, ProviderContext, ProviderContextBranch, ProviderContextSelection, ViewMode,
+    diff_graph_viewport_responses, edge_key, edge_port_offset, graph_kind_name,
+    is_provider_context_start, is_skill_invocation_anchor, node_key, node_target_id,
+    provider_context_id, route_edge, route_edge_with_offsets, shorten_id, summarize_node,
 };
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -79,6 +80,12 @@ struct ParentEdge {
 struct EnsureResult {
     changed: bool,
     added_nodes: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct SourceProjectionResult {
+    changed_source_nodes: u64,
+    nodes_to_reflow: Vec<String>,
 }
 
 enum ReflowStep {
@@ -744,10 +751,27 @@ impl WebGraphRuntime {
         Ok(Some(ProviderContextSelection {
             context: ProviderContext {
                 id: selection.context_id,
+                previous_id: selection.previous_context_id,
                 node_ids: selection.node_ids,
+                branches: selection
+                    .branches
+                    .into_iter()
+                    .map(|branch| ProviderContextBranch {
+                        name: branch.branch,
+                        head_node_id: branch.head_node_id,
+                        context_id: branch.context_id,
+                    })
+                    .collect(),
             },
-            selected_id: target_node_id.to_owned(),
+            selected_id: selection.selected_node_id,
         }))
+    }
+
+    pub async fn provider_context_by_id(
+        &self,
+        context_id: &str,
+    ) -> crate::Result<Option<ProviderContextSelection>> {
+        self.provider_context_for_node("", Some(context_id)).await
     }
 
     pub async fn provider_context_nodes(
@@ -911,7 +935,7 @@ impl WebGraphRuntime {
                     .fail();
                 }
                 if cursor == &through {
-                    let synchronized = self.sync_provider_contexts().await?;
+                    let synchronized = self.sync_provider_branch_history().await?;
                     let current_revision = synchronized.revision.get();
                     self.publish_revision(current_revision);
                     if let Some(progress) = progress.as_mut() {
@@ -946,39 +970,14 @@ impl WebGraphRuntime {
             }
             let page_complete = page.complete;
             let processed_nodes = page.entries.len();
+            let root_id = self.source.root_id();
             let mut changed_source_nodes = 0_u64;
             let mut nodes_to_reflow = Vec::new();
             for entries in page.entries.chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE) {
-                let node_ids = entries
-                    .iter()
-                    .map(|entry| entry.node_id.clone())
-                    .collect::<Vec<_>>();
-                let source_nodes = self
-                    .source
-                    .graph_nodes_by_ids(&node_ids)
-                    .await
-                    .context(StoreSnafu)?
-                    .into_iter()
-                    .map(|node| (node.id.clone(), node))
-                    .collect::<BTreeMap<_, _>>();
-                for entry in entries {
-                    let result = self.ensure_source_node(entry).await?;
-                    if result.changed {
-                        changed_source_nodes = changed_source_nodes.saturating_add(1);
-                    }
-                    nodes_to_reflow.extend(result.added_nodes);
-                    nodes_to_reflow.push(entry.node_id.clone());
-                    let source_node = source_nodes.get(&entry.node_id).with_context(|| {
-                        WebGraphSourceNodeMissingSnafu {
-                            node_id: entry.node_id.clone(),
-                        }
-                    })?;
-                    let projection = tool_session_projection(entry.row_id, source_node);
-                    self.store
-                        .apply_tool_session_projection(&projection)
-                        .await
-                        .context(WebGraphStoreSnafu)?;
-                }
+                let projected = self.process_source_entries(entries, &root_id).await?;
+                changed_source_nodes =
+                    changed_source_nodes.saturating_add(projected.changed_source_nodes);
+                nodes_to_reflow.extend(projected.nodes_to_reflow);
             }
             let page_cursor = page
                 .entries
@@ -1003,11 +1002,120 @@ impl WebGraphRuntime {
         }
     }
 
-    async fn sync_provider_contexts(&self) -> crate::Result<StoredGraphState> {
+    async fn process_source_entries(
+        &self,
+        entries: &[GraphNodeCursor],
+        root_id: &str,
+    ) -> crate::Result<SourceProjectionResult> {
+        let node_ids = entries
+            .iter()
+            .map(|entry| entry.node_id.clone())
+            .collect::<Vec<_>>();
+        let source_nodes = self
+            .source
+            .graph_nodes_by_ids(&node_ids)
+            .await
+            .context(StoreSnafu)?
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let parent_ids = source_nodes
+            .values()
+            .filter(|node| !node.parent.is_empty())
+            .map(|node| node.parent.clone())
+            .collect::<Vec<_>>();
+        let mut context_projections = self
+            .store
+            .provider_context_node_projections(&parent_ids)
+            .await
+            .context(WebGraphStoreSnafu)?;
+        let mut new_context_projections = Vec::new();
+        let mut result = SourceProjectionResult::default();
+        for entry in entries {
+            let ensured = self.ensure_source_node(entry).await?;
+            result.changed_source_nodes = result
+                .changed_source_nodes
+                .saturating_add(u64::from(ensured.changed));
+            result.nodes_to_reflow.extend(ensured.added_nodes);
+            result.nodes_to_reflow.push(entry.node_id.clone());
+            let source_node = source_nodes.get(&entry.node_id).with_context(|| {
+                WebGraphSourceNodeMissingSnafu {
+                    node_id: entry.node_id.clone(),
+                }
+            })?;
+            let projection = tool_session_projection(entry.row_id, source_node);
+            self.store
+                .apply_tool_session_projection(&projection)
+                .await
+                .context(WebGraphStoreSnafu)?;
+        }
+        let primary_children = self
+            .source
+            .graph_primary_child_ids(&parent_ids)
+            .await
+            .context(StoreSnafu)?;
+        let mut split_parents = BTreeSet::new();
+        let mut context_splits = Vec::new();
+        for entry in entries {
+            let source_node = source_nodes.get(&entry.node_id).with_context(|| {
+                WebGraphSourceNodeMissingSnafu {
+                    node_id: entry.node_id.clone(),
+                }
+            })?;
+            let fork_children = primary_children
+                .get(&source_node.parent)
+                .filter(|children| children.len() > 1);
+            let starts_branch = fork_children.is_some();
+            if let Some(projection) = provider_context_node_projection(
+                entry.row_id,
+                source_node,
+                context_projections.get(&source_node.parent),
+                root_id,
+                starts_branch,
+            )? {
+                if let Some(children) = fork_children
+                    && split_parents.insert(source_node.parent.clone())
+                    && let Some(parent) = context_projections.get(&source_node.parent)
+                {
+                    context_splits.extend(children.iter().map(|child_id| {
+                        (
+                            parent.source_row_id,
+                            ProviderContextSplit {
+                                start_node_id: child_id.clone(),
+                                previous_context_id: parent.context_id.clone(),
+                                context_id: provider_context_id(child_id),
+                            },
+                        )
+                    }));
+                }
+                context_projections.insert(source_node.id.clone(), projection.clone());
+                new_context_projections.push(projection);
+            }
+        }
+        // Parent rows precede descendant rows, so this orders nested splits from
+        // the inside out regardless of how their new siblings reached this batch.
+        context_splits.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.start_node_id.cmp(&right.1.start_node_id))
+        });
+        let context_splits = context_splits
+            .into_iter()
+            .map(|(_, split)| split)
+            .collect::<Vec<_>>();
+        self.store
+            .apply_provider_context_node_projections(&new_context_projections, &context_splits)
+            .await
+            .context(WebGraphStoreSnafu)?;
+        Ok(result)
+    }
+
+    async fn sync_provider_branch_history(&self) -> crate::Result<StoredGraphState> {
         loop {
             let stored = self
                 .store
-                .provider_context_branch_heads()
+                .provider_branch_heads()
                 .await
                 .context(WebGraphStoreSnafu)?
                 .context(WebGraphNotInitializedSnafu)?;
@@ -1033,15 +1141,14 @@ impl WebGraphRuntime {
                     head.as_ref().map(|head| (branch.clone(), head.clone()))
                 })
                 .collect::<BTreeMap<_, _>>();
-            if stored.value.projected_heads == source_heads && history_heads == source_heads {
+            if history_heads == source_heads {
                 return Ok(stored.state);
             }
 
             let removed_branches = stored
                 .value
-                .projected_heads
+                .history_heads
                 .keys()
-                .chain(history_heads.keys())
                 .filter(|branch| !source_heads.contains_key(*branch))
                 .cloned()
                 .collect::<BTreeSet<_>>()
@@ -1049,20 +1156,12 @@ impl WebGraphRuntime {
                 .collect::<Vec<_>>();
             let mut projections = Vec::new();
             for branch in source_branches.into_iter().filter(|branch| {
-                stored.value.projected_heads.get(&branch.name) != Some(&branch.head_id)
-                    || stored.value.history_heads.get(&branch.name)
-                        != Some(&Some(branch.head_id.clone()))
+                stored.value.history_heads.get(&branch.name) != Some(&Some(branch.head_id.clone()))
             }) {
-                let ancestry = self
-                    .source
-                    .ancestry(&branch.head_id)
-                    .await
-                    .context(StoreSnafu)?;
-                projections.push(provider_context_branch_projection(
-                    branch.name,
-                    branch.head_id,
-                    ancestry,
-                ));
+                projections.push(ProviderBranchProjection {
+                    branch: branch.name,
+                    head_node_id: branch.head_id,
+                });
             }
             let revision = stored.state.revision.get().checked_add(1).context(
                 WebGraphRevisionExhaustedSnafu {
@@ -1071,7 +1170,7 @@ impl WebGraphRuntime {
             )?;
             if let Some(state) = self
                 .store
-                .apply_provider_context_branches(
+                .apply_provider_branch_history(
                     stored.state.revision,
                     Revision::new(revision),
                     &projections,
@@ -2190,29 +2289,55 @@ fn tool_session_projection(source_row_id: i64, node: &Node) -> ToolSessionProjec
     projection
 }
 
-fn provider_context_branch_projection(
-    branch: String,
-    head_node_id: String,
-    ancestry: Vec<Node>,
-) -> ProviderContextBranchProjection {
-    let contexts = provider_contexts_from_head(ancestry)
-        .into_iter()
-        .filter_map(|nodes| {
-            let id = provider_context_id(&branch, &nodes)?;
-            let head = nodes.first()?;
-            Some(ProviderContextProjection {
-                id,
-                head_created_at_seconds: head.created_at.as_second(),
-                head_created_at_nanoseconds: head.created_at.subsec_nanosecond(),
-                node_ids: nodes.into_iter().map(|node| node.id).collect(),
+fn provider_context_node_projection(
+    source_row_id: i64,
+    node: &Node,
+    parent: Option<&ProviderContextNodeProjection>,
+    root_id: &str,
+    starts_branch: bool,
+) -> crate::Result<Option<ProviderContextNodeProjection>> {
+    if node.is_root() {
+        return Ok(None);
+    }
+    let is_context_start = is_provider_context_start(node);
+    let parent = (node.parent != root_id)
+        .then(|| {
+            parent.with_context(|| WebGraphProviderContextParentMissingSnafu {
+                node_id: node.id.clone(),
+                parent_id: node.parent.clone(),
             })
         })
-        .collect();
-    ProviderContextBranchProjection {
-        branch,
-        head_node_id,
-        contexts,
-    }
+        .transpose()?;
+    let previous_node_id = if is_context_start {
+        None
+    } else if let Some(parent) = parent {
+        if is_skill_invocation_anchor(node) && parent.is_tool_use {
+            parent.previous_node_id.clone()
+        } else {
+            Some(parent.node_id.clone())
+        }
+    } else {
+        None
+    };
+    let context_id = if starts_branch || is_context_start {
+        provider_context_id(&node.id)
+    } else {
+        parent
+            .map(|parent| parent.context_id.clone())
+            .unwrap_or_else(|| provider_context_id(&node.id))
+    };
+    let previous_context_id = starts_branch
+        .then(|| parent.map(|parent| parent.context_id.clone()))
+        .flatten();
+    Ok(Some(ProviderContextNodeProjection {
+        node_id: node.id.clone(),
+        source_row_id,
+        context_id,
+        previous_context_id,
+        previous_node_id,
+        source_parent_node_id: node.parent.clone(),
+        is_tool_use: node.kind.as_tool_uses().is_some(),
+    }))
 }
 
 fn exec_session_id_from_output(output: &str) -> Option<String> {
@@ -2362,7 +2487,8 @@ mod tests {
 
     use coco_mem::{
         Anchor, BranchStore, Kind, MergeParent, NewNode, NewNodeContent, NodeStore, PromptAnchor,
-        Role, SessionAnchor, SessionRole, SqliteStore, ToolResult, ToolUse,
+        Role, SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode, SqliteStore,
+        ToolResult, ToolUse,
     };
     use diesel::connection::SimpleConnection;
     use diesel::sql_types::{Integer, Text};
@@ -3233,10 +3359,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_layout_rebuild_backfills_historical_provider_context() {
-        const PREVIOUS_LAYOUT_VERSION: u32 = 4;
+    async fn v6_layout_rebuild_backfills_historical_provider_context() {
+        const PREVIOUS_LAYOUT_VERSION: u32 = 6;
 
-        assert_eq!(LAYOUT_VERSION, 5);
+        assert_eq!(LAYOUT_VERSION, 7);
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let historical_session = append_session_anchor(&writer, &root, "historical").await;
@@ -3270,7 +3396,7 @@ mod tests {
             .bind::<Integer, _>(i32::try_from(PREVIOUS_LAYOUT_VERSION).unwrap())
             .execute(&mut connection)
             .unwrap();
-        diesel::sql_query("DELETE FROM web_graph_provider_contexts WHERE node_id = ?")
+        diesel::sql_query("DELETE FROM web_graph_provider_context_nodes WHERE node_id = ?")
             .bind::<Text, _>(&historical_anchor)
             .execute(&mut connection)
             .unwrap();
@@ -3718,7 +3844,7 @@ mod tests {
         );
         let history = runtime
             .store
-            .provider_context_branch_history()
+            .provider_branch_history()
             .await
             .unwrap()
             .unwrap()
@@ -3742,13 +3868,348 @@ mod tests {
         assert_eq!(
             runtime
                 .store
-                .provider_context_branch_history()
+                .provider_branch_history()
                 .await
                 .unwrap()
                 .unwrap()
                 .value,
             history
         );
+    }
+
+    #[tokio::test]
+    async fn provider_context_is_built_incrementally_without_live_branches() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "incremental").await;
+        let first = append_text(&writer, &session, "first context node").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+
+        runtime.catch_up().await.unwrap();
+        let first_context = runtime
+            .provider_context_for_node(&first, None)
+            .await
+            .unwrap()
+            .expect("an unreferenced node should have provider context");
+        assert_eq!(
+            first_context.context.node_ids,
+            [first.clone(), session.clone()]
+        );
+        assert_eq!(first_context.context.id, provider_context_id(&session));
+        assert_eq!(first_context.context.previous_id, None);
+
+        let second = append_text(&writer, &first, "second context node").await;
+        let tail = append_text(&writer, &second, "linear context tail").await;
+        runtime.catch_up().await.unwrap();
+        let focused = runtime
+            .provider_context_for_node(&first, None)
+            .await
+            .unwrap()
+            .expect("focus should not truncate the current context");
+        assert_eq!(
+            focused.context.node_ids,
+            [tail.clone(), second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(focused.selected_id, first);
+        let linear = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&session)))
+            .await
+            .unwrap()
+            .expect("linear growth should keep the current context id");
+        assert_eq!(
+            linear.context.node_ids,
+            [tail.clone(), second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(linear.context.id, provider_context_id(&session));
+
+        let alternate = append_text(&writer, &first, "alternate context node").await;
+        runtime.catch_up().await.unwrap();
+        let latest = runtime
+            .provider_context_for_node(&first, None)
+            .await
+            .unwrap()
+            .expect("the original context head should remain addressable");
+        assert_eq!(latest.context.node_ids, [first.clone(), session.clone()]);
+        assert_eq!(latest.context.id, provider_context_id(&session));
+        let switched = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&second)))
+            .await
+            .unwrap()
+            .expect("an explicit descendant context should expand the selected branch");
+        assert_eq!(
+            switched.context.node_ids,
+            [tail.clone(), second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(switched.context.id, provider_context_id(&second));
+        assert_eq!(
+            switched.context.previous_id,
+            Some(provider_context_id(&session))
+        );
+        let alternate_context = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
+            .await
+            .unwrap()
+            .expect("an alternate branch context should remain selectable");
+        assert_eq!(
+            alternate_context.context.node_ids,
+            [alternate.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(
+            alternate_context.context.id,
+            provider_context_id(&alternate)
+        );
+        assert_eq!(
+            alternate_context.context.previous_id,
+            Some(provider_context_id(&session))
+        );
+        assert_ne!(switched.context.id, alternate_context.context.id);
+
+        writer.fork("main", &tail).await.unwrap();
+        runtime.catch_up().await.unwrap();
+        writer.delete_branch("main").await.unwrap();
+        runtime.catch_up().await.unwrap();
+        assert!(
+            runtime
+                .provider_context_for_node(&second, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "deleting a branch must not delete node provider context"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_applies_same_batch_nested_splits_descendant_first() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "nested splits").await;
+        let first = append_text(&writer, &session, "first").await;
+        let second = append_text(&writer, &first, "second").await;
+        let tail = append_text(&writer, &second, "tail").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let alternate = append_text(&writer, &first, "outer alternate").await;
+        let nested_alternate = append_text(&writer, &second, "nested alternate").await;
+        runtime.catch_up().await.unwrap();
+
+        let outer_context_id = provider_context_id(&second);
+        let tail_context = runtime
+            .provider_context_for_node(&second, Some(&provider_context_id(&tail)))
+            .await
+            .unwrap()
+            .expect("the existing nested branch should receive its own context");
+        assert_eq!(
+            tail_context.context.node_ids,
+            [tail, second.clone(), first.clone(), session.clone()]
+        );
+        assert_eq!(
+            tail_context.context.previous_id,
+            Some(outer_context_id.clone())
+        );
+        let nested_alternate_context = runtime
+            .provider_context_for_node(&second, Some(&provider_context_id(&nested_alternate)))
+            .await
+            .unwrap()
+            .expect("the new nested branch should receive its own context");
+        assert_eq!(
+            nested_alternate_context.context.node_ids,
+            [nested_alternate, second, first.clone(), session.clone()]
+        );
+        assert_eq!(
+            nested_alternate_context.context.previous_id,
+            Some(outer_context_id)
+        );
+        let alternate_context = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
+            .await
+            .unwrap()
+            .expect("the outer alternate branch should remain selectable");
+        assert_eq!(
+            alternate_context.context.node_ids,
+            [alternate, first, session]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_orders_nested_splits_by_ancestry() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "nested split order").await;
+        let first = append_text(&writer, &session, "first").await;
+        let second = append_text(&writer, &first, "second").await;
+        let tail = append_text(&writer, &second, "tail").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let nested_alternate = append_text(&writer, &second, "nested alternate").await;
+        let alternate = append_text(&writer, &first, "outer alternate").await;
+        runtime.catch_up().await.unwrap();
+
+        let outer_context_id = provider_context_id(&second);
+        for node_id in [&tail, &nested_alternate] {
+            let context = runtime
+                .provider_context_for_node(&second, Some(&provider_context_id(node_id)))
+                .await
+                .unwrap()
+                .expect("the nested branch should receive its own context");
+            assert_eq!(context.context.previous_id, Some(outer_context_id.clone()));
+        }
+        let alternate_context = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
+            .await
+            .unwrap()
+            .expect("the outer alternate branch should remain selectable");
+        assert_eq!(
+            alternate_context.context.node_ids,
+            [alternate, first, session]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_start_fork_children_preserve_lineage() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "context start lineage").await;
+        let first = append_text(&writer, &session, "first").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let nested_session = append_session_anchor(&writer, &first, "nested session").await;
+        let alternate = append_text(&writer, &first, "alternate").await;
+        runtime.catch_up().await.unwrap();
+        let nested_context = runtime
+            .provider_context_for_node(&nested_session, Some(&provider_context_id(&nested_session)))
+            .await
+            .unwrap()
+            .expect("a context-start fork child should have provider context");
+        assert_eq!(nested_context.context.node_ids, [nested_session]);
+        assert_eq!(
+            nested_context.context.previous_id,
+            Some(provider_context_id(&session))
+        );
+
+        let late_session = append_session_anchor(&writer, &alternate, "late session").await;
+        runtime.catch_up().await.unwrap();
+        append_text(&writer, &alternate, "late sibling").await;
+        runtime.catch_up().await.unwrap();
+        let late_context = runtime
+            .provider_context_for_node(&late_session, Some(&provider_context_id(&late_session)))
+            .await
+            .unwrap()
+            .expect("a previously projected context-start child should keep its lineage");
+        assert_eq!(late_context.context.node_ids, [late_session]);
+        assert_eq!(
+            late_context.context.previous_id,
+            Some(provider_context_id(&alternate))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_is_built_for_merge_only_nodes() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "merge").await;
+        let primary = append_text(&writer, &session, "primary").await;
+        let merge_only = append_text(&writer, &session, "merge only").await;
+        let head = append_anchor(
+            &writer,
+            &primary,
+            vec![MergeParent::merge(merge_only.clone())],
+            "merged",
+        )
+        .await;
+        writer.fork("main", &head).await.unwrap();
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+
+        runtime.catch_up().await.unwrap();
+        let context = runtime
+            .provider_context_for_node(&merge_only, None)
+            .await
+            .unwrap()
+            .expect("a merge-only node should have provider context");
+        assert_eq!(context.context.node_ids, [merge_only, session]);
+    }
+
+    #[tokio::test]
+    async fn incremental_provider_context_skips_skill_launcher_tool_use() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "skill").await;
+        let launcher = append_tool_use(&writer, &session, "launch", "exec_command").await;
+        let invocation = writer
+            .append(NewNode {
+                parent: launcher.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    Vec::new(),
+                    SkillInvocationAnchor {
+                        skill_name: "test".to_owned(),
+                        mode: SkillInvocationMode::InheritContext,
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let head = append_text(&writer, &invocation, "skill context").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+
+        runtime.catch_up().await.unwrap();
+        let context = runtime
+            .provider_context_for_node(&session, Some(&provider_context_id(&session)))
+            .await
+            .unwrap()
+            .expect("skill context should be indexed");
+        assert_eq!(
+            context.context.node_ids,
+            [head.clone(), invocation.clone(), session.clone()]
+        );
+        assert!(!context.context.node_ids.contains(&launcher));
+        let launcher_context = runtime
+            .provider_context_for_node(&launcher, Some(&provider_context_id(&session)))
+            .await
+            .unwrap()
+            .expect("the skipped launcher should remain addressable");
+        assert_eq!(
+            launcher_context.context.node_ids,
+            [launcher.clone(), session.clone()]
+        );
+
+        append_text(&writer, &session, "alternate context").await;
+        runtime.catch_up().await.unwrap();
+        let branch_context_id = provider_context_id(&launcher);
+        let context = runtime
+            .provider_context_for_node(&session, Some(&branch_context_id))
+            .await
+            .unwrap()
+            .expect("the launcher branch should remain indexed after a late fork");
+        assert_eq!(
+            context.context.node_ids,
+            [head, invocation, session.clone()]
+        );
+        assert_eq!(
+            context.context.previous_id,
+            Some(provider_context_id(&session))
+        );
+        let launcher_context = runtime
+            .provider_context_for_node(&launcher, Some(&branch_context_id))
+            .await
+            .unwrap()
+            .expect("the skipped launcher should remain addressable after a late fork");
+        assert_eq!(launcher_context.context.node_ids, [launcher, session]);
     }
 
     #[tokio::test]

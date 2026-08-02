@@ -21,7 +21,7 @@ const DATABASE_FILE_NAME: &str = "web-graph.sqlite3";
 const WRITE_BATCH_SIZE: usize = 64;
 const MAX_READ_BATCH_SIZE: usize = 128;
 // This version covers every source-derived projection stored alongside the layouts.
-pub const LAYOUT_VERSION: u32 = 5;
+pub const LAYOUT_VERSION: u32 = 7;
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("web-graph-migrations");
 
 mod database;
@@ -32,7 +32,7 @@ use database::{AsyncSqliteConnection, Database};
 use schema::{
     web_graph_edge_routes, web_graph_edges, web_graph_exec_sessions, web_graph_layouts,
     web_graph_node_placements, web_graph_nodes, web_graph_provider_branch_history,
-    web_graph_provider_contexts, web_graph_state, web_graph_tool_uses,
+    web_graph_provider_context_nodes, web_graph_state, web_graph_tool_uses,
 };
 pub use spatial::{Viewport, ViewportCursor, ViewportPage};
 
@@ -78,34 +78,52 @@ pub struct ProjectedExecSessionResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderContextBranchProjection {
+pub struct ProviderBranchProjection {
     pub branch: String,
     pub head_node_id: String,
-    pub contexts: Vec<ProviderContextProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderContextProjection {
-    pub id: String,
-    pub head_created_at_seconds: i64,
-    pub head_created_at_nanoseconds: i32,
-    pub node_ids: Vec<String>,
+pub struct ProviderContextNodeProjection {
+    pub node_id: String,
+    pub source_row_id: i64,
+    pub context_id: String,
+    pub previous_context_id: Option<String>,
+    pub previous_node_id: Option<String>,
+    pub source_parent_node_id: String,
+    pub is_tool_use: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContextSplit {
+    pub start_node_id: String,
+    pub previous_context_id: String,
+    pub context_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContextBranch {
+    pub branch: String,
+    pub head_node_id: String,
+    pub context_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderContextIndexSelection {
     pub context_id: String,
+    pub previous_context_id: Option<String>,
+    pub selected_node_id: String,
     pub node_ids: Vec<String>,
+    pub branches: Vec<ProviderContextBranch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderContextBranchState {
-    pub projected_heads: BTreeMap<String, String>,
+pub struct ProviderBranchState {
     pub history_heads: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderContextBranchHistoryEvent {
+pub struct ProviderBranchHistoryEvent {
     pub change_id: i64,
     pub branch: String,
     pub head_node_id: Option<String>,
@@ -514,11 +532,7 @@ impl WebGraphStore {
             .map(|rows| rows.into_iter().collect())
     }
 
-    pub async fn provider_context_branch_heads(
-        &self,
-    ) -> Result<Option<GraphRead<ProviderContextBranchState>>> {
-        use diesel_async::RunQueryDsl;
-
+    pub async fn provider_branch_heads(&self) -> Result<Option<GraphRead<ProviderBranchState>>> {
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
         connection
@@ -526,33 +540,19 @@ impl WebGraphStore {
                 let Some(state) = load_state(connection).await? else {
                     return Ok(None);
                 };
-                let projected_heads = web_graph_provider_contexts::table
-                    .select((
-                        web_graph_provider_contexts::branch_name,
-                        web_graph_provider_contexts::branch_head_node_id,
-                    ))
-                    .distinct()
-                    .order(web_graph_provider_contexts::branch_name.asc())
-                    .load::<(String, String)>(connection)
-                    .await?
-                    .into_iter()
-                    .collect();
                 let history_heads = load_provider_context_history_heads(connection).await?;
                 Ok(Some(GraphRead {
                     state,
-                    value: ProviderContextBranchState {
-                        projected_heads,
-                        history_heads,
-                    },
+                    value: ProviderBranchState { history_heads },
                 }))
             })
             .await
             .map_err(|error| error.into_store_error(path))
     }
 
-    pub async fn provider_context_branch_history(
+    pub async fn provider_branch_history(
         &self,
-    ) -> Result<Option<GraphRead<Vec<ProviderContextBranchHistoryEvent>>>> {
+    ) -> Result<Option<GraphRead<Vec<ProviderBranchHistoryEvent>>>> {
         use diesel_async::RunQueryDsl;
 
         let path = self.path.clone();
@@ -576,7 +576,7 @@ impl WebGraphStore {
                     .load::<ProviderBranchHistoryStoredRow>(connection)
                     .await?
                     .into_iter()
-                    .map(ProviderContextBranchHistoryEvent::try_from)
+                    .map(ProviderBranchHistoryEvent::try_from)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok(Some(GraphRead {
                     state,
@@ -587,7 +587,7 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
-    pub async fn provider_context_branch_heads_at(
+    pub async fn provider_branch_heads_at(
         &self,
         change_id: i64,
     ) -> Result<Option<GraphRead<BTreeMap<String, String>>>> {
@@ -631,52 +631,50 @@ impl WebGraphStore {
         use diesel_async::RunQueryDsl;
 
         let path = self.path.clone();
-        let target_node_id = target_node_id.to_owned();
-        let context_id = context_id.map(str::to_owned);
         let mut connection = self.database.acquire().await?;
         connection
             .transaction::<_, TransactionError, _>(async |connection| {
                 let Some(state) = load_state(connection).await? else {
                     return Ok(None);
                 };
-                let mut query = web_graph_provider_contexts::table
-                    .filter(web_graph_provider_contexts::node_id.eq(Some(&target_node_id)))
-                    .select((
-                        web_graph_provider_contexts::branch_name,
-                        web_graph_provider_contexts::context_id,
-                    ))
-                    .order((
-                        web_graph_provider_contexts::head_created_at_seconds.asc(),
-                        web_graph_provider_contexts::head_created_at_nanoseconds.asc(),
-                        web_graph_provider_contexts::context_id.asc(),
-                    ))
-                    .into_boxed();
-                if let Some(context_id) = context_id.as_ref() {
-                    query = query.filter(web_graph_provider_contexts::context_id.eq(context_id));
-                }
-                let selected = query
-                    .first::<(String, String)>(connection)
-                    .await
-                    .optional()?;
-                let selection = if let Some((branch, context_id)) = selected {
-                    let node_ids = web_graph_provider_contexts::table
-                        .filter(web_graph_provider_contexts::branch_name.eq(branch))
-                        .filter(web_graph_provider_contexts::context_id.eq(&context_id))
-                        .filter(web_graph_provider_contexts::node_id.is_not_null())
-                        .order(web_graph_provider_contexts::ordinal.asc())
-                        .select(web_graph_provider_contexts::node_id)
-                        .load::<Option<String>>(connection)
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    Some(ProviderContextIndexSelection {
-                        context_id,
-                        node_ids,
+                let rows = diesel::sql_query(PROVIDER_CONTEXT_SELECTION_QUERY)
+                    .bind::<Text, _>(target_node_id)
+                    .bind::<Nullable<Text>, _>(context_id)
+                    .load::<ProviderContextSelectionRow>(connection)
+                    .await?;
+                let context_id = rows.as_slice().first().map(|row| row.context_id.clone());
+                let previous_context_id =
+                    rows.iter().find_map(|row| row.previous_context_id.clone());
+                let selected_node_id = rows
+                    .as_slice()
+                    .first()
+                    .map(|row| row.selected_node_id.clone());
+                let node_ids = rows
+                    .iter()
+                    .filter_map(|row| row.node_id.clone())
+                    .collect::<Vec<_>>();
+                let branches = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        Some(ProviderContextBranch {
+                            branch: row.branch_name?,
+                            head_node_id: row.branch_head_node_id?,
+                            context_id: row.branch_context_id?,
+                        })
                     })
-                } else {
-                    None
-                };
+                    .collect::<Vec<_>>();
+                let selection =
+                    context_id
+                        .zip(selected_node_id)
+                        .map(
+                            |(context_id, selected_node_id)| ProviderContextIndexSelection {
+                                context_id,
+                                previous_context_id,
+                                selected_node_id,
+                                node_ids,
+                                branches,
+                            },
+                        );
                 Ok(Some(GraphRead {
                     state,
                     value: selection,
@@ -686,11 +684,97 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
-    pub async fn apply_provider_context_branches(
+    pub async fn provider_context_node_projections(
+        &self,
+        node_ids: &[String],
+    ) -> Result<HashMap<String, ProviderContextNodeProjection>> {
+        use diesel_async::RunQueryDsl;
+
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let path = self.path.clone();
+        let mut connection = self.database.acquire().await?;
+        web_graph_provider_context_nodes::table
+            .filter(web_graph_provider_context_nodes::node_id.eq_any(node_ids))
+            .select(ProviderContextNodeRow::as_select())
+            .load::<ProviderContextNodeRow>(&mut connection)
+            .await
+            .context(QuerySnafu { path })
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        let projection = ProviderContextNodeProjection::from(row);
+                        (projection.node_id.clone(), projection)
+                    })
+                    .collect()
+            })
+    }
+
+    pub async fn apply_provider_context_node_projections(
+        &self,
+        projections: &[ProviderContextNodeProjection],
+        splits: &[ProviderContextSplit],
+    ) -> Result<()> {
+        use diesel::upsert::excluded;
+        use diesel_async::RunQueryDsl;
+
+        if projections.is_empty() && splits.is_empty() {
+            return Ok(());
+        }
+        let rows = projections
+            .iter()
+            .cloned()
+            .map(ProviderContextNodeRow::from)
+            .collect::<Vec<_>>();
+        let splits = splits.to_vec();
+        let path = self.path.clone();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .immediate_transaction::<_, TransactionError, _>(async |connection| {
+                for row in rows {
+                    diesel::insert_into(web_graph_provider_context_nodes::table)
+                        .values(row)
+                        .on_conflict(web_graph_provider_context_nodes::node_id)
+                        .do_update()
+                        .set((
+                            web_graph_provider_context_nodes::source_row_id
+                                .eq(excluded(web_graph_provider_context_nodes::source_row_id)),
+                            web_graph_provider_context_nodes::context_id
+                                .eq(excluded(web_graph_provider_context_nodes::context_id)),
+                            web_graph_provider_context_nodes::previous_context_id.eq(excluded(
+                                web_graph_provider_context_nodes::previous_context_id,
+                            )),
+                            web_graph_provider_context_nodes::previous_node_id
+                                .eq(excluded(web_graph_provider_context_nodes::previous_node_id)),
+                            web_graph_provider_context_nodes::source_parent_node_id.eq(excluded(
+                                web_graph_provider_context_nodes::source_parent_node_id,
+                            )),
+                            web_graph_provider_context_nodes::is_tool_use
+                                .eq(excluded(web_graph_provider_context_nodes::is_tool_use)),
+                        ))
+                        .execute(connection)
+                        .await?;
+                }
+                for split in splits {
+                    diesel::sql_query(REASSIGN_PROVIDER_CONTEXT_SEGMENT_QUERY)
+                        .bind::<Text, _>(&split.start_node_id)
+                        .bind::<Text, _>(&split.previous_context_id)
+                        .bind::<Text, _>(&split.context_id)
+                        .execute(connection)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
+    pub async fn apply_provider_branch_history(
         &self,
         expected_revision: Revision,
         revision: Revision,
-        branches: &[ProviderContextBranchProjection],
+        branches: &[ProviderBranchProjection],
         removed_branches: &[String],
     ) -> Result<Option<StoredGraphState>> {
         let path = self.path.clone();
@@ -715,13 +799,8 @@ impl WebGraphStore {
                         format!("{} -> {}", expected_revision.get(), revision.get()),
                     ));
                 }
-                replace_provider_context_branches(
-                    connection,
-                    revision,
-                    &branches,
-                    &removed_branches,
-                )
-                .await?;
+                record_provider_branch_history(connection, revision, &branches, &removed_branches)
+                    .await?;
                 Ok(Some(StoredGraphState { revision, ..state }))
             })
             .await
@@ -867,7 +946,7 @@ struct ProviderBranchHistoryStoredRow {
     head_node_id: Option<String>,
 }
 
-impl TryFrom<ProviderBranchHistoryStoredRow> for ProviderContextBranchHistoryEvent {
+impl TryFrom<ProviderBranchHistoryStoredRow> for ProviderBranchHistoryEvent {
     type Error = TransactionError;
 
     fn try_from(row: ProviderBranchHistoryStoredRow) -> std::result::Result<Self, Self::Error> {
@@ -891,17 +970,67 @@ struct ProviderBranchHistoryHeadRow {
     head_node_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = web_graph_provider_contexts)]
-#[diesel(treat_none_as_default_value = false)]
-struct ProviderContextRow {
-    branch_name: String,
-    branch_head_node_id: String,
+#[derive(Debug, Clone, Insertable, Queryable, Selectable)]
+#[diesel(table_name = web_graph_provider_context_nodes)]
+struct ProviderContextNodeRow {
+    node_id: String,
+    source_row_id: i64,
     context_id: String,
-    head_created_at_seconds: Option<i64>,
-    head_created_at_nanoseconds: Option<i32>,
-    ordinal: i64,
+    previous_context_id: Option<String>,
+    previous_node_id: Option<String>,
+    source_parent_node_id: String,
+    is_tool_use: bool,
+}
+
+impl From<ProviderContextNodeRow> for ProviderContextNodeProjection {
+    fn from(row: ProviderContextNodeRow) -> Self {
+        Self {
+            node_id: row.node_id,
+            source_row_id: row.source_row_id,
+            context_id: row.context_id,
+            previous_context_id: row.previous_context_id,
+            previous_node_id: row.previous_node_id,
+            source_parent_node_id: row.source_parent_node_id,
+            is_tool_use: row.is_tool_use,
+        }
+    }
+}
+
+impl From<ProviderContextNodeProjection> for ProviderContextNodeRow {
+    fn from(projection: ProviderContextNodeProjection) -> Self {
+        Self {
+            node_id: projection.node_id,
+            source_row_id: projection.source_row_id,
+            context_id: projection.context_id,
+            previous_context_id: projection.previous_context_id,
+            previous_node_id: projection.previous_node_id,
+            source_parent_node_id: projection.source_parent_node_id,
+            is_tool_use: projection.is_tool_use,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, QueryableByName)]
+struct ProviderContextSelectionRow {
+    #[diesel(sql_type = Text)]
+    row_kind: String,
+    #[diesel(sql_type = Text)]
+    context_id: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    previous_context_id: Option<String>,
+    #[diesel(sql_type = Text)]
+    selected_node_id: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    sort_order: Option<i64>,
+    #[diesel(sql_type = Nullable<Text>)]
     node_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    branch_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    branch_head_node_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    branch_context_id: Option<String>,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -1619,6 +1748,243 @@ const PROVIDER_BRANCH_HEADS_AT_CHANGE_QUERY: &str = r#"
     ORDER BY history.branch_name
 "#;
 
+const PROVIDER_CONTEXT_SELECTION_QUERY: &str = r#"
+WITH RECURSIVE query_input(target_node_id, context_id) AS (
+    VALUES (?, ?)
+),
+default_target_path(node_id, context_id, previous_node_id, source_row_id) AS (
+    SELECT
+        context.node_id,
+        context.context_id,
+        context.previous_node_id,
+        context.source_row_id
+    FROM web_graph_provider_context_nodes AS context
+    CROSS JOIN query_input
+    WHERE query_input.context_id IS NULL
+      AND context.node_id = query_input.target_node_id
+
+    UNION ALL
+
+    SELECT
+        child.node_id,
+        child.context_id,
+        child.previous_node_id,
+        child.source_row_id
+    FROM web_graph_provider_context_nodes AS child
+    JOIN default_target_path AS path ON child.previous_node_id = path.node_id
+    WHERE child.context_id = path.context_id
+),
+default_head(node_id, context_id, previous_node_id) AS (
+    SELECT node_id, context_id, previous_node_id
+    FROM default_target_path
+    ORDER BY source_row_id DESC, node_id DESC
+    LIMIT 1
+),
+explicit_target_path(node_id, context_id, previous_node_id, source_row_id) AS (
+    SELECT
+        context.node_id,
+        context.context_id,
+        context.previous_node_id,
+        context.source_row_id
+    FROM web_graph_provider_context_nodes AS context
+    CROSS JOIN query_input
+    WHERE query_input.context_id IS NOT NULL
+      AND query_input.target_node_id <> ''
+      AND context.node_id = query_input.target_node_id
+      AND context.context_id = query_input.context_id
+
+    UNION ALL
+
+    SELECT
+        child.node_id,
+        child.context_id,
+        child.previous_node_id,
+        child.source_row_id
+    FROM web_graph_provider_context_nodes AS child
+    JOIN explicit_target_path AS path ON child.previous_node_id = path.node_id
+    CROSS JOIN query_input
+    WHERE child.context_id = query_input.context_id
+),
+explicit_target_head(node_id, context_id, previous_node_id) AS (
+    SELECT node_id, context_id, previous_node_id
+    FROM explicit_target_path
+    ORDER BY source_row_id DESC, node_id DESC
+    LIMIT 1
+),
+explicit_latest_head(node_id, context_id, previous_node_id) AS (
+    SELECT context.node_id, context.context_id, context.previous_node_id
+    FROM web_graph_provider_context_nodes AS context
+    JOIN query_input ON query_input.context_id = context.context_id
+    WHERE query_input.target_node_id = ''
+       OR NOT EXISTS (SELECT 1 FROM explicit_target_path)
+    ORDER BY context.source_row_id DESC, context.node_id DESC
+    LIMIT 1
+),
+explicit_head(node_id, context_id, previous_node_id) AS (
+    SELECT node_id, context_id, previous_node_id FROM explicit_target_head
+    UNION ALL
+    SELECT node_id, context_id, previous_node_id FROM explicit_latest_head
+),
+selected_head(node_id, context_id, previous_node_id) AS (
+    SELECT node_id, context_id, previous_node_id FROM default_head
+    UNION ALL
+    SELECT node_id, context_id, previous_node_id FROM explicit_head
+),
+selected_context(node_id, previous_node_id, depth) AS (
+    SELECT node_id, previous_node_id, 0
+    FROM selected_head
+
+    UNION ALL
+
+    SELECT previous.node_id, previous.previous_node_id, selected.depth + 1
+    FROM web_graph_provider_context_nodes AS previous
+    JOIN selected_context AS selected
+      ON previous.node_id = selected.previous_node_id
+),
+valid_selection AS (
+    SELECT 1 AS valid
+    FROM selected_context
+    CROSS JOIN query_input
+    WHERE query_input.target_node_id = ''
+       OR selected_context.node_id = query_input.target_node_id
+    LIMIT 1
+),
+selection_target(selected_node_id) AS (
+    SELECT CASE
+        WHEN query_input.target_node_id = '' THEN selected_head.node_id
+        ELSE query_input.target_node_id
+    END
+    FROM selected_head
+    CROSS JOIN query_input
+),
+selected_context_meta(previous_context_id) AS (
+    SELECT MAX(context.previous_context_id)
+    FROM web_graph_provider_context_nodes AS context
+    JOIN selected_head ON selected_head.context_id = context.context_id
+),
+latest_branch_changes(branch_name, change_id) AS (
+    SELECT branch_name, MAX(change_id)
+    FROM web_graph_provider_branch_history
+    GROUP BY branch_name
+),
+latest_branch_heads(branch_name, head_node_id) AS (
+    SELECT history.branch_name, history.head_node_id
+    FROM web_graph_provider_branch_history AS history
+    JOIN latest_branch_changes AS latest
+      ON latest.branch_name = history.branch_name
+     AND latest.change_id = history.change_id
+    WHERE history.head_node_id IS NOT NULL
+),
+branch_paths(branch_name, head_node_id, head_context_id, node_id, context_id, previous_node_id) AS (
+    SELECT
+        branch.branch_name,
+        branch.head_node_id,
+        context.context_id,
+        context.node_id,
+        context.context_id,
+        context.previous_node_id
+    FROM latest_branch_heads AS branch
+    JOIN web_graph_provider_context_nodes AS context
+      ON context.node_id = branch.head_node_id
+
+    UNION ALL
+
+    SELECT
+        path.branch_name,
+        path.head_node_id,
+        path.head_context_id,
+        previous.node_id,
+        previous.context_id,
+        previous.previous_node_id
+    FROM web_graph_provider_context_nodes AS previous
+    JOIN branch_paths AS path ON previous.node_id = path.previous_node_id
+),
+involved_branches(branch_name, head_node_id, context_id) AS (
+    SELECT DISTINCT path.branch_name, path.head_node_id, path.head_context_id
+    FROM branch_paths AS path
+    JOIN selected_head ON selected_head.context_id = path.context_id
+)
+SELECT
+    'node' AS row_kind,
+    selected_head.context_id,
+    selected_context_meta.previous_context_id,
+    selection_target.selected_node_id,
+    depth AS sort_order,
+    selected_context.node_id,
+    NULL AS branch_name,
+    NULL AS branch_head_node_id,
+    NULL AS branch_context_id
+FROM selected_context
+CROSS JOIN selected_head
+CROSS JOIN selected_context_meta
+CROSS JOIN selection_target
+CROSS JOIN valid_selection
+UNION ALL
+SELECT
+    'branch' AS row_kind,
+    selected_head.context_id,
+    selected_context_meta.previous_context_id,
+    selection_target.selected_node_id,
+    NULL AS sort_order,
+    NULL AS node_id,
+    branch.branch_name,
+    branch.head_node_id AS branch_head_node_id,
+    branch.context_id AS branch_context_id
+FROM involved_branches AS branch
+CROSS JOIN selected_head
+CROSS JOIN selected_context_meta
+CROSS JOIN selection_target
+CROSS JOIN valid_selection
+ORDER BY row_kind DESC, sort_order ASC, branch_name ASC
+"#;
+
+const REASSIGN_PROVIDER_CONTEXT_SEGMENT_QUERY: &str = r#"
+WITH RECURSIVE
+split(start_node_id, previous_context_id, context_id) AS (
+    VALUES (?, ?, ?)
+),
+segment(node_id) AS (
+    SELECT context.node_id
+    FROM web_graph_provider_context_nodes AS context
+    CROSS JOIN split
+    WHERE context.node_id = split.start_node_id
+      AND context.context_id = split.previous_context_id
+
+    UNION ALL
+
+    SELECT child.node_id
+    FROM web_graph_provider_context_nodes AS child
+    JOIN segment ON segment.node_id = child.source_parent_node_id
+    CROSS JOIN split
+    WHERE child.context_id = split.previous_context_id
+)
+UPDATE web_graph_provider_context_nodes
+SET
+    context_id = CASE
+        WHEN node_id IN segment THEN (SELECT context_id FROM split)
+        ELSE context_id
+    END,
+    previous_context_id = CASE
+        WHEN node_id = (SELECT start_node_id FROM split)
+            THEN (SELECT previous_context_id FROM split)
+        WHEN previous_context_id = (SELECT previous_context_id FROM split)
+          AND source_parent_node_id IN segment
+          AND context_id <> (SELECT previous_context_id FROM split)
+            THEN (SELECT context_id FROM split)
+        ELSE previous_context_id
+    END
+WHERE node_id IN segment
+   OR (
+       node_id = (SELECT start_node_id FROM split)
+       AND context_id = (SELECT context_id FROM split)
+   )
+   OR (
+       previous_context_id = (SELECT previous_context_id FROM split)
+       AND source_parent_node_id IN segment
+       AND context_id <> (SELECT previous_context_id FROM split)
+   )
+"#;
+
 async fn apply_tool_session_projection(
     connection: &mut AsyncSqliteConnection,
     projection: &ToolSessionProjection,
@@ -1655,10 +2021,10 @@ async fn apply_tool_session_projection(
     Ok(())
 }
 
-async fn replace_provider_context_branches(
+async fn record_provider_branch_history(
     connection: &mut AsyncSqliteConnection,
     revision: Revision,
-    branches: &[ProviderContextBranchProjection],
+    branches: &[ProviderBranchProjection],
     removed_branches: &[String],
 ) -> std::result::Result<(), TransactionError> {
     use diesel::dsl::max;
@@ -1704,60 +2070,8 @@ async fn replace_provider_context_branches(
             .collect()
     };
 
-    let replaced_branches = branches
-        .iter()
-        .map(|branch| branch.branch.clone())
-        .chain(removed_branches.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    if !replaced_branches.is_empty() {
-        diesel::delete(
-            web_graph_provider_contexts::table
-                .filter(web_graph_provider_contexts::branch_name.eq_any(replaced_branches)),
-        )
-        .execute(connection)
-        .await?;
-    }
-
-    let mut context_rows = Vec::new();
-    for branch in branches {
-        let first_row = context_rows.len();
-        for context in &branch.contexts {
-            for (ordinal, node_id) in context.node_ids.iter().enumerate() {
-                let ordinal = i64::try_from(ordinal).map_err(|_| {
-                    invalid_value("web_graph_provider_contexts.ordinal", ordinal.to_string())
-                })?;
-                context_rows.push(ProviderContextRow {
-                    branch_name: branch.branch.clone(),
-                    branch_head_node_id: branch.head_node_id.clone(),
-                    context_id: context.id.clone(),
-                    head_created_at_seconds: Some(context.head_created_at_seconds),
-                    head_created_at_nanoseconds: Some(context.head_created_at_nanoseconds),
-                    ordinal,
-                    node_id: Some(node_id.clone()),
-                });
-            }
-        }
-        if context_rows.len() == first_row {
-            context_rows.push(ProviderContextRow {
-                branch_name: branch.branch.clone(),
-                branch_head_node_id: branch.head_node_id.clone(),
-                context_id: String::new(),
-                head_created_at_seconds: None,
-                head_created_at_nanoseconds: None,
-                ordinal: -1,
-                node_id: None,
-            });
-        }
-    }
-
     for row in history_rows {
         diesel::insert_into(web_graph_provider_branch_history::table)
-            .values(row)
-            .execute(connection)
-            .await?;
-    }
-    for row in context_rows {
-        diesel::insert_into(web_graph_provider_contexts::table)
             .values(row)
             .execute(connection)
             .await?;
@@ -1768,7 +2082,7 @@ async fn replace_provider_context_branches(
         .set(web_graph_state::revision.eq(revision))
         .execute(connection)
         .await?;
-    expect_row_count("replace_provider_context_branches", 1, changed)
+    expect_row_count("record_provider_branch_history", 1, changed)
 }
 
 async fn replace_snapshot(
@@ -1779,7 +2093,7 @@ async fn replace_snapshot(
 
     let rows = snapshot_rows(snapshot)?;
     spatial::clear(connection).await?;
-    diesel::delete(web_graph_provider_contexts::table)
+    diesel::delete(web_graph_provider_context_nodes::table)
         .execute(connection)
         .await?;
     diesel::delete(web_graph_exec_sessions::table)
@@ -3317,7 +3631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_context_projection_uses_two_tables_and_tracks_empty_branches() {
+    async fn incremental_provider_context_uses_two_tables_and_tracks_empty_branches() {
         #[derive(QueryableByName)]
         struct TableCount {
             #[diesel(sql_type = BigInt)]
@@ -3340,23 +3654,50 @@ mod tests {
         drop(connection);
         assert_eq!(table_count, 2);
 
-        let main = ProviderContextBranchProjection {
+        let main = ProviderBranchProjection {
             branch: "main".to_owned(),
             head_node_id: "c".to_owned(),
-            contexts: vec![ProviderContextProjection {
-                id: "detail-a-context-6d61696e".to_owned(),
-                head_created_at_seconds: 10,
-                head_created_at_nanoseconds: 20,
-                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
-            }],
         };
-        let without_contexts = ProviderContextBranchProjection {
+        let without_contexts = ProviderBranchProjection {
             branch: String::new(),
             head_node_id: "a".to_owned(),
-            contexts: Vec::new(),
         };
+        let context_id = "detail-a-context".to_owned();
+        let context = [
+            ProviderContextNodeProjection {
+                node_id: "a".to_owned(),
+                source_row_id: 1,
+                context_id: context_id.clone(),
+                previous_context_id: None,
+                previous_node_id: None,
+                source_parent_node_id: "root".to_owned(),
+                is_tool_use: false,
+            },
+            ProviderContextNodeProjection {
+                node_id: "b".to_owned(),
+                source_row_id: 2,
+                context_id: context_id.clone(),
+                previous_context_id: None,
+                previous_node_id: Some("a".to_owned()),
+                source_parent_node_id: "a".to_owned(),
+                is_tool_use: false,
+            },
+            ProviderContextNodeProjection {
+                node_id: "c".to_owned(),
+                source_row_id: 3,
+                context_id: context_id.clone(),
+                previous_context_id: None,
+                previous_node_id: Some("b".to_owned()),
+                source_parent_node_id: "b".to_owned(),
+                is_tool_use: false,
+            },
+        ];
         store
-            .apply_provider_context_branches(
+            .apply_provider_context_node_projections(&context, &[])
+            .await
+            .unwrap();
+        store
+            .apply_provider_branch_history(
                 Revision::new(1),
                 Revision::new(2),
                 &[main.clone(), without_contexts],
@@ -3366,18 +3707,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let heads = store
-            .provider_context_branch_heads()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            heads.value.projected_heads,
-            BTreeMap::from([
-                (String::new(), "a".to_owned()),
-                ("main".to_owned(), "c".to_owned()),
-            ])
-        );
+        let heads = store.provider_branch_heads().await.unwrap().unwrap();
         assert_eq!(
             heads.value.history_heads,
             BTreeMap::from([
@@ -3393,13 +3723,148 @@ mod tests {
                 .unwrap()
                 .value,
             Some(ProviderContextIndexSelection {
-                context_id: main.contexts[0].id.clone(),
-                node_ids: main.contexts[0].node_ids.clone(),
+                context_id: context_id.clone(),
+                previous_context_id: None,
+                selected_node_id: "b".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: vec![
+                    ProviderContextBranch {
+                        branch: String::new(),
+                        head_node_id: "a".to_owned(),
+                        context_id: context_id.clone(),
+                    },
+                    ProviderContextBranch {
+                        branch: "main".to_owned(),
+                        head_node_id: "c".to_owned(),
+                        context_id: context_id.clone(),
+                    },
+                ],
             })
         );
+        assert_eq!(
+            store
+                .provider_context_selection("b", Some(&context_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(ProviderContextIndexSelection {
+                context_id: context_id.clone(),
+                previous_context_id: None,
+                selected_node_id: "b".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: vec![
+                    ProviderContextBranch {
+                        branch: String::new(),
+                        head_node_id: "a".to_owned(),
+                        context_id: context_id.clone(),
+                    },
+                    ProviderContextBranch {
+                        branch: "main".to_owned(),
+                        head_node_id: "c".to_owned(),
+                        context_id: context_id.clone(),
+                    },
+                ],
+            })
+        );
+        assert_eq!(
+            store
+                .provider_context_selection("", Some(&context_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(ProviderContextIndexSelection {
+                context_id: context_id.clone(),
+                previous_context_id: None,
+                selected_node_id: "c".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: vec![
+                    ProviderContextBranch {
+                        branch: String::new(),
+                        head_node_id: "a".to_owned(),
+                        context_id: context_id.clone(),
+                    },
+                    ProviderContextBranch {
+                        branch: "main".to_owned(),
+                        head_node_id: "c".to_owned(),
+                        context_id: context_id.clone(),
+                    },
+                ],
+            })
+        );
+        assert_eq!(
+            store
+                .provider_context_selection("b", Some("detail-c-context"))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            None
+        );
+
+        let branch_context_id = "detail-b-context".to_owned();
+        store
+            .apply_provider_context_node_projections(
+                &[],
+                &[ProviderContextSplit {
+                    start_node_id: "b".to_owned(),
+                    previous_context_id: context_id.clone(),
+                    context_id: branch_context_id.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .provider_context_selection("a", Some(&branch_context_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(ProviderContextIndexSelection {
+                context_id: branch_context_id.clone(),
+                previous_context_id: Some(context_id.clone()),
+                selected_node_id: "a".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: vec![ProviderContextBranch {
+                    branch: "main".to_owned(),
+                    head_node_id: "c".to_owned(),
+                    context_id: branch_context_id.clone(),
+                }],
+            })
+        );
+        assert_eq!(
+            store
+                .provider_context_selection("", Some(&branch_context_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(ProviderContextIndexSelection {
+                context_id: branch_context_id.clone(),
+                previous_context_id: Some(context_id.clone()),
+                selected_node_id: "c".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: vec![ProviderContextBranch {
+                    branch: "main".to_owned(),
+                    head_node_id: "c".to_owned(),
+                    context_id: branch_context_id.clone(),
+                }],
+            })
+        );
+        let mut connection = store.database.acquire().await.unwrap();
+        let TableCount { count } = diesel_async::RunQueryDsl::get_result(
+            diesel::sql_query("SELECT COUNT(*) AS count FROM web_graph_provider_context_nodes"),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        drop(connection);
+        assert_eq!(count, 3);
 
         store
-            .apply_provider_context_branches(
+            .apply_provider_branch_history(
                 Revision::new(2),
                 Revision::new(3),
                 &[],
@@ -3409,7 +3874,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let history = store
-            .provider_context_branch_history()
+            .provider_branch_history()
             .await
             .unwrap()
             .unwrap()
@@ -3426,12 +3891,92 @@ mod tests {
         assert_eq!(history[2].graph_revision, 3);
         assert_eq!(
             store
-                .provider_context_branch_heads_at(history[2].change_id)
+                .provider_branch_heads_at(history[2].change_id)
                 .await
                 .unwrap()
                 .unwrap()
                 .value,
             BTreeMap::new()
+        );
+        assert_eq!(
+            store
+                .provider_context_selection("c", Some(&branch_context_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(ProviderContextIndexSelection {
+                context_id: branch_context_id,
+                previous_context_id: Some(context_id),
+                selected_node_id: "c".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: Vec::new(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_split_retargets_nested_context_lineage() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let root_context_id = "detail-a-context".to_owned();
+        let branch_context_id = "detail-b-context".to_owned();
+        let nested_context_id = "detail-c-context".to_owned();
+        store
+            .apply_provider_context_node_projections(
+                &[
+                    ProviderContextNodeProjection {
+                        node_id: "a".to_owned(),
+                        source_row_id: 1,
+                        context_id: root_context_id.clone(),
+                        previous_context_id: None,
+                        previous_node_id: None,
+                        source_parent_node_id: "root".to_owned(),
+                        is_tool_use: false,
+                    },
+                    ProviderContextNodeProjection {
+                        node_id: "b".to_owned(),
+                        source_row_id: 2,
+                        context_id: root_context_id.clone(),
+                        previous_context_id: None,
+                        previous_node_id: Some("a".to_owned()),
+                        source_parent_node_id: "a".to_owned(),
+                        is_tool_use: false,
+                    },
+                    ProviderContextNodeProjection {
+                        node_id: "c".to_owned(),
+                        source_row_id: 3,
+                        context_id: nested_context_id.clone(),
+                        previous_context_id: Some(root_context_id.clone()),
+                        previous_node_id: Some("b".to_owned()),
+                        source_parent_node_id: "b".to_owned(),
+                        is_tool_use: false,
+                    },
+                ],
+                &[ProviderContextSplit {
+                    start_node_id: "b".to_owned(),
+                    previous_context_id: root_context_id.clone(),
+                    context_id: branch_context_id.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .provider_context_selection("", Some(&nested_context_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(ProviderContextIndexSelection {
+                context_id: nested_context_id,
+                previous_context_id: Some(branch_context_id),
+                selected_node_id: "c".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: Vec::new(),
+            })
         );
     }
 
@@ -3441,18 +3986,12 @@ mod tests {
         let store = WebGraphStore::open(&directory.path).await.unwrap();
         let graph = graph();
         store.replace(&graph).await.unwrap();
-        let projection = ProviderContextBranchProjection {
+        let projection = ProviderBranchProjection {
             branch: "main".to_owned(),
             head_node_id: "c".to_owned(),
-            contexts: vec![ProviderContextProjection {
-                id: "detail-a-context-6d61696e".to_owned(),
-                head_created_at_seconds: 10,
-                head_created_at_nanoseconds: 20,
-                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
-            }],
         };
         store
-            .apply_provider_context_branches(
+            .apply_provider_branch_history(
                 Revision::new(1),
                 Revision::new(2),
                 std::slice::from_ref(&projection),
@@ -3463,24 +4002,19 @@ mod tests {
             .unwrap();
 
         store.replace(&graph).await.unwrap();
-        let rebuilt = store
-            .provider_context_branch_heads()
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(rebuilt.value.projected_heads.is_empty());
+        let rebuilt = store.provider_branch_heads().await.unwrap().unwrap();
         assert_eq!(
             rebuilt.value.history_heads,
             BTreeMap::from([("main".to_owned(), Some("c".to_owned()))])
         );
         store
-            .apply_provider_context_branches(Revision::new(1), Revision::new(2), &[projection], &[])
+            .apply_provider_branch_history(Revision::new(1), Revision::new(2), &[projection], &[])
             .await
             .unwrap()
             .unwrap();
 
         let history = store
-            .provider_context_branch_history()
+            .provider_branch_history()
             .await
             .unwrap()
             .unwrap()
@@ -3489,7 +4023,7 @@ mod tests {
         assert_eq!(history[0].head_node_id.as_deref(), Some("c"));
         assert_eq!(
             store
-                .provider_context_branch_heads_at(history[0].change_id)
+                .provider_branch_heads_at(history[0].change_id)
                 .await
                 .unwrap()
                 .unwrap()
