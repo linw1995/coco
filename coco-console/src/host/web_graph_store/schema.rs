@@ -81,14 +81,12 @@ diesel::table! {
 }
 
 diesel::table! {
-    web_graph_provider_contexts (branch_name, context_id, ordinal) {
-        branch_name -> Text,
-        branch_head_node_id -> Text,
+    web_graph_provider_contexts (node_id) {
+        node_id -> Text,
+        source_row_id -> BigInt,
         context_id -> Text,
-        head_created_at_seconds -> Nullable<BigInt>,
-        head_created_at_nanoseconds -> Nullable<Integer>,
-        ordinal -> BigInt,
-        node_id -> Nullable<Text>,
+        previous_node_id -> Nullable<Text>,
+        is_tool_use -> Bool,
     }
 }
 

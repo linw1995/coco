@@ -78,32 +78,7 @@ pub struct ProviderContextSelection {
     pub selected_id: String,
 }
 
-pub fn provider_contexts_from_head(ancestry: Vec<Node>) -> Vec<Vec<Node>> {
-    let mut contexts = Vec::new();
-    let mut current = Vec::new();
-    let mut previous_is_skill_invocation = false;
-
-    for node in ancestry.into_iter().take_while(|node| !node.is_root()) {
-        if node.kind.as_tool_uses().is_some() && previous_is_skill_invocation {
-            continue;
-        }
-        let is_start = is_provider_context_start(&node);
-        previous_is_skill_invocation = matches!(
-            &node.kind,
-            Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some()
-        );
-        current.push(node);
-        if is_start {
-            contexts.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        contexts.push(current);
-    }
-    contexts
-}
-
-fn is_provider_context_start(node: &Node) -> bool {
+pub fn is_provider_context_start(node: &Node) -> bool {
     matches!(
         &node.kind,
         Kind::Anchor(anchor)
@@ -116,25 +91,15 @@ fn is_provider_context_start(node: &Node) -> bool {
     )
 }
 
-pub fn provider_context_id(branch: &str, context: &[Node]) -> Option<String> {
-    Some(format!(
-        "{}-context-{}",
-        node_target_id(&context.last()?.id),
-        stable_token(branch)
-    ))
+pub fn is_skill_invocation_anchor(node: &Node) -> bool {
+    matches!(
+        &node.kind,
+        Kind::Anchor(anchor) if anchor.as_skill_invocation().is_some()
+    )
 }
 
-fn stable_token(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    value
-        .bytes()
-        .flat_map(|byte| {
-            [
-                HEX[(byte >> 4) as usize] as char,
-                HEX[(byte & 0x0f) as usize] as char,
-            ]
-        })
-        .collect()
+pub fn provider_context_id(head_node_id: &str) -> String {
+    format!("{}-context", node_target_id(head_node_id))
 }
 
 pub fn graph_kind_name(node: &Node) -> &'static str {
