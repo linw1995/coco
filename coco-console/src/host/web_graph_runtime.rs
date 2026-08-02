@@ -2300,7 +2300,7 @@ fn provider_context_node_projection(
         return Ok(None);
     }
     let is_context_start = is_provider_context_start(node);
-    let parent = (!is_context_start && node.parent != root_id)
+    let parent = (node.parent != root_id)
         .then(|| {
             parent.with_context(|| WebGraphProviderContextParentMissingSnafu {
                 node_id: node.id.clone(),
@@ -2308,7 +2308,9 @@ fn provider_context_node_projection(
             })
         })
         .transpose()?;
-    let previous_node_id = if let Some(parent) = parent {
+    let previous_node_id = if is_context_start {
+        None
+    } else if let Some(parent) = parent {
         if is_skill_invocation_anchor(node) && parent.is_tool_use {
             parent.previous_node_id.clone()
         } else {
@@ -2317,7 +2319,7 @@ fn provider_context_node_projection(
     } else {
         None
     };
-    let context_id = if starts_branch {
+    let context_id = if starts_branch || is_context_start {
         provider_context_id(&node.id)
     } else {
         parent
@@ -4067,6 +4069,47 @@ mod tests {
         assert_eq!(
             alternate_context.context.node_ids,
             [alternate, first, session]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_start_fork_children_preserve_lineage() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let session = append_session_anchor(&writer, &root, "context start lineage").await;
+        let first = append_text(&writer, &session, "first").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let nested_session = append_session_anchor(&writer, &first, "nested session").await;
+        let alternate = append_text(&writer, &first, "alternate").await;
+        runtime.catch_up().await.unwrap();
+        let nested_context = runtime
+            .provider_context_for_node(&nested_session, Some(&provider_context_id(&nested_session)))
+            .await
+            .unwrap()
+            .expect("a context-start fork child should have provider context");
+        assert_eq!(nested_context.context.node_ids, [nested_session]);
+        assert_eq!(
+            nested_context.context.previous_id,
+            Some(provider_context_id(&session))
+        );
+
+        let late_session = append_session_anchor(&writer, &alternate, "late session").await;
+        runtime.catch_up().await.unwrap();
+        append_text(&writer, &alternate, "late sibling").await;
+        runtime.catch_up().await.unwrap();
+        let late_context = runtime
+            .provider_context_for_node(&late_session, Some(&provider_context_id(&late_session)))
+            .await
+            .unwrap()
+            .expect("a previously projected context-start child should keep its lineage");
+        assert_eq!(late_context.context.node_ids, [late_session]);
+        assert_eq!(
+            late_context.context.previous_id,
+            Some(provider_context_id(&alternate))
         );
     }
 

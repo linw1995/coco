@@ -1975,6 +1975,10 @@ SET
     END
 WHERE node_id IN segment
    OR (
+       node_id = (SELECT start_node_id FROM split)
+       AND context_id = (SELECT context_id FROM split)
+   )
+   OR (
        previous_context_id = (SELECT previous_context_id FROM split)
        AND source_parent_node_id IN segment
        AND context_id <> (SELECT previous_context_id FROM split)
