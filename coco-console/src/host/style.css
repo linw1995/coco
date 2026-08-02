@@ -195,6 +195,12 @@ body {
   stroke-width: 2.6;
 }
 
+.edge.provider-context-path-edge {
+  opacity: 1;
+  stroke: #38bdf8;
+  stroke-width: 3.2;
+}
+
 .edge-hit-target {
   cursor: pointer;
   fill: none;
@@ -308,6 +314,17 @@ body {
 .node.active .core { stroke: #7dd3fc; stroke-width: 2.4; }
 
 .node-link.node-link-selected .core {
+  stroke: #facc15;
+  stroke-width: 3.8;
+}
+
+.node-link.provider-context-path-node .core {
+  filter: drop-shadow(0 0 6px rgba(56, 189, 248, 0.72));
+  stroke: #38bdf8;
+  stroke-width: 3;
+}
+
+.node-link.provider-context-path-node.node-link-selected .core {
   stroke: #facc15;
   stroke-width: 3.8;
 }

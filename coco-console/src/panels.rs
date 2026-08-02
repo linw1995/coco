@@ -1724,6 +1724,7 @@ fn provider_context_row_content(
             <a
                 class="provider-context-node-link provider-context-node-placeholder"
                 href=target
+                data-node-id=node_id.to_owned()
                 data-node-target=node_target
                 aria-current=selected.then_some("true")
                 aria-busy=(!failed || retrying).then_some("true")
@@ -1756,6 +1757,7 @@ fn provider_context_row_content(
         <a
             class="provider-context-node-link"
             href=target
+            data-node-id=node_id.to_owned()
             data-node-target=node_target
             aria-current=selected.then_some("true")
         >

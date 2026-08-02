@@ -3798,22 +3798,32 @@ mod tests {
         );
 
         let second = append_text(&writer, &first, "second context node").await;
+        let alternate = append_text(&writer, &first, "alternate context node").await;
         runtime.catch_up().await.unwrap();
         let latest = runtime
             .provider_context_for_node(&first, None)
             .await
             .unwrap()
-            .expect("a new descendant should extend provider context");
-        assert_eq!(
-            latest.context.node_ids,
-            [second.clone(), first.clone(), session.clone()]
-        );
-        let historical = runtime
-            .provider_context_for_node(&first, Some(&first_context.context.id))
+            .expect("the original context head should remain addressable");
+        assert_eq!(latest.context.node_ids, [first.clone(), session.clone()]);
+        let switched = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&second)))
             .await
             .unwrap()
-            .expect("the prior context head should remain addressable");
-        assert_eq!(historical.context.node_ids, [first.clone(), session]);
+            .expect("an explicit descendant context should expand the selected branch");
+        assert_eq!(
+            switched.context.node_ids,
+            [second.clone(), first.clone(), session.clone()]
+        );
+        let alternate_context = runtime
+            .provider_context_for_node(&first, Some(&provider_context_id(&alternate)))
+            .await
+            .unwrap()
+            .expect("an alternate branch context should remain selectable");
+        assert_eq!(
+            alternate_context.context.node_ids,
+            [alternate, first.clone(), session.clone()]
+        );
 
         writer.fork("main", &second).await.unwrap();
         runtime.catch_up().await.unwrap();
@@ -3885,7 +3895,7 @@ mod tests {
 
         runtime.catch_up().await.unwrap();
         let context = runtime
-            .provider_context_for_node(&session, None)
+            .provider_context_for_node(&session, Some(&provider_context_id(&head)))
             .await
             .unwrap()
             .expect("skill context should be indexed");

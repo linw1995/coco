@@ -1161,7 +1161,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::ConsoleStore;
-    use crate::host::web_graph_view::node_target_id;
+    use crate::host::web_graph_view::{node_target_id, provider_context_id};
 
     fn client_asset_by_path(path: &str) -> &'static ClientAsset {
         CLIENT_ASSETS
@@ -1951,12 +1951,13 @@ mod tests {
             .unwrap();
         web_graph.catch_up().await.unwrap();
         let state = AppState { store, web_graph };
+        let context_id = provider_context_id(&head_id);
 
         let response = provider_context(
             State(state.clone()),
             RawQuery(Some(format!(
-                "target={}&mode=all",
-                node_target_id(&selected_id)
+                "target={}&context={context_id}&mode=all",
+                node_target_id(&selected_id),
             ))),
         )
         .await;
@@ -1979,7 +1980,7 @@ mod tests {
         let initial = load_initial_provider_context(
             &state,
             &node_target_id(&selected_id),
-            None,
+            Some(&context_id),
             ViewMode::All,
         )
         .await;
@@ -2008,8 +2009,8 @@ mod tests {
         let index = index_page(
             State(state.clone()),
             RawQuery(Some(format!(
-                "mode=all&target={}",
-                node_target_id(&selected_id)
+                "mode=all&target={}&context={context_id}",
+                node_target_id(&selected_id),
             ))),
         )
         .await;
@@ -2048,8 +2049,8 @@ mod tests {
 
         let request = Request::builder()
             .uri(format!(
-                "/api/panels/provider-context?target={}",
-                node_target_id(&selected_id)
+                "/api/panels/provider-context?target={}&context={context_id}",
+                node_target_id(&selected_id),
             ))
             .body(Body::empty())
             .unwrap();

@@ -618,17 +618,11 @@ impl WebGraphStore {
                 let Some(state) = load_state(connection).await? else {
                     return Ok(None);
                 };
-                let rows = if let Some(context_id) = context_id {
-                    diesel::sql_query(PROVIDER_CONTEXT_BY_ID_QUERY)
-                        .bind::<Text, _>(context_id)
-                        .load::<ProviderContextSelectionRow>(connection)
-                        .await?
-                } else {
-                    diesel::sql_query(LATEST_PROVIDER_CONTEXT_FOR_NODE_QUERY)
-                        .bind::<Text, _>(target_node_id)
-                        .load::<ProviderContextSelectionRow>(connection)
-                        .await?
-                };
+                let rows = diesel::sql_query(PROVIDER_CONTEXT_SELECTION_QUERY)
+                    .bind::<Text, _>(target_node_id)
+                    .bind::<Nullable<Text>, _>(context_id)
+                    .load::<ProviderContextSelectionRow>(connection)
+                    .await?;
                 let selection = rows
                     .iter()
                     .any(|row| row.node_id == target_node_id)
@@ -1673,52 +1667,27 @@ const PROVIDER_BRANCH_HEADS_AT_CHANGE_QUERY: &str = r#"
     ORDER BY history.branch_name
 "#;
 
-const LATEST_PROVIDER_CONTEXT_FOR_NODE_QUERY: &str = r#"
-WITH RECURSIVE candidate_heads(node_id, source_row_id) AS (
-    SELECT node_id, source_row_id
-    FROM web_graph_provider_contexts
-    WHERE node_id = ?
+const PROVIDER_CONTEXT_SELECTION_QUERY: &str = r#"
+WITH RECURSIVE query_input(target_node_id, context_id) AS (
+    VALUES (?, ?)
+),
+selected_head(node_id) AS (
+    SELECT context.node_id
+    FROM web_graph_provider_contexts AS context
+    CROSS JOIN query_input
+    WHERE query_input.context_id IS NULL
+      AND context.node_id = query_input.target_node_id
 
     UNION ALL
 
-    SELECT child.node_id, child.source_row_id
-    FROM web_graph_provider_contexts AS child
-    JOIN candidate_heads AS parent
-      ON child.previous_node_id = parent.node_id
-),
-selected_head(node_id) AS (
-    SELECT candidate.node_id
-    FROM candidate_heads AS candidate
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM web_graph_provider_contexts AS child
-        WHERE child.previous_node_id = candidate.node_id
-    )
-    ORDER BY candidate.source_row_id DESC, candidate.node_id DESC
-    LIMIT 1
+    SELECT context.node_id
+    FROM web_graph_provider_contexts AS context
+    JOIN query_input ON query_input.context_id = context.context_id
 ),
 selected_context(node_id, context_id, previous_node_id, depth) AS (
     SELECT context.node_id, context.context_id, context.previous_node_id, 0
     FROM web_graph_provider_contexts AS context
     JOIN selected_head ON selected_head.node_id = context.node_id
-
-    UNION ALL
-
-    SELECT previous.node_id, previous.context_id, previous.previous_node_id, selected.depth + 1
-    FROM web_graph_provider_contexts AS previous
-    JOIN selected_context AS selected
-      ON previous.node_id = selected.previous_node_id
-)
-SELECT node_id, context_id
-FROM selected_context
-ORDER BY depth ASC
-"#;
-
-const PROVIDER_CONTEXT_BY_ID_QUERY: &str = r#"
-WITH RECURSIVE selected_context(node_id, context_id, previous_node_id, depth) AS (
-    SELECT node_id, context_id, previous_node_id, 0
-    FROM web_graph_provider_contexts
-    WHERE context_id = ?
 
     UNION ALL
 
@@ -3465,8 +3434,8 @@ mod tests {
                 .unwrap()
                 .value,
             Some(ProviderContextIndexSelection {
-                context_id: context_ids[2].clone(),
-                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                context_id: context_ids[1].clone(),
+                node_ids: ["b", "a"].map(str::to_owned).to_vec(),
             })
         );
         assert_eq!(
@@ -3483,12 +3452,15 @@ mod tests {
         );
         assert_eq!(
             store
-                .provider_context_selection("c", Some(&context_ids[1]))
+                .provider_context_selection("b", Some(&context_ids[2]))
                 .await
                 .unwrap()
                 .unwrap()
                 .value,
-            None
+            Some(ProviderContextIndexSelection {
+                context_id: context_ids[2].clone(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+            })
         );
 
         store
