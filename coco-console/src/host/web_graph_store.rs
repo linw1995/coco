@@ -756,10 +756,7 @@ impl WebGraphStore {
                     diesel::sql_query(REASSIGN_PROVIDER_CONTEXT_SEGMENT_QUERY)
                         .bind::<Text, _>(&split.start_node_id)
                         .bind::<Text, _>(&split.previous_context_id)
-                        .bind::<Text, _>(&split.previous_context_id)
                         .bind::<Text, _>(&split.context_id)
-                        .bind::<Text, _>(&split.start_node_id)
-                        .bind::<Text, _>(&split.previous_context_id)
                         .execute(connection)
                         .await?;
                 }
@@ -1876,27 +1873,46 @@ ORDER BY row_kind DESC, sort_order ASC, branch_name ASC
 "#;
 
 const REASSIGN_PROVIDER_CONTEXT_SEGMENT_QUERY: &str = r#"
-WITH RECURSIVE segment(node_id) AS (
-    SELECT node_id
-    FROM web_graph_provider_context_nodes
-    WHERE node_id = ?
-      AND context_id = ?
+WITH RECURSIVE
+split(start_node_id, previous_context_id, context_id) AS (
+    VALUES (?, ?, ?)
+),
+segment(node_id) AS (
+    SELECT context.node_id
+    FROM web_graph_provider_context_nodes AS context
+    CROSS JOIN split
+    WHERE context.node_id = split.start_node_id
+      AND context.context_id = split.previous_context_id
 
     UNION ALL
 
     SELECT child.node_id
     FROM web_graph_provider_context_nodes AS child
     JOIN segment ON segment.node_id = child.previous_node_id
-    WHERE child.context_id = ?
+    CROSS JOIN split
+    WHERE child.context_id = split.previous_context_id
 )
 UPDATE web_graph_provider_context_nodes
 SET
-    context_id = ?,
+    context_id = CASE
+        WHEN node_id IN segment THEN (SELECT context_id FROM split)
+        ELSE context_id
+    END,
     previous_context_id = CASE
-        WHEN node_id = ? THEN ?
+        WHEN node_id = (SELECT start_node_id FROM split)
+            THEN (SELECT previous_context_id FROM split)
+        WHEN previous_context_id = (SELECT previous_context_id FROM split)
+          AND previous_node_id IN segment
+          AND context_id <> (SELECT previous_context_id FROM split)
+            THEN (SELECT context_id FROM split)
         ELSE previous_context_id
     END
 WHERE node_id IN segment
+   OR (
+       previous_context_id = (SELECT previous_context_id FROM split)
+       AND previous_node_id IN segment
+       AND context_id <> (SELECT previous_context_id FROM split)
+   )
 "#;
 
 async fn apply_tool_session_projection(
@@ -3819,6 +3835,68 @@ mod tests {
             Some(ProviderContextIndexSelection {
                 context_id: branch_context_id,
                 previous_context_id: Some(context_id),
+                selected_node_id: "c".to_owned(),
+                node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
+                branches: Vec::new(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_split_retargets_nested_context_lineage() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let root_context_id = "detail-a-context".to_owned();
+        let branch_context_id = "detail-b-context".to_owned();
+        let nested_context_id = "detail-c-context".to_owned();
+        store
+            .apply_provider_context_node_projections(
+                &[
+                    ProviderContextNodeProjection {
+                        node_id: "a".to_owned(),
+                        source_row_id: 1,
+                        context_id: root_context_id.clone(),
+                        previous_context_id: None,
+                        previous_node_id: None,
+                        is_tool_use: false,
+                    },
+                    ProviderContextNodeProjection {
+                        node_id: "b".to_owned(),
+                        source_row_id: 2,
+                        context_id: root_context_id.clone(),
+                        previous_context_id: None,
+                        previous_node_id: Some("a".to_owned()),
+                        is_tool_use: false,
+                    },
+                    ProviderContextNodeProjection {
+                        node_id: "c".to_owned(),
+                        source_row_id: 3,
+                        context_id: nested_context_id.clone(),
+                        previous_context_id: Some(root_context_id.clone()),
+                        previous_node_id: Some("b".to_owned()),
+                        is_tool_use: false,
+                    },
+                ],
+                &[ProviderContextSplit {
+                    start_node_id: "b".to_owned(),
+                    previous_context_id: root_context_id.clone(),
+                    context_id: branch_context_id.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .provider_context_selection("", Some(&nested_context_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(ProviderContextIndexSelection {
+                context_id: nested_context_id,
+                previous_context_id: Some(branch_context_id),
                 selected_node_id: "c".to_owned(),
                 node_ids: ["c", "b", "a"].map(str::to_owned).to_vec(),
                 branches: Vec::new(),
