@@ -1254,24 +1254,29 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 }
 
 .provider-context-branches {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
+  display: grid;
+  gap: 0.12rem;
 }
 
 .provider-context-branch {
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  border-radius: 999px;
-  color: #cbd5e1;
+  border-left: 2px solid transparent;
+  color: #94a3b8;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.68rem;
-  padding: 0.18rem 0.48rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  padding: 0.28rem 0.5rem;
   text-decoration: none;
 }
 
-.provider-context-branch:hover,
+.provider-context-branch:hover {
+  background: rgba(148, 163, 184, 0.06);
+  color: #e2e8f0;
+}
+
 .provider-context-branch[aria-current="true"] {
-  background: rgba(34, 211, 238, 0.12);
-  border-color: rgba(34, 211, 238, 0.62);
+  background: linear-gradient(90deg, rgba(34, 211, 238, 0.12), transparent 85%);
+  border-left-color: rgba(34, 211, 238, 0.78);
   color: #cffafe;
 }
 
