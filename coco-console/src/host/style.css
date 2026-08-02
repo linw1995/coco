@@ -510,8 +510,14 @@ body {
 }
 
 .provider-context-slot > leptos-island,
+.provider-context-slot .panel-content {
+  display: block;
+  height: 100%;
+  min-height: 0;
+}
+
 .node-detail-slot > leptos-island,
-.panel-content {
+.node-detail-slot .panel-content {
   display: contents;
 }
 
@@ -1406,6 +1412,11 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   .provider-context-section {
     height: auto;
     max-height: min(42svh, 22rem);
+  }
+
+  .provider-context-slot > leptos-island,
+  .provider-context-slot .panel-content {
+    height: auto;
   }
 
   .node-details {
