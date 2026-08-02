@@ -1,4 +1,6 @@
 :root {
+  --scrollbar-color: rgba(148, 163, 184, 0.46);
+  --scrollbar-size: 0.5rem;
   color-scheme: dark;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #090b12;
@@ -13,11 +15,73 @@ body {
   margin: 0;
   min-height: 100vh;
   overflow: hidden;
+  scrollbar-color: var(--scrollbar-color) transparent;
+  scrollbar-width: thin;
   background:
     radial-gradient(circle at 18% 12%, rgba(84, 112, 255, 0.20), transparent 32rem),
     radial-gradient(circle at 80% 18%, rgba(89, 214, 181, 0.13), transparent 30rem),
     linear-gradient(135deg, rgba(255, 255, 255, 0.025), transparent 18rem),
     #090b12;
+}
+
+:where(
+  .node-details,
+  .node-detail-section pre,
+  .markdown-body,
+  .tool-input-list-root,
+  .provider-context-section
+) {
+  scrollbar-color: var(--scrollbar-color) transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+:where(
+  body,
+  .node-details,
+  .node-detail-section pre,
+  .markdown-body,
+  .tool-input-list-root,
+  .provider-context-section
+)::-webkit-scrollbar {
+  height: var(--scrollbar-size);
+  width: var(--scrollbar-size);
+}
+
+:where(
+  body,
+  .node-details,
+  .node-detail-section pre,
+  .markdown-body,
+  .tool-input-list-root,
+  .provider-context-section
+)::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-color);
+  border-radius: 999px;
+}
+
+:where(
+  body,
+  .node-details,
+  .node-detail-section pre,
+  .markdown-body,
+  .tool-input-list-root,
+  .provider-context-section
+)::-webkit-scrollbar-corner,
+:where(
+  body,
+  .node-details,
+  .node-detail-section pre,
+  .markdown-body,
+  .tool-input-list-root,
+  .provider-context-section
+)::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Safari overlay scrollbars ignore scrollbar-gutter, so protect unpadded content explicitly. */
+:where(.node-details, .provider-context-section) {
+  padding-inline-end: 0.75rem;
 }
 
 .shell {
@@ -554,7 +618,6 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 
 .node-detail {
   --detail-accent: #94a3b8;
-  scrollbar-color: rgba(148, 163, 184, 0.46) transparent;
 }
 
 .node-detail.kind-session { --detail-accent: #9bb8ff; }
