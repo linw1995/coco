@@ -23,7 +23,7 @@ pub fn render_index_page(
     viewport: &GraphViewportResponse,
     initial_provider_context: Option<InitialProviderContext>,
 ) -> String {
-    render_document(render_root(mode, viewport, initial_provider_context))
+    render_document(render_root(mode, viewport, initial_provider_context), true)
 }
 
 pub fn render_skills_page(
@@ -42,14 +42,20 @@ pub fn render_skills_page(
             .and_then(|version| skill.versions.get(&version))
             .or_else(|| skill.current())
     });
-    render_document(render_skills_root(groups, role, selected, version))
+    render_document(render_skills_root(groups, role, selected, version), false)
 }
 
-fn render_document(root: AnyView) -> String {
-    let options = LeptosOptions::builder()
-        .output_name("coco_console")
-        .site_pkg_dir(format!("pkg/{CLIENT_ASSET_VERSION}"))
-        .build();
+fn render_document(root: AnyView, hydrate: bool) -> String {
+    let hydration = hydrate.then(|| {
+        let options = LeptosOptions::builder()
+            .output_name("coco_console")
+            .site_pkg_dir(format!("pkg/{CLIENT_ASSET_VERSION}"))
+            .build();
+        view! {
+            <script>{HYDRATION_BOOTSTRAP}</script>
+            <HydrationScripts options=options islands=true/>
+        }
+    });
     let rendered: View<HtmlElement<_, _, _>> = view! {
         <html lang="en">
             <head>
@@ -58,8 +64,7 @@ fn render_document(root: AnyView) -> String {
                 <title>"CoCo Console"</title>
                 <link rel="stylesheet" href="/style.css" />
                 <link rel="license" href="/third-party-notices.html" />
-                <script>{HYDRATION_BOOTSTRAP}</script>
-                <HydrationScripts options=options islands=true/>
+                {hydration}
             </head>
             <body>{root}</body>
         </html>
@@ -555,6 +560,9 @@ mod tests {
         assert!(historical.contains("v2"));
         assert!(historical.contains("Current"));
         assert!(!historical.contains("#!/bin/sh"));
+        assert!(!historical.contains(HYDRATION_BOOTSTRAP));
+        assert!(!historical.contains("coco_console.js"));
+        assert!(!historical.contains("coco_console_bg.wasm"));
 
         let current = render_skills_page(
             &groups,

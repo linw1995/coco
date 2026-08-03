@@ -15,7 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use coco_mem::{Kind, Node, SessionRole, SkillGroups, Store, StoreError};
+use coco_mem::{Kind, Node, SessionRole, Store, StoreError};
 use futures_util::{StreamExt, stream};
 use leptos::prelude::provide_context;
 use leptos_axum::handle_server_fns_with_context;
@@ -361,22 +361,9 @@ where
         .get("role")
         .and_then(SessionRole::parse)
         .unwrap_or(SessionRole::Orchestrator);
-    let (orchestrator, runner) = tokio::join!(
-        state.store.list_skills(SessionRole::Orchestrator),
-        state.store.list_skills(SessionRole::Runner),
-    );
-    let groups = match (orchestrator, runner) {
-        (Ok(orchestrator), Ok(runner)) => SkillGroups {
-            orchestrator: orchestrator
-                .into_iter()
-                .map(|skill| (skill.name.clone(), skill))
-                .collect(),
-            runner: runner
-                .into_iter()
-                .map(|skill| (skill.name.clone(), skill))
-                .collect(),
-        },
-        (Err(source), _) | (_, Err(source)) => return plain_error(source.to_string()),
+    let groups = match state.store.list_skill_groups().await {
+        Ok(groups) => groups,
+        Err(source) => return plain_error(source.to_string()),
     };
     html_response(render_skills_page(
         &groups,

@@ -16,8 +16,8 @@ pub use sqlite::{
 
 use crate::{
     Job, JobStatus, MergeParent, MessageQueueItem, NewNode, NewNodeContent, Node, Preset,
-    PresetRecord, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillRecord,
-    SkillUpdatePatch, SkillVersionSpec, StoreResult,
+    PresetRecord, PromptAnchor, SessionAnchorPatch, SessionRole, SessionState, SkillGroups,
+    SkillRecord, SkillUpdatePatch, SkillVersionSpec, StoreResult,
 };
 
 #[derive(Debug, Clone)]
@@ -171,6 +171,22 @@ pub trait PresetStore {
 /// Persisted skill storage API.
 #[async_trait]
 pub trait SkillStore {
+    /// Returns all persisted skills grouped by role.
+    async fn list_skill_groups(&self) -> StoreResult<SkillGroups> {
+        let orchestrator = self.list_skills(SessionRole::Orchestrator).await?;
+        let runner = self.list_skills(SessionRole::Runner).await?;
+        Ok(SkillGroups {
+            orchestrator: orchestrator
+                .into_iter()
+                .map(|skill| (skill.name.clone(), skill))
+                .collect(),
+            runner: runner
+                .into_iter()
+                .map(|skill| (skill.name.clone(), skill))
+                .collect(),
+        })
+    }
+
     /// Returns all persisted skills for the given role.
     async fn list_skills(&self, role: SessionRole) -> StoreResult<Vec<SkillRecord>>;
 
