@@ -178,7 +178,7 @@ fn render_list_item(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> 
 }
 
 fn render_fenced_code(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
-    let opening_fence = opening_fence(node_text(node, source));
+    let opening_fence = opening_fence(node_text(node, source), node.start_position().column);
     let mut cursor = node.walk();
     let mut language = None;
     let mut code = String::new();
@@ -194,27 +194,34 @@ fn render_fenced_code(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
             _ => {}
         }
     }
-    if let Some((marker, minimum_length)) = opening_fence {
-        strip_leaked_closing_fence(&mut code, marker, minimum_length);
+    if let Some((marker, minimum_length, indentation)) = opening_fence {
+        strip_leaked_closing_fence(&mut code, marker, minimum_length, indentation);
     }
     MarkdownNode::CodeBlock { language, code }
 }
 
-fn opening_fence(block: &str) -> Option<(u8, usize)> {
-    let opening = block.lines().next()?.trim_start_matches(' ').as_bytes();
+fn opening_fence(block: &str, start_column: usize) -> Option<(u8, usize, usize)> {
+    let line = block.lines().next()?.as_bytes();
+    let indentation = line.iter().take_while(|byte| **byte == b' ').count();
+    let opening = &line[indentation..];
     let marker = *opening.first()?;
     if !matches!(marker, b'`' | b'~') {
         return None;
     }
     let length = opening.iter().take_while(|byte| **byte == marker).count();
-    (length >= 3).then_some((marker, length))
+    (length >= 3).then_some((marker, length, start_column + indentation))
 }
 
-fn strip_leaked_closing_fence(code: &mut String, marker: u8, minimum_length: usize) {
+fn strip_leaked_closing_fence(
+    code: &mut String,
+    marker: u8,
+    minimum_length: usize,
+    opening_indentation: usize,
+) {
     let line_start = code.rfind('\n').map_or(0, |index| index + 1);
     let candidate = &code.as_bytes()[line_start..];
     let indentation = candidate.iter().take_while(|byte| **byte == b' ').count();
-    if indentation > 3 {
+    if indentation.abs_diff(opening_indentation) > 3 {
         return;
     }
     let marker_length = candidate[indentation..]
@@ -640,6 +647,24 @@ mod tests {
                 document.blocks
             );
         }
+    }
+
+    #[test]
+    fn nested_fenced_code_at_eof_excludes_its_closing_fence() {
+        let document = parse("10. item\n\n    ```text\n    content\n    ```");
+
+        assert!(
+            matches!(
+                &document.blocks[0],
+                MarkdownNode::OrderedList { items, .. }
+                    if items[0].contains(&MarkdownNode::CodeBlock {
+                        language: Some("text".to_owned()),
+                        code: "content\n".to_owned(),
+                    })
+            ),
+            "{:#?}",
+            document.blocks
+        );
     }
 
     #[test]
