@@ -882,7 +882,7 @@ fn DetailTextBlock(
     }
 }
 
-pub(crate) fn render_markdown_nodes(nodes: Vec<MarkdownNode>) -> Vec<AnyView> {
+pub fn render_markdown_nodes(nodes: Vec<MarkdownNode>) -> Vec<AnyView> {
     nodes.into_iter().map(render_markdown_node).collect()
 }
 
