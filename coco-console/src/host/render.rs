@@ -20,29 +20,33 @@ __INCOMPLETE_CHUNKS=[];";
 
 pub fn render_index_page(
     mode: ViewMode,
-    viewport: &GraphViewportResponse,
+    viewport: GraphViewportResponse,
     initial_provider_context: Option<InitialProviderContext>,
 ) -> String {
-    render_document(render_root(mode, viewport, initial_provider_context), true)
+    render_document(
+        view! { <GraphPage mode viewport initial_provider_context/> }.into_any(),
+        true,
+    )
 }
 
 pub fn render_skills_page(
-    groups: &SkillGroups,
+    groups: SkillGroups,
     requested_role: SessionRole,
     requested_name: Option<&str>,
     requested_version: Option<u64>,
 ) -> String {
-    let role = requested_role;
-    let skills = groups.for_role(role);
-    let selected = requested_name
-        .and_then(|name| skills.get(name))
-        .or_else(|| skills.values().next());
-    let version = selected.and_then(|skill| {
-        requested_version
-            .and_then(|version| skill.versions.get(&version))
-            .or_else(|| skill.current())
-    });
-    render_document(render_skills_root(groups, role, selected, version), false)
+    render_document(
+        view! {
+            <SkillsPage
+                groups
+                role=requested_role
+                requested_name=requested_name.map(str::to_owned)
+                requested_version
+            />
+        }
+        .into_any(),
+        false,
+    )
 }
 
 fn render_document(root: AnyView, hydrate: bool) -> String {
@@ -72,20 +76,16 @@ fn render_document(root: AnyView, hydrate: bool) -> String {
     format!("<!doctype html>{}", rendered.to_html())
 }
 
-fn render_root(
+#[component]
+fn GraphPage(
     mode: ViewMode,
-    viewport: &GraphViewportResponse,
+    viewport: GraphViewportResponse,
     initial_provider_context: Option<InitialProviderContext>,
-) -> AnyView {
+) -> impl IntoView {
     let revision = viewport.version;
     let stats = format!("{} / revision {}", mode.label(), revision);
     let graph_mode = mode.as_query_value().to_owned();
-    let graph = GraphCanvasModel::new(mode == ViewMode::Anchors, viewport);
-    let provider_context_panel = view! {
-        <ProviderContextPanel graph_mode=graph_mode initial=initial_provider_context/>
-    }
-    .into_any();
-    let node_detail_panel = view! { <NodeDetailPanel/> }.into_any();
+    let graph = GraphCanvasModel::new(mode == ViewMode::Anchors, &viewport);
     view! {
         <main
             id="console-root"
@@ -99,28 +99,30 @@ fn render_root(
                     <p>"Live node relationship graph from the daemon store."</p>
                 </section>
                 <section class="topbar-actions">
-                    {render_app_nav(AppPage::Graph)}
-                    {render_mode_switch(mode)}
+                    <AppNav active=AppPage::Graph/>
+                    <ModeSwitch mode/>
                     <p class="stats">{stats}</p>
                 </section>
             </header>
             <section class="content">
                 <div class="graph-shell">
                     <div class="graph-surface"><GraphCanvas graph/></div>
-                    {render_empty_time_scale()}
+                    <EmptyTimeScale/>
                 </div>
                 <section class="provider-context-panel">
                     <div class="provider-context-slot">
-                        {provider_context_panel}
+                        <ProviderContextPanel
+                            graph_mode=graph_mode
+                            initial=initial_provider_context
+                        />
                     </div>
                 </section>
                 <aside class="side">
-                    <div id=NODE_DETAIL_PANEL_ID class="node-detail-slot">{node_detail_panel}</div>
+                    <div id=NODE_DETAIL_PANEL_ID class="node-detail-slot"><NodeDetailPanel/></div>
                 </aside>
             </section>
         </main>
     }
-    .into_any()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,14 +131,14 @@ enum AppPage {
     Skills,
 }
 
-fn render_app_nav(active: AppPage) -> AnyView {
+#[component]
+fn AppNav(active: AppPage) -> impl IntoView {
     view! {
         <nav class="app-nav" aria-label="Console section">
             <a class=app_nav_class(active == AppPage::Graph) href="/">"Graph"</a>
             <a class=app_nav_class(active == AppPage::Skills) href="/skills">"Skills"</a>
         </nav>
     }
-    .into_any()
 }
 
 fn app_nav_class(active: bool) -> &'static str {
@@ -147,14 +149,42 @@ fn app_nav_class(active: bool) -> &'static str {
     }
 }
 
-fn render_skills_root(
-    groups: &SkillGroups,
+#[derive(Clone)]
+struct SkillCatalogItem {
+    name: String,
+    current_version: u64,
+    summary: String,
+}
+
+#[component]
+fn SkillsPage(
+    mut groups: SkillGroups,
     role: SessionRole,
-    selected: Option<&SkillRecord>,
-    version: Option<&SkillVersion>,
-) -> AnyView {
-    let skill_count = groups.orchestrator.len() + groups.runner.len();
+    requested_name: Option<String>,
+    requested_version: Option<u64>,
+) -> impl IntoView {
+    let orchestrator_count = groups.orchestrator.len();
+    let runner_count = groups.runner.len();
+    let skill_count = orchestrator_count + runner_count;
     let stats = format!("{skill_count} skills");
+    let skills = groups.for_role(role);
+    let selected_name = requested_name
+        .filter(|name| skills.contains_key(name))
+        .or_else(|| skills.keys().next().cloned());
+    let catalog = skills
+        .values()
+        .map(|skill| SkillCatalogItem {
+            name: skill.name.clone(),
+            current_version: skill.current_version,
+            summary: skill
+                .current()
+                .map(|version| version.description.clone())
+                .unwrap_or_else(|| "Missing current version".to_owned()),
+        })
+        .collect();
+    let selected = selected_name
+        .as_deref()
+        .and_then(|name| groups.for_role_mut(role).remove(name));
     view! {
         <main class="shell skills-shell">
             <header class="topbar">
@@ -163,91 +193,90 @@ fn render_skills_root(
                     <p>"Inspect persisted skills, revisions, and bundled scripts."</p>
                 </section>
                 <section class="topbar-actions">
-                    {render_app_nav(AppPage::Skills)}
+                    <AppNav active=AppPage::Skills/>
                     <p class="stats">{stats}</p>
                 </section>
             </header>
             <section class="skills-content">
-                {render_skill_catalog(groups, role, selected.map(|skill| skill.name.as_str()))}
-                {render_skill_detail(role, selected, version)}
+                <SkillCatalog
+                    role
+                    selected_name
+                    orchestrator_count
+                    runner_count
+                    skills=catalog
+                />
+                <SkillDetail role skill=selected requested_version/>
             </section>
         </main>
     }
-    .into_any()
 }
 
-fn render_skill_catalog(
-    groups: &SkillGroups,
+#[component]
+fn SkillCatalog(
     role: SessionRole,
-    selected_name: Option<&str>,
-) -> AnyView {
-    let skills = groups.for_role(role);
+    selected_name: Option<String>,
+    orchestrator_count: usize,
+    runner_count: usize,
+    skills: Vec<SkillCatalogItem>,
+) -> impl IntoView {
     view! {
         <aside class="skills-catalog">
             <nav class="skill-role-switch" aria-label="Skill role">
-                {render_skill_role_link(
-                    SessionRole::Orchestrator,
-                    role,
-                    groups.orchestrator.len(),
-                )}
-                {render_skill_role_link(SessionRole::Runner, role, groups.runner.len())}
+                <SkillRoleLink
+                    role=SessionRole::Orchestrator
+                    active_role=role
+                    count=orchestrator_count
+                />
+                <SkillRoleLink role=SessionRole::Runner active_role=role count=runner_count/>
             </nav>
             <nav class="skill-list" aria-label="Skills">
-                {skills.values().map(|skill| {
-                    let current = skill.current();
+                {skills.into_iter().map(|skill| {
                     let href = skill_href(role, &skill.name, Some(skill.current_version));
-                    let class = if selected_name == Some(skill.name.as_str()) {
+                    let class = if selected_name.as_deref() == Some(skill.name.as_str()) {
                         "skill-list-item active"
                     } else {
                         "skill-list-item"
                     };
-                    let summary = current
-                        .map(|version| version.description.as_str())
-                        .unwrap_or("Missing current version");
                     view! {
                         <a class=class href=href>
                             <span class="skill-list-heading">
-                                <strong>{skill.name.clone()}</strong>
+                                <strong>{skill.name}</strong>
                                 <span>{format!("v{}", skill.current_version)}</span>
                             </span>
-                            <span class="skill-list-summary">{summary.to_owned()}</span>
+                            <span class="skill-list-summary">{skill.summary}</span>
                         </a>
                     }
                 }).collect::<Vec<_>>()}
             </nav>
         </aside>
     }
-    .into_any()
 }
 
-fn render_skill_role_link(
-    link_role: SessionRole,
-    active_role: SessionRole,
-    count: usize,
-) -> AnyView {
-    let class = if link_role == active_role {
+#[component]
+fn SkillRoleLink(role: SessionRole, active_role: SessionRole, count: usize) -> impl IntoView {
+    let class = if role == active_role {
         "skill-role-item active"
     } else {
         "skill-role-item"
     };
-    let label = match link_role {
+    let label = match role {
         SessionRole::Orchestrator => "Orchestrator",
         SessionRole::Runner => "Runner",
     };
     view! {
-        <a class=class href=skill_role_href(link_role)>
+        <a class=class href=skill_role_href(role)>
             <span>{label}</span><small>{count}</small>
         </a>
     }
-    .into_any()
 }
 
-fn render_skill_detail(
+#[component]
+fn SkillDetail(
     role: SessionRole,
-    skill: Option<&SkillRecord>,
-    version: Option<&SkillVersion>,
+    skill: Option<SkillRecord>,
+    requested_version: Option<u64>,
 ) -> AnyView {
-    let (Some(skill), Some(version)) = (skill, version) else {
+    let Some(mut skill) = skill else {
         return view! {
             <section class="skill-detail skill-detail-empty">
                 <h2>"No skills"</h2>
@@ -256,66 +285,87 @@ fn render_skill_detail(
         }
         .into_any();
     };
-    let is_current = version.version == skill.current_version;
-    let body = markdown_document(&version.body);
+    let selected_version = requested_version
+        .filter(|version| skill.versions.contains_key(version))
+        .unwrap_or(skill.current_version);
+    let versions = skill.versions.keys().rev().copied().collect();
+    let Some(version) = skill.versions.remove(&selected_version) else {
+        return view! {
+            <section class="skill-detail skill-detail-empty">
+                <h2>"No skills"</h2>
+                <p>"No persisted skills are available for this role."</p>
+            </section>
+        }
+        .into_any();
+    };
+    let SkillVersion {
+        version,
+        id,
+        created_at,
+        description,
+        body,
+        scripts,
+        enable_coco_shim,
+    } = version;
+    let is_current = version == skill.current_version;
+    let script_count = scripts.len();
     view! {
         <article class="skill-detail">
             <header class="skill-detail-header">
                 <div>
                     <p class="skill-eyebrow">{role.as_str()}</p>
                     <h2>{skill.name.clone()}</h2>
-                    <p class="skill-description">{version.description.clone()}</p>
+                    <p class="skill-description">{description}</p>
                 </div>
                 <span class:current=is_current class="skill-version-badge">
-                    {format!("v{}{}", version.version, if is_current { " · current" } else { "" })}
+                    {format!("v{version}{}", if is_current { " · current" } else { "" })}
                 </span>
             </header>
-            {render_version_switch(role, skill, version.version)}
+            <VersionSwitch
+                role
+                skill_name=skill.name
+                versions
+                current_version=skill.current_version
+                selected_version=version
+            />
             <dl class="skill-metadata">
-                <div><dt>"Revision ID"</dt><dd><code>{version.id.clone()}</code></dd></div>
-                <div><dt>"Created"</dt><dd>{version.created_at.to_string()}</dd></div>
-                <div><dt>"Scripts"</dt><dd>{version.scripts.len().to_string()}</dd></div>
+                <div><dt>"Revision ID"</dt><dd><code>{id}</code></dd></div>
+                <div><dt>"Created"</dt><dd>{created_at.to_string()}</dd></div>
+                <div><dt>"Scripts"</dt><dd>{script_count.to_string()}</dd></div>
                 <div>
                     <dt>"CoCo shim"</dt>
-                    <dd>{if version.enable_coco_shim { "Enabled" } else { "Disabled" }}</dd>
+                    <dd>{if enable_coco_shim { "Enabled" } else { "Disabled" }}</dd>
                 </div>
             </dl>
-            <section class="skill-section">
-                <h3>"Skill instructions"</h3>
-                {if version.body.is_empty() {
-                    view! { <p class="skill-empty">"Empty"</p> }.into_any()
-                } else if let Some(document) = body {
-                    view! {
-                        <div class="markdown-body skill-markdown">
-                            {render_markdown_nodes(document.blocks)}
-                        </div>
-                    }
-                    .into_any()
-                } else {
-                    view! { <pre class="skill-source">{version.body.clone()}</pre> }.into_any()
-                }}
-            </section>
-            {render_skill_scripts(&version.scripts)}
+            <SkillInstructions body/>
+            <SkillScripts scripts/>
         </article>
     }
     .into_any()
 }
 
-fn render_version_switch(role: SessionRole, skill: &SkillRecord, selected: u64) -> AnyView {
+#[component]
+fn VersionSwitch(
+    role: SessionRole,
+    skill_name: String,
+    versions: Vec<u64>,
+    current_version: u64,
+    selected_version: u64,
+) -> impl IntoView {
     view! {
         <nav class="skill-version-switch" aria-label="Skill version">
             <span>"Version"</span>
             <div>
-                {skill.versions.values().rev().map(|version| {
-                    let class = if version.version == selected {
+                {versions.into_iter().map(|version| {
+                    let class = if version == selected_version {
                         "skill-version-item active"
                     } else {
                         "skill-version-item"
                     };
-                    let current = (version.version == skill.current_version).then_some("Current");
+                    let current = (version == current_version).then_some("Current");
                     view! {
-                        <a class=class href=skill_href(role, &skill.name, Some(version.version))>
-                            {format!("v{}", version.version)}
+                        <a class=class href=skill_href(role, &skill_name, Some(version))>
+                            {format!("v{version}")}
                             {current.map(|label| view! { <small>{label}</small> })}
                         </a>
                     }
@@ -323,30 +373,55 @@ fn render_version_switch(role: SessionRole, skill: &SkillRecord, selected: u64) 
             </div>
         </nav>
     }
+}
+
+#[component]
+fn SkillInstructions(body: String) -> AnyView {
+    let document = markdown_document(&body);
+    view! {
+        <section class="skill-section">
+            <h3>"Skill instructions"</h3>
+            {if body.is_empty() {
+                view! { <p class="skill-empty">"Empty"</p> }.into_any()
+            } else if let Some(document) = document {
+                view! {
+                    <div class="markdown-body skill-markdown">
+                        {render_markdown_nodes(document.blocks)}
+                    </div>
+                }
+                .into_any()
+            } else {
+                view! { <pre class="skill-source">{body}</pre> }.into_any()
+            }}
+        </section>
+    }
     .into_any()
 }
 
-fn render_skill_scripts(scripts: &[SkillScript]) -> AnyView {
+#[component]
+fn SkillScripts(scripts: Vec<SkillScript>) -> impl IntoView {
+    let count = scripts.len();
     view! {
         <section class="skill-section skill-scripts">
             <div class="skill-section-heading">
                 <h3>"Scripts"</h3>
-                <span>{scripts.len()}</span>
+                <span>{count}</span>
             </div>
             {if scripts.is_empty() {
                 view! { <p class="skill-empty">"No scripts in this version."</p> }.into_any()
             } else {
                 view! {
                     <div class="skill-script-list">
-                        {scripts.iter().enumerate().map(|(index, script)| {
+                        {scripts.into_iter().enumerate().map(|(index, script)| {
+                            let language = script_language(&script.path).map(str::to_owned);
                             view! {
                                 <details class="skill-script" open=index == 0>
                                     <summary>
-                                        <code>{script.path.clone()}</code>
+                                        <code>{script.path}</code>
                                         <span>{format_script_size(script.content.len())}</span>
                                     </summary>
-                                    <pre data-language=script_language(&script.path)>
-                                        <code>{script.content.clone()}</code>
+                                    <pre data-language=language>
+                                        <code>{script.content}</code>
                                     </pre>
                                 </details>
                             }
@@ -357,7 +432,6 @@ fn render_skill_scripts(scripts: &[SkillScript]) -> AnyView {
             }}
         </section>
     }
-    .into_any()
 }
 
 fn skill_role_href(role: SessionRole) -> String {
@@ -386,7 +460,8 @@ fn format_script_size(bytes: usize) -> String {
     }
 }
 
-fn render_mode_switch(mode: ViewMode) -> AnyView {
+#[component]
+fn ModeSwitch(mode: ViewMode) -> impl IntoView {
     let anchors_class = mode_switch_class(mode == ViewMode::Anchors);
     let all_class = mode_switch_class(mode == ViewMode::All);
     view! {
@@ -395,7 +470,6 @@ fn render_mode_switch(mode: ViewMode) -> AnyView {
             <a class=all_class href="/?mode=all">"All"</a>
         </nav>
     }
-    .into_any()
 }
 
 fn mode_switch_class(active: bool) -> &'static str {
@@ -406,7 +480,8 @@ fn mode_switch_class(active: bool) -> &'static str {
     }
 }
 
-fn render_empty_time_scale() -> AnyView {
+#[component]
+fn EmptyTimeScale() -> impl IntoView {
     view! {
         <nav class="time-scale time-scale-empty" aria-label="Graph time navigator">
             <div class="time-scale-track">
@@ -420,7 +495,6 @@ fn render_empty_time_scale() -> AnyView {
             </div>
         </nav>
     }
-    .into_any()
 }
 
 #[cfg(test)]
@@ -471,7 +545,7 @@ mod tests {
                 },
             }],
         };
-        let page = render_index_page(ViewMode::All, &viewport, None);
+        let page = render_index_page(ViewMode::All, viewport, None);
 
         assert!(page.contains("data-version=\"7\""));
         assert!(page.contains("data-graph-mode=\"all\""));
@@ -544,7 +618,7 @@ mod tests {
         };
 
         let historical = render_skills_page(
-            &groups,
+            groups.clone(),
             SessionRole::Orchestrator,
             Some("deploy & verify"),
             Some(1),
@@ -565,7 +639,7 @@ mod tests {
         assert!(!historical.contains("coco_console_bg.wasm"));
 
         let current = render_skills_page(
-            &groups,
+            groups,
             SessionRole::Orchestrator,
             Some("deploy & verify"),
             Some(99),

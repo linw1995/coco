@@ -24,6 +24,19 @@
 - Prefer `${module_name}.rs` over `${module_name}/mod.rs` for module root
   files.
 
+## Leptos Components
+
+- Model reusable or semantically distinct UI regions as `#[component]`
+  functions with PascalCase names and explicit typed props.
+- Keep request handling, data selection, document assembly, URL construction,
+  formatting, and other non-UI logic in ordinary Rust functions.
+- Do not use `render_* -> AnyView` helpers as substitutes for components when
+  the function represents a page or a meaningful UI section.
+- Server-only rendering is not a reason to skip component boundaries; use
+  Leptos components even when a page does not hydrate or hold reactive state.
+- Small local view fragments may remain inline when extracting a component
+  would not create a meaningful API or reusable boundary.
+
 ## SNAFU Error Construction
 
 - If you already have a `Result<T, E>` and only need to attach extra context,

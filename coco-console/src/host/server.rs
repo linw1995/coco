@@ -347,7 +347,7 @@ where
         }
     };
     match viewport {
-        Ok(viewport) => html_response(render_index_page(mode, &viewport, initial_provider_context)),
+        Ok(viewport) => html_response(render_index_page(mode, viewport, initial_provider_context)),
         Err(error) => plain_error(error.to_string()),
     }
 }
@@ -366,7 +366,7 @@ where
         Err(source) => return plain_error(source.to_string()),
     };
     html_response(render_skills_page(
-        &groups,
+        groups,
         role,
         query.get("name"),
         query.u64("version"),
