@@ -996,10 +996,7 @@ impl CodeHighlightKind {
     }
 }
 
-pub(crate) fn highlighted_code_views(
-    source: String,
-    ranges: &[CodeHighlightRange],
-) -> Vec<AnyView> {
+pub fn highlighted_code_views(source: String, ranges: &[CodeHighlightRange]) -> Vec<AnyView> {
     highlighted_source_views(
         source,
         ranges
