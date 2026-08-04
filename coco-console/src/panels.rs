@@ -2457,6 +2457,25 @@ mod tests {
     }
 
     #[test]
+    fn code_highlight_kinds_map_to_css_classes() {
+        assert_eq!(CodeHighlightKind::Plain.class(), None);
+        for (kind, class) in [
+            (CodeHighlightKind::Comment, "syntax-comment"),
+            (CodeHighlightKind::Constant, "syntax-constant"),
+            (CodeHighlightKind::Function, "syntax-function"),
+            (CodeHighlightKind::Keyword, "syntax-keyword"),
+            (CodeHighlightKind::Number, "syntax-number"),
+            (CodeHighlightKind::Operator, "syntax-operator"),
+            (CodeHighlightKind::Property, "syntax-property"),
+            (CodeHighlightKind::String, "syntax-string"),
+            (CodeHighlightKind::Type, "syntax-type"),
+            (CodeHighlightKind::Variable, "syntax-variable"),
+        ] {
+            assert_eq!(kind.class(), Some(class));
+        }
+    }
+
+    #[test]
     fn node_detail_bodies_render_kind_specific_fields() {
         let session = view! {
             <NodeDetailBody kind=Kind::Anchor(Anchor::session(
