@@ -1684,6 +1684,45 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   font-weight: 650;
 }
 
+.syntax-comment {
+  color: #64748b;
+  font-style: italic;
+}
+
+.syntax-constant,
+.syntax-number {
+  color: #f0abfc;
+}
+
+.syntax-function {
+  color: #7dd3fc;
+}
+
+.syntax-keyword {
+  color: #c4b5fd;
+  font-weight: 650;
+}
+
+.syntax-operator {
+  color: #f472b6;
+}
+
+.syntax-property {
+  color: #93c5fd;
+}
+
+.syntax-string {
+  color: #86efac;
+}
+
+.syntax-type {
+  color: #fbbf24;
+}
+
+.syntax-variable {
+  color: #cbd5e1;
+}
+
 .node-detail-failure pre {
   background: rgba(127, 29, 29, 0.18);
   border-color: rgba(248, 113, 113, 0.28);

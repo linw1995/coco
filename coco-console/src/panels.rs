@@ -11,10 +11,10 @@ use leptos::server_fn::codec::GetUrl;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
-    AnchorRangeResponse, GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange,
-    MarkdownDocument, MarkdownNode, NodeDetailResponse, ProviderContextBranch, ProviderContextItem,
-    ProviderContextResponse, ShellHighlightKind, ShellHighlightToken, ToolInputJsonHighlight,
-    ToolInputShellHighlight, ToolUseInputLink,
+    AnchorRangeResponse, CodeHighlightKind, CodeHighlightRange, GraphViewportEdgeKind,
+    JsonHighlightKind, JsonHighlightRange, MarkdownDocument, MarkdownNode, NodeDetailResponse,
+    ProviderContextBranch, ProviderContextItem, ProviderContextResponse, ShellHighlightKind,
+    ShellHighlightToken, ToolInputJsonHighlight, ToolInputShellHighlight, ToolUseInputLink,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -963,13 +963,46 @@ fn render_markdown_block(node: MarkdownNode) -> AnyView {
 fn render_markdown_leaf_block(node: MarkdownNode) -> AnyView {
     match node {
         MarkdownNode::Heading { level, children } => render_markdown_heading(level, children),
-        MarkdownNode::CodeBlock { language, code } => view! {
-            <pre class="markdown-code" data-language=language><code>{code}</code></pre>
+        MarkdownNode::CodeBlock {
+            language,
+            code,
+            highlights,
+        } => view! {
+            <pre class="markdown-code" data-language=language>
+                <code>{highlighted_code_views(code, &highlights)}</code>
+            </pre>
         }
         .into_any(),
         MarkdownNode::ThematicBreak => view! { <hr/> }.into_any(),
         _ => unreachable!("inline and structural block nodes are rendered separately"),
     }
+}
+
+impl CodeHighlightKind {
+    fn class(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Comment => Some("syntax-comment"),
+            Self::Constant => Some("syntax-constant"),
+            Self::Function => Some("syntax-function"),
+            Self::Keyword => Some("syntax-keyword"),
+            Self::Number => Some("syntax-number"),
+            Self::Operator => Some("syntax-operator"),
+            Self::Property => Some("syntax-property"),
+            Self::String => Some("syntax-string"),
+            Self::Type => Some("syntax-type"),
+            Self::Variable => Some("syntax-variable"),
+        }
+    }
+}
+
+pub fn highlighted_code_views(source: String, ranges: &[CodeHighlightRange]) -> Vec<AnyView> {
+    highlighted_source_views(
+        source,
+        ranges
+            .iter()
+            .map(|range| (range.kind.class(), range.start, range.end)),
+    )
 }
 
 fn render_markdown_heading(level: u8, children: Vec<MarkdownNode>) -> AnyView {
@@ -1346,26 +1379,38 @@ fn ToolInputRaw(
 }
 
 fn highlighted_json_views(source: String, ranges: &[JsonHighlightRange]) -> Vec<AnyView> {
-    let mut tokens = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(1));
+    highlighted_source_views(
+        source,
+        ranges
+            .iter()
+            .map(|range| (range.kind.class(), range.start, range.end)),
+    )
+}
+
+fn highlighted_source_views(
+    source: String,
+    ranges: impl IntoIterator<Item = (Option<&'static str>, usize, usize)>,
+) -> Vec<AnyView> {
+    let mut tokens = Vec::new();
     let mut cursor = 0;
-    for range in ranges {
-        if range.start < cursor
-            || range.end <= range.start
-            || range.end > source.len()
-            || !source.is_char_boundary(range.start)
-            || !source.is_char_boundary(range.end)
+    for (class, start, end) in ranges {
+        if start < cursor
+            || end <= start
+            || end > source.len()
+            || !source.is_char_boundary(start)
+            || !source.is_char_boundary(end)
         {
             return vec![source.into_any()];
         }
-        if cursor < range.start {
-            tokens.push(source[cursor..range.start].to_owned().into_any());
+        if cursor < start {
+            tokens.push(source[cursor..start].to_owned().into_any());
         }
-        let text = source[range.start..range.end].to_owned();
-        tokens.push(match range.kind.class() {
+        let text = source[start..end].to_owned();
+        tokens.push(match class {
             Some(class) => view! { <span class=class>{text}</span> }.into_any(),
             None => text.into_any(),
         });
-        cursor = range.end;
+        cursor = end;
     }
     if cursor < source.len() {
         tokens.push(source[cursor..].to_owned().into_any());
@@ -2372,6 +2417,7 @@ mod tests {
             MarkdownNode::CodeBlock {
                 language: Some("rust".to_owned()),
                 code: "fn main() {}".to_owned(),
+                highlights: Vec::new(),
             },
             MarkdownNode::ThematicBreak,
         ]);
@@ -2405,6 +2451,25 @@ mod tests {
         assert!(rendered.contains(r#"href="https://example.com""#));
         assert!(rendered.contains(r#"start="3""#));
         assert!(rendered.contains(r#"data-language="rust""#));
+    }
+
+    #[test]
+    fn code_highlight_kinds_map_to_css_classes() {
+        assert_eq!(CodeHighlightKind::Plain.class(), None);
+        for (kind, class) in [
+            (CodeHighlightKind::Comment, "syntax-comment"),
+            (CodeHighlightKind::Constant, "syntax-constant"),
+            (CodeHighlightKind::Function, "syntax-function"),
+            (CodeHighlightKind::Keyword, "syntax-keyword"),
+            (CodeHighlightKind::Number, "syntax-number"),
+            (CodeHighlightKind::Operator, "syntax-operator"),
+            (CodeHighlightKind::Property, "syntax-property"),
+            (CodeHighlightKind::String, "syntax-string"),
+            (CodeHighlightKind::Type, "syntax-type"),
+            (CodeHighlightKind::Variable, "syntax-variable"),
+        ] {
+            assert_eq!(kind.class(), Some(class));
+        }
     }
 
     #[test]

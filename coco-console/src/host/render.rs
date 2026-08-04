@@ -6,7 +6,7 @@ use crate::graph_render::{GraphCanvas, GraphCanvasModel};
 use crate::host::web_graph_view::ViewMode;
 use crate::panels::{
     InitialProviderContext, NODE_DETAIL_PANEL_ID, NodeDetailPanel, ProviderContextPanel,
-    render_markdown_nodes,
+    highlighted_code_views, render_markdown_nodes,
 };
 
 use super::CLIENT_ASSET_VERSION;
@@ -414,14 +414,25 @@ fn SkillScripts(scripts: Vec<SkillScript>) -> impl IntoView {
                     <div class="skill-script-list">
                         {scripts.into_iter().enumerate().map(|(index, script)| {
                             let language = script_language(&script.path).map(str::to_owned);
+                            let highlights = language
+                                .as_deref()
+                                .map(|language| {
+                                    super::syntax_highlight::code_highlight_ranges(
+                                        language,
+                                        &script.content,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let size = format_script_size(script.content.len());
+                            let code = highlighted_code_views(script.content, &highlights);
                             view! {
                                 <details class="skill-script" open=index == 0>
                                     <summary>
                                         <code>{script.path}</code>
-                                        <span>{format_script_size(script.content.len())}</span>
+                                        <span>{size}</span>
                                     </summary>
                                     <pre data-language=language>
-                                        <code>{script.content}</code>
+                                        <code>{code}</code>
                                     </pre>
                                 </details>
                             }
@@ -627,6 +638,8 @@ mod tests {
         assert!(historical.contains("Initial revision"));
         assert!(historical.contains("scripts/old.py"));
         assert!(historical.contains("&lt;unsafe&gt;"));
+        assert!(historical.contains("syntax-function"));
+        assert!(historical.contains("syntax-string"));
         assert!(!historical.contains("<unsafe>"));
         assert!(historical.contains("name=deploy+%26+verify"));
         assert!(historical.contains("version=1"));

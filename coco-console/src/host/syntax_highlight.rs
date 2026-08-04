@@ -2,8 +2,8 @@ use coco_types::{Kind, Node};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 use crate::api::{
-    JsonHighlightKind, JsonHighlightRange, ShellHighlightKind, ShellHighlightToken,
-    ToolInputJsonHighlight, ToolInputShellHighlight,
+    CodeHighlightKind, CodeHighlightRange, JsonHighlightKind, JsonHighlightRange,
+    ShellHighlightKind, ShellHighlightToken, ToolInputJsonHighlight, ToolInputShellHighlight,
 };
 
 const BASH_HIGHLIGHT_NAMES: &[&str] = &[
@@ -17,6 +17,25 @@ const JSON_HIGHLIGHT_NAMES: &[&str] = &[
     "number",
     "string",
     "string.special.key",
+];
+const PYTHON_HIGHLIGHT_NAMES: &[&str] = &[
+    "comment",
+    "constant",
+    "constant.builtin",
+    "constructor",
+    "embedded",
+    "escape",
+    "function",
+    "function.builtin",
+    "function.method",
+    "keyword",
+    "number",
+    "operator",
+    "property",
+    "punctuation.special",
+    "string",
+    "type",
+    "variable",
 ];
 
 #[derive(Default)]
@@ -99,6 +118,104 @@ fn json_highlight_configuration() -> Option<&'static HighlightConfiguration> {
             Some(configuration)
         })
         .as_ref()
+}
+
+fn python_highlight_configuration() -> Option<&'static HighlightConfiguration> {
+    static CONFIGURATION: std::sync::OnceLock<Option<HighlightConfiguration>> =
+        std::sync::OnceLock::new();
+    CONFIGURATION
+        .get_or_init(|| {
+            let mut configuration = HighlightConfiguration::new(
+                tree_sitter_python::LANGUAGE.into(),
+                "python",
+                tree_sitter_python::HIGHLIGHTS_QUERY,
+                "",
+                "",
+            )
+            .ok()?;
+            configuration.configure(PYTHON_HIGHLIGHT_NAMES);
+            Some(configuration)
+        })
+        .as_ref()
+}
+
+pub fn code_highlight_ranges(language: &str, source: &str) -> Vec<CodeHighlightRange> {
+    if !matches!(
+        language.to_ascii_lowercase().as_str(),
+        "py" | "python" | "python3"
+    ) {
+        return Vec::new();
+    }
+    let Some(configuration) = python_highlight_configuration() else {
+        return Vec::new();
+    };
+    highlighted_python_ranges(source, configuration, &mut Highlighter::new())
+}
+
+fn highlighted_python_ranges(
+    source: &str,
+    configuration: &HighlightConfiguration,
+    highlighter: &mut Highlighter,
+) -> Vec<CodeHighlightRange> {
+    let mut offset = 0;
+    highlighted_tokens(
+        source,
+        configuration,
+        highlighter,
+        CodeHighlightKind::Plain,
+        active_python_highlight_kind,
+    )
+    .into_iter()
+    .filter_map(|token| {
+        let start = offset;
+        offset += token.text.len();
+        (token.kind != CodeHighlightKind::Plain).then_some(CodeHighlightRange {
+            kind: token.kind,
+            start,
+            end: offset,
+        })
+    })
+    .collect()
+}
+
+fn active_python_highlight_kind(highlights: &[usize], _source: &str) -> CodeHighlightKind {
+    highlights
+        .iter()
+        .copied()
+        .map(python_highlight_kind)
+        .max_by_key(|kind| python_highlight_priority(*kind))
+        .unwrap_or(CodeHighlightKind::Plain)
+}
+
+fn python_highlight_kind(highlight: usize) -> CodeHighlightKind {
+    match PYTHON_HIGHLIGHT_NAMES.get(highlight).copied() {
+        Some("comment") => CodeHighlightKind::Comment,
+        Some("constant" | "constant.builtin") => CodeHighlightKind::Constant,
+        Some("function" | "function.builtin" | "function.method") => CodeHighlightKind::Function,
+        Some("keyword") => CodeHighlightKind::Keyword,
+        Some("number") => CodeHighlightKind::Number,
+        Some("operator" | "punctuation.special") => CodeHighlightKind::Operator,
+        Some("property") => CodeHighlightKind::Property,
+        Some("embedded" | "escape" | "string") => CodeHighlightKind::String,
+        Some("constructor" | "type") => CodeHighlightKind::Type,
+        Some("variable") => CodeHighlightKind::Variable,
+        _ => CodeHighlightKind::Plain,
+    }
+}
+
+fn python_highlight_priority(kind: CodeHighlightKind) -> u8 {
+    match kind {
+        CodeHighlightKind::Plain => 0,
+        CodeHighlightKind::Variable => 1,
+        CodeHighlightKind::Operator => 2,
+        CodeHighlightKind::Property => 3,
+        CodeHighlightKind::Function => 4,
+        CodeHighlightKind::Type => 5,
+        CodeHighlightKind::Number | CodeHighlightKind::Constant => 6,
+        CodeHighlightKind::String => 7,
+        CodeHighlightKind::Keyword => 8,
+        CodeHighlightKind::Comment => 9,
+    }
 }
 
 fn collect_shell_highlights(
@@ -370,6 +487,30 @@ mod tests {
             source
         );
         assert_eq!(commands, vec!["printf", "printf"]);
+    }
+
+    #[test]
+    fn tree_sitter_highlights_python_fences_and_script_extensions() {
+        let source = concat!(
+            "class Greeter:\n",
+            "    def greet(self, name: str) -> str:\n",
+            "        return f\"Hello, {name}\"  # welcome\n",
+        );
+
+        for language in ["python", "py", "python3", "PYTHON"] {
+            let ranges = code_highlight_ranges(language, source);
+            let highlighted = ranges
+                .iter()
+                .map(|range| (range.kind, &source[range.start..range.end]))
+                .collect::<Vec<_>>();
+
+            assert!(highlighted.contains(&(CodeHighlightKind::Keyword, "class")));
+            assert!(highlighted.contains(&(CodeHighlightKind::Type, "Greeter")));
+            assert!(highlighted.contains(&(CodeHighlightKind::Function, "greet")));
+            assert!(highlighted.contains(&(CodeHighlightKind::Type, "str")));
+            assert!(highlighted.contains(&(CodeHighlightKind::Comment, "# welcome")));
+        }
+        assert!(code_highlight_ranges("rust", source).is_empty());
     }
 
     #[test]
