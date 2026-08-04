@@ -77,9 +77,34 @@ pub enum MarkdownNode {
     CodeBlock {
         language: Option<String>,
         code: String,
+        #[serde(default)]
+        highlights: Vec<CodeHighlightRange>,
     },
     ThematicBreak,
     LineBreak,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CodeHighlightRange {
+    pub kind: CodeHighlightKind,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeHighlightKind {
+    Plain,
+    Comment,
+    Constant,
+    Function,
+    Keyword,
+    Number,
+    Operator,
+    Property,
+    String,
+    Type,
+    Variable,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

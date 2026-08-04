@@ -89,15 +89,18 @@ fn render_leaf_block(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) ->
         "indented_code_block" => vec![MarkdownNode::CodeBlock {
             language: None,
             code: dedent_code(node, source),
+            highlights: Vec::new(),
         }],
         "thematic_break" => vec![MarkdownNode::ThematicBreak],
         "html_block" => vec![MarkdownNode::CodeBlock {
             language: None,
             code: node_text(node, source).to_owned(),
+            highlights: Vec::new(),
         }],
         "pipe_table" => vec![MarkdownNode::CodeBlock {
             language: None,
             code: node_text(node, source).to_owned(),
+            highlights: Vec::new(),
         }],
         "link_reference_definition"
         | "minus_metadata"
@@ -197,7 +200,15 @@ fn render_fenced_code(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
     if let Some((marker, minimum_length, indentation)) = opening_fence {
         strip_leaked_closing_fence(&mut code, marker, minimum_length, indentation);
     }
-    MarkdownNode::CodeBlock { language, code }
+    let highlights = language
+        .as_deref()
+        .map(|language| super::syntax_highlight::code_highlight_ranges(language, &code))
+        .unwrap_or_default();
+    MarkdownNode::CodeBlock {
+        language,
+        code,
+        highlights,
+    }
 }
 
 fn opening_fence(block: &str, start_column: usize) -> Option<(u8, usize, usize)> {
@@ -506,7 +517,7 @@ mod tests {
         ));
         assert!(matches!(
             &document.blocks[3],
-            MarkdownNode::CodeBlock { language: Some(language), code }
+            MarkdownNode::CodeBlock { language: Some(language), code, .. }
                 if language == "rust" && code == "fn main() {}\n"
         ));
     }
@@ -614,6 +625,7 @@ mod tests {
             vec![MarkdownNode::CodeBlock {
                 language: None,
                 code: source.to_owned(),
+                highlights: Vec::new(),
             }]
         );
     }
@@ -627,8 +639,33 @@ mod tests {
             vec![MarkdownNode::CodeBlock {
                 language: None,
                 code: "line\n\n".to_owned(),
+                highlights: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn python_fenced_code_includes_syntax_highlights() {
+        let document = parse("```python\ndef greet(name):\n    return f\"Hi {name}\"\n```\n");
+        let MarkdownNode::CodeBlock {
+            language,
+            code,
+            highlights,
+        } = &document.blocks[0]
+        else {
+            panic!("expected a code block");
+        };
+
+        assert_eq!(language.as_deref(), Some("python"));
+        assert_eq!(code, "def greet(name):\n    return f\"Hi {name}\"\n");
+        assert!(highlights.iter().any(|range| {
+            range.kind == crate::api::CodeHighlightKind::Keyword
+                && &code[range.start..range.end] == "def"
+        }));
+        assert!(highlights.iter().any(|range| {
+            range.kind == crate::api::CodeHighlightKind::Function
+                && &code[range.start..range.end] == "greet"
+        }));
     }
 
     #[test]
@@ -660,6 +697,7 @@ mod tests {
                     if items[0].contains(&MarkdownNode::CodeBlock {
                         language: Some("text".to_owned()),
                         code: "content\n".to_owned(),
+                        highlights: Vec::new(),
                     })
             ),
             "{:#?}",
@@ -676,6 +714,7 @@ mod tests {
             vec![MarkdownNode::CodeBlock {
                 language: Some("markdown".to_owned()),
                 code: "```\n".to_owned(),
+                highlights: Vec::new(),
             }]
         );
     }
@@ -715,6 +754,7 @@ mod tests {
                     if items[0].contains(&MarkdownNode::CodeBlock {
                         language: None,
                         code: "first\n  second\n".to_owned(),
+                        highlights: Vec::new(),
                     })
             ),
             "{:#?}",
@@ -731,6 +771,7 @@ mod tests {
             vec![MarkdownNode::CodeBlock {
                 language: None,
                 code: "  first\nsecond\n".to_owned(),
+                highlights: Vec::new(),
             }]
         );
     }
@@ -745,6 +786,7 @@ mod tests {
             vec![MarkdownNode::CodeBlock {
                 language: None,
                 code: source.to_owned(),
+                highlights: Vec::new(),
             }]
         );
     }
@@ -777,6 +819,7 @@ mod tests {
             vec![MarkdownNode::CodeBlock {
                 language: None,
                 code: "command\n".to_owned(),
+                highlights: Vec::new(),
             }]
         );
     }
