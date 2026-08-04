@@ -15,7 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use coco_mem::{Kind, Node, Store, StoreError};
+use coco_mem::{Kind, Node, SessionRole, Store, StoreError};
 use futures_util::{StreamExt, stream};
 use leptos::prelude::provide_context;
 use leptos_axum::handle_server_fns_with_context;
@@ -29,7 +29,7 @@ use super::error::{
     StoreSnafu,
 };
 use super::publisher::ConsolePublisher;
-use super::render::render_index_page;
+use super::render::{render_index_page, render_skills_page};
 use crate::Result;
 use crate::api::{
     AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdgeKind,
@@ -268,6 +268,7 @@ where
     Router::new()
         .route("/", get(index_page::<S>).post(method_not_allowed))
         .route("/index.html", get(index_page::<S>))
+        .route("/skills", get(skills_page::<S>).post(method_not_allowed))
         .route("/style.css", get(style_css))
         .route("/third-party-notices.html", get(third_party_notices))
         .route("/api/graph/viewport", get(graph_viewport::<S>))
@@ -346,9 +347,30 @@ where
         }
     };
     match viewport {
-        Ok(viewport) => html_response(render_index_page(mode, &viewport, initial_provider_context)),
+        Ok(viewport) => html_response(render_index_page(mode, viewport, initial_provider_context)),
         Err(error) => plain_error(error.to_string()),
     }
+}
+
+async fn skills_page<S>(State(state): State<AppState<S>>, RawQuery(query): RawQuery) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    let query = parse_query(query.as_deref().unwrap_or_default());
+    let role = query
+        .get("role")
+        .and_then(SessionRole::parse)
+        .unwrap_or(SessionRole::Orchestrator);
+    let groups = match state.store.list_skill_groups().await {
+        Ok(groups) => groups,
+        Err(source) => return plain_error(source.to_string()),
+    };
+    html_response(render_skills_page(
+        groups,
+        role,
+        query.get("name"),
+        query.u64("version"),
+    ))
 }
 
 async fn style_css() -> Response {
@@ -1220,7 +1242,8 @@ mod tests {
     use axum::body::to_bytes;
     use coco_mem::{
         Anchor, BranchStore, Kind, MergeParent, NewNode, NodeStore, PromptAnchor, Role,
-        SessionAnchor, SessionRole, SqliteStore, ToolResult, ToolUse,
+        SessionAnchor, SessionRole, SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec,
+        SqliteStore, ToolResult, ToolUse,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1665,6 +1688,59 @@ mod tests {
         let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
         let detail: NodeDetailResponse = serde_json::from_slice(&detail_body).unwrap();
         assert!(matches!(detail, NodeDetailResponse::Found { node, .. } if node.id == node_id));
+    }
+
+    #[tokio::test]
+    async fn skills_page_reads_the_selected_persisted_revision() {
+        let source = SqliteStore::open_temporary().await.unwrap();
+        source
+            .add_skill(
+                SessionRole::Runner,
+                "console-skill",
+                SkillVersionSpec {
+                    description: "Historical description".to_owned(),
+                    body: "# Historical body".to_owned(),
+                    scripts: vec![SkillScript {
+                        path: "scripts/historical.sh".to_owned(),
+                        content: "echo historical\n".to_owned(),
+                    }],
+                    enable_coco_shim: false,
+                },
+            )
+            .await
+            .unwrap();
+        source
+            .update_skill(
+                SessionRole::Runner,
+                "console-skill",
+                &SkillUpdatePatch {
+                    description: Some("Current description".to_owned()),
+                    body: Some("# Current body".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(source.clone(), publisher.clone());
+        let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
+            .await
+            .unwrap();
+        let state = AppState { store, web_graph };
+
+        let response = skills_page(
+            State(state),
+            RawQuery(Some("role=runner&name=console-skill&version=1".to_owned())),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("Historical description"));
+        assert!(body.contains("scripts/historical.sh"));
+        assert!(body.contains("echo historical"));
+        assert!(body.contains("version=2"));
+        assert!(!body.contains("Current body"));
     }
 
     #[tokio::test]

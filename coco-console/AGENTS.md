@@ -1,5 +1,18 @@
 # coco-console Guidelines
 
+## Leptos Components
+
+- Model reusable or semantically distinct UI regions as `#[component]`
+  functions with PascalCase names and explicit typed props.
+- Keep request handling, data selection, document assembly, URL construction,
+  formatting, and other non-UI logic in ordinary Rust functions.
+- Do not use `render_* -> AnyView` helpers as substitutes for components when
+  the function represents a page or a meaningful UI section.
+- Server-only rendering is not a reason to skip component boundaries; use
+  Leptos components even when a page does not hydrate or hold reactive state.
+- Small local view fragments may remain inline when extracting a component
+  would not create a meaningful API or reusable boundary.
+
 ## Web Graph Rebuilds
 
 - Treat `host::web_graph_store::LAYOUT_VERSION` as the algorithm version for

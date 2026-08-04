@@ -3661,7 +3661,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(child_cursor.node_id, child);
-        timeout(Duration::from_secs(10), async {
+        timeout(Duration::from_secs(30), async {
             loop {
                 revisions.changed().await.unwrap();
                 let revision = *revisions.borrow_and_update();

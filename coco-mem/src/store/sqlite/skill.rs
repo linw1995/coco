@@ -671,9 +671,14 @@ fn validate_skill_name(name: &str) -> Result<()> {
 
 #[async_trait]
 impl SkillStore for SqliteStore {
-    async fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
+    async fn list_skill_groups(&self) -> Result<SkillGroups> {
         let mut connection = self.connect().await?;
-        Ok(load_skill_groups(&mut connection, &self.database_path)
+        load_skill_groups(&mut connection, &self.database_path).await
+    }
+
+    async fn list_skills(&self, role: SessionRole) -> Result<Vec<SkillRecord>> {
+        Ok(self
+            .list_skill_groups()
             .await?
             .for_role(role)
             .values()

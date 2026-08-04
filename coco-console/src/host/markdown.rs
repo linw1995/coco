@@ -36,6 +36,10 @@ pub fn node_markdown_documents(node: &Node) -> Vec<MarkdownDocument> {
         .collect()
 }
 
+pub fn markdown_document(source: &str) -> Option<MarkdownDocument> {
+    parse_document(&mut MarkdownParser::default(), source)
+}
+
 fn parse_document(parser: &mut MarkdownParser, source: &str) -> Option<MarkdownDocument> {
     let tree = parser.parse(source.as_bytes(), None)?;
     let blocks = block_children(&tree, tree.block_tree().root_node(), source);
@@ -174,6 +178,7 @@ fn render_list_item(tree: &MarkdownTree, node: SyntaxNode<'_>, source: &str) -> 
 }
 
 fn render_fenced_code(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
+    let opening_fence = opening_fence(node_text(node, source), node.start_position().column);
     let mut cursor = node.walk();
     let mut language = None;
     let mut code = String::new();
@@ -189,7 +194,46 @@ fn render_fenced_code(node: SyntaxNode<'_>, source: &str) -> MarkdownNode {
             _ => {}
         }
     }
+    if let Some((marker, minimum_length, indentation)) = opening_fence {
+        strip_leaked_closing_fence(&mut code, marker, minimum_length, indentation);
+    }
     MarkdownNode::CodeBlock { language, code }
+}
+
+fn opening_fence(block: &str, start_column: usize) -> Option<(u8, usize, usize)> {
+    let line = block.lines().next()?.as_bytes();
+    let indentation = line.iter().take_while(|byte| **byte == b' ').count();
+    let opening = &line[indentation..];
+    let marker = *opening.first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = opening.iter().take_while(|byte| **byte == marker).count();
+    (length >= 3).then_some((marker, length, start_column + indentation))
+}
+
+fn strip_leaked_closing_fence(
+    code: &mut String,
+    marker: u8,
+    minimum_length: usize,
+    opening_indentation: usize,
+) {
+    let line_start = code.rfind('\n').map_or(0, |index| index + 1);
+    let candidate = &code.as_bytes()[line_start..];
+    let indentation = candidate.iter().take_while(|byte| **byte == b' ').count();
+    if indentation.abs_diff(opening_indentation) > 3 {
+        return;
+    }
+    let marker_length = candidate[indentation..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    let remainder = &candidate[indentation + marker_length..];
+    if marker_length >= minimum_length && remainder.iter().all(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        // tree-sitter-md includes an EOF closing fence in code_fence_content when no newline follows.
+        code.truncate(line_start);
+    }
 }
 
 fn inline_children(node: SyntaxNode<'_>, source: &str) -> Vec<MarkdownNode> {
@@ -585,6 +629,79 @@ mod tests {
                 code: "line\n\n".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn fenced_code_at_eof_excludes_its_closing_fence() {
+        for (source, expected) in [
+            ("```bash\ncommand\n```", "command\n"),
+            ("~~~text\ncontent\n~~~", "content\n"),
+        ] {
+            let document = parse(source);
+            assert!(
+                matches!(
+                    document.blocks.as_slice(),
+                    [MarkdownNode::CodeBlock { code, .. }] if code == expected
+                ),
+                "{:#?}",
+                document.blocks
+            );
+        }
+    }
+
+    #[test]
+    fn nested_fenced_code_at_eof_excludes_its_closing_fence() {
+        let document = parse("10. item\n\n    ```text\n    content\n    ```");
+
+        assert!(
+            matches!(
+                &document.blocks[0],
+                MarkdownNode::OrderedList { items, .. }
+                    if items[0].contains(&MarkdownNode::CodeBlock {
+                        language: Some("text".to_owned()),
+                        code: "content\n".to_owned(),
+                    })
+            ),
+            "{:#?}",
+            document.blocks
+        );
+    }
+
+    #[test]
+    fn longer_fence_preserves_shorter_fence_in_code() {
+        let document = parse("````markdown\n```\n````");
+
+        assert_eq!(
+            document.blocks,
+            vec![MarkdownNode::CodeBlock {
+                language: Some("markdown".to_owned()),
+                code: "```\n".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn builtin_skill_fenced_code_blocks_exclude_closing_fences() {
+        for (name, source) in [
+            (
+                "coco-orchestrator",
+                include_str!("../../../coco-mem/src/default_skills/coco-orchestrator.md"),
+            ),
+            (
+                "cronjob",
+                include_str!("../../../coco-mem/src/default_skills/cronjob.md"),
+            ),
+        ] {
+            let document = parse(source.trim());
+            for block in document.blocks {
+                if let MarkdownNode::CodeBlock { code, .. } = block {
+                    assert!(
+                        !code.trim_end().ends_with("```"),
+                        "{name} closing fence leaked into code: {code:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
