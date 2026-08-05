@@ -680,7 +680,7 @@ where
         || nodes.last().is_none_or(|node| node.id != target_id)
         || nodes
             .first()
-            .is_none_or(|node| node.kind.anchor_payload_kind().is_none())
+            .is_none_or(|node| !node.is_root() && node.kind.anchor_payload_kind().is_none())
     {
         return Ok(None);
     }
@@ -1827,9 +1827,19 @@ mod tests {
         let source = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
         let store = ConsoleStore::new(source.clone(), publisher.clone());
+        let root = store.root_id();
+        let top_level_detail = store
+            .append(NewNode {
+                parent: root.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("top-level detail".to_owned()),
+            })
+            .await
+            .unwrap();
         let source_anchor = store
             .append(NewNode {
-                parent: store.root_id(),
+                parent: top_level_detail.clone(),
                 role: Role::User,
                 metadata: None,
                 kind: Kind::Anchor(Anchor::prompt(
@@ -1922,6 +1932,27 @@ mod tests {
             .unwrap();
         web_graph.catch_up().await.unwrap();
         let state = AppState { store, web_graph };
+
+        let top_level = load_anchor_range(
+            &state,
+            &root,
+            &source_anchor,
+            GraphViewportEdgeKind::Primary,
+        )
+        .await
+        .unwrap();
+        let AnchorRangeResponse::Found { paths } = top_level else {
+            panic!("top-level anchor range should exist");
+        };
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0]
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            [&root, &top_level_detail, &source_anchor]
+        );
 
         let primary = load_anchor_range(
             &state,
