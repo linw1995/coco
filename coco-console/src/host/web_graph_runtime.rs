@@ -2007,6 +2007,7 @@ impl WebGraphRuntime {
     ) -> crate::Result<Option<Patch>> {
         let node_id = NodeId::new(node.id.clone()).context(WebGraphModelSnafu)?;
         let all_parents = raw_parent_edges(node);
+        let visible_in_anchors = node.is_anchor || node.parent.is_empty();
         let anchor_parents = if node.is_anchor {
             self.anchor_parent_edges(&all_parents).await?
         } else {
@@ -2018,7 +2019,7 @@ impl WebGraphRuntime {
         else {
             return Ok(None);
         };
-        let anchors = if node.is_anchor {
+        let anchors = if visible_in_anchors {
             let Some(layout) = self
                 .build_layout_patch(
                     LayoutKind::Anchors,
@@ -2193,7 +2194,7 @@ impl WebGraphRuntime {
         let mut resolved = Vec::new();
         let mut sources = BTreeSet::new();
         for parent in parents {
-            let Some(source) = self.nearest_anchor(&parent.node_id).await? else {
+            let Some(source) = self.nearest_anchor_or_root(&parent.node_id).await? else {
                 continue;
             };
             if sources.insert(source.clone()) {
@@ -2206,11 +2207,11 @@ impl WebGraphRuntime {
         Ok(resolved)
     }
 
-    async fn nearest_anchor(&self, start_id: &str) -> crate::Result<Option<String>> {
+    async fn nearest_anchor_or_root(&self, start_id: &str) -> crate::Result<Option<String>> {
         let mut current = start_id.to_owned();
         while !current.is_empty() {
             let node = self.source_node(&current).await?;
-            if node.is_anchor {
+            if node.is_anchor || node.parent.is_empty() {
                 return Ok(Some(node.id));
             }
             current = node.parent;
@@ -3359,10 +3360,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v7_layout_rebuild_connects_root_to_top_level_anchors() {
+        const PREVIOUS_LAYOUT_VERSION: u32 = 7;
+
+        assert_eq!(LAYOUT_VERSION, 8);
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let day = append_session_anchor(&writer, &root, "day").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        let derived_path = runtime.store.path().to_owned();
+        drop(runtime);
+
+        let mut connection = SqliteConnection::establish(derived_path.to_str().unwrap()).unwrap();
+        diesel::sql_query("UPDATE web_graph_state SET layout_version = ?")
+            .bind::<Integer, _>(i32::try_from(PREVIOUS_LAYOUT_VERSION).unwrap())
+            .execute(&mut connection)
+            .unwrap();
+        drop(connection);
+
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        let reset = runtime.store.state().await.unwrap().unwrap();
+        assert_eq!(reset.layout_version, LAYOUT_VERSION);
+        assert_eq!(reset.source_cursor, None);
+        runtime.catch_up().await.unwrap();
+
+        let anchors = runtime
+            .viewport(ViewMode::Anchors, complete_viewport())
+            .await
+            .unwrap();
+        assert!(anchors.edges.iter().any(|edge| {
+            edge.kind == GraphViewportEdgeKind::Primary
+                && edge.source_id == root
+                && edge.target_id == day
+        }));
+    }
+
+    #[tokio::test]
     async fn v6_layout_rebuild_backfills_historical_provider_context() {
         const PREVIOUS_LAYOUT_VERSION: u32 = 6;
 
-        assert_eq!(LAYOUT_VERSION, 7);
+        assert_eq!(LAYOUT_VERSION, 8);
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let historical_session = append_session_anchor(&writer, &root, "historical").await;
@@ -3527,6 +3569,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anchors_layout_connects_root_to_top_level_sessions() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        append_session_anchor(&writer, &root, "main").await;
+        let day = append_session_anchor(&writer, &root, "day").await;
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+
+        runtime.catch_up().await.unwrap();
+
+        let anchors = runtime
+            .viewport(ViewMode::Anchors, complete_viewport())
+            .await
+            .unwrap();
+        assert!(anchors.nodes.iter().any(|node| node.id == root));
+        assert!(anchors.edges.iter().any(|edge| {
+            edge.kind == GraphViewportEdgeKind::Primary
+                && edge.source_id == root
+                && edge.target_id == day
+        }));
+    }
+
+    #[tokio::test]
     async fn synchronization_builds_global_topology_and_both_layouts_incrementally() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
@@ -3565,11 +3631,17 @@ mod tests {
                 .map(|node| node.id.as_str())
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
+                root.as_str(),
                 first_anchor.as_str(),
                 second_anchor.as_str(),
                 third_anchor.as_str(),
             ])
         );
+        assert!(anchors.edges.iter().any(|edge| {
+            edge.kind == GraphViewportEdgeKind::Primary
+                && edge.source_id == root
+                && edge.target_id == first_anchor
+        }));
         assert!(anchors.edges.iter().any(|edge| {
             edge.kind == GraphViewportEdgeKind::Primary
                 && edge.source_id == first_anchor
