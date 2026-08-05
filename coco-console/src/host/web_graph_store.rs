@@ -2093,6 +2093,12 @@ async fn replace_snapshot(
 
     let rows = snapshot_rows(snapshot)?;
     spatial::clear(connection).await?;
+    // Break self-referential cascades before clearing a deep provider context chain. SQLite
+    // counts foreign-key cascades against its trigger recursion limit even for a full-table delete.
+    diesel::update(web_graph_provider_context_nodes::table)
+        .set(web_graph_provider_context_nodes::previous_node_id.eq(None::<String>))
+        .execute(connection)
+        .await?;
     diesel::delete(web_graph_provider_context_nodes::table)
         .execute(connection)
         .await?;
@@ -4053,6 +4059,69 @@ mod tests {
         let state = store.state().await.unwrap().unwrap();
         assert_eq!(state.layout_version, LAYOUT_VERSION);
         assert_eq!(state.source_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn initialize_clears_provider_context_chains_beyond_sqlite_trigger_depth() {
+        const CHAIN_LENGTH: i32 = 1_101;
+
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let mut connection = store.database.acquire().await.unwrap();
+        diesel_async::RunQueryDsl::execute(
+            diesel::sql_query(
+                "WITH RECURSIVE sequence(id) AS (\
+                     VALUES (1) \
+                     UNION ALL \
+                     SELECT id + 1 FROM sequence WHERE id < ?\
+                 ) \
+                 INSERT INTO web_graph_nodes (node_id) \
+                 SELECT printf('deep-context-%04d', id) FROM sequence",
+            )
+            .bind::<diesel::sql_types::Integer, _>(CHAIN_LENGTH),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        diesel_async::RunQueryDsl::execute(
+            diesel::sql_query(
+                "WITH RECURSIVE sequence(id) AS (\
+                     VALUES (1) \
+                     UNION ALL \
+                     SELECT id + 1 FROM sequence WHERE id < ?\
+                 ) \
+                 INSERT INTO web_graph_provider_context_nodes (\
+                     node_id, source_row_id, context_id, previous_context_id, \
+                     previous_node_id, source_parent_node_id, is_tool_use\
+                 ) \
+                 SELECT \
+                     printf('deep-context-%04d', id), \
+                     id, \
+                     'deep-context', \
+                     NULL, \
+                     CASE WHEN id = 1 THEN NULL ELSE printf('deep-context-%04d', id - 1) END, \
+                     'source-parent', \
+                     0 \
+                 FROM sequence",
+            )
+            .bind::<diesel::sql_types::Integer, _>(CHAIN_LENGTH),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        diesel_async::RunQueryDsl::execute(
+            diesel::update(web_graph_state::table.filter(web_graph_state::id.eq(1)))
+                .set(web_graph_state::layout_version.eq(0)),
+            &mut connection,
+        )
+        .await
+        .unwrap();
+        drop(connection);
+        let empty = empty_graph(0, 0);
+
+        assert!(store.initialize(&empty).await.unwrap());
+        assert_eq!(load_graph_for_test(&store).await, Some(empty));
     }
 
     #[tokio::test]
