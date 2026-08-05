@@ -1828,6 +1828,11 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   position: relative;
 }
 
+.provider-context-node.llm-context-start {
+  border-top: 2px solid rgba(34, 211, 238, 0.72);
+  margin-top: 0.45rem;
+}
+
 .provider-context-node-link {
   color: inherit;
   cursor: pointer;

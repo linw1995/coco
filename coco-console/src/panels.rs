@@ -1650,12 +1650,14 @@ fn ProviderContextList(
                 <ol class="provider-context-list">
                     {node_ids
                         .into_iter()
-                        .map(|node_id| {
+                        .enumerate()
+                        .map(|(index, node_id)| {
                             let initial_item = initial_items.remove(&node_id);
                             view! {
                                 <ProviderContextRow
                                     context_target=context_target.clone()
                                     selected=node_id == selected_id
+                                    llm_context_start={index > 0 && node_id == selected_id}
                                     node_id
                                     initial_item
                                     scroll_root
@@ -1706,6 +1708,7 @@ fn ProviderContextBranches(
 fn ProviderContextRow(
     context_target: String,
     selected: bool,
+    llm_context_start: bool,
     node_id: String,
     initial_item: Option<ProviderContextItem>,
     scroll_root: NodeRef<leptos::html::Section>,
@@ -1771,6 +1774,7 @@ fn ProviderContextRow(
         provider_context_node_class(
             item.with(|item| item.as_ref().is_some_and(|item| item.point.is_some())),
             selected,
+            llm_context_start,
         )
     };
     let content = move || {
@@ -1872,13 +1876,18 @@ fn provider_context_short_id(node_id: &str) -> String {
     node_id.chars().take(12).collect()
 }
 
-fn provider_context_node_class(visible: bool, selected: bool) -> &'static str {
-    match (visible, selected) {
-        (true, true) => "provider-context-node visible selected",
-        (true, false) => "provider-context-node visible",
-        (false, true) => "provider-context-node selected",
-        (false, false) => "provider-context-node",
+fn provider_context_node_class(visible: bool, selected: bool, llm_context_start: bool) -> String {
+    let mut class = "provider-context-node".to_owned();
+    if visible {
+        class.push_str(" visible");
     }
+    if selected {
+        class.push_str(" selected");
+    }
+    if llm_context_start {
+        class.push_str(" llm-context-start");
+    }
+    class
 }
 
 #[component]
@@ -2286,6 +2295,38 @@ mod tests {
         assert!(provider.contains(deferred_id));
         assert!(provider.contains("Scroll to load node summary..."));
         assert!(provider.contains("aria-busy=\"true\""));
+    }
+
+    #[test]
+    fn provider_context_separates_the_llm_context_start_from_newer_nodes() {
+        let owner = Owner::new();
+        owner.set();
+        let newer_id = "11111111111111111111111111111111";
+        let selected_id = "22222222222222222222222222222222";
+        let older_id = "33333333333333333333333333333333";
+        let provider = view! {
+            <ProviderContextContent
+                graph_mode="all".to_owned()
+                payload=ProviderContextPayload {
+                    response: ProviderContextResponse::Found {
+                        context_target: "detail-context".to_owned(),
+                        previous_context_target: None,
+                        selected_id: selected_id.to_owned(),
+                        node_ids: vec![
+                            newer_id.to_owned(),
+                            selected_id.to_owned(),
+                            older_id.to_owned(),
+                        ],
+                        branches: Vec::new(),
+                    },
+                    items: Vec::new(),
+                }
+            />
+        }
+        .to_html();
+
+        assert_eq!(provider.matches("llm-context-start").count(), 1);
+        assert!(provider.contains("class=\"provider-context-node selected llm-context-start\""));
     }
 
     #[test]
