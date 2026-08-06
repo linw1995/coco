@@ -671,6 +671,28 @@ pub async fn load_nodes_by_exact_ids(
     node_rows_into_nodes(connection, path, rows).await
 }
 
+pub async fn load_failure_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+) -> Result<Vec<Node>> {
+    let rows = nodes::table
+        .filter(nodes::kind.eq("failure"))
+        .select(node_row_columns!())
+        .load::<NodeRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    let mut nodes = node_rows_into_nodes(connection, path, rows).await?;
+    nodes.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(nodes)
+}
+
 pub async fn load_child_ids_by_parent_ids(
     connection: &mut AsyncSqliteConnection,
     path: &Path,

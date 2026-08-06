@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 
 use crate::api::{
-    GraphBezierRoute, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode,
+    GraphBezierRoute, GraphErrorNode, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode,
     GraphViewportResponse,
 };
 
@@ -15,6 +15,8 @@ pub struct GraphCanvasModel {
     viewport_width: i32,
     viewport_height: i32,
     render_edge_hit_targets: bool,
+    error_links_are_local: bool,
+    error_nodes: Vec<GraphErrorNode>,
     nodes: Vec<RenderedNode>,
     edges: Vec<RenderedEdge>,
 }
@@ -54,7 +56,11 @@ struct RenderedEdge {
 }
 
 impl GraphCanvasModel {
-    pub fn new(render_edge_hit_targets: bool, response: &GraphViewportResponse) -> Self {
+    pub fn new(
+        render_edge_hit_targets: bool,
+        error_links_are_local: bool,
+        response: &GraphViewportResponse,
+    ) -> Self {
         Self {
             canvas_width: response.canvas.width,
             canvas_height: response.canvas.height,
@@ -63,6 +69,8 @@ impl GraphCanvasModel {
             viewport_width: response.viewport.width,
             viewport_height: response.viewport.height,
             render_edge_hit_targets,
+            error_links_are_local,
+            error_nodes: response.error_nodes.clone(),
             nodes: response.nodes.iter().map(RenderedNode::new).collect(),
             edges: response.edges.iter().map(RenderedEdge::new).collect(),
         }
@@ -122,6 +130,8 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
         viewport_width,
         viewport_height,
         render_edge_hit_targets,
+        error_links_are_local,
+        error_nodes,
         nodes,
         edges,
     } = graph;
@@ -130,16 +140,24 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
         .map(|edge| graph_edge_view(edge, render_edge_hit_targets))
         .collect_view();
     let nodes = nodes.into_iter().map(graph_node_view).collect_view();
+    let error_count = error_nodes.len();
+    let error_nodes = error_nodes
+        .into_iter()
+        .map(|node| error_node_view(node, error_links_are_local))
+        .collect_view();
 
     view! {
-        <div
-            class="graph-wrap virtual-graph"
-            tabindex="0"
-            data-viewport-x=viewport_x
-            data-viewport-y=viewport_y
-            data-canvas-width=canvas_width
-            data-zoom="1"
-        >
+        <div class="graph-controls">
+            <details class="error-node-popover">
+                <summary aria-label=format!("Error Nodes ({error_count})")>
+                    <span>"Error Nodes"</span>
+                    <span class="error-node-count">{error_count}</span>
+                </summary>
+                <div class="error-node-menu" role="list" aria-label="Error Nodes">
+                    <p class="error-node-empty" hidden=error_count != 0>"No error nodes"</p>
+                    <div class="error-node-list">{error_nodes}</div>
+                </div>
+            </details>
             <button
                 class="follow-toggle"
                 type="button"
@@ -148,6 +166,15 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
             >
                 "Follow"
             </button>
+        </div>
+        <div
+            class="graph-wrap virtual-graph"
+            tabindex="0"
+            data-viewport-x=viewport_x
+            data-viewport-y=viewport_y
+            data-canvas-width=canvas_width
+            data-zoom="1"
+        >
             <svg
                 class="graph"
                 role="img"
@@ -171,6 +198,32 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
             </svg>
             <div class="graph-status" hidden></div>
         </div>
+    }
+    .into_any()
+}
+
+fn error_node_view(node: GraphErrorNode, local: bool) -> AnyView {
+    let href = if local {
+        format!("#{}", node.node_target)
+    } else {
+        format!("/?mode=all#{}", node.node_target)
+    };
+    let created_at = node.created_at;
+    let datetime = created_at.clone();
+    view! {
+        <a
+            class="error-node-link"
+            href=href
+            data-node-x=node.point.x
+            data-node-y=node.point.y
+            role="listitem"
+        >
+            <span class="error-node-link-head">
+                <strong>{node.short_id}</strong>
+                <time datetime=datetime>{created_at}</time>
+            </span>
+            <span class="error-node-summary">{node.summary}</span>
+        </a>
     }
     .into_any()
 }

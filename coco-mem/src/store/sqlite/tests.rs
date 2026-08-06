@@ -864,6 +864,68 @@ async fn graph_read_api_loads_branches_nodes_and_children_in_bounded_calls() {
 }
 
 #[tokio::test]
+async fn graph_failure_nodes_are_ordered_newest_first() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let older = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Failure("older failure".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .append(NewNode {
+            parent: older.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text("not a failure".to_owned()),
+        })
+        .await
+        .unwrap();
+    let newer = store
+        .append(NewNode {
+            parent: older.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Failure("newer failure".to_owned()),
+        })
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&older)))
+        .set(nodes::created_at.eq("2026-08-06T09:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&newer)))
+        .set(nodes::created_at.eq("2026-08-06T09:00:00.001Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+
+    let failures = graph.graph_failure_nodes().await.unwrap();
+
+    assert_eq!(
+        failures
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![newer, older]
+    );
+    assert!(matches!(
+        failures[0].kind,
+        Kind::Failure(ref message) if message == "newer failure"
+    ));
+}
+
+#[tokio::test]
 async fn graph_branch_pages_are_ordered_and_mark_an_exact_final_page_complete() {
     let store = SqliteStore::open_temporary().await.unwrap();
     let root = store.root_id();
