@@ -5192,7 +5192,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn error_node_popover_renders_in_response_order_and_targets_graph_points() {
+    fn graph_items_error_node_popover_renders_in_response_order_and_targets_graph_points() {
         let fixture = GraphFixture::new();
         let document = fixture.graph.borrow().document.clone();
         sync_error_nodes(
