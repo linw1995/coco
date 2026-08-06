@@ -1417,9 +1417,10 @@ impl WebGraphRuntime {
                 .into_iter()
                 .filter_map(|node| {
                     let point = points.remove(&node.id)?;
-                    let Kind::Failure(summary) = node.kind else {
+                    if !matches!(&node.kind, Kind::Failure(_)) {
                         return None;
-                    };
+                    }
+                    let summary = summarize_node(&node);
                     Some(GraphErrorNode {
                         node_target: node_target_id(&node.id),
                         short_id: shorten_id(&node.id),
@@ -3067,6 +3068,9 @@ mod tests {
     async fn viewport_indexes_error_nodes_newest_first_with_all_layout_points() {
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
+        let newer_failure = format!("newer failure {}", "x".repeat(500));
+        let expected_summary =
+            format!("{}...", newer_failure.chars().take(140).collect::<String>());
         let older = writer
             .append(NewNode {
                 parent: root,
@@ -3081,7 +3085,7 @@ mod tests {
                 parent: older.clone(),
                 role: Role::System,
                 metadata: None,
-                kind: Kind::Failure("newer failure".to_owned()),
+                kind: Kind::Failure(newer_failure),
             })
             .await
             .unwrap();
@@ -3103,7 +3107,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![newer.as_str(), older.as_str()]
         );
-        assert_eq!(viewport.error_nodes[0].summary, "newer failure");
+        assert_eq!(viewport.error_nodes[0].summary, expected_summary);
         let placements = runtime
             .store
             .node_placements(
