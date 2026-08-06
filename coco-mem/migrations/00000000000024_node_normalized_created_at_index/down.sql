@@ -1,0 +1,1 @@
+DROP INDEX nodes_kind_normalized_created_at_id_idx;
