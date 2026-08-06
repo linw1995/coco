@@ -7,6 +7,10 @@ use crate::api::{
     GraphViewportResponse,
 };
 
+pub(crate) const GRAPH_FOCUS_TARGET_QUERY: &str = "graph_focus_target";
+pub(crate) const GRAPH_FOCUS_X_QUERY: &str = "graph_focus_x";
+pub(crate) const GRAPH_FOCUS_Y_QUERY: &str = "graph_focus_y";
+
 pub struct GraphCanvasModel {
     canvas_width: i32,
     canvas_height: i32,
@@ -143,7 +147,7 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
     let error_count = error_nodes.len();
     let error_nodes = error_nodes
         .into_iter()
-        .map(|node| error_node_view(node, error_links_are_local))
+        .map(|node| view! { <ErrorNodeItem node local=error_links_are_local/> })
         .collect_view();
 
     view! {
@@ -202,12 +206,9 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
     .into_any()
 }
 
-fn error_node_view(node: GraphErrorNode, local: bool) -> AnyView {
-    let href = if local {
-        format!("#{}", node.node_target)
-    } else {
-        format!("/?mode=all#{}", node.node_target)
-    };
+#[component]
+fn ErrorNodeItem(node: GraphErrorNode, local: bool) -> impl IntoView {
+    let href = error_node_href(&node, local);
     let created_at = node.created_at;
     let datetime = created_at.clone();
     view! {
@@ -225,7 +226,19 @@ fn error_node_view(node: GraphErrorNode, local: bool) -> AnyView {
             <span class="error-node-summary">{node.summary}</span>
         </a>
     }
-    .into_any()
+}
+
+pub(crate) fn error_node_href(node: &GraphErrorNode, local: bool) -> String {
+    if local {
+        return format!("#{}", node.node_target);
+    }
+    format!(
+        "/?mode=all&{GRAPH_FOCUS_TARGET_QUERY}={}&{GRAPH_FOCUS_X_QUERY}={}&{GRAPH_FOCUS_Y_QUERY}={}#{}",
+        percent_encode(&node.node_target),
+        node.point.x,
+        node.point.y,
+        node.node_target,
+    )
 }
 
 #[component]

@@ -564,6 +564,12 @@ mod tests {
                 },
             }],
         };
+        let anchors_href = crate::graph_render::error_node_href(&viewport.error_nodes[0], false);
+        assert!(anchors_href.contains("mode=all"));
+        assert!(anchors_href.contains("graph_focus_target=detail-failed"));
+        assert!(anchors_href.contains("graph_focus_x=2100"));
+        assert!(anchors_href.contains("graph_focus_y=240"));
+
         let page = render_index_page(ViewMode::All, viewport, None);
 
         assert!(page.contains("data-version=\"7\""));

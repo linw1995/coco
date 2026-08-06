@@ -23,7 +23,8 @@ use crate::api::{
 #[cfg(test)]
 use crate::graph_render::truncate_label;
 use crate::graph_render::{
-    bezier_path, edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style,
+    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
+    edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
     node_group_class, node_label, node_title_text, percent_encode, render_element_id,
 };
 use crate::panels::{
@@ -1552,11 +1553,7 @@ fn error_node_link_element(
     node: GraphErrorNode,
 ) -> Result<Element, JsValue> {
     let link = document.create_element("a")?;
-    let href = if graph_mode == "all" {
-        format!("#{}", node.node_target)
-    } else {
-        format!("/?mode=all#{}", node.node_target)
-    };
+    let href = error_node_href(&node, graph_mode == "all");
     set_attributes(
         &link,
         [
@@ -3151,6 +3148,68 @@ fn detail_hash(selection: &PanelSelection) -> Option<String> {
     Some(format!("#{target}{context}"))
 }
 
+#[derive(Default)]
+struct GraphFocusQuery {
+    target: Option<String>,
+    x: Option<String>,
+    y: Option<String>,
+    remaining: Vec<(String, String)>,
+    present: bool,
+}
+
+impl GraphFocusQuery {
+    fn parse(search: &str) -> Self {
+        let mut query = Self::default();
+        for (name, value) in url::form_urlencoded::parse(search.trim_start_matches('?').as_bytes())
+        {
+            match name.as_ref() {
+                GRAPH_FOCUS_TARGET_QUERY => query.target = Some(value.into_owned()),
+                GRAPH_FOCUS_X_QUERY => query.x = Some(value.into_owned()),
+                GRAPH_FOCUS_Y_QUERY => query.y = Some(value.into_owned()),
+                _ => {
+                    query
+                        .remaining
+                        .push((name.into_owned(), value.into_owned()));
+                    continue;
+                }
+            }
+            query.present = true;
+        }
+        query
+    }
+
+    fn point(&self, selected_target: Option<&str>) -> Option<Point> {
+        (self.target.as_deref()? == selected_target?).then_some(Point {
+            x: self.x.as_deref()?.parse().ok()?,
+            y: self.y.as_deref()?.parse().ok()?,
+        })
+    }
+}
+
+fn take_graph_focus_point(
+    window: &Window,
+    selected_target: Option<&str>,
+) -> Result<Option<Point>, JsValue> {
+    let query = GraphFocusQuery::parse(&window.location().search()?);
+    if !query.present {
+        return Ok(None);
+    }
+    let point = query.point(selected_target);
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(query.remaining);
+    let search = serializer.finish();
+    let search = (!search.is_empty()).then(|| format!("?{search}"));
+    let url = format!(
+        "{}{}",
+        search.unwrap_or_default(),
+        window.location().hash()?
+    );
+    window
+        .history()?
+        .replace_state_with_url(&JsValue::NULL, "", Some(&url))?;
+    Ok(point)
+}
+
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
     let point = {
         let graph = graph.borrow();
@@ -3162,11 +3221,19 @@ fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
             .anchor_range
             .as_ref()
             .map(|expansion| expansion.transform);
-        match selected_graph_focus_point(&graph.window, &graph.document, transform) {
+        let selected_target = selected_node_target(&graph.window);
+        let link_point = match take_graph_focus_point(&graph.window, selected_target.as_deref()) {
             Ok(point) => point,
             Err(error) => {
                 web_sys::console::error_1(&error);
                 None
+            }
+        };
+        match selected_graph_focus_point(&graph.window, &graph.document, transform) {
+            Ok(point) => point.or(link_point),
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                link_point
             }
         }
     };
@@ -4577,6 +4644,43 @@ mod tests {
         let selection = selected_panel_selection(&window);
         assert_eq!(selection.target.as_deref(), Some("detail-feature?x"));
         assert_eq!(selection.context.as_deref(), Some("detail-root&y"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_cross_mode_error_node_focus_is_consumed_after_navigation() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some(
+                    "?mode=all&graph_focus_target=detail-offscreen&graph_focus_x=320&graph_focus_y=180#detail-offscreen",
+                ),
+            )
+            .expect_throw("cross-mode error node URL should be set");
+
+        sync_initial_detail_url(&window).expect_throw("detail URL should canonicalize");
+        let selected = selected_node_target(&window);
+        assert_eq!(
+            take_graph_focus_point(&window, selected.as_deref())
+                .expect_throw("error node focus should be consumed"),
+            Some(Point { x: 320, y: 180 })
+        );
+
+        let search = window
+            .location()
+            .search()
+            .expect_throw("search should exist");
+        assert!(search.contains("mode=all"));
+        assert!(search.contains("target=detail-offscreen"));
+        assert!(!search.contains("graph_focus_"));
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-offscreen"
+        );
     }
 
     #[wasm_bindgen_test]
