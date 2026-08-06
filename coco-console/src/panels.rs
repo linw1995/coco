@@ -482,13 +482,13 @@ fn NodeDetail(
                 {parent.map(|parent| view! {
                     <div class="node-detail-meta-wide">
                         <dt>"Parent"</dt>
-                        <dd><code>{parent}</code></dd>
+                        <ParentRef label="Parent".to_owned() node_id=parent/>
                     </div>
                 })}
                 {merge_parents.into_iter().map(|(kind, node_id)| view! {
                     <div class="node-detail-meta-wide">
                         <dt>{format!("{kind} parent")}</dt>
-                        <dd><code>{node_id}</code></dd>
+                        <ParentRef label=format!("{kind} parent") node_id/>
                     </div>
                 }).collect::<Vec<_>>()}
             </dl>
@@ -500,6 +500,20 @@ fn NodeDetail(
                 tool_input_json_highlights
             />
         </section>
+    }
+}
+
+#[component]
+fn ParentRef(label: String, node_id: String) -> impl IntoView {
+    let href = format!("#{NODE_TARGET_PREFIX}{node_id}");
+    let aria_label = format!("Jump to {label}: {node_id}");
+    let title = node_id.clone();
+
+    view! {
+        <dd class="node-detail-parent-ref">
+            <code title=title>{node_id}</code>
+            <a class="node-detail-parent-link" href=href aria-label=aria_label>"Jump"</a>
+        </dd>
     }
 }
 
@@ -1972,7 +1986,7 @@ fn test_json_range(source: &str, text: &str, kind: JsonHighlightKind) -> JsonHig
 mod tests {
     use super::*;
     use crate::api::ProviderContextNode;
-    use coco_types::{Anchor, PromptAnchor, SessionRole, SkillResultAnchor};
+    use coco_types::{Anchor, MergeParent, PromptAnchor, SessionRole, SkillResultAnchor};
 
     fn test_node(kind: Kind) -> Node {
         serde_json::from_value(serde_json::json!({
@@ -2355,6 +2369,49 @@ mod tests {
         .to_html();
         assert!(failed.contains("Failed to load node summary."));
         assert!(!failed.contains("aria-busy=\"true\""));
+    }
+
+    #[test]
+    fn node_detail_parent_refs_link_to_each_parent() {
+        let node = test_node(Kind::Anchor(Anchor::prompt(
+            vec![
+                MergeParent::merge("merge-node"),
+                MergeParent::shadow("shadow-node"),
+            ],
+            PromptAnchor {
+                prompt: "Follow the parent refs".to_owned(),
+                attachments: Vec::new(),
+            },
+        )));
+        let detail = view! {
+            <NodeDetail
+                node
+                markdown_documents=Vec::new()
+                tool_use_input_links=Vec::new()
+                tool_input_shell_highlights=Vec::new()
+                tool_input_json_highlights=Vec::new()
+            />
+        }
+        .to_html();
+
+        assert_eq!(
+            detail.matches(r#"class="node-detail-parent-link""#).count(),
+            3
+        );
+        for (label, node_id) in [
+            ("Parent", "parent-node"),
+            ("Merge parent", "merge-node"),
+            ("Shadow parent", "shadow-node"),
+        ] {
+            assert!(
+                detail.contains(&format!(r##"href="#detail-{node_id}""##)),
+                "{detail}"
+            );
+            assert!(
+                detail.contains(&format!(r#"aria-label="Jump to {label}: {node_id}""#)),
+                "{detail}"
+            );
+        }
     }
 
     #[test]
