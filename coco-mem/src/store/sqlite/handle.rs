@@ -324,9 +324,10 @@ impl SqliteGraphStore {
         load_nodes_by_exact_ids(&mut connection, &self.database_path, ids).await
     }
 
-    pub async fn graph_failure_nodes(&self) -> Result<Vec<Node>> {
+    pub async fn graph_failure_nodes(&self, limit: NonZeroUsize) -> Result<Vec<Node>> {
+        ensure_graph_read_batch_size(limit.get())?;
         let mut connection = self.connect().await?;
-        load_failure_nodes(&mut connection, &self.database_path).await
+        load_failure_nodes(&mut connection, &self.database_path, limit.get()).await
     }
 
     pub async fn graph_primary_child_ids(

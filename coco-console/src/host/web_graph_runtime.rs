@@ -57,6 +57,7 @@ const CATCH_UP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const CATCH_UP_SOURCE_PAGE_SIZE: usize = GRAPH_READ_BATCH_SIZE;
 // Full node payloads can be large, so release the source connection between small batches.
 const SOURCE_NODE_HYDRATION_BATCH_SIZE: usize = 16;
+const ERROR_NODE_LIMIT: usize = 100;
 
 #[derive(Clone)]
 pub(crate) struct WebGraphRuntime {
@@ -1373,7 +1374,9 @@ impl WebGraphRuntime {
     ) -> crate::Result<Option<Vec<GraphErrorNode>>> {
         let failures = self
             .source
-            .graph_failure_nodes()
+            .graph_failure_nodes(
+                NonZeroUsize::new(ERROR_NODE_LIMIT).expect("error node limit is non-zero"),
+            )
             .await
             .context(StoreSnafu)?;
         let mut points = BTreeMap::new();

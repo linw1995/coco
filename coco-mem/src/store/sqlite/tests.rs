@@ -910,14 +910,17 @@ async fn graph_failure_nodes_are_ordered_newest_first() {
         .await
         .unwrap();
 
-    let failures = graph.graph_failure_nodes().await.unwrap();
+    let failures = graph
+        .graph_failure_nodes(NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
 
     assert_eq!(
         failures
             .iter()
             .map(|node| node.id.as_str())
             .collect::<Vec<_>>(),
-        vec![newer, older]
+        vec![newer]
     );
     assert!(matches!(
         failures[0].kind,
