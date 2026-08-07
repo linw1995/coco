@@ -250,6 +250,7 @@ pub struct GraphViewportResponse {
     pub version: u64,
     pub canvas: GraphCanvas,
     pub viewport: GraphViewport,
+    pub error_nodes: Vec<GraphErrorNode>,
     pub nodes: Vec<GraphViewportNode>,
     pub edges: Vec<GraphViewportEdge>,
 }
@@ -260,9 +261,20 @@ pub struct GraphViewportDiffResponse {
     pub canvas: GraphCanvas,
     pub previous_viewport: GraphViewport,
     pub viewport: GraphViewport,
+    pub error_nodes: Vec<GraphErrorNode>,
     pub added: GraphViewportItems,
     pub updated: GraphViewportItems,
     pub removed: Vec<GraphViewportRemovedItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GraphErrorNode {
+    pub id: String,
+    pub node_target: String,
+    pub short_id: String,
+    pub created_at: String,
+    pub summary: String,
+    pub point: Point,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]

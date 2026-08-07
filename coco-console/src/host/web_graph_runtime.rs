@@ -5,7 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use coco_mem::{
-    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Node, NodeStore, SqliteGraphStore,
+    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Kind, Node, NodeStore,
+    SqliteGraphStore,
 };
 use snafu::{IntoError, prelude::*};
 use tokio::sync::watch;
@@ -36,8 +37,9 @@ use super::web_graph_view::{
     provider_context_id, route_edge, route_edge_with_offsets, shorten_id, summarize_node,
 };
 use crate::api::{
-    GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
-    GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse, Point as ApiPoint,
+    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphViewport, GraphViewportDiffResponse,
+    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse,
+    Point as ApiPoint,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::web_graph::{
@@ -55,6 +57,7 @@ const CATCH_UP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const CATCH_UP_SOURCE_PAGE_SIZE: usize = GRAPH_READ_BATCH_SIZE;
 // Full node payloads can be large, so release the source connection between small batches.
 const SOURCE_NODE_HYDRATION_BATCH_SIZE: usize = 16;
+const ERROR_NODE_LIMIT: usize = 100;
 
 #[derive(Clone)]
 pub(crate) struct WebGraphRuntime {
@@ -1348,16 +1351,87 @@ impl WebGraphRuntime {
         }
         let edges = routes.into_iter().map(viewport_edge).collect();
         let canvas = canvas.context(WebGraphNotInitializedSnafu)?;
+        let revision = revision.context(WebGraphNotInitializedSnafu)?;
+        let Some(error_nodes) = self.error_nodes_once(revision).await? else {
+            return Ok(None);
+        };
         Ok(Some(GraphViewportResponse {
-            version: revision.context(WebGraphNotInitializedSnafu)?.get(),
+            version: revision.get(),
             canvas: GraphCanvas {
                 width: canvas.width,
                 height: canvas.height,
             },
             viewport: graph_viewport(request),
+            error_nodes,
             nodes,
             edges,
         }))
+    }
+
+    async fn error_nodes_once(
+        &self,
+        revision: Revision,
+    ) -> crate::Result<Option<Vec<GraphErrorNode>>> {
+        let failures = self
+            .source
+            .graph_failure_nodes(
+                NonZeroUsize::new(ERROR_NODE_LIMIT).expect("error node limit is non-zero"),
+            )
+            .await
+            .context(StoreSnafu)?;
+        let mut points = BTreeMap::new();
+        for chunk in failures.chunks(GRAPH_READ_BATCH_SIZE) {
+            let node_ids = chunk
+                .iter()
+                .map(|node| NodeId::new(node.id.clone()).context(WebGraphModelSnafu))
+                .collect::<crate::Result<Vec<_>>>()?;
+            let placements = self
+                .store
+                .node_placements(LayoutKind::All, &node_ids)
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            if placements.state.revision != revision {
+                return Ok(None);
+            }
+            points.extend(
+                placements
+                    .value
+                    .into_iter()
+                    .map(|placement| (placement.node.to_string(), placement.point)),
+            );
+        }
+        if failures.is_empty() {
+            let state = self
+                .store
+                .state()
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            if state.revision != revision {
+                return Ok(None);
+            }
+        }
+        Ok(Some(
+            failures
+                .into_iter()
+                .filter_map(|node| {
+                    let point = points.remove(&node.id)?;
+                    if !matches!(&node.kind, Kind::Failure(_)) {
+                        return None;
+                    }
+                    let summary = summarize_node(&node);
+                    Some(GraphErrorNode {
+                        node_target: node_target_id(&node.id),
+                        short_id: shorten_id(&node.id),
+                        id: node.id,
+                        created_at: node.created_at.to_string(),
+                        summary,
+                        point: api_point(point),
+                    })
+                })
+                .collect(),
+        ))
     }
 
     async fn ensure_source_node(
@@ -2476,6 +2550,7 @@ fn empty_viewport_response(
         version,
         canvas,
         viewport: graph_viewport(request),
+        error_nodes: Vec::new(),
         nodes: Vec::new(),
         edges: Vec::new(),
     }
@@ -2987,6 +3062,69 @@ mod tests {
             lower_route.route.target.y,
             after[&lower_child_id].y + edge_port_offset(0, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn viewport_indexes_error_nodes_newest_first_with_all_layout_points() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let newer_failure = format!("newer failure {}", "x".repeat(500));
+        let expected_summary =
+            format!("{}...", newer_failure.chars().take(140).collect::<String>());
+        let older = writer
+            .append(NewNode {
+                parent: root,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Failure("older failure".to_owned()),
+            })
+            .await
+            .unwrap();
+        let newer = writer
+            .append(NewNode {
+                parent: older.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Failure(newer_failure),
+            })
+            .await
+            .unwrap();
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let viewport = runtime
+            .viewport(ViewMode::Anchors, complete_viewport())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            viewport
+                .error_nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![newer.as_str(), older.as_str()]
+        );
+        assert_eq!(viewport.error_nodes[0].summary, expected_summary);
+        let placements = runtime
+            .store
+            .node_placements(
+                LayoutKind::All,
+                &[
+                    NodeId::new(newer.clone()).unwrap(),
+                    NodeId::new(older).unwrap(),
+                ],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .into_iter()
+            .map(|placement| (placement.node.to_string(), api_point(placement.point)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(viewport.error_nodes[0].point, placements[&newer]);
     }
 
     #[tokio::test]

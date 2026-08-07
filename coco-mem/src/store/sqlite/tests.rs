@@ -58,6 +58,12 @@ struct JobSummaryRow {
     status: String,
 }
 
+#[derive(diesel::QueryableByName)]
+struct QueryPlanDetail {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    detail: String,
+}
+
 fn session_anchor_node(parent: &str) -> NewNode {
     NewNode {
         parent: parent.to_owned(),
@@ -860,6 +866,95 @@ async fn graph_read_api_loads_branches_nodes_and_children_in_bounded_calls() {
             .unwrap()
             .get(&root),
         Some(&vec![child])
+    );
+}
+
+#[tokio::test]
+async fn graph_failure_nodes_are_ordered_newest_first() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let older = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Failure("older failure".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .append(NewNode {
+            parent: older.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text("not a failure".to_owned()),
+        })
+        .await
+        .unwrap();
+    let newer = store
+        .append(NewNode {
+            parent: older.clone(),
+            role: Role::System,
+            metadata: None,
+            kind: Kind::Failure("newer failure".to_owned()),
+        })
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&older)))
+        .set(nodes::created_at.eq("2026-08-06T09:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::update(nodes::table.filter(nodes::id.eq(&newer)))
+        .set(nodes::created_at.eq("2026-08-06T09:00:00.001Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+
+    let failures = graph
+        .graph_failure_nodes(NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        failures
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![newer]
+    );
+    assert!(matches!(
+        failures[0].kind,
+        Kind::Failure(ref message) if message == "newer failure"
+    ));
+
+    let mut connection = store.connect().await.unwrap();
+    let query_plan = diesel::sql_query(
+        "EXPLAIN QUERY PLAN
+         SELECT id FROM nodes
+         WHERE kind = 'failure'
+         ORDER BY
+             CAST(strftime('%s', created_at) AS INTEGER) DESC,
+             CASE WHEN instr(created_at, '.') = 0 THEN 0 ELSE CAST(substr(replace(substr(created_at, instr(created_at, '.') + 1), 'Z', '') || '000000000', 1, 9) AS INTEGER) END DESC,
+             id DESC
+         LIMIT 100",
+    )
+    .load::<QueryPlanDetail>(&mut connection)
+    .await
+    .unwrap();
+    assert!(query_plan.iter().any(|row| {
+        row.detail
+            .contains("USING COVERING INDEX nodes_kind_normalized_created_at_id_idx")
+    }));
+    assert!(
+        query_plan
+            .iter()
+            .all(|row| !row.detail.contains("USE TEMP B-TREE"))
     );
 }
 

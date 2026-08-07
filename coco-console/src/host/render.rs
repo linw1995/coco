@@ -85,7 +85,7 @@ fn GraphPage(
     let revision = viewport.version;
     let stats = format!("{} / revision {}", mode.label(), revision);
     let graph_mode = mode.as_query_value().to_owned();
-    let graph = GraphCanvasModel::new(mode == ViewMode::Anchors, &viewport);
+    let graph = GraphCanvasModel::new(mode == ViewMode::Anchors, mode == ViewMode::All, &viewport);
     view! {
         <main
             id="console-root"
@@ -512,8 +512,8 @@ fn EmptyTimeScale() -> impl IntoView {
 mod tests {
     use super::*;
     use crate::api::{
-        GraphBezierRoute, GraphCanvas, GraphViewport, GraphViewportEdge, GraphViewportEdgeKind,
-        GraphViewportNode, Point,
+        GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphViewport, GraphViewportEdge,
+        GraphViewportEdgeKind, GraphViewportNode, Point,
     };
     use coco_types::{SkillScript, SkillUpdatePatch, SkillVersionSpec};
 
@@ -532,6 +532,14 @@ mod tests {
                 height: 720,
                 overscan: 180,
             },
+            error_nodes: vec![GraphErrorNode {
+                id: "failed".to_owned(),
+                node_target: "detail-failed".to_owned(),
+                short_id: "failed".to_owned(),
+                created_at: "2026-08-06T09:00:00Z".to_owned(),
+                summary: "backend unavailable".to_owned(),
+                point: Point { x: 2100, y: 240 },
+            }],
             nodes: vec![GraphViewportNode {
                 key: "node:latest".to_owned(),
                 id: "latest".to_owned(),
@@ -556,6 +564,12 @@ mod tests {
                 },
             }],
         };
+        let anchors_href = crate::graph_render::error_node_href(&viewport.error_nodes[0], false);
+        assert!(anchors_href.contains("mode=all"));
+        assert!(anchors_href.contains("graph_focus_target=detail-failed"));
+        assert!(anchors_href.contains("graph_focus_x=2100"));
+        assert!(anchors_href.contains("graph_focus_y=240"));
+
         let page = render_index_page(ViewMode::All, viewport, None);
 
         assert!(page.contains("data-version=\"7\""));
@@ -567,6 +581,10 @@ mod tests {
         assert!(page.contains("preserveAspectRatio=\"xMaxYMin meet\""));
         assert!(page.contains("width=\"2400\" height=\"900\""));
         assert!(page.contains("data-node-id=\"latest\""));
+        assert!(page.contains("Error Nodes"));
+        assert!(page.contains("href=\"#detail-failed\""));
+        assert!(page.contains("backend unavailable"));
+        assert!(page.contains("data-node-x=\"2100\""));
         assert!(page.contains("data-render-key=\"edge:latest\""));
         assert!(!page.contains("Loading graph..."));
         assert!(page.contains(&format!("/pkg/{CLIENT_ASSET_VERSION}/coco_console.js")));

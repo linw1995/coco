@@ -329,6 +329,7 @@ pub fn diff_graph_viewport_responses(
     current: GraphViewportResponse,
     known: Option<&GraphViewportKnownItems>,
 ) -> GraphViewportDiffResponse {
+    let error_nodes = current.error_nodes.clone();
     let (known_node_keys, known_node_fingerprints) = known.map_or_else(
         || {
             item_state(
@@ -396,6 +397,7 @@ pub fn diff_graph_viewport_responses(
         canvas: current.canvas,
         previous_viewport: previous.viewport,
         viewport: current.viewport,
+        error_nodes,
         added: GraphViewportItems {
             nodes: added_nodes,
             edges: added_edges,
@@ -489,6 +491,7 @@ mod tests {
                 height: 100,
                 overscan: 0,
             },
+            error_nodes: Vec::new(),
             nodes,
             edges: Vec::new(),
         }

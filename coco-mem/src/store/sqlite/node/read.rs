@@ -5,6 +5,8 @@ diesel::table! {
     nodes_with_rowid (id) {
         rowid -> BigInt,
         id -> Text,
+        created_at -> Text,
+        kind -> Text,
     }
 }
 
@@ -669,6 +671,41 @@ pub async fn load_nodes_by_exact_ids(
         }
     );
     node_rows_into_nodes(connection, path, rows).await
+}
+
+pub async fn load_failure_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<Node>> {
+    let second = diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "CAST(strftime('%s', created_at) AS INTEGER)",
+    );
+    let nanosecond = diesel::dsl::sql::<diesel::sql_types::BigInt>(
+        "CASE WHEN instr(created_at, '.') = 0 THEN 0 ELSE CAST(substr(replace(substr(created_at, instr(created_at, '.') + 1), 'Z', '') || '000000000', 1, 9) AS INTEGER) END",
+    );
+    let ids = nodes_with_rowid::table
+        .filter(nodes_with_rowid::kind.eq("failure"))
+        .select(nodes_with_rowid::id)
+        .order((
+            second.desc(),
+            nanosecond.desc(),
+            nodes_with_rowid::id.desc(),
+        ))
+        .limit(i64::try_from(limit).expect("graph failure node limit should fit in i64"))
+        .load::<String>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    let mut nodes = load_nodes_by_exact_ids(connection, path, &ids).await?;
+    nodes.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(nodes)
 }
 
 pub async fn load_child_ids_by_parent_ids(

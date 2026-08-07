@@ -16,14 +16,15 @@ use super::refresh::{
     pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
 use crate::api::{
-    AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphViewport,
-    GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportItems,
-    GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
+    AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphErrorNode,
+    GraphViewport, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
+    GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
 #[cfg(test)]
 use crate::graph_render::truncate_label;
 use crate::graph_render::{
-    bezier_path, edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style,
+    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
+    edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
     node_group_class, node_label, node_title_text, percent_encode, render_element_id,
 };
 use crate::panels::{
@@ -454,6 +455,7 @@ impl VirtualGraph {
             version,
             canvas,
             viewport,
+            error_nodes,
             nodes,
             edges,
         } = response;
@@ -461,6 +463,7 @@ impl VirtualGraph {
         clear_children(&self.node_group);
         self.rendered = RenderedKeys::new();
         self.apply_response_viewport(version, canvas, viewport)?;
+        sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
         self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
         self.sync_anchor_range()?;
         self.sync_svg_viewport();
@@ -474,12 +477,14 @@ impl VirtualGraph {
             version,
             canvas,
             viewport,
+            error_nodes,
             added,
             updated,
             removed,
             ..
         } = response;
         self.apply_response_viewport(version, canvas, viewport)?;
+        sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
         self.sync_anchor_range()?;
@@ -1510,6 +1515,72 @@ impl VirtualGraphElements {
 
 fn query_optional(document: &Document, selector: &str) -> Option<Element> {
     document.query_selector(selector).ok().flatten()
+}
+
+fn sync_error_nodes(
+    document: &Document,
+    graph_mode: &str,
+    error_nodes: Vec<GraphErrorNode>,
+) -> Result<(), JsValue> {
+    let Some(list) = query_optional(document, ".error-node-list") else {
+        return Ok(());
+    };
+    let count = error_nodes.len();
+    if let Some(count_element) = query_optional(document, ".error-node-count") {
+        count_element.set_text_content(Some(&count.to_string()));
+    }
+    if let Some(summary) = query_optional(document, ".error-node-popover summary") {
+        summary.set_attribute("aria-label", &format!("Error Nodes ({count})"))?;
+    }
+    if let Some(empty) = query_optional(document, ".error-node-empty") {
+        if count == 0 {
+            empty.remove_attribute("hidden")?;
+        } else {
+            empty.set_attribute("hidden", "hidden")?;
+        }
+    }
+    clear_children(&list);
+    for node in error_nodes {
+        let link = error_node_link_element(document, graph_mode, node)?;
+        list.append_child(&link)?;
+    }
+    Ok(())
+}
+
+fn error_node_link_element(
+    document: &Document,
+    graph_mode: &str,
+    node: GraphErrorNode,
+) -> Result<Element, JsValue> {
+    let link = document.create_element("a")?;
+    let href = error_node_href(&node, graph_mode == "all");
+    set_attributes(
+        &link,
+        [
+            ("class", "error-node-link".to_owned()),
+            ("href", href),
+            ("data-node-x", node.point.x.to_string()),
+            ("data-node-y", node.point.y.to_string()),
+            ("role", "listitem".to_owned()),
+        ],
+    )?;
+
+    let head = document.create_element("span")?;
+    head.set_attribute("class", "error-node-link-head")?;
+    let id = document.create_element("strong")?;
+    id.set_text_content(Some(&node.short_id));
+    head.append_child(&id)?;
+    let time = document.create_element("time")?;
+    time.set_attribute("datetime", &node.created_at)?;
+    time.set_text_content(Some(&node.created_at));
+    head.append_child(&time)?;
+    link.append_child(&head)?;
+
+    let summary = document.create_element("span")?;
+    summary.set_attribute("class", "error-node-summary")?;
+    summary.set_text_content(Some(&node.summary));
+    link.append_child(&summary)?;
+    Ok(link)
 }
 
 fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, JsValue> {
@@ -2902,11 +2973,35 @@ fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), 
 
         event.prevent_default();
         event.stop_propagation();
+        close_error_node_popover(&link);
+        if let Some(point) = error_node_link_point(&link) {
+            update_viewport(detail_graph.clone(), |graph| {
+                if graph.auto_follow
+                    && let Err(error) = graph.set_auto_follow(false)
+                {
+                    web_sys::console::error_1(&error);
+                }
+                center_viewport_on_graph_point(graph, point);
+            });
+        }
         select_detail_link(detail_graph.clone(), hash);
     });
     document.add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
     detail_closure.forget();
     Ok(())
+}
+
+fn error_node_link_point(link: &Element) -> Option<Point> {
+    Some(Point {
+        x: rounded_i32(numeric_attribute(link, "data-node-x")?),
+        y: rounded_i32(numeric_attribute(link, "data-node-y")?),
+    })
+}
+
+fn close_error_node_popover(link: &Element) {
+    if let Some(popover) = link.closest(".error-node-popover").ok().flatten() {
+        let _ = popover.remove_attribute("open");
+    }
 }
 
 fn detail_link_from_event(event: &MouseEvent) -> Option<Element> {
@@ -3053,6 +3148,68 @@ fn detail_hash(selection: &PanelSelection) -> Option<String> {
     Some(format!("#{target}{context}"))
 }
 
+#[derive(Default)]
+struct GraphFocusQuery {
+    target: Option<String>,
+    x: Option<String>,
+    y: Option<String>,
+    remaining: Vec<(String, String)>,
+    present: bool,
+}
+
+impl GraphFocusQuery {
+    fn parse(search: &str) -> Self {
+        let mut query = Self::default();
+        for (name, value) in url::form_urlencoded::parse(search.trim_start_matches('?').as_bytes())
+        {
+            match name.as_ref() {
+                GRAPH_FOCUS_TARGET_QUERY => query.target = Some(value.into_owned()),
+                GRAPH_FOCUS_X_QUERY => query.x = Some(value.into_owned()),
+                GRAPH_FOCUS_Y_QUERY => query.y = Some(value.into_owned()),
+                _ => {
+                    query
+                        .remaining
+                        .push((name.into_owned(), value.into_owned()));
+                    continue;
+                }
+            }
+            query.present = true;
+        }
+        query
+    }
+
+    fn point(&self, selected_target: Option<&str>) -> Option<Point> {
+        (self.target.as_deref()? == selected_target?).then_some(Point {
+            x: self.x.as_deref()?.parse().ok()?,
+            y: self.y.as_deref()?.parse().ok()?,
+        })
+    }
+}
+
+fn take_graph_focus_point(
+    window: &Window,
+    selected_target: Option<&str>,
+) -> Result<Option<Point>, JsValue> {
+    let query = GraphFocusQuery::parse(&window.location().search()?);
+    if !query.present {
+        return Ok(None);
+    }
+    let point = query.point(selected_target);
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(query.remaining);
+    let search = serializer.finish();
+    let search = (!search.is_empty()).then(|| format!("?{search}"));
+    let url = format!(
+        "{}{}",
+        search.unwrap_or_default(),
+        window.location().hash()?
+    );
+    window
+        .history()?
+        .replace_state_with_url(&JsValue::NULL, "", Some(&url))?;
+    Ok(point)
+}
+
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
     let point = {
         let graph = graph.borrow();
@@ -3064,11 +3221,19 @@ fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
             .anchor_range
             .as_ref()
             .map(|expansion| expansion.transform);
-        match selected_graph_focus_point(&graph.window, &graph.document, transform) {
+        let selected_target = selected_node_target(&graph.window);
+        let link_point = match take_graph_focus_point(&graph.window, selected_target.as_deref()) {
             Ok(point) => point,
             Err(error) => {
                 web_sys::console::error_1(&error);
                 None
+            }
+        };
+        match selected_graph_focus_point(&graph.window, &graph.document, transform) {
+            Ok(point) => point.or(link_point),
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                link_point
             }
         }
     };
@@ -3544,6 +3709,15 @@ mod tests {
             root.set_inner_html(
                 r#"
                 <main id="console-root" data-version="0" data-graph-mode="anchors">
+                  <div class="graph-controls">
+                    <details class="error-node-popover">
+                      <summary><span>Error Nodes</span><span class="error-node-count">0</span></summary>
+                      <div class="error-node-menu">
+                        <p class="error-node-empty">No error nodes</p>
+                        <div class="error-node-list"></div>
+                      </div>
+                    </details>
+                  </div>
                   <div class="graph-wrap" data-zoom="1">
                     <button class="follow-toggle" type="button" aria-pressed="false">Follow</button>
                     <svg class="graph">
@@ -3830,6 +4004,7 @@ mod tests {
                     },
                     previous_viewport: response_viewport,
                     viewport: response_viewport,
+                    error_nodes: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
                     removed: Vec::new(),
@@ -4090,6 +4265,7 @@ mod tests {
                         height: 280,
                     },
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     nodes: vec![
                         graph_node("source", 100, 80),
                         graph_node("target", 212, 80),
@@ -4136,6 +4312,7 @@ mod tests {
                     },
                     previous_viewport: viewport(),
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
                         nodes: vec![
@@ -4220,6 +4397,7 @@ mod tests {
                     },
                     previous_viewport: viewport(),
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
                     removed: vec![
@@ -4277,6 +4455,7 @@ mod tests {
                     },
                     previous_viewport: viewport(),
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     added: GraphViewportItems {
                         nodes: vec![
                             graph_node("target", 280, 160),
@@ -4323,6 +4502,7 @@ mod tests {
                         height: 280,
                     },
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
                     edges: Vec::new(),
                 })
@@ -4336,6 +4516,7 @@ mod tests {
                     },
                     previous_viewport: viewport(),
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
                         nodes: vec![graph_node("target", 260, 140)],
@@ -4463,6 +4644,43 @@ mod tests {
         let selection = selected_panel_selection(&window);
         assert_eq!(selection.target.as_deref(), Some("detail-feature?x"));
         assert_eq!(selection.context.as_deref(), Some("detail-root&y"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_cross_mode_error_node_focus_is_consumed_after_navigation() {
+        let fixture = GraphFixture::new();
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .history()
+            .expect_throw("history should exist")
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some(
+                    "?mode=all&graph_focus_target=detail-offscreen&graph_focus_x=320&graph_focus_y=180#detail-offscreen",
+                ),
+            )
+            .expect_throw("cross-mode error node URL should be set");
+
+        sync_initial_detail_url(&window).expect_throw("detail URL should canonicalize");
+        let selected = selected_node_target(&window);
+        assert_eq!(
+            take_graph_focus_point(&window, selected.as_deref())
+                .expect_throw("error node focus should be consumed"),
+            Some(Point { x: 320, y: 180 })
+        );
+
+        let search = window
+            .location()
+            .search()
+            .expect_throw("search should exist");
+        assert!(search.contains("mode=all"));
+        assert!(search.contains("target=detail-offscreen"));
+        assert!(!search.contains("graph_focus_"));
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-offscreen"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -4919,6 +5137,7 @@ mod tests {
                         height: 360,
                     },
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     nodes: vec![
                         graph_node("aaaaaaaa", 56, 56),
                         graph_node("bbbbbbbb", 168, 128),
@@ -4976,6 +5195,7 @@ mod tests {
                     },
                     previous_viewport: viewport(),
                     viewport: viewport(),
+                    error_nodes: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
                         nodes: vec![graph_node("aaaaaaaa", 280, 162)],
@@ -5073,6 +5293,64 @@ mod tests {
                 Some("middle")
             );
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_error_node_popover_renders_in_response_order_and_targets_graph_points() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        sync_error_nodes(
+            &document,
+            "all",
+            vec![
+                GraphErrorNode {
+                    id: "newer".to_owned(),
+                    node_target: "detail-newer".to_owned(),
+                    short_id: "newer".to_owned(),
+                    created_at: "2026-08-06T09:00:00Z".to_owned(),
+                    summary: "newer failure".to_owned(),
+                    point: Point { x: 320, y: 180 },
+                },
+                GraphErrorNode {
+                    id: "older".to_owned(),
+                    node_target: "detail-older".to_owned(),
+                    short_id: "older".to_owned(),
+                    created_at: "2026-08-06T08:00:00Z".to_owned(),
+                    summary: "older failure".to_owned(),
+                    point: Point { x: 120, y: 90 },
+                },
+            ],
+        )
+        .expect_throw("error nodes should render");
+
+        let links = fixture
+            .root
+            .query_selector_all(".error-node-link")
+            .expect_throw("error node links should query");
+        assert_eq!(links.length(), 2);
+        let first = links
+            .item(0)
+            .expect_throw("first error node should exist")
+            .dyn_into::<Element>()
+            .expect_throw("error node should be an element");
+        assert_eq!(
+            first.get_attribute("href").as_deref(),
+            Some("#detail-newer")
+        );
+        assert_eq!(
+            error_node_link_point(&first),
+            Some(Point { x: 320, y: 180 })
+        );
+        assert_eq!(
+            fixture
+                .root
+                .query_selector(".error-node-count")
+                .expect_throw("error count query should succeed")
+                .expect_throw("error count should exist")
+                .text_content()
+                .as_deref(),
+            Some("2")
+        );
     }
 
     fn graph_node(id: &str, x: i32, y: i32) -> GraphViewportNode {
