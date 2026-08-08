@@ -2,9 +2,9 @@ use std::io::{IsTerminal, Read};
 
 use clap::Parser;
 use coco_llm::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
-    COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest,
-    CocoCliRuntimeResponse,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_REF_ENV,
+    COCO_PARENT_TOOL_USE_ID_ENV, COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV,
+    COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
 };
 use coco_mem::SessionRole;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -316,6 +316,7 @@ fn build_forward_socket_request(args: &[String], stdin: Vec<u8>) -> CocoCliRunti
             .ok()
             .and_then(|value| SessionRole::parse(&value)),
         store_path_env: std::env::var(COCO_STORE_PATH_ENV).ok(),
+        parent_ref_env: std::env::var(COCO_PARENT_REF_ENV).ok(),
         parent_tool_use_id_env: std::env::var(COCO_PARENT_TOOL_USE_ID_ENV).ok(),
     }
 }
@@ -454,8 +455,9 @@ mod tests {
     };
     use coco_cli::{COCO_DAEMON_SOCKET_ENV, resolve_default_daemon_socket_path};
     use coco_llm::{
-        COCO_CLI_RUNTIME_SOCKET_ENV, COCO_PARENT_TOOL_USE_ID_ENV, COCO_SESSION_BRANCH_ENV,
-        COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
+        COCO_CLI_RUNTIME_SOCKET_ENV, COCO_PARENT_REF_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
+        COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest,
+        CocoCliRuntimeResponse,
     };
     use coco_mem::SessionRole;
     use tempfile::tempdir;
@@ -686,6 +688,7 @@ mod tests {
                 (COCO_SESSION_BRANCH_ENV, Some("feature")),
                 (COCO_SESSION_ROLE_ENV, Some("runner")),
                 (COCO_STORE_PATH_ENV, Some("/tmp/store")),
+                (COCO_PARENT_REF_ENV, Some("day-parent")),
                 (COCO_PARENT_TOOL_USE_ID_ENV, Some("tool-call")),
             ],
             || {
@@ -701,6 +704,7 @@ mod tests {
         assert_eq!(request.branch_env.as_deref(), Some("feature"));
         assert_eq!(request.session_role, Some(SessionRole::Runner));
         assert_eq!(request.store_path_env.as_deref(), Some("/tmp/store"));
+        assert_eq!(request.parent_ref_env.as_deref(), Some("day-parent"));
         assert_eq!(request.parent_tool_use_id_env.as_deref(), Some("tool-call"));
     }
 
@@ -854,6 +858,7 @@ mod tests {
             branch_env: None,
             session_role: None,
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         };
 
@@ -889,6 +894,7 @@ mod tests {
             assert_eq!(request.branch_env.as_deref(), Some("feature"));
             assert_eq!(request.session_role, Some(SessionRole::Runner));
             assert_eq!(request.store_path_env.as_deref(), Some("/tmp/store"));
+            assert_eq!(request.parent_ref_env.as_deref(), Some("day-parent"));
             assert_eq!(request.parent_tool_use_id_env.as_deref(), Some("tool-call"));
 
             let response = CocoCliRuntimeResponse {
@@ -907,6 +913,7 @@ mod tests {
             branch_env: Some("feature".to_owned()),
             session_role: Some(SessionRole::Runner),
             store_path_env: Some("/tmp/store".to_owned()),
+            parent_ref_env: Some("day-parent".to_owned()),
             parent_tool_use_id_env: Some("tool-call".to_owned()),
         };
 
@@ -942,6 +949,7 @@ mod tests {
             branch_env: None,
             session_role: None,
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         };
 

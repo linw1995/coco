@@ -16,10 +16,11 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 
 use crate::{
-    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_TOOL_USE_ID_ENV,
-    COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV, COCO_SKILL_DIR_ENV, COCO_SKILL_NAME_ENV,
-    COCO_SKILL_PERSIST_DIR_ENV, COCO_STORE_PATH_ENV, CocoCliRuntimeRequest, CocoCliRuntimeResponse,
-    ToolInvocationContext, ToolRuntimeEnv, credential_proxy,
+    COCO_CLI_RUNTIME_SOCKET_ENV, COCO_COMMAND_SHIM_MODE_ENV, COCO_PARENT_REF_ENV,
+    COCO_PARENT_TOOL_USE_ID_ENV, COCO_SESSION_BRANCH_ENV, COCO_SESSION_ROLE_ENV,
+    COCO_SKILL_DIR_ENV, COCO_SKILL_NAME_ENV, COCO_SKILL_PERSIST_DIR_ENV, COCO_STORE_PATH_ENV,
+    CocoCliRuntimeRequest, CocoCliRuntimeResponse, ToolInvocationContext, ToolRuntimeEnv,
+    credential_proxy,
 };
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -1577,6 +1578,17 @@ async fn collect_session_until_deadline(
     }
 }
 
+fn forwarded_parent_ref(request: &ExecCommandRequest) -> Option<&str> {
+    let parent_tool_use_id = request.parent_tool_use_id.as_deref()?;
+    Some(
+        request
+            .context
+            .active_skill
+            .as_ref()
+            .map_or(parent_tool_use_id, |skill| skill.parent_ref.as_str()),
+    )
+}
+
 async fn execute_command(
     request: ExecCommandRequest,
     sessions: UnifiedExecSessionStoreHandle,
@@ -1669,6 +1681,7 @@ async fn execute_command(
         .env_remove(COCO_SESSION_ROLE_ENV)
         .env_remove(COCO_STORE_PATH_ENV)
         .env_remove(COCO_CLI_RUNTIME_SOCKET_ENV)
+        .env_remove(COCO_PARENT_REF_ENV)
         .env_remove(COCO_PARENT_TOOL_USE_ID_ENV)
         .env_remove(COCO_LOG_DIR_ENV)
         .env_remove(COCO_SKILL_NAME_ENV)
@@ -1693,6 +1706,9 @@ async fn execute_command(
             }
             if let Some(parent_tool_use_id) = &request.parent_tool_use_id {
                 command.env(COCO_PARENT_TOOL_USE_ID_ENV, parent_tool_use_id);
+            }
+            if let Some(parent_ref) = forwarded_parent_ref(&request) {
+                command.env(COCO_PARENT_REF_ENV, parent_ref);
             }
         } else {
             command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
@@ -1820,6 +1836,7 @@ async fn execute_pty_command(
     command.env_remove(COCO_SESSION_ROLE_ENV);
     command.env_remove(COCO_STORE_PATH_ENV);
     command.env_remove(COCO_CLI_RUNTIME_SOCKET_ENV);
+    command.env_remove(COCO_PARENT_REF_ENV);
     command.env_remove(COCO_PARENT_TOOL_USE_ID_ENV);
     command.env_remove(COCO_LOG_DIR_ENV);
     command.env_remove(COCO_SKILL_NAME_ENV);
@@ -1842,6 +1859,9 @@ async fn execute_pty_command(
             }
             if let Some(parent_tool_use_id) = &request.parent_tool_use_id {
                 command.env(COCO_PARENT_TOOL_USE_ID_ENV, parent_tool_use_id);
+            }
+            if let Some(parent_ref) = forwarded_parent_ref(&request) {
+                command.env(COCO_PARENT_REF_ENV, parent_ref);
             }
         } else {
             command.env(COCO_COMMAND_SHIM_MODE_ENV, "disabled");
@@ -3173,6 +3193,7 @@ mod tests {
                     name: "scripted".to_owned(),
                     directory: skill_dir.path().to_path_buf(),
                     persistent_directory: skill_persist_dir.clone(),
+                    parent_ref: "caller-tool-use".to_owned(),
                 }),
                 credential_routes: Vec::new(),
                 store_path: None,
@@ -3407,6 +3428,7 @@ mod tests {
                     name: "scripted".to_owned(),
                     directory: skill_dir.path().to_path_buf(),
                     persistent_directory: skill_persist_dir.clone(),
+                    parent_ref: "caller-tool-use".to_owned(),
                 }),
                 credential_routes: Vec::new(),
                 store_path: None,
@@ -3454,16 +3476,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_command_runtime_injects_parent_tool_use_env_for_invocation() {
+    async fn exec_command_runtime_keeps_skill_parent_ref_for_forwarded_writes() {
         let workspace = tempfile::tempdir().unwrap();
+        let skill_dir = tempfile::tempdir().unwrap();
+        let skill_persist_dir = tempfile::tempdir().unwrap();
         let runtime = runtime(
             temp_exec_command_tool(),
             workspace.path().to_path_buf(),
             ToolRuntimeEnv {
                 session_branch: "draft".to_owned(),
                 session_role: coco_mem::SessionRole::Orchestrator,
-                current_skill_name: None,
-                active_skill: None,
+                current_skill_name: Some("recovery".to_owned()),
+                active_skill: Some(crate::ActiveSkillRuntimeContext {
+                    name: "recovery".to_owned(),
+                    directory: skill_dir.path().to_path_buf(),
+                    persistent_directory: skill_persist_dir.path().to_path_buf(),
+                    parent_ref: "day-tool-use".to_owned(),
+                }),
                 credential_routes: Vec::new(),
                 store_path: None,
                 enable_coco_shim: true,
@@ -3478,7 +3507,7 @@ mod tests {
                 runtime
                     .execute(
                         format!(
-                            r#"{{"cmd":"printf '%s' \"${{COCO_PARENT_TOOL_USE_ID:-}}\"","workdir":"{}","shell":"bash"}}"#,
+                            r#"{{"cmd":"printf '%s|%s' \"${{COCO_PARENT_TOOL_USE_ID:-}}\" \"${{COCO_PARENT_REF:-}}\"","workdir":"{}","shell":"bash"}}"#,
                             workspace.path().display()
                         ),
                         ToolInvocationContext {
@@ -3491,7 +3520,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(output.contains("stdout:\ntool-use-node"));
+        assert!(output.contains("stdout:\ntool-use-node|day-tool-use"));
     }
 
     #[tokio::test]
@@ -3902,6 +3931,7 @@ mod tests {
             branch_env: Some("draft".to_owned()),
             session_role: Some(coco_mem::SessionRole::Runner),
             store_path_env: Some(runtime_store.display().to_string()),
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         };
         let payload = serde_json::to_vec(&request).unwrap();
@@ -3986,6 +4016,7 @@ mod tests {
             branch_env: None,
             session_role: None,
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         };
         let payload = serde_json::to_vec(&request).unwrap();

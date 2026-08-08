@@ -5646,6 +5646,7 @@ async fn forwarded_runtime_prompt_uses_branch_env_when_flag_is_omitted() {
             branch_env: Some("draft"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -5695,6 +5696,7 @@ async fn forwarded_runtime_orchestrator_prompt_records_shadow_parent() {
             branch_env: Some("draft"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: Some(&parent_tool_use),
         },
         RuntimeServices {
@@ -5780,6 +5782,7 @@ async fn forwarded_runtime_skill_run_records_skill_invocation_parent() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: Some(&parent_tool_use),
         },
         RuntimeServices {
@@ -5940,6 +5943,7 @@ async fn forwarded_runtime_skill_run_uses_effective_role_from_session_patch() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: Some(&parent_tool_use),
         },
         RuntimeServices {
@@ -6003,6 +6007,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
             branch_env: Some("draft"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6020,7 +6025,7 @@ async fn forwarded_runtime_prompt_keeps_explicit_branch_over_env_default() {
 }
 
 #[tokio::test]
-async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() {
+async fn forwarded_runtime_orchestrator_worker_prefers_skill_parent_ref() {
     let (_tempdir, store_path) = temp_store_path();
     with_coco_env_async(
         &[("COCO_PROVIDER", "openai"), ("COCO_MODEL", "gpt-4.1-mini")],
@@ -6038,8 +6043,15 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
 
     let store = open_store(&store_path).await.unwrap();
     let session_head = store.get_branch_head("main").await.unwrap();
-    let parent_tool_use =
-        append_tool_use_node(&store, &session_head, "tool-call-1", "exec_command").await;
+    let day_parent_ref =
+        append_tool_use_node(&store, &session_head, "day-tool-call", "exec_command").await;
+    let parent_tool_use = append_tool_use_node(
+        &store,
+        &day_parent_ref,
+        "recovery-tool-call",
+        "exec_command",
+    )
+    .await;
     let job = submit_prompt_job(&store, "main", "hello").await;
     let llm = llm_with_test_provider_config(
         store.clone(),
@@ -6058,6 +6070,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: Some(&day_parent_ref),
             parent_tool_use_id_env: Some(&parent_tool_use),
         },
         RuntimeServices {
@@ -6090,7 +6103,7 @@ async fn forwarded_runtime_orchestrator_worker_records_continue_shadow_parent() 
         .expect("expected forwarded continue shadow anchor");
     assert_eq!(
         shadow_anchor.merge_parents(),
-        [MergeParent::shadow(parent_tool_use)].as_slice()
+        [MergeParent::shadow(day_parent_ref)].as_slice()
     );
 }
 
@@ -6107,6 +6120,7 @@ async fn forwarded_runtime_runner_prompt_help_hides_write_entrypoints() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6141,6 +6155,7 @@ async fn forwarded_runtime_runner_session_help_hides_write_subcommands() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6177,6 +6192,7 @@ async fn forwarded_runtime_orchestrator_help_hides_store_path_option() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6207,6 +6223,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6237,6 +6254,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6267,6 +6285,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6292,6 +6311,7 @@ async fn forwarded_runtime_runner_write_commands_fail_via_parser_errors() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Runner),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6329,6 +6349,7 @@ async fn forwarded_runtime_rejects_store_path_override() {
             branch_env: Some("main"),
             session_role: Some(SessionRole::Orchestrator),
             store_path_env: None,
+            parent_ref_env: None,
             parent_tool_use_id_env: None,
         },
         RuntimeServices {
@@ -6399,6 +6420,7 @@ async fn daemon_server_executes_forwarded_cli_requests_over_socket() {
         branch_env: Some("main".to_owned()),
         session_role: Some(SessionRole::Orchestrator),
         store_path_env: None,
+        parent_ref_env: None,
         parent_tool_use_id_env: None,
     };
 

@@ -231,6 +231,7 @@ fn materialize_skill_runtime(
         name: request.skill_name.clone(),
         directory: runtime_dir.path().to_path_buf(),
         persistent_directory,
+        parent_ref: request.parent_tool_use_id.clone(),
     };
     Ok(runtime_dir.into_runtime(context))
 }
@@ -856,6 +857,27 @@ mod tests {
         assert!(prompt.contains("uv run --script \"$COCO_SKILL_DIR/scripts/inspect.py\""));
         assert!(prompt.contains("Skill instructions:\n# Find Skills"));
         assert!(!prompt.contains("Additional task from caller:"));
+    }
+
+    #[test]
+    fn materialized_skill_runtime_preserves_caller_parent_ref() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = materialize_skill_runtime(&SkillInvocationRequest {
+            workspace_root: workspace.path().to_path_buf(),
+            base_branch: "day".to_owned(),
+            parent_tool_use_id: "day-tool-use".to_owned(),
+            skill_name: "recovery".to_owned(),
+            skill_description: "Recover a failed job.".to_owned(),
+            skill_path: "store://skills/orchestrator/recovery@1".to_owned(),
+            skill_body: "# Recovery".to_owned(),
+            scripts: Vec::new(),
+            session_role: SessionRole::Orchestrator,
+            enable_coco_shim: true,
+            handoff: Some("Recover the job.".to_owned()),
+        })
+        .unwrap();
+
+        assert_eq!(runtime.context.as_ref().unwrap().parent_ref, "day-tool-use");
     }
 
     #[test]
