@@ -42,6 +42,7 @@ pub struct ForwardedRuntimeInputs<'a> {
     pub branch_env: Option<&'a str>,
     pub session_role: Option<SessionRole>,
     pub store_path_env: Option<&'a str>,
+    pub parent_ref_env: Option<&'a str>,
     pub parent_tool_use_id_env: Option<&'a str>,
 }
 
@@ -256,6 +257,7 @@ where
         scope,
         inputs.branch_env,
         inputs.store_path_env,
+        inputs.parent_ref_env,
         inputs.parent_tool_use_id_env,
     );
 
@@ -371,10 +373,17 @@ fn apply_forwarded_defaults(
     scope: ForwardedRuntimeScope,
     branch_env: Option<&str>,
     store_path_env: Option<&str>,
+    parent_ref_env: Option<&str>,
     parent_tool_use_id_env: Option<&str>,
 ) {
     apply_forwarded_store_path(cli, store_path_env);
-    apply_forwarded_orchestrator_defaults(cli, scope, branch_env, parent_tool_use_id_env);
+    apply_forwarded_orchestrator_defaults(
+        cli,
+        scope,
+        branch_env,
+        parent_ref_env,
+        parent_tool_use_id_env,
+    );
     apply_forwarded_branch_default(cli, args, branch_env);
 }
 
@@ -388,6 +397,7 @@ fn apply_forwarded_orchestrator_defaults(
     cli: &mut Cli,
     scope: ForwardedRuntimeScope,
     branch_env: Option<&str>,
+    parent_ref_env: Option<&str>,
     parent_tool_use_id_env: Option<&str>,
 ) {
     if scope != ForwardedRuntimeScope::Orchestrator {
@@ -398,7 +408,10 @@ fn apply_forwarded_orchestrator_defaults(
         return;
     };
     let parent_tool_use_id = parent_tool_use_id.to_owned();
-    apply_forwarded_shadow_parent(cli, parent_tool_use_id.clone());
+    apply_forwarded_shadow_parent(
+        cli,
+        parent_ref_env.unwrap_or(&parent_tool_use_id).to_owned(),
+    );
     apply_forwarded_skill_parent(cli, parent_tool_use_id, branch_env.map(str::to_owned));
 }
 

@@ -55,6 +55,7 @@ pub const COCO_SESSION_ROLE_ENV: &str = "COCO_SESSION_ROLE";
 pub const COCO_STORE_PATH_ENV: &str = "COCO_STORE_PATH";
 pub const COCO_CLI_RUNTIME_SOCKET_ENV: &str = "COCO_CLI_RUNTIME_SOCKET";
 pub const COCO_COMMAND_SHIM_MODE_ENV: &str = "COCO_COMMAND_SHIM_MODE";
+pub const COCO_PARENT_REF_ENV: &str = "COCO_PARENT_REF";
 pub const COCO_PARENT_TOOL_USE_ID_ENV: &str = "COCO_PARENT_TOOL_USE_ID";
 pub const COCO_SKILL_NAME_ENV: &str = "COCO_SKILL_NAME";
 pub const COCO_SKILL_DIR_ENV: &str = "COCO_SKILL_DIR";
@@ -548,6 +549,8 @@ pub struct CocoCliRuntimeRequest {
     pub branch_env: Option<String>,
     pub session_role: Option<SessionRole>,
     pub store_path_env: Option<String>,
+    #[serde(default)]
+    pub parent_ref_env: Option<String>,
     pub parent_tool_use_id_env: Option<String>,
 }
 
@@ -682,6 +685,7 @@ pub struct ActiveSkillRuntimeContext {
     pub name: String,
     pub directory: PathBuf,
     pub persistent_directory: PathBuf,
+    pub parent_ref: String,
 }
 
 impl std::fmt::Debug for ActiveSkillRuntimeContext {
@@ -691,6 +695,7 @@ impl std::fmt::Debug for ActiveSkillRuntimeContext {
             .field("name", &self.name)
             .field("directory", &self.directory)
             .field("persistent_directory", &self.persistent_directory)
+            .field("parent_ref", &self.parent_ref)
             .finish()
     }
 }
