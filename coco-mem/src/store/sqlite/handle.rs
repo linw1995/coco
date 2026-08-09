@@ -22,7 +22,7 @@ use super::node::{
 use super::skill::migrate_builtin_skills;
 use super::{
     AsyncSqliteConnection, AsyncSqliteConnectionGuard, GRAPH_READ_BATCH_SIZE, GraphBranchPage,
-    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor,
+    GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor, GraphJobRecord,
     GraphNodeCursor, GraphNodePage, GraphNodeRecord, SqliteDatabase, SqliteGraphConnectionFuture,
     SqliteGraphConnectionGuard, SqliteGraphStore, SqliteStore, SqliteTransactionError, StoreAccess,
     migration,
@@ -328,6 +328,12 @@ impl SqliteGraphStore {
         ensure_graph_read_batch_size(limit.get())?;
         let mut connection = self.connect().await?;
         load_failure_nodes(&mut connection, &self.database_path, limit.get()).await
+    }
+
+    pub async fn graph_jobs(&self, limit: NonZeroUsize) -> Result<Vec<GraphJobRecord>> {
+        ensure_graph_read_batch_size(limit.get())?;
+        let mut connection = self.connect().await?;
+        super::job::load_graph_job_records(&mut connection, &self.database_path, limit.get()).await
     }
 
     pub async fn graph_primary_child_ids(

@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use coco_mem::{
-    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Job, JobStatus, JobStore, Kind, Node,
-    NodeStore, SqliteGraphStore, SqliteStore,
+    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Kind, Node, NodeStore,
+    SqliteGraphStore,
 };
 use snafu::{IntoError, prelude::*};
 use tokio::sync::watch;
@@ -60,22 +60,10 @@ const SOURCE_NODE_HYDRATION_BATCH_SIZE: usize = 16;
 const ERROR_NODE_LIMIT: usize = 100;
 const JOB_LIMIT: usize = 100;
 
-fn compare_indexed_jobs(left: &Job, right: &Job) -> std::cmp::Ordering {
-    let left_finished = matches!(left.status, JobStatus::Finished);
-    let right_finished = matches!(right.status, JobStatus::Finished);
-    left_finished.cmp(&right_finished).then_with(|| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| left.job_id.cmp(&right.job_id))
-    })
-}
-
 #[derive(Clone)]
 pub(crate) struct WebGraphRuntime {
     store: WebGraphStore,
     source: SqliteGraphStore,
-    source_store: SqliteStore,
     publisher: ConsolePublisher,
     ready: watch::Sender<u64>,
 }
@@ -708,9 +696,6 @@ impl WebGraphRuntime {
         let source = SqliteGraphStore::open_read_only(path)
             .await
             .context(StoreSnafu)?;
-        let source_store = SqliteStore::open_read_only(path)
-            .await
-            .context(StoreSnafu)?;
         let store = WebGraphStore::open(path)
             .await
             .context(WebGraphStoreSnafu)?;
@@ -725,7 +710,6 @@ impl WebGraphRuntime {
         Ok(Self {
             store,
             source,
-            source_store,
             publisher,
             ready,
         })
@@ -751,6 +735,25 @@ impl WebGraphRuntime {
 
     pub fn subscribe_source_changes(&self) -> watch::Receiver<u64> {
         self.publisher.subscribe_source_changes()
+    }
+
+    pub fn subscribe_job_changes(&self) -> watch::Receiver<u64> {
+        self.publisher.subscribe_job_changes()
+    }
+
+    pub async fn jobs(&self) -> crate::Result<Vec<GraphJob>> {
+        loop {
+            let state = self
+                .store
+                .state()
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            if let Some(jobs) = self.jobs_once(state.revision).await? {
+                return Ok(jobs);
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     pub async fn provider_context_for_node(
@@ -1390,20 +1393,20 @@ impl WebGraphRuntime {
     }
 
     async fn jobs_once(&self, revision: Revision) -> crate::Result<Option<Vec<GraphJob>>> {
-        let mut jobs = self
-            .source_store
-            .list_jobs()
+        let records = self
+            .source
+            .graph_jobs(NonZeroUsize::new(JOB_LIMIT).expect("job limit is non-zero"))
             .await
-            .context(StoreSnafu)?
-            .into_values()
-            .collect::<Vec<_>>();
-        jobs.sort_by(compare_indexed_jobs);
-        jobs.truncate(JOB_LIMIT);
+            .context(StoreSnafu)?;
 
-        let mut heads = BTreeMap::new();
-        for job in &jobs {
-            heads.insert(job.job_id.clone(), self.job_head(job).await?);
-        }
+        let mut heads = records
+            .iter()
+            .map(|record| (record.job.job_id.clone(), record.head_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let jobs = records
+            .into_iter()
+            .map(|record| record.job)
+            .collect::<Vec<_>>();
         let head_ids = heads.values().cloned().collect::<BTreeSet<_>>();
         let mut points = BTreeMap::new();
         for chunk in head_ids
@@ -1430,6 +1433,9 @@ impl WebGraphRuntime {
                     .into_iter()
                     .map(|placement| (placement.node.to_string(), placement.point)),
             );
+        }
+        if points.len() != head_ids.len() {
+            return Ok(None);
         }
         if jobs.is_empty() {
             let state = self
@@ -1463,16 +1469,6 @@ impl WebGraphRuntime {
                 })
                 .collect(),
         ))
-    }
-
-    async fn job_head(&self, job: &Job) -> crate::Result<String> {
-        match self.source_store.log(&job.base, &job.work_branch).await {
-            Ok(path) => Ok(path
-                .first()
-                .map_or_else(|| job.base.clone(), |node| node.id.clone())),
-            Err(coco_mem::StoreError::RefsNotConnected { .. }) => Ok(job.base.clone()),
-            Err(source) => Err(source).context(StoreSnafu),
-        }
     }
 
     async fn error_nodes_once(
@@ -2670,9 +2666,9 @@ mod tests {
     use std::time::Duration;
 
     use coco_mem::{
-        Anchor, BranchStore, Kind, MergeParent, NewNode, NewNodeContent, NodeStore, PromptAnchor,
-        Role, SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode, SqliteStore,
-        ToolResult, ToolUse,
+        Anchor, BranchStore, JobStore, Kind, MergeParent, NewNode, NewNodeContent, NodeStore,
+        PromptAnchor, Role, SessionAnchor, SessionRole, SkillInvocationAnchor, SkillInvocationMode,
+        SqliteStore, ToolResult, ToolUse,
     };
     use diesel::connection::SimpleConnection;
     use diesel::sql_types::{Integer, Text};
@@ -2734,22 +2730,6 @@ mod tests {
         progress.observe_high_watermark(&through);
         assert_eq!(progress.total_nodes(), 8);
         assert_eq!(progress.pending_nodes(6), 6);
-    }
-
-    #[test]
-    fn indexed_jobs_prioritize_active_jobs_before_newer_finished_jobs() {
-        let mut active = Job::new("job-active", "main", "base");
-        active.created_at = "2026-08-06T08:00:00Z".parse().unwrap();
-        active.status = JobStatus::Running;
-        let mut finished = Job::new("job-finished", "main", "base");
-        finished.created_at = "2026-08-06T09:00:00Z".parse().unwrap();
-        finished.status = JobStatus::Finished;
-        let mut jobs = [finished, active];
-
-        jobs.sort_by(compare_indexed_jobs);
-
-        assert_eq!(jobs[0].job_id, "job-active");
-        assert_eq!(jobs[1].job_id, "job-finished");
     }
 
     #[test]

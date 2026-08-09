@@ -60,6 +60,12 @@ pub struct GraphNodePage {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphJobRecord {
+    pub job: crate::Job,
+    pub head_id: String,
+}
+
 /// Topology-only node data for incremental graph construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphNodeRecord {

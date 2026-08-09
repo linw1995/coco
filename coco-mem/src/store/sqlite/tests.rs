@@ -959,6 +959,77 @@ async fn graph_failure_nodes_are_ordered_newest_first() {
 }
 
 #[tokio::test]
+async fn graph_jobs_batch_current_heads_and_prioritize_active_jobs() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    store.fork("main", &root).await.unwrap();
+    store.fork("archive", &root).await.unwrap();
+    let main_head = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text("active head".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .set_branch_head("main", &root, &main_head)
+        .await
+        .unwrap();
+    let detached_base = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("detached base".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .submit_job_with_id("job-active", "main", &root)
+        .await
+        .unwrap();
+    store
+        .submit_job_with_id("job-finished", "archive", &detached_base)
+        .await
+        .unwrap();
+    store
+        .set_job_status("job-finished", JobStatus::Queued, JobStatus::Running)
+        .await
+        .unwrap();
+    store
+        .set_job_status("job-finished", JobStatus::Running, JobStatus::Finished)
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(jobs::table.filter(jobs::job_id.eq("job-active")))
+        .set(jobs::created_at.eq("2026-08-06T09:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::update(jobs::table.filter(jobs::job_id.eq("job-finished")))
+        .set(jobs::created_at.eq("2026-08-06T10:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+
+    let records = graph
+        .graph_jobs(NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(records[0].job.job_id, "job-active");
+    assert_eq!(records[0].head_id, main_head);
+    assert_eq!(records[1].job.job_id, "job-finished");
+    assert_eq!(records[1].head_id, detached_base);
+}
+
+#[tokio::test]
 async fn graph_branch_pages_are_ordered_and_mark_an_exact_final_page_complete() {
     let store = SqliteStore::open_temporary().await.unwrap();
     let root = store.root_id();

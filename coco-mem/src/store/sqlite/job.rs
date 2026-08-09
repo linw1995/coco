@@ -4,12 +4,13 @@ use std::path::Path;
 use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
+use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
 use super::branch::{load_branch_head, load_session_chain};
 use super::node::{load_node_by_exact_id, persist_node_without_transaction, validate_new_node};
-use super::{AsyncSqliteConnection, SqliteStore, SqliteTransactionError};
+use super::{AsyncSqliteConnection, GraphJobRecord, SqliteStore, SqliteTransactionError};
 use crate::error::{
     CorruptedStoreSnafu, PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
@@ -31,6 +32,117 @@ pub struct JobRow {
     pub work_branch: String,
     pub base: String,
     pub status: String,
+}
+
+#[derive(QueryableByName)]
+struct GraphJobRow {
+    #[diesel(sql_type = Text)]
+    job_id: String,
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    finished_at: Option<String>,
+    #[diesel(sql_type = Text)]
+    branch: String,
+    #[diesel(sql_type = Text)]
+    work_branch: String,
+    #[diesel(sql_type = Text)]
+    base: String,
+    #[diesel(sql_type = Text)]
+    status: String,
+    #[diesel(sql_type = Text)]
+    head_id: String,
+}
+
+const GRAPH_JOBS_QUERY: &str = r#"
+WITH RECURSIVE
+selected_jobs AS (
+    SELECT
+        jobs.job_id,
+        jobs.created_at,
+        jobs.finished_at,
+        jobs.branch,
+        jobs.work_branch,
+        jobs.base,
+        jobs.status,
+        COALESCE(branches.head_id, jobs.base) AS branch_head
+    FROM jobs
+    LEFT JOIN branches ON branches.name = jobs.work_branch
+    ORDER BY
+        CASE WHEN jobs.status = 'finished' THEN 1 ELSE 0 END,
+        jobs.created_at DESC,
+        jobs.job_id
+    LIMIT ?
+),
+paths(job_id, node_id, base) AS (
+    SELECT job_id, branch_head, base
+    FROM selected_jobs
+    UNION ALL
+    SELECT paths.job_id, nodes.parent_id, paths.base
+    FROM paths
+    JOIN nodes ON nodes.id = paths.node_id
+    WHERE paths.node_id <> paths.base
+      AND nodes.parent_id <> ''
+),
+connections AS (
+    SELECT job_id, MAX(node_id = base) AS connected
+    FROM paths
+    GROUP BY job_id
+)
+SELECT
+    selected_jobs.job_id,
+    selected_jobs.created_at,
+    selected_jobs.finished_at,
+    selected_jobs.branch,
+    selected_jobs.work_branch,
+    selected_jobs.base,
+    selected_jobs.status,
+    CASE
+        WHEN connections.connected = 1 THEN selected_jobs.branch_head
+        ELSE selected_jobs.base
+    END AS head_id
+FROM selected_jobs
+JOIN connections ON connections.job_id = selected_jobs.job_id
+ORDER BY
+    CASE WHEN selected_jobs.status = 'finished' THEN 1 ELSE 0 END,
+    selected_jobs.created_at DESC,
+    selected_jobs.job_id
+"#;
+
+pub async fn load_graph_job_records(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<GraphJobRecord>> {
+    let limit = i64::try_from(limit).map_err(|source| crate::StoreError::CorruptedStore {
+        path: path.to_owned(),
+        message: format!("graph job limit does not fit in SQLite integer: {source}"),
+    })?;
+    diesel::sql_query(GRAPH_JOBS_QUERY)
+        .bind::<BigInt, _>(limit)
+        .load::<GraphJobRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .into_iter()
+        .map(|row| {
+            let head_id = row.head_id;
+            let job = job_row_into_job(
+                path,
+                JobRow {
+                    job_id: row.job_id,
+                    created_at: row.created_at,
+                    finished_at: row.finished_at,
+                    branch: row.branch,
+                    work_branch: row.work_branch,
+                    base: row.base,
+                    status: row.status,
+                },
+            )?;
+            Ok(GraphJobRecord { job, head_id })
+        })
+        .collect()
 }
 
 async fn load_job_map(

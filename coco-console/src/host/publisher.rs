@@ -3,6 +3,7 @@ use tokio::sync::watch;
 #[derive(Clone)]
 pub struct ConsolePublisher {
     source_dirty: watch::Sender<u64>,
+    jobs_changed: watch::Sender<u64>,
 }
 
 impl Default for ConsolePublisher {
@@ -14,7 +15,11 @@ impl Default for ConsolePublisher {
 impl ConsolePublisher {
     pub fn new() -> Self {
         let (source_dirty, _) = watch::channel(0);
-        Self { source_dirty }
+        let (jobs_changed, _) = watch::channel(0);
+        Self {
+            source_dirty,
+            jobs_changed,
+        }
     }
 
     pub(crate) fn mark_source_dirty(&self) -> u64 {
@@ -28,6 +33,19 @@ impl ConsolePublisher {
 
     pub(crate) fn subscribe_source_changes(&self) -> watch::Receiver<u64> {
         self.source_dirty.subscribe()
+    }
+
+    pub(crate) fn mark_jobs_changed(&self) -> u64 {
+        let mut generation = 0;
+        self.jobs_changed.send_modify(|current| {
+            *current = current.wrapping_add(1);
+            generation = *current;
+        });
+        generation
+    }
+
+    pub(crate) fn subscribe_job_changes(&self) -> watch::Receiver<u64> {
+        self.jobs_changed.subscribe()
     }
 }
 
@@ -45,5 +63,17 @@ mod tests {
         assert_eq!(publisher.mark_source_dirty(), 2);
         changes.changed().await.unwrap();
         assert_eq!(*changes.borrow_and_update(), 2);
+    }
+
+    #[tokio::test]
+    async fn job_changes_are_published_independently() {
+        let publisher = ConsolePublisher::new();
+        let mut changes = publisher.subscribe_job_changes();
+        changes.borrow_and_update();
+
+        assert_eq!(publisher.mark_jobs_changed(), 1);
+        changes.changed().await.unwrap();
+        assert_eq!(*changes.borrow_and_update(), 1);
+        assert_eq!(*publisher.subscribe_source_changes().borrow(), 0);
     }
 }

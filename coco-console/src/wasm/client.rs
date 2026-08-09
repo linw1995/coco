@@ -209,6 +209,17 @@ fn install_graph_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>
     source.add_event_listener_with_callback("graph", version_callback.as_ref().unchecked_ref())?;
     version_callback.forget();
 
+    let jobs_graph = graph.clone();
+    let jobs_callback =
+        Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+            let Some(data) = event.data().as_string() else {
+                return;
+            };
+            handle_job_version_event(jobs_graph.clone(), &data);
+        }));
+    source.add_event_listener_with_callback("jobs", jobs_callback.as_ref().unchecked_ref())?;
+    jobs_callback.forget();
+
     graph.borrow_mut().events = Some(source);
     Ok(())
 }
@@ -220,6 +231,40 @@ fn handle_graph_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
             notify_graph_revision();
         }
         Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
+    }
+}
+
+fn handle_job_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
+    match data.parse::<u64>() {
+        Ok(version) if version > graph.borrow().job_version => {
+            spawn_local(refresh_jobs(graph, version));
+        }
+        Ok(_) => {}
+        Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
+    }
+}
+
+async fn refresh_jobs(graph: Rc<RefCell<VirtualGraph>>, version: u64) {
+    let (window, document, graph_mode) = {
+        let graph = graph.borrow();
+        (
+            graph.window.clone(),
+            graph.document.clone(),
+            graph.graph_mode.clone(),
+        )
+    };
+    match fetch_json::<Vec<GraphJob>>(&window, "/api/graph/jobs").await {
+        Ok(jobs) => {
+            if version <= graph.borrow().job_version {
+                return;
+            }
+            if let Err(error) = sync_jobs(&document, &graph_mode, jobs) {
+                web_sys::console::error_1(&error);
+                return;
+            }
+            graph.borrow_mut().job_version = version;
+        }
+        Err(error) => web_sys::console::error_1(&error),
     }
 }
 
@@ -299,6 +344,7 @@ struct VirtualGraph {
     canvas: Option<GraphCanvas>,
     auto_fit_short_canvas: bool,
     version: u64,
+    job_version: u64,
     rendered: RenderedKeys,
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
@@ -346,6 +392,7 @@ impl VirtualGraph {
             canvas: None,
             auto_fit_short_canvas,
             version,
+            job_version: 0,
             rendered: RenderedKeys::new(),
             rendered_viewport: viewport,
             patch_in_flight: false,

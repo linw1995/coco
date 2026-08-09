@@ -272,6 +272,7 @@ where
         .route("/style.css", get(style_css))
         .route("/third-party-notices.html", get(third_party_notices))
         .route("/api/graph/viewport", get(graph_viewport::<S>))
+        .route("/api/graph/jobs", get(graph_jobs::<S>))
         .route(
             "/api/graph/viewport/items/diff",
             get(graph_viewport_items_diff_get::<S>).post(graph_viewport_items_diff_post::<S>),
@@ -402,6 +403,16 @@ where
     };
     match response {
         Ok(response) => json_response(&response, "graph viewport"),
+        Err(error) => plain_error(error.to_string()),
+    }
+}
+
+async fn graph_jobs<S>(State(state): State<AppState<S>>) -> Response
+where
+    S: Store + Clone + Send + Sync + 'static,
+{
+    match state.web_graph.jobs().await {
+        Ok(jobs) => json_response(&jobs, "graph jobs"),
         Err(error) => plain_error(error.to_string()),
     }
 }
@@ -899,11 +910,22 @@ where
     S: Store + Clone + Send + Sync + 'static,
 {
     let mut revisions = state.web_graph.subscribe();
-    let current = *revisions.borrow_and_update();
-    let initial = stream::once(async move {
-        Ok::<_, Infallible>(Event::default().event("graph").data(current.to_string()))
-    });
-    let changes = stream::unfold(revisions, |mut revisions| async move {
+    let current_revision = *revisions.borrow_and_update();
+    let mut job_changes = state.web_graph.subscribe_job_changes();
+    let current_job_version = *job_changes.borrow_and_update();
+    let initial = stream::iter([
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("graph")
+                .data(current_revision.to_string()),
+        ),
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("jobs")
+                .data(current_job_version.to_string()),
+        ),
+    ]);
+    let graph_events = stream::unfold(revisions, |mut revisions| async move {
         revisions.changed().await.ok()?;
         let revision = *revisions.borrow_and_update();
         Some((
@@ -911,7 +933,15 @@ where
             revisions,
         ))
     });
-    Sse::new(initial.chain(changes)).into_response()
+    let job_events = stream::unfold(job_changes, |mut changes| async move {
+        changes.changed().await.ok()?;
+        let version = *changes.borrow_and_update();
+        Some((
+            Ok::<_, Infallible>(Event::default().event("jobs").data(version.to_string())),
+            changes,
+        ))
+    });
+    Sse::new(initial.chain(stream::select(graph_events, job_events))).into_response()
 }
 
 async fn client_asset(
