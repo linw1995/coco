@@ -741,15 +741,19 @@ impl WebGraphRuntime {
         self.publisher.subscribe_job_changes()
     }
 
+    async fn stored_revision(&self) -> crate::Result<Revision> {
+        Ok(self
+            .store
+            .state()
+            .await
+            .context(WebGraphStoreSnafu)?
+            .context(WebGraphNotInitializedSnafu)?
+            .revision)
+    }
+
     pub async fn jobs(&self) -> crate::Result<Vec<GraphJob>> {
         loop {
-            let state = self
-                .store
-                .state()
-                .await
-                .context(WebGraphStoreSnafu)?
-                .context(WebGraphNotInitializedSnafu)?;
-            if let Some(jobs) = self.jobs_once(state.revision).await? {
+            if let Some(jobs) = self.jobs_once(self.stored_revision().await?).await? {
                 return Ok(jobs);
             }
             tokio::task::yield_now().await;
@@ -3271,6 +3275,7 @@ mod tests {
             .viewport(ViewMode::Anchors, complete_viewport())
             .await
             .unwrap();
+        let jobs = runtime.jobs().await.unwrap();
 
         assert_eq!(
             viewport
@@ -3280,6 +3285,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["job-newer", "job-older"]
         );
+        assert_eq!(jobs, viewport.jobs);
         assert!(viewport.jobs.iter().all(|job| job.head_id == head));
         assert_eq!(viewport.jobs[0].status, "queued");
         assert_eq!(viewport.jobs[1].status, "finished");
