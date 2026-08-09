@@ -12,7 +12,7 @@ use web_sys::{
 };
 
 use super::refresh::{
-    PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
+    JobRefreshState, PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
     pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
 use crate::api::{
@@ -236,15 +236,35 @@ fn handle_graph_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
 
 fn handle_job_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
     match data.parse::<u64>() {
-        Ok(version) if version > graph.borrow().job_version => {
-            spawn_local(refresh_jobs(graph, version));
-        }
-        Ok(_) => {}
+        Ok(_) => request_jobs_refresh(graph),
         Err(error) => web_sys::console::error_1(&JsValue::from_str(&error.to_string())),
     }
 }
 
-async fn refresh_jobs(graph: Rc<RefCell<VirtualGraph>>, version: u64) {
+fn request_jobs_refresh(graph: Rc<RefCell<VirtualGraph>>) {
+    let should_schedule = graph.borrow_mut().job_refresh.request();
+    if should_schedule {
+        spawn_jobs_refresh(graph);
+    }
+}
+
+fn spawn_jobs_refresh(graph: Rc<RefCell<VirtualGraph>>) {
+    spawn_local(run_scheduled_jobs_refresh(graph));
+}
+
+async fn run_scheduled_jobs_refresh(graph: Rc<RefCell<VirtualGraph>>) {
+    graph.borrow_mut().job_refresh.begin();
+    let synchronized = refresh_jobs_once(graph.clone()).await;
+    if !synchronized {
+        delay_graph_items_retry(graph.clone()).await;
+    }
+    let should_schedule = graph.borrow_mut().job_refresh.finish(synchronized);
+    if should_schedule {
+        spawn_jobs_refresh(graph);
+    }
+}
+
+async fn refresh_jobs_once(graph: Rc<RefCell<VirtualGraph>>) -> bool {
     let (window, document, graph_mode) = {
         let graph = graph.borrow();
         (
@@ -255,16 +275,16 @@ async fn refresh_jobs(graph: Rc<RefCell<VirtualGraph>>, version: u64) {
     };
     match fetch_json::<Vec<GraphJob>>(&window, "/api/graph/jobs").await {
         Ok(jobs) => {
-            if version <= graph.borrow().job_version {
-                return;
-            }
             if let Err(error) = sync_jobs(&document, &graph_mode, jobs) {
                 web_sys::console::error_1(&error);
-                return;
+                return false;
             }
-            graph.borrow_mut().job_version = version;
+            true
         }
-        Err(error) => web_sys::console::error_1(&error),
+        Err(error) => {
+            web_sys::console::error_1(&error);
+            false
+        }
     }
 }
 
@@ -344,7 +364,7 @@ struct VirtualGraph {
     canvas: Option<GraphCanvas>,
     auto_fit_short_canvas: bool,
     version: u64,
-    job_version: u64,
+    job_refresh: JobRefreshState,
     rendered: RenderedKeys,
     rendered_viewport: ViewportState,
     patch_in_flight: bool,
@@ -392,7 +412,7 @@ impl VirtualGraph {
             canvas: None,
             auto_fit_short_canvas,
             version,
-            job_version: 0,
+            job_refresh: JobRefreshState::default(),
             rendered: RenderedKeys::new(),
             rendered_viewport: viewport,
             patch_in_flight: false,
@@ -512,7 +532,9 @@ impl VirtualGraph {
         self.rendered = RenderedKeys::new();
         self.apply_response_viewport(version, canvas, viewport)?;
         sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
-        sync_jobs(&self.document, &self.graph_mode, jobs)?;
+        if self.job_refresh.accepts_viewport_snapshot() {
+            sync_jobs(&self.document, &self.graph_mode, jobs)?;
+        }
         self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
         self.sync_anchor_range()?;
         self.sync_svg_viewport();
@@ -535,7 +557,9 @@ impl VirtualGraph {
         } = response;
         self.apply_response_viewport(version, canvas, viewport)?;
         sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
-        sync_jobs(&self.document, &self.graph_mode, jobs)?;
+        if self.job_refresh.accepts_viewport_snapshot() {
+            sync_jobs(&self.document, &self.graph_mode, jobs)?;
+        }
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
         self.sync_anchor_range()?;
