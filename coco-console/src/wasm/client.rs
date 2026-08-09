@@ -17,8 +17,9 @@ use super::refresh::{
 };
 use crate::api::{
     AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob,
-    GraphViewport, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
-    GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
+    GraphJobsResponse, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
+    GraphViewportEdgeKind, GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem,
+    GraphViewportResponse, Point,
 };
 #[cfg(test)]
 use crate::graph_render::truncate_label;
@@ -274,9 +275,9 @@ async fn refresh_jobs_once(graph: Rc<RefCell<VirtualGraph>>) -> bool {
             graph.graph_mode.clone(),
         )
     };
-    match fetch_json::<Vec<GraphJob>>(&window, "/api/graph/jobs").await {
-        Ok(jobs) => {
-            if let Err(error) = sync_jobs(&document, &graph_mode, jobs) {
+    match fetch_json::<GraphJobsResponse>(&window, "/api/graph/jobs").await {
+        Ok(response) => {
+            if let Err(error) = sync_jobs(&document, &graph_mode, response) {
                 web_sys::console::error_1(&error);
                 return false;
             }
@@ -524,6 +525,7 @@ impl VirtualGraph {
             canvas,
             viewport,
             error_nodes,
+            active_job_count,
             jobs,
             nodes,
             edges,
@@ -534,7 +536,14 @@ impl VirtualGraph {
         self.apply_response_viewport(version, canvas, viewport)?;
         sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
         if self.job_refresh.accepts_viewport_snapshot() {
-            sync_jobs(&self.document, &self.graph_mode, jobs)?;
+            sync_jobs(
+                &self.document,
+                &self.graph_mode,
+                GraphJobsResponse {
+                    active_job_count,
+                    jobs,
+                },
+            )?;
         }
         self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
         self.sync_anchor_range()?;
@@ -550,6 +559,7 @@ impl VirtualGraph {
             canvas,
             viewport,
             error_nodes,
+            active_job_count,
             jobs,
             added,
             updated,
@@ -559,7 +569,14 @@ impl VirtualGraph {
         self.apply_response_viewport(version, canvas, viewport)?;
         sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
         if self.job_refresh.accepts_viewport_snapshot() {
-            sync_jobs(&self.document, &self.graph_mode, jobs)?;
+            sync_jobs(
+                &self.document,
+                &self.graph_mode,
+                GraphJobsResponse {
+                    active_job_count,
+                    jobs,
+                },
+            )?;
         }
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
@@ -1659,12 +1676,16 @@ fn error_node_link_element(
     Ok(link)
 }
 
-fn sync_jobs(document: &Document, graph_mode: &str, jobs: Vec<GraphJob>) -> Result<(), JsValue> {
+fn sync_jobs(
+    document: &Document,
+    graph_mode: &str,
+    response: GraphJobsResponse,
+) -> Result<(), JsValue> {
     let Some(list) = query_optional(document, ".job-list") else {
         return Ok(());
     };
-    let count = jobs.len();
-    let active_count = jobs.iter().filter(|job| job.status != "finished").count();
+    let count = response.jobs.len();
+    let active_count = response.active_job_count;
     if let Some(count_element) = query_optional(document, ".job-count") {
         count_element.set_text_content(Some(&active_count.to_string()));
     }
@@ -1679,7 +1700,7 @@ fn sync_jobs(document: &Document, graph_mode: &str, jobs: Vec<GraphJob>) -> Resu
         }
     }
     clear_children(&list);
-    for job in jobs {
+    for job in response.jobs {
         let link = job_link_element(document, graph_mode, job)?;
         list.append_child(&link)?;
     }
@@ -4167,6 +4188,7 @@ mod tests {
                     previous_viewport: response_viewport,
                     viewport: response_viewport,
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
@@ -4429,6 +4451,7 @@ mod tests {
                     },
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     nodes: vec![
                         graph_node("source", 100, 80),
@@ -4477,6 +4500,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
@@ -4563,6 +4587,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
@@ -4622,6 +4647,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     added: GraphViewportItems {
                         nodes: vec![
@@ -4670,6 +4696,7 @@ mod tests {
                     },
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
                     edges: Vec::new(),
@@ -4685,6 +4712,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
@@ -5307,6 +5335,7 @@ mod tests {
                     },
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     nodes: vec![
                         graph_node("aaaaaaaa", 56, 56),
@@ -5366,6 +5395,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    active_job_count: 0,
                     jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
@@ -5548,32 +5578,35 @@ mod tests {
         sync_jobs(
             &document,
             "all",
-            vec![
-                GraphJob {
-                    id: "job-newer".to_owned(),
-                    short_id: "job-newe".to_owned(),
-                    created_at: "2026-08-06T09:00:00Z".to_owned(),
-                    status: "running".to_owned(),
-                    branch: "main".to_owned(),
-                    work_branch: "recovery".to_owned(),
-                    head_id: "current".to_owned(),
-                    head_target: "detail-current".to_owned(),
-                    head_short_id: "current".to_owned(),
-                    point: Point { x: 320, y: 180 },
-                },
-                GraphJob {
-                    id: "job-finished".to_owned(),
-                    short_id: "job-fini".to_owned(),
-                    created_at: "2026-08-06T08:00:00Z".to_owned(),
-                    status: "finished".to_owned(),
-                    branch: "main".to_owned(),
-                    work_branch: "main".to_owned(),
-                    head_id: "previous".to_owned(),
-                    head_target: "detail-previous".to_owned(),
-                    head_short_id: "previous".to_owned(),
-                    point: Point { x: 120, y: 90 },
-                },
-            ],
+            GraphJobsResponse {
+                active_job_count: 101,
+                jobs: vec![
+                    GraphJob {
+                        id: "job-newer".to_owned(),
+                        short_id: "job-newe".to_owned(),
+                        created_at: "2026-08-06T09:00:00Z".to_owned(),
+                        status: "running".to_owned(),
+                        branch: "main".to_owned(),
+                        work_branch: "recovery".to_owned(),
+                        head_id: "current".to_owned(),
+                        head_target: "detail-current".to_owned(),
+                        head_short_id: "current".to_owned(),
+                        point: Point { x: 320, y: 180 },
+                    },
+                    GraphJob {
+                        id: "job-finished".to_owned(),
+                        short_id: "job-fini".to_owned(),
+                        created_at: "2026-08-06T08:00:00Z".to_owned(),
+                        status: "finished".to_owned(),
+                        branch: "main".to_owned(),
+                        work_branch: "main".to_owned(),
+                        head_id: "previous".to_owned(),
+                        head_target: "detail-previous".to_owned(),
+                        head_short_id: "previous".to_owned(),
+                        point: Point { x: 120, y: 90 },
+                    },
+                ],
+            },
         )
         .expect_throw("jobs should render");
 
@@ -5598,7 +5631,7 @@ mod tests {
                 .expect_throw("job count should exist")
                 .text_content()
                 .as_deref(),
-            Some("1")
+            Some("101")
         );
         assert_eq!(
             fixture

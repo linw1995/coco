@@ -540,6 +540,7 @@ mod tests {
                 summary: "backend unavailable".to_owned(),
                 point: Point { x: 2100, y: 240 },
             }],
+            active_job_count: 1,
             jobs: vec![GraphJob {
                 id: "job-current".to_owned(),
                 short_id: "job-curr".to_owned(),

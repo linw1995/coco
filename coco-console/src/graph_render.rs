@@ -21,6 +21,7 @@ pub struct GraphCanvasModel {
     render_edge_hit_targets: bool,
     index_links_are_local: bool,
     error_nodes: Vec<GraphErrorNode>,
+    active_job_count: usize,
     jobs: Vec<GraphJob>,
     nodes: Vec<RenderedNode>,
     edges: Vec<RenderedEdge>,
@@ -76,6 +77,7 @@ impl GraphCanvasModel {
             render_edge_hit_targets,
             index_links_are_local,
             error_nodes: response.error_nodes.clone(),
+            active_job_count: response.active_job_count,
             jobs: response.jobs.clone(),
             nodes: response.nodes.iter().map(RenderedNode::new).collect(),
             edges: response.edges.iter().map(RenderedEdge::new).collect(),
@@ -138,6 +140,7 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
         render_edge_hit_targets,
         index_links_are_local,
         error_nodes,
+        active_job_count,
         jobs,
         nodes,
         edges,
@@ -153,7 +156,6 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
         .map(|node| view! { <ErrorNodeItem node local=index_links_are_local/> })
         .collect_view();
     let job_count = jobs.len();
-    let active_job_count = jobs.iter().filter(|job| job.status != "finished").count();
     let jobs = jobs
         .into_iter()
         .map(|job| view! { <JobItem job local=index_links_are_local/> })

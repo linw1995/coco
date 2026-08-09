@@ -10,7 +10,9 @@ use snafu::prelude::*;
 
 use super::branch::{load_branch_head, load_session_chain};
 use super::node::{load_node_by_exact_id, persist_node_without_transaction, validate_new_node};
-use super::{AsyncSqliteConnection, GraphJobRecord, SqliteStore, SqliteTransactionError};
+use super::{
+    AsyncSqliteConnection, GraphJobPage, GraphJobRecord, SqliteStore, SqliteTransactionError,
+};
 use crate::error::{
     CorruptedStoreSnafu, PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
@@ -52,6 +54,8 @@ struct GraphJobRow {
     status: String,
     #[diesel(sql_type = Text)]
     head_id: String,
+    #[diesel(sql_type = BigInt)]
+    active_count: i64,
 }
 
 const GRAPH_JOBS_QUERY: &str = r#"
@@ -100,7 +104,8 @@ SELECT
     CASE
         WHEN connections.connected = 1 THEN selected_jobs.branch_head
         ELSE selected_jobs.base
-    END AS head_id
+    END AS head_id,
+    (SELECT COUNT(*) FROM jobs WHERE status <> 'finished') AS active_count
 FROM selected_jobs
 JOIN connections ON connections.job_id = selected_jobs.job_id
 ORDER BY
@@ -113,18 +118,25 @@ pub async fn load_graph_job_records(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     limit: usize,
-) -> Result<Vec<GraphJobRecord>> {
+) -> Result<GraphJobPage> {
     let limit = i64::try_from(limit).map_err(|source| crate::StoreError::CorruptedStore {
         path: path.to_owned(),
         message: format!("graph job limit does not fit in SQLite integer: {source}"),
     })?;
-    diesel::sql_query(GRAPH_JOBS_QUERY)
+    let rows = diesel::sql_query(GRAPH_JOBS_QUERY)
         .bind::<BigInt, _>(limit)
         .load::<GraphJobRow>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
-        })?
+        })?;
+    let active_count = rows.as_slice().first().map_or(Ok(0), |row| {
+        usize::try_from(row.active_count).map_err(|source| crate::StoreError::CorruptedStore {
+            path: path.to_owned(),
+            message: format!("active graph job count does not fit in usize: {source}"),
+        })
+    })?;
+    let records = rows
         .into_iter()
         .map(|row| {
             let head_id = row.head_id;
@@ -142,7 +154,11 @@ pub async fn load_graph_job_records(
             )?;
             Ok(GraphJobRecord { job, head_id })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GraphJobPage {
+        records,
+        active_count,
+    })
 }
 
 async fn load_job_map(

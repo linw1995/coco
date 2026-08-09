@@ -251,6 +251,7 @@ pub struct GraphViewportResponse {
     pub canvas: GraphCanvas,
     pub viewport: GraphViewport,
     pub error_nodes: Vec<GraphErrorNode>,
+    pub active_job_count: usize,
     pub jobs: Vec<GraphJob>,
     pub nodes: Vec<GraphViewportNode>,
     pub edges: Vec<GraphViewportEdge>,
@@ -263,10 +264,17 @@ pub struct GraphViewportDiffResponse {
     pub previous_viewport: GraphViewport,
     pub viewport: GraphViewport,
     pub error_nodes: Vec<GraphErrorNode>,
+    pub active_job_count: usize,
     pub jobs: Vec<GraphJob>,
     pub added: GraphViewportItems,
     pub updated: GraphViewportItems,
     pub removed: Vec<GraphViewportRemovedItem>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct GraphJobsResponse {
+    pub active_job_count: usize,
+    pub jobs: Vec<GraphJob>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

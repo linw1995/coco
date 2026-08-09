@@ -37,7 +37,7 @@ use super::web_graph_view::{
     provider_context_id, route_edge, route_edge_with_offsets, shorten_id, summarize_node,
 };
 use crate::api::{
-    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphViewport,
+    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphJobsResponse, GraphViewport,
     GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode,
     GraphViewportResponse, Point as ApiPoint,
 };
@@ -751,7 +751,7 @@ impl WebGraphRuntime {
             .revision)
     }
 
-    pub async fn jobs(&self) -> crate::Result<Vec<GraphJob>> {
+    pub async fn jobs(&self) -> crate::Result<GraphJobsResponse> {
         loop {
             if let Some(jobs) = self.jobs_once(self.stored_revision().await?).await? {
                 return Ok(jobs);
@@ -1379,7 +1379,7 @@ impl WebGraphRuntime {
         let Some(error_nodes) = self.error_nodes_once(revision).await? else {
             return Ok(None);
         };
-        let Some(jobs) = self.jobs_once(revision).await? else {
+        let Some(job_response) = self.jobs_once(revision).await? else {
             return Ok(None);
         };
         Ok(Some(GraphViewportResponse {
@@ -1390,24 +1390,27 @@ impl WebGraphRuntime {
             },
             viewport: graph_viewport(request),
             error_nodes,
-            jobs,
+            active_job_count: job_response.active_job_count,
+            jobs: job_response.jobs,
             nodes,
             edges,
         }))
     }
 
-    async fn jobs_once(&self, revision: Revision) -> crate::Result<Option<Vec<GraphJob>>> {
-        let records = self
+    async fn jobs_once(&self, revision: Revision) -> crate::Result<Option<GraphJobsResponse>> {
+        let page = self
             .source
             .graph_jobs(NonZeroUsize::new(JOB_LIMIT).expect("job limit is non-zero"))
             .await
             .context(StoreSnafu)?;
 
-        let mut heads = records
+        let mut heads = page
+            .records
             .iter()
             .map(|record| (record.job.job_id.clone(), record.head_id.clone()))
             .collect::<BTreeMap<_, _>>();
-        let jobs = records
+        let jobs = page
+            .records
             .into_iter()
             .map(|record| record.job)
             .collect::<Vec<_>>();
@@ -1453,8 +1456,10 @@ impl WebGraphRuntime {
             }
         }
 
-        Ok(Some(
-            jobs.into_iter()
+        Ok(Some(GraphJobsResponse {
+            active_job_count: page.active_count,
+            jobs: jobs
+                .into_iter()
                 .filter_map(|job| {
                     let head_id = heads.remove(&job.job_id)?;
                     let point = *points.get(&head_id)?;
@@ -1472,7 +1477,7 @@ impl WebGraphRuntime {
                     })
                 })
                 .collect(),
-        ))
+        }))
     }
 
     async fn error_nodes_once(
@@ -2658,6 +2663,7 @@ fn empty_viewport_response(
         canvas,
         viewport: graph_viewport(request),
         error_nodes: Vec::new(),
+        active_job_count: 0,
         jobs: Vec::new(),
         nodes: Vec::new(),
         edges: Vec::new(),
@@ -3285,7 +3291,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["job-newer", "job-older"]
         );
-        assert_eq!(jobs, viewport.jobs);
+        assert_eq!(jobs.jobs, viewport.jobs);
+        assert_eq!(jobs.active_job_count, viewport.active_job_count);
         assert!(viewport.jobs.iter().all(|job| job.head_id == head));
         assert_eq!(viewport.jobs[0].status, "queued");
         assert_eq!(viewport.jobs[1].status, "finished");

@@ -66,6 +66,12 @@ pub struct GraphJobRecord {
     pub head_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphJobPage {
+    pub records: Vec<GraphJobRecord>,
+    pub active_count: usize,
+}
+
 /// Topology-only node data for incremental graph construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphNodeRecord {

@@ -964,6 +964,7 @@ async fn graph_jobs_batch_current_heads_and_prioritize_active_jobs() {
     let root = store.root_id();
     store.fork("main", &root).await.unwrap();
     store.fork("archive", &root).await.unwrap();
+    store.fork("secondary", &root).await.unwrap();
     let main_head = store
         .append(NewNode {
             parent: root.clone(),
@@ -991,6 +992,10 @@ async fn graph_jobs_batch_current_heads_and_prioritize_active_jobs() {
         .await
         .unwrap();
     store
+        .submit_job_with_id("job-active-newer", "secondary", &root)
+        .await
+        .unwrap();
+    store
         .submit_job_with_id("job-finished", "archive", &detached_base)
         .await
         .unwrap();
@@ -1013,20 +1018,35 @@ async fn graph_jobs_batch_current_heads_and_prioritize_active_jobs() {
         .execute(&mut connection)
         .await
         .unwrap();
+    diesel::update(jobs::table.filter(jobs::job_id.eq("job-active-newer")))
+        .set(jobs::created_at.eq("2026-08-06T11:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
     drop(connection);
     let graph = SqliteGraphStore::open_read_only(store.store_path())
         .await
         .unwrap();
 
     let records = graph
-        .graph_jobs(NonZeroUsize::new(2).unwrap())
+        .graph_jobs(NonZeroUsize::new(3).unwrap())
         .await
         .unwrap();
 
-    assert_eq!(records[0].job.job_id, "job-active");
-    assert_eq!(records[0].head_id, main_head);
-    assert_eq!(records[1].job.job_id, "job-finished");
-    assert_eq!(records[1].head_id, detached_base);
+    assert_eq!(records.active_count, 2);
+    assert_eq!(records.records[0].job.job_id, "job-active-newer");
+    assert_eq!(records.records[0].head_id, root);
+    assert_eq!(records.records[1].job.job_id, "job-active");
+    assert_eq!(records.records[1].head_id, main_head);
+    assert_eq!(records.records[2].job.job_id, "job-finished");
+    assert_eq!(records.records[2].head_id, detached_base);
+
+    let truncated = graph
+        .graph_jobs(NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(truncated.records.len(), 1);
+    assert_eq!(truncated.active_count, 2);
 }
 
 #[tokio::test]
