@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use coco_mem::{
-    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Kind, Node, NodeStore,
-    SqliteGraphStore,
+    GRAPH_READ_BATCH_SIZE, GraphNodeCursor, GraphNodeRecord, Job, JobStatus, JobStore, Kind, Node,
+    NodeStore, SqliteGraphStore, SqliteStore,
 };
 use snafu::{IntoError, prelude::*};
 use tokio::sync::watch;
@@ -37,9 +37,9 @@ use super::web_graph_view::{
     provider_context_id, route_edge, route_edge_with_offsets, shorten_id, summarize_node,
 };
 use crate::api::{
-    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphViewport, GraphViewportDiffResponse,
-    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse,
-    Point as ApiPoint,
+    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphViewport,
+    GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode,
+    GraphViewportResponse, Point as ApiPoint,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::web_graph::{
@@ -58,11 +58,24 @@ const CATCH_UP_SOURCE_PAGE_SIZE: usize = GRAPH_READ_BATCH_SIZE;
 // Full node payloads can be large, so release the source connection between small batches.
 const SOURCE_NODE_HYDRATION_BATCH_SIZE: usize = 16;
 const ERROR_NODE_LIMIT: usize = 100;
+const JOB_LIMIT: usize = 100;
+
+fn compare_indexed_jobs(left: &Job, right: &Job) -> std::cmp::Ordering {
+    let left_finished = matches!(left.status, JobStatus::Finished);
+    let right_finished = matches!(right.status, JobStatus::Finished);
+    left_finished.cmp(&right_finished).then_with(|| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    })
+}
 
 #[derive(Clone)]
 pub(crate) struct WebGraphRuntime {
     store: WebGraphStore,
     source: SqliteGraphStore,
+    source_store: SqliteStore,
     publisher: ConsolePublisher,
     ready: watch::Sender<u64>,
 }
@@ -695,6 +708,9 @@ impl WebGraphRuntime {
         let source = SqliteGraphStore::open_read_only(path)
             .await
             .context(StoreSnafu)?;
+        let source_store = SqliteStore::open_read_only(path)
+            .await
+            .context(StoreSnafu)?;
         let store = WebGraphStore::open(path)
             .await
             .context(WebGraphStoreSnafu)?;
@@ -709,6 +725,7 @@ impl WebGraphRuntime {
         Ok(Self {
             store,
             source,
+            source_store,
             publisher,
             ready,
         })
@@ -1355,6 +1372,9 @@ impl WebGraphRuntime {
         let Some(error_nodes) = self.error_nodes_once(revision).await? else {
             return Ok(None);
         };
+        let Some(jobs) = self.jobs_once(revision).await? else {
+            return Ok(None);
+        };
         Ok(Some(GraphViewportResponse {
             version: revision.get(),
             canvas: GraphCanvas {
@@ -1363,9 +1383,96 @@ impl WebGraphRuntime {
             },
             viewport: graph_viewport(request),
             error_nodes,
+            jobs,
             nodes,
             edges,
         }))
+    }
+
+    async fn jobs_once(&self, revision: Revision) -> crate::Result<Option<Vec<GraphJob>>> {
+        let mut jobs = self
+            .source_store
+            .list_jobs()
+            .await
+            .context(StoreSnafu)?
+            .into_values()
+            .collect::<Vec<_>>();
+        jobs.sort_by(compare_indexed_jobs);
+        jobs.truncate(JOB_LIMIT);
+
+        let mut heads = BTreeMap::new();
+        for job in &jobs {
+            heads.insert(job.job_id.clone(), self.job_head(job).await?);
+        }
+        let head_ids = heads.values().cloned().collect::<BTreeSet<_>>();
+        let mut points = BTreeMap::new();
+        for chunk in head_ids
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(GRAPH_READ_BATCH_SIZE)
+        {
+            let node_ids = chunk
+                .iter()
+                .map(|node_id| NodeId::new((*node_id).clone()).context(WebGraphModelSnafu))
+                .collect::<crate::Result<Vec<_>>>()?;
+            let placements = self
+                .store
+                .node_placements(LayoutKind::All, &node_ids)
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            if placements.state.revision != revision {
+                return Ok(None);
+            }
+            points.extend(
+                placements
+                    .value
+                    .into_iter()
+                    .map(|placement| (placement.node.to_string(), placement.point)),
+            );
+        }
+        if jobs.is_empty() {
+            let state = self
+                .store
+                .state()
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            if state.revision != revision {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(
+            jobs.into_iter()
+                .filter_map(|job| {
+                    let head_id = heads.remove(&job.job_id)?;
+                    let point = *points.get(&head_id)?;
+                    Some(GraphJob {
+                        id: job.job_id.clone(),
+                        short_id: shorten_id(&job.job_id),
+                        created_at: job.created_at.to_string(),
+                        status: job.status.as_str().to_owned(),
+                        branch: job.branch,
+                        work_branch: job.work_branch,
+                        head_target: node_target_id(&head_id),
+                        head_short_id: shorten_id(&head_id),
+                        head_id,
+                        point: api_point(point),
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    async fn job_head(&self, job: &Job) -> crate::Result<String> {
+        match self.source_store.log(&job.base, &job.work_branch).await {
+            Ok(path) => Ok(path
+                .first()
+                .map_or_else(|| job.base.clone(), |node| node.id.clone())),
+            Err(coco_mem::StoreError::RefsNotConnected { .. }) => Ok(job.base.clone()),
+            Err(source) => Err(source).context(StoreSnafu),
+        }
     }
 
     async fn error_nodes_once(
@@ -2551,6 +2658,7 @@ fn empty_viewport_response(
         canvas,
         viewport: graph_viewport(request),
         error_nodes: Vec::new(),
+        jobs: Vec::new(),
         nodes: Vec::new(),
         edges: Vec::new(),
     }
@@ -2626,6 +2734,22 @@ mod tests {
         progress.observe_high_watermark(&through);
         assert_eq!(progress.total_nodes(), 8);
         assert_eq!(progress.pending_nodes(6), 6);
+    }
+
+    #[test]
+    fn indexed_jobs_prioritize_active_jobs_before_newer_finished_jobs() {
+        let mut active = Job::new("job-active", "main", "base");
+        active.created_at = "2026-08-06T08:00:00Z".parse().unwrap();
+        active.status = JobStatus::Running;
+        let mut finished = Job::new("job-finished", "main", "base");
+        finished.created_at = "2026-08-06T09:00:00Z".parse().unwrap();
+        finished.status = JobStatus::Finished;
+        let mut jobs = [finished, active];
+
+        jobs.sort_by(compare_indexed_jobs);
+
+        assert_eq!(jobs[0].job_id, "job-active");
+        assert_eq!(jobs[1].job_id, "job-finished");
     }
 
     #[test]
@@ -3125,6 +3249,75 @@ mod tests {
             .map(|placement| (placement.node.to_string(), api_point(placement.point)))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(viewport.error_nodes[0].point, placements[&newer]);
+    }
+
+    #[tokio::test]
+    async fn viewport_indexes_jobs_newest_first_at_their_current_heads() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("main", &root).await.unwrap();
+        writer
+            .submit_job_with_id("job-older", "main", &root)
+            .await
+            .unwrap();
+        writer
+            .set_job_status(
+                "job-older",
+                coco_mem::JobStatus::Queued,
+                coco_mem::JobStatus::Running,
+            )
+            .await
+            .unwrap();
+        writer
+            .set_job_status(
+                "job-older",
+                coco_mem::JobStatus::Running,
+                coco_mem::JobStatus::Finished,
+            )
+            .await
+            .unwrap();
+        let head = append_text(&writer, &root, "current job head").await;
+        writer.set_branch_head("main", &root, &head).await.unwrap();
+        writer
+            .submit_job_with_id("job-newer", "main", &head)
+            .await
+            .unwrap();
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let viewport = runtime
+            .viewport(ViewMode::Anchors, complete_viewport())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            viewport
+                .jobs
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job-newer", "job-older"]
+        );
+        assert!(viewport.jobs.iter().all(|job| job.head_id == head));
+        assert_eq!(viewport.jobs[0].status, "queued");
+        assert_eq!(viewport.jobs[1].status, "finished");
+        let placement = runtime
+            .store
+            .node_placements(LayoutKind::All, &[NodeId::new(head).unwrap()])
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .pop()
+            .unwrap();
+        assert!(
+            viewport
+                .jobs
+                .iter()
+                .all(|job| job.point == api_point(placement.point))
+        );
     }
 
     #[tokio::test]

@@ -512,7 +512,7 @@ fn EmptyTimeScale() -> impl IntoView {
 mod tests {
     use super::*;
     use crate::api::{
-        GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphViewport, GraphViewportEdge,
+        GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphViewport, GraphViewportEdge,
         GraphViewportEdgeKind, GraphViewportNode, Point,
     };
     use coco_types::{SkillScript, SkillUpdatePatch, SkillVersionSpec};
@@ -539,6 +539,18 @@ mod tests {
                 created_at: "2026-08-06T09:00:00Z".to_owned(),
                 summary: "backend unavailable".to_owned(),
                 point: Point { x: 2100, y: 240 },
+            }],
+            jobs: vec![GraphJob {
+                id: "job-current".to_owned(),
+                short_id: "job-curr".to_owned(),
+                created_at: "2026-08-06T09:05:00Z".to_owned(),
+                status: "running".to_owned(),
+                branch: "main".to_owned(),
+                work_branch: "recovery".to_owned(),
+                head_id: "latest".to_owned(),
+                head_target: "detail-latest".to_owned(),
+                head_short_id: "latest".to_owned(),
+                point: Point { x: 2300, y: 120 },
             }],
             nodes: vec![GraphViewportNode {
                 key: "node:latest".to_owned(),
@@ -569,6 +581,11 @@ mod tests {
         assert!(anchors_href.contains("graph_focus_target=detail-failed"));
         assert!(anchors_href.contains("graph_focus_x=2100"));
         assert!(anchors_href.contains("graph_focus_y=240"));
+        let anchors_job_href = crate::graph_render::job_href(&viewport.jobs[0], false);
+        assert!(anchors_job_href.contains("mode=all"));
+        assert!(anchors_job_href.contains("graph_focus_target=detail-latest"));
+        assert!(anchors_job_href.contains("graph_focus_x=2300"));
+        assert!(anchors_job_href.contains("graph_focus_y=120"));
 
         let page = render_index_page(ViewMode::All, viewport, None);
 
@@ -582,6 +599,11 @@ mod tests {
         assert!(page.contains("width=\"2400\" height=\"900\""));
         assert!(page.contains("data-node-id=\"latest\""));
         assert!(page.contains("Error Nodes"));
+        assert!(page.contains("Jobs"));
+        assert!(page.contains("aria-label=\"Jobs (1 active)\""));
+        assert!(page.contains("job-curr"));
+        assert!(page.contains("main → recovery"));
+        assert!(page.contains("head latest"));
         assert!(page.contains("href=\"#detail-failed\""));
         assert!(page.contains("backend unavailable"));
         assert!(page.contains("data-node-x=\"2100\""));

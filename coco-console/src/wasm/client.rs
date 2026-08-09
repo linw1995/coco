@@ -16,7 +16,7 @@ use super::refresh::{
     pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
 use crate::api::{
-    AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphErrorNode,
+    AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob,
     GraphViewport, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
     GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem, GraphViewportResponse, Point,
 };
@@ -25,7 +25,7 @@ use crate::graph_render::truncate_label;
 use crate::graph_render::{
     GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
     edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
-    node_group_class, node_label, node_title_text, percent_encode, render_element_id,
+    job_href, node_group_class, node_label, node_title_text, percent_encode, render_element_id,
 };
 use crate::panels::{
     PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, load_anchor_range, notify_graph_revision,
@@ -456,6 +456,7 @@ impl VirtualGraph {
             canvas,
             viewport,
             error_nodes,
+            jobs,
             nodes,
             edges,
         } = response;
@@ -464,6 +465,7 @@ impl VirtualGraph {
         self.rendered = RenderedKeys::new();
         self.apply_response_viewport(version, canvas, viewport)?;
         sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
+        sync_jobs(&self.document, &self.graph_mode, jobs)?;
         self.upsert_graph_items(GraphViewportItems { nodes, edges }, false)?;
         self.sync_anchor_range()?;
         self.sync_svg_viewport();
@@ -478,6 +480,7 @@ impl VirtualGraph {
             canvas,
             viewport,
             error_nodes,
+            jobs,
             added,
             updated,
             removed,
@@ -485,6 +488,7 @@ impl VirtualGraph {
         } = response;
         self.apply_response_viewport(version, canvas, viewport)?;
         sync_error_nodes(&self.document, &self.graph_mode, error_nodes)?;
+        sync_jobs(&self.document, &self.graph_mode, jobs)?;
         self.remove_graph_items(removed);
         self.upsert_diff_items(added, updated)?;
         self.sync_anchor_range()?;
@@ -1579,6 +1583,85 @@ fn error_node_link_element(
     let summary = document.create_element("span")?;
     summary.set_attribute("class", "error-node-summary")?;
     summary.set_text_content(Some(&node.summary));
+    link.append_child(&summary)?;
+    Ok(link)
+}
+
+fn sync_jobs(document: &Document, graph_mode: &str, jobs: Vec<GraphJob>) -> Result<(), JsValue> {
+    let Some(list) = query_optional(document, ".job-list") else {
+        return Ok(());
+    };
+    let count = jobs.len();
+    let active_count = jobs.iter().filter(|job| job.status != "finished").count();
+    if let Some(count_element) = query_optional(document, ".job-count") {
+        count_element.set_text_content(Some(&active_count.to_string()));
+    }
+    if let Some(summary) = query_optional(document, ".job-popover summary") {
+        summary.set_attribute("aria-label", &format!("Jobs ({active_count} active)"))?;
+    }
+    if let Some(empty) = query_optional(document, ".job-empty") {
+        if count == 0 {
+            empty.remove_attribute("hidden")?;
+        } else {
+            empty.set_attribute("hidden", "hidden")?;
+        }
+    }
+    clear_children(&list);
+    for job in jobs {
+        let link = job_link_element(document, graph_mode, job)?;
+        list.append_child(&link)?;
+    }
+    Ok(())
+}
+
+fn job_link_element(
+    document: &Document,
+    graph_mode: &str,
+    job: GraphJob,
+) -> Result<Element, JsValue> {
+    let link = document.create_element("a")?;
+    let href = job_href(&job, graph_mode == "all");
+    set_attributes(
+        &link,
+        [
+            ("class", "graph-index-link job-link".to_owned()),
+            ("href", href),
+            ("data-node-x", job.point.x.to_string()),
+            ("data-node-y", job.point.y.to_string()),
+            ("role", "listitem".to_owned()),
+        ],
+    )?;
+
+    let head = document.create_element("span")?;
+    head.set_attribute("class", "graph-index-link-head job-link-head")?;
+    let id = document.create_element("strong")?;
+    id.set_text_content(Some(&job.short_id));
+    head.append_child(&id)?;
+    let time = document.create_element("time")?;
+    time.set_attribute("datetime", &job.created_at)?;
+    time.set_text_content(Some(&job.created_at));
+    head.append_child(&time)?;
+    link.append_child(&head)?;
+
+    let summary = document.create_element("span")?;
+    summary.set_attribute("class", "job-summary")?;
+    let status = document.create_element("span")?;
+    status.set_attribute("class", &format!("job-status {}", job.status))?;
+    status.set_text_content(Some(&job.status));
+    summary.append_child(&status)?;
+    let branch = document.create_element("span")?;
+    branch.set_attribute("class", "job-branch")?;
+    let branch_text = if job.branch == job.work_branch {
+        job.branch
+    } else {
+        format!("{} → {}", job.branch, job.work_branch)
+    };
+    branch.set_text_content(Some(&branch_text));
+    summary.append_child(&branch)?;
+    let current_head = document.create_element("span")?;
+    current_head.set_attribute("class", "job-head")?;
+    current_head.set_text_content(Some(&format!("head {}", job.head_short_id)));
+    summary.append_child(&current_head)?;
     link.append_child(&summary)?;
     Ok(link)
 }
@@ -2973,8 +3056,8 @@ fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), 
 
         event.prevent_default();
         event.stop_propagation();
-        close_error_node_popover(&link);
-        if let Some(point) = error_node_link_point(&link) {
+        close_graph_index_popover(&link);
+        if let Some(point) = graph_index_link_point(&link) {
             update_viewport(detail_graph.clone(), |graph| {
                 if graph.auto_follow
                     && let Err(error) = graph.set_auto_follow(false)
@@ -2991,15 +3074,15 @@ fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), 
     Ok(())
 }
 
-fn error_node_link_point(link: &Element) -> Option<Point> {
+fn graph_index_link_point(link: &Element) -> Option<Point> {
     Some(Point {
         x: rounded_i32(numeric_attribute(link, "data-node-x")?),
         y: rounded_i32(numeric_attribute(link, "data-node-y")?),
     })
 }
 
-fn close_error_node_popover(link: &Element) {
-    if let Some(popover) = link.closest(".error-node-popover").ok().flatten() {
+fn close_graph_index_popover(link: &Element) {
+    if let Some(popover) = link.closest(".graph-index-popover").ok().flatten() {
         let _ = popover.remove_attribute("open");
     }
 }
@@ -3710,7 +3793,14 @@ mod tests {
                 r#"
                 <main id="console-root" data-version="0" data-graph-mode="anchors">
                   <div class="graph-controls">
-                    <details class="error-node-popover">
+                    <details class="graph-index-popover job-popover">
+                      <summary><span>Jobs</span><span class="job-count">0</span></summary>
+                      <div class="job-menu">
+                        <p class="job-empty">No jobs</p>
+                        <div class="job-list"></div>
+                      </div>
+                    </details>
+                    <details class="graph-index-popover error-node-popover">
                       <summary><span>Error Nodes</span><span class="error-node-count">0</span></summary>
                       <div class="error-node-menu">
                         <p class="error-node-empty">No error nodes</p>
@@ -4005,6 +4095,7 @@ mod tests {
                     previous_viewport: response_viewport,
                     viewport: response_viewport,
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
                     removed: Vec::new(),
@@ -4266,6 +4357,7 @@ mod tests {
                     },
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     nodes: vec![
                         graph_node("source", 100, 80),
                         graph_node("target", 212, 80),
@@ -4313,6 +4405,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
                         nodes: vec![
@@ -4398,6 +4491,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems::default(),
                     removed: vec![
@@ -4456,6 +4550,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     added: GraphViewportItems {
                         nodes: vec![
                             graph_node("target", 280, 160),
@@ -4503,6 +4598,7 @@ mod tests {
                     },
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     nodes: vec![graph_node("source", 100, 80), graph_node("target", 212, 80)],
                     edges: Vec::new(),
                 })
@@ -4517,6 +4613,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
                         nodes: vec![graph_node("target", 260, 140)],
@@ -5138,6 +5235,7 @@ mod tests {
                     },
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     nodes: vec![
                         graph_node("aaaaaaaa", 56, 56),
                         graph_node("bbbbbbbb", 168, 128),
@@ -5196,6 +5294,7 @@ mod tests {
                     previous_viewport: viewport(),
                     viewport: viewport(),
                     error_nodes: Vec::new(),
+                    jobs: Vec::new(),
                     added: GraphViewportItems::default(),
                     updated: GraphViewportItems {
                         nodes: vec![graph_node("aaaaaaaa", 280, 162)],
@@ -5338,7 +5437,7 @@ mod tests {
             Some("#detail-newer")
         );
         assert_eq!(
-            error_node_link_point(&first),
+            graph_index_link_point(&first),
             Some(Point { x: 320, y: 180 })
         );
         assert_eq!(
@@ -5350,6 +5449,85 @@ mod tests {
                 .text_content()
                 .as_deref(),
             Some("2")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_job_popover_renders_in_response_order_and_targets_current_heads() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        sync_jobs(
+            &document,
+            "all",
+            vec![
+                GraphJob {
+                    id: "job-newer".to_owned(),
+                    short_id: "job-newe".to_owned(),
+                    created_at: "2026-08-06T09:00:00Z".to_owned(),
+                    status: "running".to_owned(),
+                    branch: "main".to_owned(),
+                    work_branch: "recovery".to_owned(),
+                    head_id: "current".to_owned(),
+                    head_target: "detail-current".to_owned(),
+                    head_short_id: "current".to_owned(),
+                    point: Point { x: 320, y: 180 },
+                },
+                GraphJob {
+                    id: "job-finished".to_owned(),
+                    short_id: "job-fini".to_owned(),
+                    created_at: "2026-08-06T08:00:00Z".to_owned(),
+                    status: "finished".to_owned(),
+                    branch: "main".to_owned(),
+                    work_branch: "main".to_owned(),
+                    head_id: "previous".to_owned(),
+                    head_target: "detail-previous".to_owned(),
+                    head_short_id: "previous".to_owned(),
+                    point: Point { x: 120, y: 90 },
+                },
+            ],
+        )
+        .expect_throw("jobs should render");
+
+        let link = fixture
+            .root
+            .query_selector(".job-link")
+            .expect_throw("job link query should succeed")
+            .expect_throw("job link should exist");
+        assert_eq!(
+            link.get_attribute("href").as_deref(),
+            Some("#detail-current")
+        );
+        assert_eq!(
+            graph_index_link_point(&link),
+            Some(Point { x: 320, y: 180 })
+        );
+        assert_eq!(
+            fixture
+                .root
+                .query_selector(".job-count")
+                .expect_throw("job count query should succeed")
+                .expect_throw("job count should exist")
+                .text_content()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            fixture
+                .root
+                .query_selector_all(".job-link")
+                .expect_throw("job links should query")
+                .length(),
+            2
+        );
+        assert_eq!(
+            fixture
+                .root
+                .query_selector(".job-branch")
+                .expect_throw("job branch query should succeed")
+                .expect_throw("job branch should exist")
+                .text_content()
+                .as_deref(),
+            Some("main → recovery")
         );
     }
 
