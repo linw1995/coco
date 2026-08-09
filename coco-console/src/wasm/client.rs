@@ -227,6 +227,7 @@ fn install_graph_events(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue>
 fn handle_graph_version_event(graph: Rc<RefCell<VirtualGraph>>, data: &str) {
     match data.parse::<u64>() {
         Ok(version) => {
+            request_jobs_refresh(graph.clone());
             request_graph_items_refresh(graph, version);
             notify_graph_revision();
         }
@@ -1632,7 +1633,7 @@ fn error_node_link_element(
     set_attributes(
         &link,
         [
-            ("class", "error-node-link".to_owned()),
+            ("class", "graph-index-link error-node-link".to_owned()),
             ("href", href),
             ("data-node-x", node.point.x.to_string()),
             ("data-node-y", node.point.y.to_string()),
@@ -1641,7 +1642,7 @@ fn error_node_link_element(
     )?;
 
     let head = document.create_element("span")?;
-    head.set_attribute("class", "error-node-link-head")?;
+    head.set_attribute("class", "graph-index-link-head error-node-link-head")?;
     let id = document.create_element("strong")?;
     id.set_text_content(Some(&node.short_id));
     head.append_child(&id)?;
@@ -1652,7 +1653,7 @@ fn error_node_link_element(
     link.append_child(&head)?;
 
     let summary = document.create_element("span")?;
-    summary.set_attribute("class", "error-node-summary")?;
+    summary.set_attribute("class", "graph-index-summary error-node-summary")?;
     summary.set_text_content(Some(&node.summary));
     link.append_child(&summary)?;
     Ok(link)
@@ -5510,6 +5511,23 @@ mod tests {
         assert_eq!(
             graph_index_link_point(&first),
             Some(Point { x: 320, y: 180 })
+        );
+        assert!(first.class_list().contains("graph-index-link"));
+        assert!(
+            first
+                .query_selector(".error-node-link-head")
+                .expect_throw("error node head query should succeed")
+                .expect_throw("error node head should exist")
+                .class_list()
+                .contains("graph-index-link-head")
+        );
+        assert!(
+            first
+                .query_selector(".error-node-summary")
+                .expect_throw("error node summary query should succeed")
+                .expect_throw("error node summary should exist")
+                .class_list()
+                .contains("graph-index-summary")
         );
         assert_eq!(
             fixture

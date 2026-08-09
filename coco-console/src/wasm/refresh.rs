@@ -310,6 +310,7 @@ mod tests {
 
         state.begin();
         assert!(!state.finish(true));
+        assert!(state.request());
     }
 
     #[test]
