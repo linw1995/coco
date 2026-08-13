@@ -107,7 +107,8 @@ use node::{
     NodeAnchorPromptAttachmentRow, NodeAnchorSessionPatchRow, NodeAnchorSessionPatchToolRow,
     NodeAnchorSessionRow, NodeAnchorSessionToolRow, NodeAnchorSkillInvocationRow,
     NodeAnchorSkillResultRow, NodeMetadataRow, NodeToolResultRow, NodeToolUseRow,
-    load_graph_node_records_by_exact_ids, load_node_by_exact_id, node_storage_kind,
+    load_graph_node_records_by_exact_ids, load_nearest_anchor_or_root_ids, load_node_by_exact_id,
+    node_storage_kind,
 };
 
 type AsyncSqliteConnection = SyncConnectionWrapper<SqliteConnection>;

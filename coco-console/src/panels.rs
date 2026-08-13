@@ -527,7 +527,7 @@ fn ParentRef(
     let target = format!("{NODE_TARGET_PREFIX}{node_id}");
     let href = graph_link.map_or_else(
         || format!("#{target}"),
-        |link| graph_point_href(&target, link.point, link.local),
+        |link| graph_point_href(&target, link.point, link.local, "all"),
     );
     let aria_label = format!("Jump to {label}: {node_id}");
     let title = node_id.clone();

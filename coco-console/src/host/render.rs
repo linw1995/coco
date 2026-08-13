@@ -554,6 +554,9 @@ mod tests {
                 head_target: "detail-latest".to_owned(),
                 head_short_id: "latest".to_owned(),
                 point: Point { x: 2300, y: 120 },
+                head_anchor_id: "anchor".to_owned(),
+                head_anchor_target: "detail-anchor".to_owned(),
+                head_anchor_point: Point { x: 2100, y: 240 },
             }],
             nodes: vec![GraphViewportNode {
                 key: "node:latest".to_owned(),
@@ -585,10 +588,15 @@ mod tests {
         assert!(anchors_href.contains("graph_focus_x=2100"));
         assert!(anchors_href.contains("graph_focus_y=240"));
         let anchors_job_href = crate::job_href(&viewport.jobs[0], false);
-        assert!(anchors_job_href.contains("mode=all"));
-        assert!(anchors_job_href.contains("graph_focus_target=detail-latest"));
-        assert!(anchors_job_href.contains("graph_focus_x=2300"));
-        assert!(anchors_job_href.contains("graph_focus_y=120"));
+        assert_eq!(anchors_job_href, "#detail-anchor");
+        let anchors_head_href =
+            crate::job_destination_href(&viewport.jobs[0], false, crate::JobDestination::Head);
+        assert!(anchors_head_href.contains("mode=all"));
+        assert!(anchors_head_href.contains("graph_focus_target=detail-latest"));
+        let all_anchor_href =
+            crate::job_destination_href(&viewport.jobs[0], true, crate::JobDestination::HeadAnchor);
+        assert!(all_anchor_href.contains("mode=anchors"));
+        assert!(all_anchor_href.contains("graph_focus_target=detail-anchor"));
 
         let page = render_index_page(ViewMode::All, viewport, None);
 
@@ -607,6 +615,10 @@ mod tests {
         assert!(page.contains("job-curr"));
         assert!(page.contains("main → recovery"));
         assert!(page.contains("head latest"));
+        assert!(page.contains("job-destination-head"));
+        assert!(page.contains("job-destination-anchor"));
+        assert!(page.contains(">Head</a>"));
+        assert!(page.contains(">Head anchor</a>"));
         assert!(page.contains("href=\"#detail-failed\""));
         assert!(page.contains("backend unavailable"));
         assert!(page.contains("data-node-x=\"2100\""));
