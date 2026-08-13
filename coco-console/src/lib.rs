@@ -6,14 +6,15 @@ mod panels;
 use graph_render::truncate_label;
 #[cfg(target_arch = "wasm32")]
 use graph_render::{
-    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
-    edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
-    job_href, node_group_class, node_label, node_title_text, percent_encode, render_element_id,
+    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, JobDestination,
+    bezier_path, edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style,
+    error_node_href, job_destination_focus, job_destination_href, job_focus, job_href,
+    node_group_class, node_label, node_title_text, percent_encode, render_element_id,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use graph_render::{GraphCanvas, GraphCanvasModel};
 #[cfg(all(test, not(target_arch = "wasm32")))]
-use graph_render::{error_node_href, job_href};
+use graph_render::{JobDestination, error_node_href, job_destination_href, job_href};
 
 #[allow(dead_code)]
 mod web_graph;

@@ -1051,6 +1051,69 @@ async fn graph_jobs_batch_current_heads_and_prioritize_active_jobs() {
 }
 
 #[tokio::test]
+async fn graph_nearest_anchor_or_root_resolves_deep_shared_ancestry_in_one_query() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let anchor = store.append(session_anchor_node(&root)).await.unwrap();
+    let mut current = anchor.clone();
+    let mut shared = None;
+    for index in 0..40 {
+        current = store
+            .append(NewNode {
+                parent: current,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text(format!("primary {index}")),
+            })
+            .await
+            .unwrap();
+        if index == 19 {
+            shared = Some(current.clone());
+        }
+    }
+    let primary_head = current;
+    let mut secondary_head = shared.unwrap();
+    for index in 0..20 {
+        secondary_head = store
+            .append(NewNode {
+                parent: secondary_head,
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text(format!("secondary {index}")),
+            })
+            .await
+            .unwrap();
+    }
+    let start_ids = vec![
+        primary_head.clone(),
+        secondary_head.clone(),
+        anchor.clone(),
+        root.clone(),
+    ];
+    let mut connection = store.connect().await.unwrap();
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let captured_queries = Arc::clone(&queries);
+    connection.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            captured_queries.lock().unwrap().push(query.to_string());
+        }
+    });
+
+    let resolved =
+        super::load_nearest_anchor_or_root_ids(&mut connection, &store.database_path, &start_ids)
+            .await
+            .unwrap();
+
+    assert_eq!(resolved[&primary_head], anchor);
+    assert_eq!(resolved[&secondary_head], anchor);
+    assert_eq!(resolved[&anchor], anchor);
+    assert_eq!(resolved[&root], root);
+    let queries = queries.lock().unwrap();
+    assert_eq!(queries.len(), 1, "unexpected queries: {queries:#?}");
+    assert!(queries[0].contains("WITH RECURSIVE"));
+}
+
+#[tokio::test]
 async fn graph_branch_pages_are_ordered_and_mark_an_exact_final_page_complete() {
     let store = SqliteStore::open_temporary().await.unwrap();
     let root = store.root_id();

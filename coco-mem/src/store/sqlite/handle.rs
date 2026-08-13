@@ -15,9 +15,10 @@ use super::OwnedStoreDirectory;
 use super::database::sqlite_database_path;
 use super::node::{
     load_child_ids_by_parent_ids, load_child_ids_page, load_failure_nodes,
-    load_graph_node_records_by_exact_ids, load_node_by_exact_id, load_node_by_prefix_or_branch,
-    load_node_high_watermark, load_node_page, load_nodes_by_exact_ids, load_root_id, node_count,
-    node_cursor_matches, persist_node_without_transaction,
+    load_graph_node_records_by_exact_ids, load_nearest_anchor_or_root_ids, load_node_by_exact_id,
+    load_node_by_prefix_or_branch, load_node_high_watermark, load_node_page,
+    load_nodes_by_exact_ids, load_root_id, node_count, node_cursor_matches,
+    persist_node_without_transaction,
 };
 use super::skill::migrate_builtin_skills;
 use super::{
@@ -358,6 +359,15 @@ impl SqliteGraphStore {
         ensure_graph_read_batch_size(ids.len())?;
         let mut connection = self.connect().await?;
         load_graph_node_records_by_exact_ids(&mut connection, &self.database_path, ids).await
+    }
+
+    pub async fn graph_nearest_anchor_or_root_ids(
+        &self,
+        start_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        ensure_graph_read_batch_size(start_ids.len())?;
+        let mut connection = self.connect().await?;
+        load_nearest_anchor_or_root_ids(&mut connection, &self.database_path, start_ids).await
     }
 
     pub async fn graph_node_high_watermark(&self) -> Result<Option<GraphNodeCursor>> {

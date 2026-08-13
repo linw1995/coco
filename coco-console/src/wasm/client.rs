@@ -32,9 +32,10 @@ use crate::viewport::{
     same_viewport, short_canvas_auto_zoom,
 };
 use crate::{
-    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
-    edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
-    job_href, node_group_class, node_label, node_title_text, percent_encode, render_element_id,
+    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, JobDestination,
+    bezier_path, edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style,
+    error_node_href, job_destination_focus, job_destination_href, job_focus, job_href,
+    node_group_class, node_label, node_title_text, percent_encode, render_element_id,
 };
 
 use super::anchor_range::{
@@ -1712,16 +1713,37 @@ fn job_link_element(
     graph_mode: &str,
     job: GraphJob,
 ) -> Result<Element, JsValue> {
+    let item = document.create_element("div")?;
+    set_attributes(
+        &item,
+        [
+            ("class", "graph-index-item job-item".to_owned()),
+            ("role", "listitem".to_owned()),
+        ],
+    )?;
+    let all_view = graph_mode == "all";
+    let primary_link = job_primary_link_element(document, &job, all_view)?;
+    item.append_child(&primary_link)?;
+    let actions = job_destination_actions_element(document, &job, all_view)?;
+    item.append_child(&actions)?;
+    Ok(item)
+}
+
+fn job_primary_link_element(
+    document: &Document,
+    job: &GraphJob,
+    all_view: bool,
+) -> Result<Element, JsValue> {
     let link = document.create_element("a")?;
-    let href = job_href(&job, graph_mode == "all");
+    let href = job_href(job, all_view);
+    let (_, point) = job_focus(job, all_view);
     set_attributes(
         &link,
         [
             ("class", "graph-index-link job-link".to_owned()),
             ("href", href),
-            ("data-node-x", job.point.x.to_string()),
-            ("data-node-y", job.point.y.to_string()),
-            ("role", "listitem".to_owned()),
+            ("data-node-x", point.x.to_string()),
+            ("data-node-y", point.y.to_string()),
         ],
     )?;
 
@@ -1745,7 +1767,7 @@ fn job_link_element(
     let branch = document.create_element("span")?;
     branch.set_attribute("class", "job-branch")?;
     let branch_text = if job.branch == job.work_branch {
-        job.branch
+        job.branch.clone()
     } else {
         format!("{} → {}", job.branch, job.work_branch)
     };
@@ -1757,6 +1779,69 @@ fn job_link_element(
     summary.append_child(&current_head)?;
     link.append_child(&summary)?;
     Ok(link)
+}
+
+fn job_destination_actions_element(
+    document: &Document,
+    job: &GraphJob,
+    all_view: bool,
+) -> Result<Element, JsValue> {
+    let actions = document.create_element("nav")?;
+    set_attributes(
+        &actions,
+        [
+            ("class", "job-destination-actions".to_owned()),
+            ("aria-label", "Jump destination".to_owned()),
+        ],
+    )?;
+    let head_href = job_destination_href(job, all_view, JobDestination::Head);
+    let (_, head_point) = job_destination_focus(job, JobDestination::Head);
+    let head_label = format!("Jump job {} to head in All view", job.short_id);
+    let head_button = job_destination_button_element(
+        document,
+        "job-destination-button job-destination-head",
+        "Head",
+        &head_label,
+        &head_href,
+        head_point,
+    )?;
+    actions.append_child(&head_button)?;
+    let anchor_href = job_destination_href(job, all_view, JobDestination::HeadAnchor);
+    let (_, anchor_point) = job_destination_focus(job, JobDestination::HeadAnchor);
+    let anchor_label = format!("Jump job {} to head anchor in Anchors view", job.short_id);
+    let anchor_button = job_destination_button_element(
+        document,
+        "job-destination-button job-destination-anchor",
+        "Head anchor",
+        &anchor_label,
+        &anchor_href,
+        anchor_point,
+    )?;
+    actions.append_child(&anchor_button)?;
+    Ok(actions)
+}
+
+fn job_destination_button_element(
+    document: &Document,
+    class: &str,
+    label: &str,
+    aria_label: &str,
+    href: &str,
+    point: Point,
+) -> Result<Element, JsValue> {
+    let button = document.create_element("a")?;
+    set_attributes(
+        &button,
+        [
+            ("class", class.to_owned()),
+            ("href", href.to_owned()),
+            ("data-node-x", point.x.to_string()),
+            ("data-node-y", point.y.to_string()),
+            ("aria-label", aria_label.to_owned()),
+        ],
+    )?;
+    button.set_text_content(Some(label));
+    Ok(button)
 }
 
 fn query_graph_root_elements(document: &Document) -> Result<GraphRootElements, JsValue> {
@@ -5592,6 +5677,9 @@ mod tests {
                         head_target: "detail-current".to_owned(),
                         head_short_id: "current".to_owned(),
                         point: Point { x: 320, y: 180 },
+                        head_anchor_id: "anchor-current".to_owned(),
+                        head_anchor_target: "detail-anchor-current".to_owned(),
+                        head_anchor_point: Point { x: 300, y: 160 },
                     },
                     GraphJob {
                         id: "job-finished".to_owned(),
@@ -5604,6 +5692,9 @@ mod tests {
                         head_target: "detail-previous".to_owned(),
                         head_short_id: "previous".to_owned(),
                         point: Point { x: 120, y: 90 },
+                        head_anchor_id: "anchor-previous".to_owned(),
+                        head_anchor_target: "detail-anchor-previous".to_owned(),
+                        head_anchor_point: Point { x: 100, y: 80 },
                     },
                 ],
             },
@@ -5623,6 +5714,29 @@ mod tests {
             graph_index_link_point(&link),
             Some(Point { x: 320, y: 180 })
         );
+        let head_button = fixture
+            .root
+            .query_selector(".job-destination-head")
+            .expect_throw("head button query should succeed")
+            .expect_throw("head button should exist");
+        assert_eq!(
+            head_button.get_attribute("href").as_deref(),
+            Some("#detail-current")
+        );
+        assert_eq!(
+            graph_index_link_point(&head_button),
+            Some(Point { x: 320, y: 180 })
+        );
+        let anchor_button = fixture
+            .root
+            .query_selector(".job-destination-anchor")
+            .expect_throw("anchor button query should succeed")
+            .expect_throw("anchor button should exist");
+        let anchor_href = anchor_button
+            .get_attribute("href")
+            .expect_throw("anchor button href should exist");
+        assert!(anchor_href.contains("mode=anchors"));
+        assert!(anchor_href.contains("graph_focus_target=detail-anchor-current"));
         assert_eq!(
             fixture
                 .root
@@ -5650,6 +5764,66 @@ mod tests {
                 .text_content()
                 .as_deref(),
             Some("main → recovery")
+        );
+
+        sync_jobs(
+            &document,
+            "anchors",
+            GraphJobsResponse {
+                active_job_count: 1,
+                jobs: vec![GraphJob {
+                    id: "job-newer".to_owned(),
+                    short_id: "job-newe".to_owned(),
+                    created_at: "2026-08-06T09:00:00Z".to_owned(),
+                    status: "running".to_owned(),
+                    branch: "main".to_owned(),
+                    work_branch: "recovery".to_owned(),
+                    head_id: "current".to_owned(),
+                    head_target: "detail-current".to_owned(),
+                    head_short_id: "current".to_owned(),
+                    point: Point { x: 320, y: 180 },
+                    head_anchor_id: "anchor-current".to_owned(),
+                    head_anchor_target: "detail-anchor-current".to_owned(),
+                    head_anchor_point: Point { x: 300, y: 160 },
+                }],
+            },
+        )
+        .expect_throw("anchor jobs should render");
+        let link = fixture
+            .root
+            .query_selector(".job-link")
+            .expect_throw("anchor job link query should succeed")
+            .expect_throw("anchor job link should exist");
+        assert_eq!(
+            link.get_attribute("href").as_deref(),
+            Some("#detail-anchor-current")
+        );
+        assert_eq!(
+            graph_index_link_point(&link),
+            Some(Point { x: 300, y: 160 })
+        );
+        let head_button = fixture
+            .root
+            .query_selector(".job-destination-head")
+            .expect_throw("anchor-view head button query should succeed")
+            .expect_throw("anchor-view head button should exist");
+        let head_href = head_button
+            .get_attribute("href")
+            .expect_throw("anchor-view head button href should exist");
+        assert!(head_href.contains("mode=all"));
+        assert!(head_href.contains("graph_focus_target=detail-current"));
+        let anchor_button = fixture
+            .root
+            .query_selector(".job-destination-anchor")
+            .expect_throw("anchor-view anchor button query should succeed")
+            .expect_throw("anchor-view anchor button should exist");
+        assert_eq!(
+            anchor_button.get_attribute("href").as_deref(),
+            Some("#detail-anchor-current")
+        );
+        assert_eq!(
+            graph_index_link_point(&anchor_button),
+            Some(Point { x: 300, y: 160 })
         );
     }
 

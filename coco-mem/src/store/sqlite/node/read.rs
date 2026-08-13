@@ -885,6 +885,92 @@ pub async fn load_graph_node_records_by_exact_ids(
         .collect()
 }
 
+#[derive(QueryableByName)]
+struct NearestAnchorOrRootRow {
+    #[diesel(sql_type = Text)]
+    start_id: String,
+    #[diesel(sql_type = Text)]
+    node_id: String,
+}
+
+pub async fn load_nearest_anchor_or_root_ids(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    start_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    if start_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let start_ids_json = serde_json::to_string(start_ids).context(ParseSqliteStoreValueSnafu {
+        path: path.to_owned(),
+        column: "graph nearest anchor input".to_owned(),
+    })?;
+    let rows = diesel::sql_query(
+        r#"
+WITH RECURSIVE
+input(start_id) AS (
+    SELECT DISTINCT CAST(value AS TEXT)
+    FROM json_each(?)
+),
+ancestry(start_id, node_id, parent_id, kind) AS (
+    SELECT input.start_id, nodes.id, nodes.parent_id, nodes.kind
+    FROM input
+    JOIN nodes ON nodes.id = input.start_id
+
+    UNION
+
+    SELECT ancestry.start_id, nodes.id, nodes.parent_id, nodes.kind
+    FROM ancestry
+    JOIN nodes ON nodes.id = ancestry.parent_id
+    WHERE
+        ancestry.parent_id <> ''
+        AND ancestry.kind NOT IN (
+            'anchor_session',
+            'anchor_session_patch',
+            'anchor_prompt',
+            'anchor_skill_invocation',
+            'anchor_skill_result'
+        )
+)
+SELECT start_id, node_id
+FROM ancestry
+WHERE
+    parent_id = ''
+    OR kind IN (
+        'anchor_session',
+        'anchor_session_patch',
+        'anchor_prompt',
+        'anchor_skill_invocation',
+        'anchor_skill_result'
+    )
+ORDER BY start_id
+"#,
+    )
+    .bind::<Text, _>(start_ids_json)
+    .load::<NearestAnchorOrRootRow>(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    let resolved = rows
+        .into_iter()
+        .map(|row| (row.start_id, row.node_id))
+        .collect::<HashMap<_, _>>();
+    let unique_start_count = start_ids.iter().collect::<HashSet<_>>().len();
+    ensure!(
+        resolved.len() == unique_start_count,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: format!(
+                "SQLite graph nearest anchor query resolved {} of {} starting nodes",
+                resolved.len(),
+                unique_start_count
+            ),
+        }
+    );
+    Ok(resolved)
+}
+
 fn graph_node_kind_is_anchor(path: &Path, node_id: &str, kind: &str) -> Result<bool> {
     match kind {
         NODE_KIND_ANCHOR_SESSION
