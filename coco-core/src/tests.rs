@@ -594,6 +594,39 @@ async fn llm_engine_calls_prompt_and_returns_text() {
 }
 
 #[tokio::test]
+async fn llm_engine_job_status_preserves_finished_head_after_branch_advances() {
+    let store = test_store().await;
+    let backend = FakeBackend::with_responses(&[("main", &[Ok("hello from llm")])]);
+    let llm = Arc::new(LlmService::new(store.clone(), backend));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+
+    engine.reply("main", "hello").await.unwrap();
+    let job = store
+        .list_jobs()
+        .await
+        .unwrap()
+        .into_values()
+        .next()
+        .unwrap();
+    let later_head = store
+        .append(NewNode {
+            parent: job.head.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("later".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .set_branch_head("main", &job.head, &later_head)
+        .await
+        .unwrap();
+
+    assert_eq!(engine.get_job(&job.job_id).await.unwrap().head, job.head);
+}
+
+#[tokio::test]
 async fn llm_engine_prompt_session_patch_appends_patch_anchor() {
     let store = test_store().await;
     let backend = FakeBackend::with_responses(&[("runner", &[Ok("runner done")])]);
@@ -1163,7 +1196,7 @@ async fn llm_engine_retrying_failure_node_does_not_enqueue_duplicate_recovery_ev
 }
 
 #[tokio::test]
-async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
+async fn llm_engine_finishes_job_when_branch_disappears() {
     let store = test_store().await;
     let backend = FakeBackend::with_responses(&[]);
     let llm = Arc::new(LlmService::new(store.clone(), backend));
@@ -1173,9 +1206,10 @@ async fn llm_engine_finishes_job_after_unrecoverable_resume_error() {
     let job_id = job.job_id.clone();
 
     store.delete_branch("main").await.unwrap();
-    let error = engine.drive_job(&job_id).await.unwrap_err();
+    let snapshot = engine.drive_job(&job_id).await.unwrap();
 
-    assert!(matches!(error, EngineError::SessionMissing { branch } if branch == "main"));
+    assert_eq!(snapshot.status, JobStatus::Finished);
+    assert_eq!(snapshot.head, job.base);
     assert_eq!(
         store.get_job(&job_id).await.unwrap().status,
         JobStatus::Finished

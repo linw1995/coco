@@ -870,8 +870,6 @@ where
         &self,
         job: &Job,
     ) -> std::result::Result<JobStatusSnapshot, EngineError> {
-        let head = self.job_head(job).await?;
-
         Ok(JobStatusSnapshot {
             job_id: job.job_id.clone(),
             created_at: job.created_at,
@@ -880,7 +878,7 @@ where
             work_branch: job.work_branch.clone(),
             base: job.base.clone(),
             status: job.status,
-            head,
+            head: job.head.clone(),
         })
     }
 
