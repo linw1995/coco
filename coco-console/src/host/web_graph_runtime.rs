@@ -1405,15 +1405,11 @@ impl WebGraphRuntime {
             .context(StoreSnafu)?;
 
         let mut heads = page
-            .records
+            .jobs
             .iter()
-            .map(|record| (record.job.job_id.clone(), record.head_id.clone()))
+            .map(|job| (job.job_id.clone(), job.head.clone()))
             .collect::<BTreeMap<_, _>>();
-        let jobs = page
-            .records
-            .into_iter()
-            .map(|record| record.job)
-            .collect::<Vec<_>>();
+        let jobs = page.jobs;
         let head_ids = heads.values().cloned().collect::<BTreeSet<_>>();
         let mut points = BTreeMap::new();
         for chunk in head_ids
@@ -3293,23 +3289,28 @@ mod tests {
         );
         assert_eq!(jobs.jobs, viewport.jobs);
         assert_eq!(jobs.active_job_count, viewport.active_job_count);
-        assert!(viewport.jobs.iter().all(|job| job.head_id == head));
+        assert_eq!(viewport.jobs[0].head_id, head);
+        assert_eq!(viewport.jobs[1].head_id, root);
         assert_eq!(viewport.jobs[0].status, "queued");
         assert_eq!(viewport.jobs[1].status, "finished");
-        let placement = runtime
+        let placements = runtime
             .store
-            .node_placements(LayoutKind::All, &[NodeId::new(head).unwrap()])
+            .node_placements(
+                LayoutKind::All,
+                &[NodeId::new(head).unwrap(), NodeId::new(root).unwrap()],
+            )
             .await
             .unwrap()
             .unwrap()
             .value
-            .pop()
-            .unwrap();
+            .into_iter()
+            .map(|placement| (placement.node.to_string(), api_point(placement.point)))
+            .collect::<BTreeMap<_, _>>();
         assert!(
             viewport
                 .jobs
                 .iter()
-                .all(|job| job.point == api_point(placement.point))
+                .all(|job| job.point == placements[&job.head_id])
         );
     }
 

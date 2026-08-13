@@ -486,6 +486,7 @@ fn valid_job_row() -> super::JobRow {
         branch: "main".to_owned(),
         work_branch: "main".to_owned(),
         base: "base".to_owned(),
+        head: "base".to_owned(),
         status: "queued".to_owned(),
     }
 }
@@ -1034,18 +1035,18 @@ async fn graph_jobs_batch_current_heads_and_prioritize_active_jobs() {
         .unwrap();
 
     assert_eq!(records.active_count, 2);
-    assert_eq!(records.records[0].job.job_id, "job-active-newer");
-    assert_eq!(records.records[0].head_id, root);
-    assert_eq!(records.records[1].job.job_id, "job-active");
-    assert_eq!(records.records[1].head_id, main_head);
-    assert_eq!(records.records[2].job.job_id, "job-finished");
-    assert_eq!(records.records[2].head_id, detached_base);
+    assert_eq!(records.jobs[0].job_id, "job-active-newer");
+    assert_eq!(records.jobs[0].head, root);
+    assert_eq!(records.jobs[1].job_id, "job-active");
+    assert_eq!(records.jobs[1].head, main_head);
+    assert_eq!(records.jobs[2].job_id, "job-finished");
+    assert_eq!(records.jobs[2].head, detached_base);
 
     let truncated = graph
         .graph_jobs(NonZeroUsize::new(1).unwrap())
         .await
         .unwrap();
-    assert_eq!(truncated.records.len(), 1);
+    assert_eq!(truncated.jobs.len(), 1);
     assert_eq!(truncated.active_count, 2);
 }
 

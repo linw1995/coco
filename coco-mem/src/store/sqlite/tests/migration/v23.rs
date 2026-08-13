@@ -31,7 +31,7 @@ async fn open_upgrades_v22_without_node_item_backfill_marker() {
 
     let reopened = SqliteStore::open(&path).await.unwrap();
 
-    assert_eq!(reopened.schema_version().await.unwrap(), 24);
+    assert_eq!(reopened.schema_version().await.unwrap(), 25);
     assert!(!table_exists(&reopened, "store_meta").await);
 }
 
@@ -111,7 +111,7 @@ async fn open_accepts_legacy_json_store_after_completed_sqlite_migration() {
 
     let reopened = SqliteStore::open(&path).await.unwrap();
 
-    assert_eq!(reopened.schema_version().await.unwrap(), 24);
+    assert_eq!(reopened.schema_version().await.unwrap(), 25);
     assert!(!table_exists(&reopened, "store_meta").await);
 }
 
@@ -126,6 +126,6 @@ async fn open_accepts_legacy_json_files_with_current_sqlite_schema() {
 
     let reopened = SqliteStore::open(&path).await.unwrap();
 
-    assert_eq!(reopened.schema_version().await.unwrap(), 24);
+    assert_eq!(reopened.schema_version().await.unwrap(), 25);
     assert!(!table_exists(&reopened, "store_meta").await);
 }

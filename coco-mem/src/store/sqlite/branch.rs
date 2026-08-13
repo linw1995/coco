@@ -20,7 +20,7 @@ use crate::error::{
     InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu, MissingSessionAnchorSnafu,
     ParentNotFoundSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
-use crate::schema::{branches, nodes, sessions};
+use crate::schema::{branches, jobs, nodes, sessions};
 use crate::store::{BranchAppendSessionState, BranchStore, SessionStore};
 use crate::{
     Anchor, AnchorPayload, Kind, NewNodeContent, Node, PauseReason, Role, SessionAnchorPatch,
@@ -517,7 +517,7 @@ pub async fn maybe_load_branch_head(
         })
 }
 
-async fn node_reachable_from_head(
+pub async fn node_reachable_from_head(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     head_id: &str,
@@ -631,6 +631,35 @@ async fn update_branch_head_checked_in_transaction(
             }
             .build(),
         ));
+    }
+    let active_job = jobs::table
+        .filter(jobs::work_branch.eq(branch))
+        .filter(jobs::status.ne("finished"))
+        .select((jobs::job_id, jobs::base))
+        .get_result::<(String, String)>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+        .map_err(SqliteTransactionError::Operation)?;
+    if let Some((job_id, base)) = active_job {
+        let head = if node_reachable_from_head(connection, path, new_head, &base)
+            .await
+            .map_err(SqliteTransactionError::Operation)?
+        {
+            new_head
+        } else {
+            &base
+        };
+        diesel::update(jobs::table.filter(jobs::job_id.eq(job_id)))
+            .set(jobs::head.eq(head))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })
+            .map_err(SqliteTransactionError::Operation)?;
     }
     Ok(())
 }

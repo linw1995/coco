@@ -34,6 +34,7 @@ SELECT
         'branch', branch,
         'work_branch', work_branch,
         'base', base,
+        'head', base,
         'status', status
     )
 FROM jobs;

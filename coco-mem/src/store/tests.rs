@@ -1931,6 +1931,56 @@ where
     assert_eq!(store.get_job(&job.job_id).await.unwrap(), finished);
 }
 
+async fn assert_job_head_tracks_active_branch_and_freezes_when_finished<F>()
+where
+    F: TestStoreFactory,
+{
+    let store = F::create().await;
+    let root_id = store.root_id();
+    store.fork("main", &root_id).await.unwrap();
+    let job = store.submit_job("main", &root_id).await.unwrap();
+    assert_eq!(job.head, root_id);
+
+    let active_head = store
+        .append(NewNode {
+            parent: root_id.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text("active".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .set_branch_head("main", &root_id, &active_head)
+        .await
+        .unwrap();
+    assert_eq!(store.get_job(&job.job_id).await.unwrap().head, active_head);
+
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .await
+        .unwrap();
+    store
+        .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .await
+        .unwrap();
+    let later_head = store
+        .append(NewNode {
+            parent: active_head.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("later".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .set_branch_head("main", &active_head, &later_head)
+        .await
+        .unwrap();
+
+    assert_eq!(store.get_job(&job.job_id).await.unwrap().head, active_head);
+}
+
 async fn assert_job_work_branch_round_trip<F>()
 where
     F: TestStoreFactory,
@@ -1938,8 +1988,17 @@ where
     let store = F::create().await;
     let root_id = store.root_id();
     store.fork("main", &root_id).await.unwrap();
-    store.fork("recovery", &root_id).await.unwrap();
     let job = submit_prompt_job(&store, "main", "hello").await;
+    let recovery_head = store
+        .append(NewNode {
+            parent: job.base.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text("recovered".to_owned()),
+        })
+        .await
+        .unwrap();
+    store.fork("recovery", &recovery_head).await.unwrap();
 
     assert_eq!(job.work_branch, "main");
     let updated = store
@@ -1949,6 +2008,7 @@ where
 
     assert_eq!(updated.branch, "main");
     assert_eq!(updated.work_branch, "recovery");
+    assert_eq!(updated.head, recovery_head);
     assert_eq!(
         store.get_job(&job.job_id).await.unwrap().work_branch,
         "recovery"
@@ -2873,6 +2933,11 @@ macro_rules! define_common_store_tests {
             #[tokio::test]
             async fn finished_job_round_trip() {
                 assert_finished_job_round_trip::<$factory>().await;
+            }
+
+            #[tokio::test]
+            async fn job_head_tracks_active_branch_and_freezes_when_finished() {
+                assert_job_head_tracks_active_branch_and_freezes_when_finished::<$factory>().await;
             }
 
             #[tokio::test]

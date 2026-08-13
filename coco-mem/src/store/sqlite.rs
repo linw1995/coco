@@ -61,14 +61,8 @@ pub struct GraphNodePage {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct GraphJobRecord {
-    pub job: crate::Job,
-    pub head_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct GraphJobPage {
-    pub records: Vec<GraphJobRecord>,
+    pub jobs: Vec<crate::Job>,
     pub active_count: usize,
 }
 

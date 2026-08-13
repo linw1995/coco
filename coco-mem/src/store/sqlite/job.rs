@@ -8,11 +8,9 @@ use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
-use super::branch::{load_branch_head, load_session_chain};
+use super::branch::{load_branch_head, load_session_chain, node_reachable_from_head};
 use super::node::{load_node_by_exact_id, persist_node_without_transaction, validate_new_node};
-use super::{
-    AsyncSqliteConnection, GraphJobPage, GraphJobRecord, SqliteStore, SqliteTransactionError,
-};
+use super::{AsyncSqliteConnection, GraphJobPage, SqliteStore, SqliteTransactionError};
 use crate::error::{
     CorruptedStoreSnafu, PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
@@ -33,6 +31,7 @@ pub struct JobRow {
     pub branch: String,
     pub work_branch: String,
     pub base: String,
+    pub head: String,
     pub status: String,
 }
 
@@ -53,65 +52,28 @@ struct GraphJobRow {
     #[diesel(sql_type = Text)]
     status: String,
     #[diesel(sql_type = Text)]
-    head_id: String,
+    head: String,
     #[diesel(sql_type = BigInt)]
     active_count: i64,
 }
 
 const GRAPH_JOBS_QUERY: &str = r#"
-WITH RECURSIVE
-selected_jobs AS (
-    SELECT
-        jobs.job_id,
-        jobs.created_at,
-        jobs.finished_at,
-        jobs.branch,
-        jobs.work_branch,
-        jobs.base,
-        jobs.status,
-        COALESCE(branches.head_id, jobs.base) AS branch_head
-    FROM jobs
-    LEFT JOIN branches ON branches.name = jobs.work_branch
-    ORDER BY
-        CASE WHEN jobs.status = 'finished' THEN 1 ELSE 0 END,
-        jobs.created_at DESC,
-        jobs.job_id
-    LIMIT ?
-),
-paths(job_id, node_id, base) AS (
-    SELECT job_id, branch_head, base
-    FROM selected_jobs
-    UNION ALL
-    SELECT paths.job_id, nodes.parent_id, paths.base
-    FROM paths
-    JOIN nodes ON nodes.id = paths.node_id
-    WHERE paths.node_id <> paths.base
-      AND nodes.parent_id <> ''
-),
-connections AS (
-    SELECT job_id, MAX(node_id = base) AS connected
-    FROM paths
-    GROUP BY job_id
-)
 SELECT
-    selected_jobs.job_id,
-    selected_jobs.created_at,
-    selected_jobs.finished_at,
-    selected_jobs.branch,
-    selected_jobs.work_branch,
-    selected_jobs.base,
-    selected_jobs.status,
-    CASE
-        WHEN connections.connected = 1 THEN selected_jobs.branch_head
-        ELSE selected_jobs.base
-    END AS head_id,
+    jobs.job_id,
+    jobs.created_at,
+    jobs.finished_at,
+    jobs.branch,
+    jobs.work_branch,
+    jobs.base,
+    jobs.head,
+    jobs.status,
     (SELECT COUNT(*) FROM jobs WHERE status <> 'finished') AS active_count
-FROM selected_jobs
-JOIN connections ON connections.job_id = selected_jobs.job_id
+FROM jobs
 ORDER BY
-    CASE WHEN selected_jobs.status = 'finished' THEN 1 ELSE 0 END,
-    selected_jobs.created_at DESC,
-    selected_jobs.job_id
+    CASE WHEN jobs.status = 'finished' THEN 1 ELSE 0 END,
+    jobs.created_at DESC,
+    jobs.job_id
+LIMIT ?
 "#;
 
 pub async fn load_graph_job_records(
@@ -136,11 +98,10 @@ pub async fn load_graph_job_records(
             message: format!("active graph job count does not fit in usize: {source}"),
         })
     })?;
-    let records = rows
+    let jobs = rows
         .into_iter()
         .map(|row| {
-            let head_id = row.head_id;
-            let job = job_row_into_job(
+            job_row_into_job(
                 path,
                 JobRow {
                     job_id: row.job_id,
@@ -149,16 +110,13 @@ pub async fn load_graph_job_records(
                     branch: row.branch,
                     work_branch: row.work_branch,
                     base: row.base,
+                    head: row.head,
                     status: row.status,
                 },
-            )?;
-            Ok(GraphJobRecord { job, head_id })
+            )
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(GraphJobPage {
-        records,
-        active_count,
-    })
+    Ok(GraphJobPage { jobs, active_count })
 }
 
 async fn load_job_map(
@@ -173,6 +131,7 @@ async fn load_job_map(
             jobs::branch,
             jobs::work_branch,
             jobs::base,
+            jobs::head,
             jobs::status,
         ))
         .order(jobs::job_id)
@@ -203,6 +162,7 @@ async fn load_job(
             jobs::branch,
             jobs::work_branch,
             jobs::base,
+            jobs::head,
             jobs::status,
         ))
         .get_result::<JobRow>(connection)
@@ -240,6 +200,7 @@ pub fn job_row_into_job(path: &Path, row: JobRow) -> Result<Job> {
         branch: row.branch,
         work_branch: row.work_branch,
         base: row.base,
+        head: row.head,
         status,
     })
 }
@@ -269,6 +230,7 @@ fn parse_job_status(path: &Path, status: &str) -> Result<JobStatus> {
 async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &Job) -> Result<()> {
     let mut summary = job.clone();
     summary.normalize_work_branch();
+    summary.normalize_head();
     let finished_at = summary
         .finished_at
         .as_ref()
@@ -281,6 +243,7 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
             jobs::branch.eq(&summary.branch),
             jobs::work_branch.eq(&summary.work_branch),
             jobs::base.eq(&summary.base),
+            jobs::head.eq(&summary.head),
             jobs::status.eq(summary.status.as_str()),
         ))
         .on_conflict(jobs::job_id)
@@ -291,6 +254,7 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
             jobs::branch.eq(diesel::upsert::excluded(jobs::branch)),
             jobs::work_branch.eq(diesel::upsert::excluded(jobs::work_branch)),
             jobs::base.eq(diesel::upsert::excluded(jobs::base)),
+            jobs::head.eq(diesel::upsert::excluded(jobs::head)),
             jobs::status.eq(diesel::upsert::excluded(jobs::status)),
         ))
         .execute(connection)
@@ -308,7 +272,7 @@ async fn submit_job_with_id_in_transaction(
     branch: &str,
     base: &str,
 ) -> std::result::Result<Job, SqliteTransactionError> {
-    load_branch_head(connection, path, branch)
+    let branch_head = load_branch_head(connection, path, branch)
         .await
         .map_err(SqliteTransactionError::Operation)?;
     load_node_by_exact_id(connection, path, base)
@@ -346,7 +310,13 @@ async fn submit_job_with_id_in_transaction(
             .build(),
         ));
     }
-    let job = Job::new(job_id, branch, base);
+    let mut job = Job::new(job_id, branch, base);
+    if node_reachable_from_head(connection, path, &branch_head, base)
+        .await
+        .map_err(SqliteTransactionError::Operation)?
+    {
+        job.head = branch_head;
+    }
     persist_job(connection, path, &job)
         .await
         .map_err(SqliteTransactionError::Operation)?;
@@ -635,9 +605,10 @@ impl JobStore for SqliteStore {
         let mut connection = self.connect().await?;
         connection
             .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-                load_branch_head(connection, &self.database_path, next_work_branch)
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
+                let next_branch_head =
+                    load_branch_head(connection, &self.database_path, next_work_branch)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
                 let jobs = load_job_map(connection, &self.database_path)
                     .await
                     .map_err(SqliteTransactionError::Operation)?;
@@ -682,6 +653,19 @@ impl JobStore for SqliteStore {
                     ));
                 }
                 job.work_branch = next_work_branch.to_owned();
+                job.head = if node_reachable_from_head(
+                    connection,
+                    &self.database_path,
+                    &next_branch_head,
+                    &job.base,
+                )
+                .await
+                .map_err(SqliteTransactionError::Operation)?
+                {
+                    next_branch_head
+                } else {
+                    job.base.clone()
+                };
                 persist_job(connection, &self.database_path, &job)
                     .await
                     .map_err(SqliteTransactionError::Operation)?;

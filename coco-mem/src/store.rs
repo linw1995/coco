@@ -10,8 +10,8 @@ mod tests;
 
 pub use sqlite::{
     GRAPH_READ_BATCH_SIZE, GraphBranchPage, GraphBranchPageCursor, GraphBranchRecord,
-    GraphChildPage, GraphChildPageCursor, GraphJobPage, GraphJobRecord, GraphNodeCursor,
-    GraphNodePage, GraphNodeRecord, SqliteGraphStore, SqliteStore,
+    GraphChildPage, GraphChildPageCursor, GraphJobPage, GraphNodeCursor, GraphNodePage,
+    GraphNodeRecord, SqliteGraphStore, SqliteStore,
 };
 
 use crate::{
