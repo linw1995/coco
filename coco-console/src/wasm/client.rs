@@ -5214,6 +5214,7 @@ mod tests {
         let detected = Rc::new(Cell::new(false));
         let closure_detected = detected.clone();
         let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+            event.prevent_default();
             closure_detected.set(detail_link_from_event(&event).is_some());
         });
         link.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
