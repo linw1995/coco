@@ -87,7 +87,12 @@ mod preset;
 mod skill;
 mod transaction;
 
+use branch::{
+    load_branch_head, load_graph_branch_name_high_watermark, load_graph_branch_records,
+    load_session_chain, maybe_load_branch_head, node_reachable_from_head,
+};
 use database::sqlite_database_path;
+use job::load_graph_job_records;
 
 #[cfg(test)]
 use crate::MessageQueueItem;

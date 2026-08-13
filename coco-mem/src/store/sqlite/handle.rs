@@ -25,6 +25,7 @@ use super::{
     GraphBranchPageCursor, GraphBranchRecord, GraphChildPage, GraphChildPageCursor, GraphJobPage,
     GraphNodeCursor, GraphNodePage, GraphNodeRecord, SqliteDatabase, SqliteGraphConnectionFuture,
     SqliteGraphConnectionGuard, SqliteGraphStore, SqliteStore, SqliteTransactionError, StoreAccess,
+    load_graph_branch_name_high_watermark, load_graph_branch_records, load_graph_job_records,
     migration,
 };
 use crate::StoreResult as Result;
@@ -249,15 +250,8 @@ impl SqliteGraphStore {
 
     pub async fn graph_branches(&self) -> Result<Vec<GraphBranchRecord>> {
         let mut connection = self.connect().await?;
-        super::branch::load_graph_branch_records(
-            &mut connection,
-            &self.database_path,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
+        load_graph_branch_records(&mut connection, &self.database_path, None, None, None, None)
+            .await
     }
 
     pub async fn graph_branches_by_names(
@@ -266,7 +260,7 @@ impl SqliteGraphStore {
     ) -> Result<Vec<GraphBranchRecord>> {
         ensure_graph_read_batch_size(names.len())?;
         let mut connection = self.connect().await?;
-        super::branch::load_graph_branch_records(
+        load_graph_branch_records(
             &mut connection,
             &self.database_path,
             Some(names),
@@ -279,8 +273,7 @@ impl SqliteGraphStore {
 
     pub async fn graph_branch_name_high_watermark(&self) -> Result<Option<String>> {
         let mut connection = self.connect().await?;
-        super::branch::load_graph_branch_name_high_watermark(&mut connection, &self.database_path)
-            .await
+        load_graph_branch_name_high_watermark(&mut connection, &self.database_path).await
     }
 
     pub async fn graph_branches_page(
@@ -291,7 +284,7 @@ impl SqliteGraphStore {
     ) -> Result<GraphBranchPage> {
         ensure_graph_read_batch_size(page_size.get())?;
         let mut connection = self.connect().await?;
-        let mut branches = super::branch::load_graph_branch_records(
+        let mut branches = load_graph_branch_records(
             &mut connection,
             &self.database_path,
             None,
@@ -333,7 +326,7 @@ impl SqliteGraphStore {
     pub async fn graph_jobs(&self, limit: NonZeroUsize) -> Result<GraphJobPage> {
         ensure_graph_read_batch_size(limit.get())?;
         let mut connection = self.connect().await?;
-        super::job::load_graph_job_records(&mut connection, &self.database_path, limit.get()).await
+        load_graph_job_records(&mut connection, &self.database_path, limit.get()).await
     }
 
     pub async fn graph_primary_child_ids(

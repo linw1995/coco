@@ -8,9 +8,11 @@ use diesel::sql_types::{Bool, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
-use super::branch::maybe_load_branch_head;
 use super::codec::{parse_json_column, parse_session_role, parse_u64_column};
-use super::{AsyncSqliteConnection, SqliteGraphStore, SqliteStore, SqliteTransactionError};
+use super::{
+    AsyncSqliteConnection, SqliteGraphStore, SqliteStore, SqliteTransactionError,
+    maybe_load_branch_head,
+};
 use crate::error::{
     AmbiguousNodePrefixSnafu, BranchNotFoundSnafu, CorruptedStoreSnafu, DuplicateMergeParentSnafu,
     MergeParentMatchesParentSnafu, MultipleShadowParentsSnafu, NotFoundSnafu, ParentNotFoundSnafu,

@@ -21,20 +21,20 @@ use crate::api::{
     GraphViewportEdgeKind, GraphViewportItems, GraphViewportNode, GraphViewportRemovedItem,
     GraphViewportResponse, Point,
 };
-#[cfg(test)]
-use crate::graph_render::truncate_label;
-use crate::graph_render::{
-    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
-    edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
-    job_href, node_group_class, node_label, node_title_text, percent_encode, render_element_id,
-};
 use crate::panels::{
     PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, load_anchor_range, notify_graph_revision,
     reveal_node_detail_on_mobile,
 };
+#[cfg(test)]
+use crate::truncate_label;
 use crate::viewport::{
     MIN_OVERSCAN, ViewportDrag, ViewportState, right_aligned_viewport_x, rounded_i32,
     same_viewport, short_canvas_auto_zoom,
+};
+use crate::{
+    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
+    edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
+    job_href, node_group_class, node_label, node_title_text, percent_encode, render_element_id,
 };
 
 use super::anchor_range::{

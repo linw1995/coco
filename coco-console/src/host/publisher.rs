@@ -21,32 +21,32 @@ impl ConsolePublisher {
             jobs_changed,
         }
     }
+}
 
-    pub(crate) fn mark_source_dirty(&self) -> u64 {
-        let mut generation = 0;
-        self.source_dirty.send_modify(|current| {
-            *current = current.wrapping_add(1);
-            generation = *current;
-        });
-        generation
-    }
+pub fn mark_source_dirty(publisher: &ConsolePublisher) -> u64 {
+    let mut generation = 0;
+    publisher.source_dirty.send_modify(|current| {
+        *current = current.wrapping_add(1);
+        generation = *current;
+    });
+    generation
+}
 
-    pub(crate) fn subscribe_source_changes(&self) -> watch::Receiver<u64> {
-        self.source_dirty.subscribe()
-    }
+pub fn subscribe_source_changes(publisher: &ConsolePublisher) -> watch::Receiver<u64> {
+    publisher.source_dirty.subscribe()
+}
 
-    pub(crate) fn mark_jobs_changed(&self) -> u64 {
-        let mut generation = 0;
-        self.jobs_changed.send_modify(|current| {
-            *current = current.wrapping_add(1);
-            generation = *current;
-        });
-        generation
-    }
+pub fn mark_jobs_changed(publisher: &ConsolePublisher) -> u64 {
+    let mut generation = 0;
+    publisher.jobs_changed.send_modify(|current| {
+        *current = current.wrapping_add(1);
+        generation = *current;
+    });
+    generation
+}
 
-    pub(crate) fn subscribe_job_changes(&self) -> watch::Receiver<u64> {
-        self.jobs_changed.subscribe()
-    }
+pub fn subscribe_job_changes(publisher: &ConsolePublisher) -> watch::Receiver<u64> {
+    publisher.jobs_changed.subscribe()
 }
 
 #[cfg(test)]
@@ -56,11 +56,11 @@ mod tests {
     #[tokio::test]
     async fn source_changes_are_coalesced_into_dirty_wakeups() {
         let publisher = ConsolePublisher::new();
-        let mut changes = publisher.subscribe_source_changes();
+        let mut changes = subscribe_source_changes(&publisher);
         changes.borrow_and_update();
 
-        assert_eq!(publisher.mark_source_dirty(), 1);
-        assert_eq!(publisher.mark_source_dirty(), 2);
+        assert_eq!(mark_source_dirty(&publisher), 1);
+        assert_eq!(mark_source_dirty(&publisher), 2);
         changes.changed().await.unwrap();
         assert_eq!(*changes.borrow_and_update(), 2);
     }
@@ -68,12 +68,12 @@ mod tests {
     #[tokio::test]
     async fn job_changes_are_published_independently() {
         let publisher = ConsolePublisher::new();
-        let mut changes = publisher.subscribe_job_changes();
+        let mut changes = subscribe_job_changes(&publisher);
         changes.borrow_and_update();
 
-        assert_eq!(publisher.mark_jobs_changed(), 1);
+        assert_eq!(mark_jobs_changed(&publisher), 1);
         changes.changed().await.unwrap();
         assert_eq!(*changes.borrow_and_update(), 1);
-        assert_eq!(*publisher.subscribe_source_changes().borrow(), 0);
+        assert_eq!(*subscribe_source_changes(&publisher).borrow(), 0);
     }
 }

@@ -8,9 +8,11 @@ use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
-use super::branch::{load_branch_head, load_session_chain, node_reachable_from_head};
 use super::node::{load_node_by_exact_id, persist_node_without_transaction, validate_new_node};
-use super::{AsyncSqliteConnection, GraphJobPage, SqliteStore, SqliteTransactionError};
+use super::{
+    AsyncSqliteConnection, GraphJobPage, SqliteStore, SqliteTransactionError, load_branch_head,
+    load_session_chain, node_reachable_from_head,
+};
 use crate::error::{
     CorruptedStoreSnafu, PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,

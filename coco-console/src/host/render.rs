@@ -2,12 +2,12 @@ use coco_types::{SessionRole, SkillGroups, SkillRecord, SkillScript, SkillVersio
 use leptos::{html::HtmlElement, prelude::*};
 
 use crate::api::GraphViewportResponse;
-use crate::graph_render::{GraphCanvas, GraphCanvasModel};
 use crate::host::web_graph_view::ViewMode;
 use crate::panels::{
     InitialProviderContext, NODE_DETAIL_PANEL_ID, NodeDetailPanel, ProviderContextPanel,
     highlighted_code_views, render_markdown_nodes,
 };
+use crate::{GraphCanvas, GraphCanvasModel};
 
 use super::CLIENT_ASSET_VERSION;
 use super::markdown::markdown_document;
@@ -577,12 +577,12 @@ mod tests {
                 },
             }],
         };
-        let anchors_href = crate::graph_render::error_node_href(&viewport.error_nodes[0], false);
+        let anchors_href = crate::error_node_href(&viewport.error_nodes[0], false);
         assert!(anchors_href.contains("mode=all"));
         assert!(anchors_href.contains("graph_focus_target=detail-failed"));
         assert!(anchors_href.contains("graph_focus_x=2100"));
         assert!(anchors_href.contains("graph_focus_y=240"));
-        let anchors_job_href = crate::graph_render::job_href(&viewport.jobs[0], false);
+        let anchors_job_href = crate::job_href(&viewport.jobs[0], false);
         assert!(anchors_job_href.contains("mode=all"));
         assert!(anchors_job_href.contains("graph_focus_target=detail-latest"));
         assert!(anchors_job_href.contains("graph_focus_x=2300"));

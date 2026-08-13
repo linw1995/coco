@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn job_head_migration_backfills_connected_and_detached_jobs() {
+async fn writable_open_backfills_job_heads_from_v24() {
     let tempdir = tempfile::tempdir().unwrap();
     let path = tempdir.path().join("store");
     let store = SqliteStore::open(&path).await.unwrap();
@@ -57,10 +57,10 @@ async fn job_head_migration_backfills_connected_and_detached_jobs() {
     let mut connection =
         diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
     revert_store_migrations_to(&mut connection, 24);
-    connection.run_next_migration(STORE_MIGRATIONS).unwrap();
     drop(connection);
 
     let reopened = SqliteStore::open(&path).await.unwrap();
+    assert_eq!(reopened.schema_version().await.unwrap(), 25);
     assert_eq!(
         reopened.get_job("job-connected").await.unwrap().head,
         connected_head

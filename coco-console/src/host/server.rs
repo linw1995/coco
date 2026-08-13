@@ -36,8 +36,8 @@ use crate::api::{
     NodeDetailResponse, Point as ApiPoint, ProviderContextBranch, ProviderContextItem,
     ProviderContextNode, ProviderContextResponse, ToolUseInputLink,
 };
+use crate::host::WebGraphRuntime;
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportKnownItems, GraphViewportRequest};
-use crate::host::web_graph_runtime::WebGraphRuntime;
 use crate::host::web_graph_view::{
     NodeView, ProviderContextSelection, ViewMode, node_id_from_target, tool_use_input_links,
     write_stdin_session_ids,

@@ -7,9 +7,9 @@ use crate::api::{
     GraphViewportNode, GraphViewportResponse,
 };
 
-pub(crate) const GRAPH_FOCUS_TARGET_QUERY: &str = "graph_focus_target";
-pub(crate) const GRAPH_FOCUS_X_QUERY: &str = "graph_focus_x";
-pub(crate) const GRAPH_FOCUS_Y_QUERY: &str = "graph_focus_y";
+pub const GRAPH_FOCUS_TARGET_QUERY: &str = "graph_focus_target";
+pub const GRAPH_FOCUS_X_QUERY: &str = "graph_focus_x";
+pub const GRAPH_FOCUS_Y_QUERY: &str = "graph_focus_y";
 
 pub struct GraphCanvasModel {
     canvas_width: i32,
@@ -281,11 +281,11 @@ fn JobItem(job: GraphJob, local: bool) -> impl IntoView {
     }
 }
 
-pub(crate) fn error_node_href(node: &GraphErrorNode, local: bool) -> String {
+pub fn error_node_href(node: &GraphErrorNode, local: bool) -> String {
     graph_point_href(&node.node_target, node.point, local)
 }
 
-pub(crate) fn job_href(job: &GraphJob, local: bool) -> String {
+pub fn job_href(job: &GraphJob, local: bool) -> String {
     graph_point_href(&job.head_target, job.point, local)
 }
 

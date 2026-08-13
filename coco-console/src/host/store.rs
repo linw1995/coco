@@ -10,7 +10,9 @@ use coco_mem::{
     StoreResult,
 };
 
-use crate::ConsolePublisher;
+use super::{ConsolePublisher, mark_jobs_changed, mark_source_dirty};
+#[cfg(test)]
+use super::{subscribe_job_changes, subscribe_source_changes};
 
 #[derive(Clone)]
 pub struct ConsoleStore<S> {
@@ -33,14 +35,14 @@ impl<S> ConsoleStore<S> {
 
     fn notify_source_if_ok<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
         if result.is_ok() {
-            self.publisher.mark_source_dirty();
+            mark_source_dirty(&self.publisher);
         }
         result
     }
 
     fn notify_jobs_if_ok<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
         if result.is_ok() {
-            self.publisher.mark_jobs_changed();
+            mark_jobs_changed(&self.publisher);
         }
         result
     }
@@ -282,8 +284,8 @@ where
             .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
             .await;
         if result.is_ok() {
-            self.publisher.mark_source_dirty();
-            self.publisher.mark_jobs_changed();
+            mark_source_dirty(&self.publisher);
+            mark_jobs_changed(&self.publisher);
         }
         result
     }
@@ -312,8 +314,8 @@ where
             )
             .await;
         if result.is_ok() {
-            self.publisher.mark_source_dirty();
-            self.publisher.mark_jobs_changed();
+            mark_source_dirty(&self.publisher);
+            mark_jobs_changed(&self.publisher);
         }
         result
     }
@@ -398,7 +400,7 @@ mod tests {
     async fn node_and_branch_changes_mark_the_graph_source_dirty() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
-        let mut source_changes = publisher.subscribe_source_changes();
+        let mut source_changes = subscribe_source_changes(&publisher);
         source_changes.borrow_and_update();
         let store = ConsoleStore::new(inner, publisher.clone());
         let root = store.root_id();
@@ -430,7 +432,7 @@ mod tests {
     async fn job_mutations_publish_job_changes() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
-        let mut job_changes = publisher.subscribe_job_changes();
+        let mut job_changes = subscribe_job_changes(&publisher);
         job_changes.borrow_and_update();
         let store = ConsoleStore::new(inner, publisher);
         let root = store.root_id();

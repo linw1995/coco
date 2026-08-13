@@ -19,7 +19,6 @@ use super::error::{
     WebGraphSourceCursorStalledSnafu, WebGraphSourceNodeMissingSnafu,
     WebGraphSourceVersionExhaustedSnafu, WebGraphStoreSnafu,
 };
-use super::publisher::ConsolePublisher;
 use super::web_graph_order::{
     IncomingEdge, Result as OrderResult, nearest_row_for_y, reserved_rows_from_placements,
     stable_column_order,
@@ -36,6 +35,7 @@ use super::web_graph_view::{
     is_provider_context_start, is_skill_invocation_anchor, node_key, node_target_id,
     provider_context_id, route_edge, route_edge_with_offsets, shorten_id, summarize_node,
 };
+use super::{ConsolePublisher, subscribe_job_changes, subscribe_source_changes};
 use crate::api::{
     GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphJobsResponse, GraphViewport,
     GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode,
@@ -61,7 +61,7 @@ const ERROR_NODE_LIMIT: usize = 100;
 const JOB_LIMIT: usize = 100;
 
 #[derive(Clone)]
-pub(crate) struct WebGraphRuntime {
+pub struct WebGraphRuntime {
     store: WebGraphStore,
     source: SqliteGraphStore,
     publisher: ConsolePublisher,
@@ -734,11 +734,11 @@ impl WebGraphRuntime {
     }
 
     pub fn subscribe_source_changes(&self) -> watch::Receiver<u64> {
-        self.publisher.subscribe_source_changes()
+        subscribe_source_changes(&self.publisher)
     }
 
     pub fn subscribe_job_changes(&self) -> watch::Receiver<u64> {
-        self.publisher.subscribe_job_changes()
+        subscribe_job_changes(&self.publisher)
     }
 
     async fn stored_revision(&self) -> crate::Result<Revision> {
