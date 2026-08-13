@@ -118,7 +118,9 @@ fn GraphPage(
                     </div>
                 </section>
                 <aside class="side">
-                    <div id=NODE_DETAIL_PANEL_ID class="node-detail-slot"><NodeDetailPanel/></div>
+                    <div id=NODE_DETAIL_PANEL_ID class="node-detail-slot">
+                        <NodeDetailPanel graph_mode=mode.as_query_value().to_owned()/>
+                    </div>
                 </aside>
             </section>
         </main>

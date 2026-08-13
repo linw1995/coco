@@ -289,7 +289,7 @@ pub fn job_href(job: &GraphJob, local: bool) -> String {
     graph_point_href(&job.head_target, job.point, local)
 }
 
-fn graph_point_href(target: &str, point: crate::api::Point, local: bool) -> String {
+pub(crate) fn graph_point_href(target: &str, point: crate::api::Point, local: bool) -> String {
     if local {
         return format!("#{target}");
     }
