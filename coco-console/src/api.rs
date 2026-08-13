@@ -299,6 +299,9 @@ pub struct GraphJob {
     pub head_target: String,
     pub head_short_id: String,
     pub point: Point,
+    pub head_anchor_id: String,
+    pub head_anchor_target: String,
+    pub head_anchor_point: Point,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]

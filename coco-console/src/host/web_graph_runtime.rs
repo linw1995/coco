@@ -1404,6 +1404,19 @@ impl WebGraphRuntime {
             .await
             .context(StoreSnafu)?;
 
+        if page.jobs.is_empty() {
+            let state = self
+                .store
+                .state()
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            return Ok((state.revision == revision).then_some(GraphJobsResponse {
+                active_job_count: page.active_count,
+                jobs: Vec::new(),
+            }));
+        }
+
         let mut heads = page
             .jobs
             .iter()
@@ -1411,45 +1424,42 @@ impl WebGraphRuntime {
             .collect::<BTreeMap<_, _>>();
         let jobs = page.jobs;
         let head_ids = heads.values().cloned().collect::<BTreeSet<_>>();
-        let mut points = BTreeMap::new();
-        for chunk in head_ids
+        let head_node_ids = head_ids
             .iter()
-            .collect::<Vec<_>>()
-            .chunks(GRAPH_READ_BATCH_SIZE)
-        {
-            let node_ids = chunk
-                .iter()
-                .map(|node_id| NodeId::new((*node_id).clone()).context(WebGraphModelSnafu))
-                .collect::<crate::Result<Vec<_>>>()?;
-            let placements = self
-                .store
-                .node_placements(LayoutKind::All, &node_ids)
-                .await
-                .context(WebGraphStoreSnafu)?
-                .context(WebGraphNotInitializedSnafu)?;
-            if placements.state.revision != revision {
-                return Ok(None);
-            }
-            points.extend(
-                placements
-                    .value
-                    .into_iter()
-                    .map(|placement| (placement.node.to_string(), placement.point)),
-            );
-        }
-        if points.len() != head_ids.len() {
+            .map(|node_id| NodeId::new(node_id.clone()).context(WebGraphModelSnafu))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let Some(head_placements) = self
+            .placements_at_revision(LayoutKind::All, &head_node_ids, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let head_points = head_placements
+            .into_iter()
+            .map(|placement| (placement.node.to_string(), placement.point))
+            .collect::<BTreeMap<_, _>>();
+        if head_points.len() != head_ids.len() {
             return Ok(None);
         }
-        if jobs.is_empty() {
-            let state = self
-                .store
-                .state()
-                .await
-                .context(WebGraphStoreSnafu)?
-                .context(WebGraphNotInitializedSnafu)?;
-            if state.revision != revision {
-                return Ok(None);
-            }
+
+        let head_anchors = self.nearest_anchors_or_roots(&head_ids).await?;
+        let anchor_ids = head_anchors.values().cloned().collect::<BTreeSet<_>>();
+        let anchor_node_ids = anchor_ids
+            .iter()
+            .map(|node_id| NodeId::new(node_id.clone()).context(WebGraphModelSnafu))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let Some(anchor_placements) = self
+            .placements_at_revision(LayoutKind::Anchors, &anchor_node_ids, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let anchor_points = anchor_placements
+            .into_iter()
+            .map(|placement| (placement.node.to_string(), placement.point))
+            .collect::<BTreeMap<_, _>>();
+        if anchor_points.len() != anchor_ids.len() {
+            return Ok(None);
         }
 
         Ok(Some(GraphJobsResponse {
@@ -1458,7 +1468,9 @@ impl WebGraphRuntime {
                 .into_iter()
                 .filter_map(|job| {
                     let head_id = heads.remove(&job.job_id)?;
-                    let point = *points.get(&head_id)?;
+                    let point = *head_points.get(&head_id)?;
+                    let head_anchor_id = head_anchors.get(&head_id)?.clone();
+                    let head_anchor_point = *anchor_points.get(&head_anchor_id)?;
                     Some(GraphJob {
                         id: job.job_id.clone(),
                         short_id: shorten_id(&job.job_id),
@@ -1470,10 +1482,63 @@ impl WebGraphRuntime {
                         head_short_id: shorten_id(&head_id),
                         head_id,
                         point: api_point(point),
+                        head_anchor_target: node_target_id(&head_anchor_id),
+                        head_anchor_id,
+                        head_anchor_point: api_point(head_anchor_point),
                     })
                 })
                 .collect(),
         }))
+    }
+
+    async fn nearest_anchors_or_roots(
+        &self,
+        start_ids: &BTreeSet<String>,
+    ) -> crate::Result<BTreeMap<String, String>> {
+        let mut current = start_ids
+            .iter()
+            .map(|node_id| (node_id.clone(), node_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut resolved = BTreeMap::new();
+        while !current.is_empty() {
+            let current_ids = current.values().cloned().collect::<BTreeSet<_>>();
+            let mut nodes = BTreeMap::new();
+            for chunk in current_ids
+                .iter()
+                .collect::<Vec<_>>()
+                .chunks(GRAPH_READ_BATCH_SIZE)
+            {
+                let ids = chunk
+                    .iter()
+                    .map(|node_id| (*node_id).clone())
+                    .collect::<Vec<_>>();
+                nodes.extend(
+                    self.source
+                        .graph_node_records_by_ids(&ids)
+                        .await
+                        .context(StoreSnafu)?
+                        .into_iter()
+                        .map(|node| (node.id.clone(), node)),
+                );
+            }
+
+            let mut next = BTreeMap::new();
+            for (start_id, current_id) in current {
+                let node =
+                    nodes
+                        .get(&current_id)
+                        .with_context(|| WebGraphSourceNodeMissingSnafu {
+                            node_id: current_id.clone(),
+                        })?;
+                if node.is_anchor || node.parent.is_empty() {
+                    resolved.insert(start_id, node.id.clone());
+                } else {
+                    next.insert(start_id, node.parent.clone());
+                }
+            }
+            current = next;
+        }
+        Ok(resolved)
     }
 
     async fn error_nodes_once(
@@ -2390,15 +2455,10 @@ impl WebGraphRuntime {
     }
 
     async fn nearest_anchor_or_root(&self, start_id: &str) -> crate::Result<Option<String>> {
-        let mut current = start_id.to_owned();
-        while !current.is_empty() {
-            let node = self.source_node(&current).await?;
-            if node.is_anchor || node.parent.is_empty() {
-                return Ok(Some(node.id));
-            }
-            current = node.parent;
-        }
-        Ok(None)
+        Ok(self
+            .nearest_anchors_or_roots(&BTreeSet::from([start_id.to_owned()]))
+            .await?
+            .remove(start_id))
     }
 }
 
@@ -3291,13 +3351,18 @@ mod tests {
         assert_eq!(jobs.active_job_count, viewport.active_job_count);
         assert_eq!(viewport.jobs[0].head_id, head);
         assert_eq!(viewport.jobs[1].head_id, root);
+        assert_eq!(viewport.jobs[0].head_anchor_id, root);
+        assert_eq!(viewport.jobs[1].head_anchor_id, root);
         assert_eq!(viewport.jobs[0].status, "queued");
         assert_eq!(viewport.jobs[1].status, "finished");
         let placements = runtime
             .store
             .node_placements(
                 LayoutKind::All,
-                &[NodeId::new(head).unwrap(), NodeId::new(root).unwrap()],
+                &[
+                    NodeId::new(head).unwrap(),
+                    NodeId::new(root.clone()).unwrap(),
+                ],
             )
             .await
             .unwrap()
@@ -3312,6 +3377,20 @@ mod tests {
                 .iter()
                 .all(|job| job.point == placements[&job.head_id])
         );
+        let anchor_placement = runtime
+            .store
+            .node_placements(LayoutKind::Anchors, &[NodeId::new(root.clone()).unwrap()])
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(viewport.jobs.iter().all(|job| {
+            job.head_anchor_point == api_point(anchor_placement.point)
+                && job.head_anchor_target == node_target_id(&job.head_anchor_id)
+        }));
     }
 
     #[tokio::test]

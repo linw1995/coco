@@ -158,7 +158,7 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
     let job_count = jobs.len();
     let jobs = jobs
         .into_iter()
-        .map(|job| view! { <JobItem job local=index_links_are_local/> })
+        .map(|job| view! { <JobItem job all_view=index_links_are_local/> })
         .collect_view();
 
     view! {
@@ -250,8 +250,15 @@ fn ErrorNodeItem(node: GraphErrorNode, local: bool) -> impl IntoView {
 }
 
 #[component]
-fn JobItem(job: GraphJob, local: bool) -> impl IntoView {
-    let href = job_href(&job, local);
+fn JobItem(job: GraphJob, all_view: bool) -> impl IntoView {
+    let href = job_href(&job, all_view);
+    let (_, point) = job_focus(&job, all_view);
+    let head_href = job_destination_href(&job, all_view, JobDestination::Head);
+    let (_, head_point) = job_destination_focus(&job, JobDestination::Head);
+    let anchor_href = job_destination_href(&job, all_view, JobDestination::HeadAnchor);
+    let (_, anchor_point) = job_destination_focus(&job, JobDestination::HeadAnchor);
+    let head_label = format!("Jump job {} to head in All view", job.short_id);
+    let anchor_label = format!("Jump job {} to head anchor in Anchors view", job.short_id);
     let created_at = job.created_at;
     let datetime = created_at.clone();
     let status_class = format!("job-status {}", job.status);
@@ -261,40 +268,96 @@ fn JobItem(job: GraphJob, local: bool) -> impl IntoView {
         format!("{} → {}", job.branch, job.work_branch)
     };
     view! {
-        <a
-            class="graph-index-link job-link"
-            href=href
-            data-node-x=job.point.x
-            data-node-y=job.point.y
-            role="listitem"
-        >
-            <span class="graph-index-link-head job-link-head">
-                <strong>{job.short_id}</strong>
-                <time datetime=datetime>{created_at}</time>
-            </span>
-            <span class="job-summary">
-                <span class=status_class>{job.status}</span>
-                <span class="job-branch">{branch}</span>
-                <span class="job-head">{format!("head {}", job.head_short_id)}</span>
-            </span>
-        </a>
+        <div class="graph-index-item job-item" role="listitem">
+            <a
+                class="graph-index-link job-link"
+                href=href
+                data-node-x=point.x
+                data-node-y=point.y
+            >
+                <span class="graph-index-link-head job-link-head">
+                    <strong>{job.short_id}</strong>
+                    <time datetime=datetime>{created_at}</time>
+                </span>
+                <span class="job-summary">
+                    <span class=status_class>{job.status}</span>
+                    <span class="job-branch">{branch}</span>
+                    <span class="job-head">{format!("head {}", job.head_short_id)}</span>
+                </span>
+            </a>
+            <nav class="job-destination-actions" aria-label="Jump destination">
+                <a
+                    class="job-destination-button job-destination-head"
+                    href=head_href
+                    data-node-x=head_point.x
+                    data-node-y=head_point.y
+                    aria-label=head_label
+                >
+                    "Head"
+                </a>
+                <a
+                    class="job-destination-button job-destination-anchor"
+                    href=anchor_href
+                    data-node-x=anchor_point.x
+                    data-node-y=anchor_point.y
+                    aria-label=anchor_label
+                >
+                    "Head anchor"
+                </a>
+            </nav>
+        </div>
     }
 }
 
 pub fn error_node_href(node: &GraphErrorNode, local: bool) -> String {
-    graph_point_href(&node.node_target, node.point, local)
+    graph_point_href(&node.node_target, node.point, local, "all")
 }
 
-pub fn job_href(job: &GraphJob, local: bool) -> String {
-    graph_point_href(&job.head_target, job.point, local)
+pub fn job_href(job: &GraphJob, all_view: bool) -> String {
+    let (target, _) = job_focus(job, all_view);
+    format!("#{target}")
 }
 
-fn graph_point_href(target: &str, point: crate::api::Point, local: bool) -> String {
+pub fn job_focus(job: &GraphJob, all_view: bool) -> (&str, crate::api::Point) {
+    let destination = if all_view {
+        JobDestination::Head
+    } else {
+        JobDestination::HeadAnchor
+    };
+    job_destination_focus(job, destination)
+}
+
+#[derive(Clone, Copy)]
+pub enum JobDestination {
+    Head,
+    HeadAnchor,
+}
+
+pub fn job_destination_href(job: &GraphJob, all_view: bool, destination: JobDestination) -> String {
+    let (target, point) = job_destination_focus(job, destination);
+    let (local, mode) = match destination {
+        JobDestination::Head => (all_view, "all"),
+        JobDestination::HeadAnchor => (!all_view, "anchors"),
+    };
+    graph_point_href(target, point, local, mode)
+}
+
+pub fn job_destination_focus(
+    job: &GraphJob,
+    destination: JobDestination,
+) -> (&str, crate::api::Point) {
+    match destination {
+        JobDestination::Head => (&job.head_target, job.point),
+        JobDestination::HeadAnchor => (&job.head_anchor_target, job.head_anchor_point),
+    }
+}
+
+fn graph_point_href(target: &str, point: crate::api::Point, local: bool, mode: &str) -> String {
     if local {
         return format!("#{target}");
     }
     format!(
-        "/?mode=all&{GRAPH_FOCUS_TARGET_QUERY}={}&{GRAPH_FOCUS_X_QUERY}={}&{GRAPH_FOCUS_Y_QUERY}={}#{}",
+        "/?mode={mode}&{GRAPH_FOCUS_TARGET_QUERY}={}&{GRAPH_FOCUS_X_QUERY}={}&{GRAPH_FOCUS_Y_QUERY}={}#{}",
         percent_encode(target),
         point.x,
         point.y,

@@ -743,6 +743,10 @@ body {
   border-top: 1px solid rgba(148, 163, 184, 0.14);
 }
 
+.job-item + .job-item {
+  border-top: 1px solid rgba(148, 163, 184, 0.14);
+}
+
 .graph-index-link:hover,
 .graph-index-link:focus-visible {
   background: var(--graph-index-hover-bg);
@@ -825,6 +829,31 @@ body {
   flex: 0 0 auto;
   margin-left: auto;
   white-space: nowrap;
+}
+
+.job-destination-actions {
+  display: flex;
+  gap: 0.42rem;
+  padding: 0 0.78rem 0.68rem;
+}
+
+.job-destination-button {
+  background: rgba(30, 41, 59, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 5px;
+  color: #aebbd0;
+  font-size: 0.64rem;
+  line-height: 1;
+  padding: 0.3rem 0.48rem;
+  text-decoration: none;
+}
+
+.job-destination-button:hover,
+.job-destination-button:focus-visible {
+  background: rgba(59, 130, 246, 0.16);
+  border-color: rgba(96, 165, 250, 0.58);
+  color: #dbeafe;
+  outline: none;
 }
 
 .follow-toggle:hover {
