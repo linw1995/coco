@@ -1442,7 +1442,11 @@ impl WebGraphRuntime {
             return Ok(None);
         }
 
-        let head_anchors = self.nearest_anchors_or_roots(&head_ids).await?;
+        let head_anchors = self
+            .source
+            .graph_nearest_anchor_or_root_ids(&head_ids.iter().cloned().collect::<Vec<_>>())
+            .await
+            .context(StoreSnafu)?;
         let anchor_ids = head_anchors.values().cloned().collect::<BTreeSet<_>>();
         let anchor_node_ids = anchor_ids
             .iter()
@@ -1489,56 +1493,6 @@ impl WebGraphRuntime {
                 })
                 .collect(),
         }))
-    }
-
-    async fn nearest_anchors_or_roots(
-        &self,
-        start_ids: &BTreeSet<String>,
-    ) -> crate::Result<BTreeMap<String, String>> {
-        let mut current = start_ids
-            .iter()
-            .map(|node_id| (node_id.clone(), node_id.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut resolved = BTreeMap::new();
-        while !current.is_empty() {
-            let current_ids = current.values().cloned().collect::<BTreeSet<_>>();
-            let mut nodes = BTreeMap::new();
-            for chunk in current_ids
-                .iter()
-                .collect::<Vec<_>>()
-                .chunks(GRAPH_READ_BATCH_SIZE)
-            {
-                let ids = chunk
-                    .iter()
-                    .map(|node_id| (*node_id).clone())
-                    .collect::<Vec<_>>();
-                nodes.extend(
-                    self.source
-                        .graph_node_records_by_ids(&ids)
-                        .await
-                        .context(StoreSnafu)?
-                        .into_iter()
-                        .map(|node| (node.id.clone(), node)),
-                );
-            }
-
-            let mut next = BTreeMap::new();
-            for (start_id, current_id) in current {
-                let node =
-                    nodes
-                        .get(&current_id)
-                        .with_context(|| WebGraphSourceNodeMissingSnafu {
-                            node_id: current_id.clone(),
-                        })?;
-                if node.is_anchor || node.parent.is_empty() {
-                    resolved.insert(start_id, node.id.clone());
-                } else {
-                    next.insert(start_id, node.parent.clone());
-                }
-            }
-            current = next;
-        }
-        Ok(resolved)
     }
 
     async fn error_nodes_once(
@@ -2456,8 +2410,10 @@ impl WebGraphRuntime {
 
     async fn nearest_anchor_or_root(&self, start_id: &str) -> crate::Result<Option<String>> {
         Ok(self
-            .nearest_anchors_or_roots(&BTreeSet::from([start_id.to_owned()]))
-            .await?
+            .source
+            .graph_nearest_anchor_or_root_ids(&[start_id.to_owned()])
+            .await
+            .context(StoreSnafu)?
             .remove(start_id))
     }
 }

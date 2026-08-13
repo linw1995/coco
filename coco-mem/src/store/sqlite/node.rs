@@ -39,9 +39,9 @@ mod write;
 pub use read::{
     load_ancestry_nodes, load_child_ids_by_parent_ids, load_child_ids_page, load_child_nodes,
     load_failure_nodes, load_graph_node_records_by_exact_ids, load_log_nodes,
-    load_node_by_exact_id, load_node_by_prefix_or_branch, load_node_high_watermark, load_node_page,
-    load_nodes_by_exact_ids, load_root_id, node_count, node_cursor_matches, resolve_ref_id,
-    validate_new_node,
+    load_nearest_anchor_or_root_ids, load_node_by_exact_id, load_node_by_prefix_or_branch,
+    load_node_high_watermark, load_node_page, load_nodes_by_exact_ids, load_root_id, node_count,
+    node_cursor_matches, resolve_ref_id, validate_new_node,
 };
 pub use row::*;
 #[cfg(test)]
