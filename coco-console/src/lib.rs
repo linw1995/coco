@@ -2,6 +2,19 @@ mod api;
 mod graph_render;
 mod panels;
 
+#[cfg(all(target_arch = "wasm32", test))]
+use graph_render::truncate_label;
+#[cfg(target_arch = "wasm32")]
+use graph_render::{
+    GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, bezier_path,
+    edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style, error_node_href,
+    job_href, node_group_class, node_label, node_title_text, percent_encode, render_element_id,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use graph_render::{GraphCanvas, GraphCanvasModel};
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use graph_render::{error_node_href, job_href};
+
 #[allow(dead_code)]
 mod web_graph;
 
@@ -23,6 +36,11 @@ mod host {
     #[allow(dead_code)]
     mod web_graph_store;
     mod web_graph_view;
+
+    use publisher::{
+        mark_jobs_changed, mark_source_dirty, subscribe_job_changes, subscribe_source_changes,
+    };
+    use web_graph_runtime::WebGraphRuntime;
 
     pub use config::ConsoleConfig;
     pub use error::{Error, Result};

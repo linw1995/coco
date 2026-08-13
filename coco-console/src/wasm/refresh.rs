@@ -88,10 +88,50 @@ pub fn version_refresh_action(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobRefreshState {
+    pending: bool,
+    scheduled: bool,
+    synchronized: bool,
+}
+
+impl JobRefreshState {
+    pub fn request(&mut self) -> bool {
+        self.pending = true;
+        self.schedule()
+    }
+
+    pub fn begin(&mut self) {
+        self.pending = false;
+    }
+
+    pub fn finish(&mut self, synchronized: bool) -> bool {
+        if synchronized {
+            self.synchronized = true;
+        } else {
+            self.pending = true;
+        }
+        self.scheduled = false;
+        self.schedule()
+    }
+
+    pub fn accepts_viewport_snapshot(self) -> bool {
+        !self.synchronized
+    }
+
+    fn schedule(&mut self) -> bool {
+        if self.scheduled || !self.pending {
+            return false;
+        }
+        self.scheduled = true;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
+        JobRefreshState, PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
         pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
     };
     use crate::wasm::viewport::ViewportState;
@@ -255,5 +295,31 @@ mod tests {
             ),
             VersionRefresh::Apply
         );
+    }
+
+    #[test]
+    fn job_refresh_coalesces_events_and_rejects_stale_viewport_snapshots() {
+        let mut state = JobRefreshState::default();
+        assert!(state.accepts_viewport_snapshot());
+        assert!(state.request());
+        state.begin();
+
+        assert!(!state.request());
+        assert!(state.finish(true));
+        assert!(!state.accepts_viewport_snapshot());
+
+        state.begin();
+        assert!(!state.finish(true));
+        assert!(state.request());
+    }
+
+    #[test]
+    fn failed_job_refresh_is_rescheduled_without_another_event() {
+        let mut state = JobRefreshState::default();
+        assert!(state.request());
+        state.begin();
+
+        assert!(state.finish(false));
+        assert!(state.accepts_viewport_snapshot());
     }
 }

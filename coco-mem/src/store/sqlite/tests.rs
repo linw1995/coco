@@ -486,6 +486,7 @@ fn valid_job_row() -> super::JobRow {
         branch: "main".to_owned(),
         work_branch: "main".to_owned(),
         base: "base".to_owned(),
+        head: "base".to_owned(),
         status: "queued".to_owned(),
     }
 }
@@ -956,6 +957,97 @@ async fn graph_failure_nodes_are_ordered_newest_first() {
             .iter()
             .all(|row| !row.detail.contains("USE TEMP B-TREE"))
     );
+}
+
+#[tokio::test]
+async fn graph_jobs_batch_current_heads_and_prioritize_active_jobs() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    store.fork("main", &root).await.unwrap();
+    store.fork("archive", &root).await.unwrap();
+    store.fork("secondary", &root).await.unwrap();
+    let main_head = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::LLM,
+            metadata: None,
+            kind: Kind::Text("active head".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .set_branch_head("main", &root, &main_head)
+        .await
+        .unwrap();
+    let detached_base = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("detached base".to_owned()),
+        })
+        .await
+        .unwrap();
+    store
+        .submit_job_with_id("job-active", "main", &root)
+        .await
+        .unwrap();
+    store
+        .submit_job_with_id("job-active-newer", "secondary", &root)
+        .await
+        .unwrap();
+    store
+        .submit_job_with_id("job-finished", "archive", &detached_base)
+        .await
+        .unwrap();
+    store
+        .set_job_status("job-finished", JobStatus::Queued, JobStatus::Running)
+        .await
+        .unwrap();
+    store
+        .set_job_status("job-finished", JobStatus::Running, JobStatus::Finished)
+        .await
+        .unwrap();
+    let mut connection = store.connect().await.unwrap();
+    diesel::update(jobs::table.filter(jobs::job_id.eq("job-active")))
+        .set(jobs::created_at.eq("2026-08-06T09:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::update(jobs::table.filter(jobs::job_id.eq("job-finished")))
+        .set(jobs::created_at.eq("2026-08-06T10:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    diesel::update(jobs::table.filter(jobs::job_id.eq("job-active-newer")))
+        .set(jobs::created_at.eq("2026-08-06T11:00:00Z"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+
+    let records = graph
+        .graph_jobs(NonZeroUsize::new(3).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(records.active_count, 2);
+    assert_eq!(records.jobs[0].job_id, "job-active-newer");
+    assert_eq!(records.jobs[0].head, root);
+    assert_eq!(records.jobs[1].job_id, "job-active");
+    assert_eq!(records.jobs[1].head, main_head);
+    assert_eq!(records.jobs[2].job_id, "job-finished");
+    assert_eq!(records.jobs[2].head, detached_base);
+
+    let truncated = graph
+        .graph_jobs(NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(truncated.jobs.len(), 1);
+    assert_eq!(truncated.active_count, 2);
 }
 
 #[tokio::test]

@@ -3,13 +3,13 @@
 use leptos::prelude::*;
 
 use crate::api::{
-    GraphBezierRoute, GraphErrorNode, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode,
-    GraphViewportResponse,
+    GraphBezierRoute, GraphErrorNode, GraphJob, GraphViewportEdge, GraphViewportEdgeKind,
+    GraphViewportNode, GraphViewportResponse,
 };
 
-pub(crate) const GRAPH_FOCUS_TARGET_QUERY: &str = "graph_focus_target";
-pub(crate) const GRAPH_FOCUS_X_QUERY: &str = "graph_focus_x";
-pub(crate) const GRAPH_FOCUS_Y_QUERY: &str = "graph_focus_y";
+pub const GRAPH_FOCUS_TARGET_QUERY: &str = "graph_focus_target";
+pub const GRAPH_FOCUS_X_QUERY: &str = "graph_focus_x";
+pub const GRAPH_FOCUS_Y_QUERY: &str = "graph_focus_y";
 
 pub struct GraphCanvasModel {
     canvas_width: i32,
@@ -19,8 +19,10 @@ pub struct GraphCanvasModel {
     viewport_width: i32,
     viewport_height: i32,
     render_edge_hit_targets: bool,
-    error_links_are_local: bool,
+    index_links_are_local: bool,
     error_nodes: Vec<GraphErrorNode>,
+    active_job_count: usize,
+    jobs: Vec<GraphJob>,
     nodes: Vec<RenderedNode>,
     edges: Vec<RenderedEdge>,
 }
@@ -62,7 +64,7 @@ struct RenderedEdge {
 impl GraphCanvasModel {
     pub fn new(
         render_edge_hit_targets: bool,
-        error_links_are_local: bool,
+        index_links_are_local: bool,
         response: &GraphViewportResponse,
     ) -> Self {
         Self {
@@ -73,8 +75,10 @@ impl GraphCanvasModel {
             viewport_width: response.viewport.width,
             viewport_height: response.viewport.height,
             render_edge_hit_targets,
-            error_links_are_local,
+            index_links_are_local,
             error_nodes: response.error_nodes.clone(),
+            active_job_count: response.active_job_count,
+            jobs: response.jobs.clone(),
             nodes: response.nodes.iter().map(RenderedNode::new).collect(),
             edges: response.edges.iter().map(RenderedEdge::new).collect(),
         }
@@ -134,8 +138,10 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
         viewport_width,
         viewport_height,
         render_edge_hit_targets,
-        error_links_are_local,
+        index_links_are_local,
         error_nodes,
+        active_job_count,
+        jobs,
         nodes,
         edges,
     } = graph;
@@ -147,19 +153,34 @@ pub fn GraphCanvas(graph: GraphCanvasModel) -> AnyView {
     let error_count = error_nodes.len();
     let error_nodes = error_nodes
         .into_iter()
-        .map(|node| view! { <ErrorNodeItem node local=error_links_are_local/> })
+        .map(|node| view! { <ErrorNodeItem node local=index_links_are_local/> })
+        .collect_view();
+    let job_count = jobs.len();
+    let jobs = jobs
+        .into_iter()
+        .map(|job| view! { <JobItem job local=index_links_are_local/> })
         .collect_view();
 
     view! {
         <div class="graph-controls">
-            <details class="error-node-popover">
+            <details class="graph-index-popover job-popover">
+                <summary aria-label=format!("Jobs ({active_job_count} active)")>
+                    <span>"Jobs"</span>
+                    <span class="graph-index-count job-count">{active_job_count}</span>
+                </summary>
+                <div class="graph-index-menu job-menu" role="list" aria-label="Jobs">
+                    <p class="graph-index-empty job-empty" hidden=job_count != 0>"No jobs"</p>
+                    <div class="graph-index-list job-list">{jobs}</div>
+                </div>
+            </details>
+            <details class="graph-index-popover error-node-popover">
                 <summary aria-label=format!("Error Nodes ({error_count})")>
                     <span>"Error Nodes"</span>
-                    <span class="error-node-count">{error_count}</span>
+                    <span class="graph-index-count error-node-count">{error_count}</span>
                 </summary>
-                <div class="error-node-menu" role="list" aria-label="Error Nodes">
-                    <p class="error-node-empty" hidden=error_count != 0>"No error nodes"</p>
-                    <div class="error-node-list">{error_nodes}</div>
+                <div class="graph-index-menu error-node-menu" role="list" aria-label="Error Nodes">
+                    <p class="graph-index-empty error-node-empty" hidden=error_count != 0>"No error nodes"</p>
+                    <div class="graph-index-list error-node-list">{error_nodes}</div>
                 </div>
             </details>
             <button
@@ -213,31 +234,71 @@ fn ErrorNodeItem(node: GraphErrorNode, local: bool) -> impl IntoView {
     let datetime = created_at.clone();
     view! {
         <a
-            class="error-node-link"
+            class="graph-index-link error-node-link"
             href=href
             data-node-x=node.point.x
             data-node-y=node.point.y
             role="listitem"
         >
-            <span class="error-node-link-head">
+            <span class="graph-index-link-head error-node-link-head">
                 <strong>{node.short_id}</strong>
                 <time datetime=datetime>{created_at}</time>
             </span>
-            <span class="error-node-summary">{node.summary}</span>
+            <span class="graph-index-summary error-node-summary">{node.summary}</span>
         </a>
     }
 }
 
-pub(crate) fn error_node_href(node: &GraphErrorNode, local: bool) -> String {
+#[component]
+fn JobItem(job: GraphJob, local: bool) -> impl IntoView {
+    let href = job_href(&job, local);
+    let created_at = job.created_at;
+    let datetime = created_at.clone();
+    let status_class = format!("job-status {}", job.status);
+    let branch = if job.branch == job.work_branch {
+        job.branch
+    } else {
+        format!("{} → {}", job.branch, job.work_branch)
+    };
+    view! {
+        <a
+            class="graph-index-link job-link"
+            href=href
+            data-node-x=job.point.x
+            data-node-y=job.point.y
+            role="listitem"
+        >
+            <span class="graph-index-link-head job-link-head">
+                <strong>{job.short_id}</strong>
+                <time datetime=datetime>{created_at}</time>
+            </span>
+            <span class="job-summary">
+                <span class=status_class>{job.status}</span>
+                <span class="job-branch">{branch}</span>
+                <span class="job-head">{format!("head {}", job.head_short_id)}</span>
+            </span>
+        </a>
+    }
+}
+
+pub fn error_node_href(node: &GraphErrorNode, local: bool) -> String {
+    graph_point_href(&node.node_target, node.point, local)
+}
+
+pub fn job_href(job: &GraphJob, local: bool) -> String {
+    graph_point_href(&job.head_target, job.point, local)
+}
+
+fn graph_point_href(target: &str, point: crate::api::Point, local: bool) -> String {
     if local {
-        return format!("#{}", node.node_target);
+        return format!("#{target}");
     }
     format!(
         "/?mode=all&{GRAPH_FOCUS_TARGET_QUERY}={}&{GRAPH_FOCUS_X_QUERY}={}&{GRAPH_FOCUS_Y_QUERY}={}#{}",
-        percent_encode(&node.node_target),
-        node.point.x,
-        node.point.y,
-        node.node_target,
+        percent_encode(target),
+        point.x,
+        point.y,
+        target,
     )
 }
 

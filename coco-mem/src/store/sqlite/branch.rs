@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
-use diesel::sql_types::{Nullable, Text};
+use diesel::sql_types::{Bool, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
@@ -20,7 +20,7 @@ use crate::error::{
     InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu, MissingSessionAnchorSnafu,
     ParentNotFoundSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
-use crate::schema::{branches, nodes, sessions};
+use crate::schema::{branches, jobs, sessions};
 use crate::store::{BranchAppendSessionState, BranchStore, SessionStore};
 use crate::{
     Anchor, AnchorPayload, Kind, NewNodeContent, Node, PauseReason, Role, SessionAnchorPatch,
@@ -52,6 +52,18 @@ struct GraphBranchRow {
     base_head_id: Option<String>,
     pause_reason: Option<String>,
     merged_anchor_id: Option<String>,
+}
+
+#[derive(QueryableByName)]
+struct ReachabilityRow {
+    #[diesel(sql_type = Bool)]
+    head_exists: bool,
+    #[diesel(sql_type = Bool)]
+    reachable: bool,
+    #[diesel(sql_type = Bool)]
+    root_reached: bool,
+    #[diesel(sql_type = Nullable<Text>)]
+    missing_parent_id: Option<String>,
 }
 
 pub async fn load_graph_branch_records(
@@ -407,24 +419,6 @@ fn session_anchor_from_node(path: &Path, node: &Node) -> Result<crate::SessionAn
     }
 }
 
-async fn update_branch_head_after_session_write(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    branch: &str,
-    expected_old_head: &str,
-    new_head: &str,
-) -> Result<()> {
-    let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
-    ensure!(
-        updated == 1,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("SQLite branch {branch:?} did not match expected head"),
-        }
-    );
-    Ok(())
-}
-
 async fn validate_session_state(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -517,42 +511,66 @@ pub async fn maybe_load_branch_head(
         })
 }
 
-async fn node_reachable_from_head(
+pub async fn node_reachable_from_head(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     head_id: &str,
     node_id: &str,
 ) -> Result<bool> {
-    let mut current_id = head_id.to_owned();
-    let mut seen = HashSet::new();
-    loop {
-        if current_id == node_id {
-            return Ok(true);
+    let row = diesel::sql_query(
+        r#"
+WITH RECURSIVE ancestry(id, parent_id) AS (
+    SELECT id, parent_id
+    FROM nodes
+    WHERE id = ?
+
+    UNION
+
+    SELECT nodes.id, nodes.parent_id
+    FROM ancestry
+    JOIN nodes ON nodes.id = ancestry.parent_id
+    WHERE ancestry.parent_id <> ''
+)
+SELECT
+    EXISTS(SELECT 1 FROM ancestry) AS head_exists,
+    EXISTS(SELECT 1 FROM ancestry WHERE id = ?) AS reachable,
+    EXISTS(SELECT 1 FROM ancestry WHERE parent_id = '') AS root_reached,
+    (
+        SELECT ancestry.parent_id
+        FROM ancestry
+        LEFT JOIN nodes AS parent ON parent.id = ancestry.parent_id
+        WHERE ancestry.parent_id <> '' AND parent.id IS NULL
+        LIMIT 1
+    ) AS missing_parent_id
+"#,
+    )
+    .bind::<Text, _>(head_id)
+    .bind::<Text, _>(node_id)
+    .get_result::<ReachabilityRow>(connection)
+    .await
+    .context(QuerySqliteStoreSnafu {
+        path: path.to_owned(),
+    })?;
+    ensure!(
+        row.head_exists,
+        ParentNotFoundSnafu {
+            id: head_id.to_owned(),
         }
-        ensure!(
-            seen.insert(current_id.clone()),
-            CorruptedStoreSnafu {
-                path: path.to_owned(),
-                message: "SQLite nodes contain cyclic parents".to_owned(),
-            }
-        );
-        let parent_id = nodes::table
-            .filter(nodes::id.eq(&current_id))
-            .select(nodes::parent_id)
-            .get_result::<String>(connection)
-            .await
-            .optional()
-            .context(QuerySqliteStoreSnafu {
-                path: path.to_owned(),
-            })?
-            .context(ParentNotFoundSnafu {
-                id: current_id.clone(),
-            })?;
-        if parent_id.is_empty() {
-            return Ok(false);
-        }
-        current_id = parent_id;
+    );
+    if row.reachable {
+        return Ok(true);
     }
+    if let Some(id) = row.missing_parent_id {
+        return ParentNotFoundSnafu { id }.fail();
+    }
+    ensure!(
+        row.root_reached,
+        CorruptedStoreSnafu {
+            path: path.to_owned(),
+            message: "SQLite nodes contain cyclic parents".to_owned(),
+        }
+    );
+    Ok(false)
 }
 
 async fn update_branch_head(
@@ -631,6 +649,35 @@ async fn update_branch_head_checked_in_transaction(
             }
             .build(),
         ));
+    }
+    let active_job = jobs::table
+        .filter(jobs::work_branch.eq(branch))
+        .filter(jobs::status.ne("finished"))
+        .select((jobs::job_id, jobs::base))
+        .get_result::<(String, String)>(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })
+        .map_err(SqliteTransactionError::Operation)?;
+    if let Some((job_id, base)) = active_job {
+        let head = if node_reachable_from_head(connection, path, new_head, &base)
+            .await
+            .map_err(SqliteTransactionError::Operation)?
+        {
+            new_head
+        } else {
+            &base
+        };
+        diesel::update(jobs::table.filter(jobs::job_id.eq(job_id)))
+            .set(jobs::head.eq(head))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })
+            .map_err(SqliteTransactionError::Operation)?;
     }
     Ok(())
 }
@@ -1076,15 +1123,14 @@ impl SessionStore for SqliteStore {
                         nodes.push(new_node);
                     }
 
-                    update_branch_head_after_session_write(
+                    update_branch_head_checked_in_transaction(
                         connection,
                         &self.database_path,
                         name,
                         &expected_old_head,
                         &new_head,
                     )
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
+                    .await?;
                     Ok((new_head, nodes))
                 },
             )
@@ -1132,15 +1178,14 @@ impl SessionStore for SqliteStore {
                     persist_node_without_transaction(connection, &self.database_path, &node)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
-                    update_branch_head_after_session_write(
+                    update_branch_head_checked_in_transaction(
                         connection,
                         &self.database_path,
                         name,
                         &expected_old_head,
                         &node.id,
                     )
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
+                    .await?;
                     Ok((node.id.clone(), node))
                 },
             )

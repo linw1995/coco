@@ -21,6 +21,7 @@ mod v20;
 mod v21;
 mod v22;
 mod v23;
+mod v25;
 mod v6;
 mod v7;
 mod v8;

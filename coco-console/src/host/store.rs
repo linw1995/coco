@@ -10,7 +10,9 @@ use coco_mem::{
     StoreResult,
 };
 
-use crate::ConsolePublisher;
+use super::{ConsolePublisher, mark_jobs_changed, mark_source_dirty};
+#[cfg(test)]
+use super::{subscribe_job_changes, subscribe_source_changes};
 
 #[derive(Clone)]
 pub struct ConsoleStore<S> {
@@ -33,7 +35,14 @@ impl<S> ConsoleStore<S> {
 
     fn notify_source_if_ok<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
         if result.is_ok() {
-            self.publisher.mark_source_dirty();
+            mark_source_dirty(&self.publisher);
+        }
+        result
+    }
+
+    fn notify_jobs_if_ok<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
+        if result.is_ok() {
+            mark_jobs_changed(&self.publisher);
         }
         result
     }
@@ -259,7 +268,8 @@ where
     S: JobStore + Sync,
 {
     async fn submit_job(&self, branch: &str, base: &str) -> StoreResult<Job> {
-        self.inner.submit_job(branch, base).await
+        let result = self.inner.submit_job(branch, base).await;
+        self.notify_jobs_if_ok(result)
     }
 
     async fn submit_job_with_prompt_base(
@@ -274,13 +284,15 @@ where
             .submit_job_with_prompt_base(branch, prompt, merge_parents, session_patch)
             .await;
         if result.is_ok() {
-            self.publisher.mark_source_dirty();
+            mark_source_dirty(&self.publisher);
+            mark_jobs_changed(&self.publisher);
         }
         result
     }
 
     async fn submit_job_with_id(&self, job_id: &str, branch: &str, base: &str) -> StoreResult<Job> {
-        self.inner.submit_job_with_id(job_id, branch, base).await
+        let result = self.inner.submit_job_with_id(job_id, branch, base).await;
+        self.notify_jobs_if_ok(result)
     }
 
     async fn submit_job_with_id_and_prompt_base(
@@ -302,7 +314,8 @@ where
             )
             .await;
         if result.is_ok() {
-            self.publisher.mark_source_dirty();
+            mark_source_dirty(&self.publisher);
+            mark_jobs_changed(&self.publisher);
         }
         result
     }
@@ -321,7 +334,8 @@ where
         expected: JobStatus,
         next: JobStatus,
     ) -> StoreResult<Job> {
-        self.inner.set_job_status(job_id, expected, next).await
+        let result = self.inner.set_job_status(job_id, expected, next).await;
+        self.notify_jobs_if_ok(result)
     }
 
     async fn set_job_work_branch(
@@ -330,9 +344,11 @@ where
         expected_work_branch: &str,
         next_work_branch: &str,
     ) -> StoreResult<Job> {
-        self.inner
+        let result = self
+            .inner
             .set_job_work_branch(job_id, expected_work_branch, next_work_branch)
-            .await
+            .await;
+        self.notify_jobs_if_ok(result)
     }
 }
 
@@ -384,7 +400,7 @@ mod tests {
     async fn node_and_branch_changes_mark_the_graph_source_dirty() {
         let inner = SqliteStore::open_temporary().await.unwrap();
         let publisher = ConsolePublisher::new();
-        let mut source_changes = publisher.subscribe_source_changes();
+        let mut source_changes = subscribe_source_changes(&publisher);
         source_changes.borrow_and_update();
         let store = ConsoleStore::new(inner, publisher.clone());
         let root = store.root_id();
@@ -410,5 +426,28 @@ mod tests {
         store.delete_branch("main").await.unwrap();
 
         assert_eq!(*source_changes.borrow(), 4);
+    }
+
+    #[tokio::test]
+    async fn job_mutations_publish_job_changes() {
+        let inner = SqliteStore::open_temporary().await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let mut job_changes = subscribe_job_changes(&publisher);
+        job_changes.borrow_and_update();
+        let store = ConsoleStore::new(inner, publisher);
+        let root = store.root_id();
+        store.fork("main", &root).await.unwrap();
+        store.fork("recovery", &root).await.unwrap();
+        let job = store.submit_job("main", &root).await.unwrap();
+        store
+            .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+            .await
+            .unwrap();
+        store
+            .set_job_work_branch(&job.job_id, "main", "recovery")
+            .await
+            .unwrap();
+
+        assert_eq!(*job_changes.borrow(), 3);
     }
 }

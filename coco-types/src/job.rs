@@ -41,6 +41,9 @@ pub struct Job {
     /// For prompt-based jobs this is the detached prompt anchor. For resume-style
     /// jobs this can be any existing node that should continue execution.
     pub base: String,
+    /// The latest node reached by this job.
+    #[serde(default)]
+    pub head: String,
     pub status: JobStatus,
 }
 
@@ -51,13 +54,15 @@ impl Job {
         base: impl Into<String>,
     ) -> Self {
         let branch = branch.into();
+        let base = base.into();
         Self {
             job_id: job_id.into(),
             created_at: Timestamp::now(),
             finished_at: None,
             work_branch: branch.clone(),
             branch,
-            base: base.into(),
+            head: base.clone(),
+            base,
             status: JobStatus::Queued,
         }
     }
@@ -65,6 +70,12 @@ impl Job {
     pub fn normalize_work_branch(&mut self) {
         if self.work_branch.is_empty() {
             self.work_branch = self.branch.clone();
+        }
+    }
+
+    pub fn normalize_head(&mut self) {
+        if self.head.is_empty() {
+            self.head = self.base.clone();
         }
     }
 }

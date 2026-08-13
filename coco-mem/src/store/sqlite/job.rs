@@ -4,12 +4,15 @@ use std::path::Path;
 use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::result::OptionalExtension;
+use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
-use super::branch::{load_branch_head, load_session_chain};
 use super::node::{load_node_by_exact_id, persist_node_without_transaction, validate_new_node};
-use super::{AsyncSqliteConnection, SqliteStore, SqliteTransactionError};
+use super::{
+    AsyncSqliteConnection, GraphJobPage, SqliteStore, SqliteTransactionError, load_branch_head,
+    load_session_chain, node_reachable_from_head,
+};
 use crate::error::{
     CorruptedStoreSnafu, PromptJobActiveOnBranchSnafu, PromptJobAlreadyExistsSnafu,
     PromptJobInvalidStatusTransitionSnafu, PromptJobMovedSnafu, PromptJobNotFoundSnafu,
@@ -30,7 +33,92 @@ pub struct JobRow {
     pub branch: String,
     pub work_branch: String,
     pub base: String,
+    pub head: String,
     pub status: String,
+}
+
+#[derive(QueryableByName)]
+struct GraphJobRow {
+    #[diesel(sql_type = Text)]
+    job_id: String,
+    #[diesel(sql_type = Text)]
+    created_at: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    finished_at: Option<String>,
+    #[diesel(sql_type = Text)]
+    branch: String,
+    #[diesel(sql_type = Text)]
+    work_branch: String,
+    #[diesel(sql_type = Text)]
+    base: String,
+    #[diesel(sql_type = Text)]
+    status: String,
+    #[diesel(sql_type = Text)]
+    head: String,
+    #[diesel(sql_type = BigInt)]
+    active_count: i64,
+}
+
+const GRAPH_JOBS_QUERY: &str = r#"
+SELECT
+    jobs.job_id,
+    jobs.created_at,
+    jobs.finished_at,
+    jobs.branch,
+    jobs.work_branch,
+    jobs.base,
+    jobs.head,
+    jobs.status,
+    (SELECT COUNT(*) FROM jobs WHERE status <> 'finished') AS active_count
+FROM jobs
+ORDER BY
+    CASE WHEN jobs.status = 'finished' THEN 1 ELSE 0 END,
+    jobs.created_at DESC,
+    jobs.job_id
+LIMIT ?
+"#;
+
+pub async fn load_graph_job_records(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    limit: usize,
+) -> Result<GraphJobPage> {
+    let limit = i64::try_from(limit).map_err(|source| crate::StoreError::CorruptedStore {
+        path: path.to_owned(),
+        message: format!("graph job limit does not fit in SQLite integer: {source}"),
+    })?;
+    let rows = diesel::sql_query(GRAPH_JOBS_QUERY)
+        .bind::<BigInt, _>(limit)
+        .load::<GraphJobRow>(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    let active_count = rows.as_slice().first().map_or(Ok(0), |row| {
+        usize::try_from(row.active_count).map_err(|source| crate::StoreError::CorruptedStore {
+            path: path.to_owned(),
+            message: format!("active graph job count does not fit in usize: {source}"),
+        })
+    })?;
+    let jobs = rows
+        .into_iter()
+        .map(|row| {
+            job_row_into_job(
+                path,
+                JobRow {
+                    job_id: row.job_id,
+                    created_at: row.created_at,
+                    finished_at: row.finished_at,
+                    branch: row.branch,
+                    work_branch: row.work_branch,
+                    base: row.base,
+                    head: row.head,
+                    status: row.status,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GraphJobPage { jobs, active_count })
 }
 
 async fn load_job_map(
@@ -45,6 +133,7 @@ async fn load_job_map(
             jobs::branch,
             jobs::work_branch,
             jobs::base,
+            jobs::head,
             jobs::status,
         ))
         .order(jobs::job_id)
@@ -75,6 +164,7 @@ async fn load_job(
             jobs::branch,
             jobs::work_branch,
             jobs::base,
+            jobs::head,
             jobs::status,
         ))
         .get_result::<JobRow>(connection)
@@ -112,6 +202,7 @@ pub fn job_row_into_job(path: &Path, row: JobRow) -> Result<Job> {
         branch: row.branch,
         work_branch: row.work_branch,
         base: row.base,
+        head: row.head,
         status,
     })
 }
@@ -141,6 +232,7 @@ fn parse_job_status(path: &Path, status: &str) -> Result<JobStatus> {
 async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &Job) -> Result<()> {
     let mut summary = job.clone();
     summary.normalize_work_branch();
+    summary.normalize_head();
     let finished_at = summary
         .finished_at
         .as_ref()
@@ -153,6 +245,7 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
             jobs::branch.eq(&summary.branch),
             jobs::work_branch.eq(&summary.work_branch),
             jobs::base.eq(&summary.base),
+            jobs::head.eq(&summary.head),
             jobs::status.eq(summary.status.as_str()),
         ))
         .on_conflict(jobs::job_id)
@@ -163,6 +256,7 @@ async fn persist_job(connection: &mut AsyncSqliteConnection, path: &Path, job: &
             jobs::branch.eq(diesel::upsert::excluded(jobs::branch)),
             jobs::work_branch.eq(diesel::upsert::excluded(jobs::work_branch)),
             jobs::base.eq(diesel::upsert::excluded(jobs::base)),
+            jobs::head.eq(diesel::upsert::excluded(jobs::head)),
             jobs::status.eq(diesel::upsert::excluded(jobs::status)),
         ))
         .execute(connection)
@@ -180,7 +274,7 @@ async fn submit_job_with_id_in_transaction(
     branch: &str,
     base: &str,
 ) -> std::result::Result<Job, SqliteTransactionError> {
-    load_branch_head(connection, path, branch)
+    let branch_head = load_branch_head(connection, path, branch)
         .await
         .map_err(SqliteTransactionError::Operation)?;
     load_node_by_exact_id(connection, path, base)
@@ -218,7 +312,13 @@ async fn submit_job_with_id_in_transaction(
             .build(),
         ));
     }
-    let job = Job::new(job_id, branch, base);
+    let mut job = Job::new(job_id, branch, base);
+    if node_reachable_from_head(connection, path, &branch_head, base)
+        .await
+        .map_err(SqliteTransactionError::Operation)?
+    {
+        job.head = branch_head;
+    }
     persist_job(connection, path, &job)
         .await
         .map_err(SqliteTransactionError::Operation)?;
@@ -507,9 +607,10 @@ impl JobStore for SqliteStore {
         let mut connection = self.connect().await?;
         connection
             .immediate_transaction::<Job, SqliteTransactionError, _>(async |connection| {
-                load_branch_head(connection, &self.database_path, next_work_branch)
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
+                let next_branch_head =
+                    load_branch_head(connection, &self.database_path, next_work_branch)
+                        .await
+                        .map_err(SqliteTransactionError::Operation)?;
                 let jobs = load_job_map(connection, &self.database_path)
                     .await
                     .map_err(SqliteTransactionError::Operation)?;
@@ -554,6 +655,19 @@ impl JobStore for SqliteStore {
                     ));
                 }
                 job.work_branch = next_work_branch.to_owned();
+                job.head = if node_reachable_from_head(
+                    connection,
+                    &self.database_path,
+                    &next_branch_head,
+                    &job.base,
+                )
+                .await
+                .map_err(SqliteTransactionError::Operation)?
+                {
+                    next_branch_head
+                } else {
+                    job.base.clone()
+                };
                 persist_job(connection, &self.database_path, &job)
                     .await
                     .map_err(SqliteTransactionError::Operation)?;

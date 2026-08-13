@@ -15,6 +15,7 @@ diesel::table! {
         branch -> Text,
         work_branch -> Text,
         base -> Text,
+        head -> Text,
         status -> Text,
     }
 }
