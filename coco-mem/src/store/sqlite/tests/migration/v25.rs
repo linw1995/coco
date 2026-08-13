@@ -26,12 +26,29 @@ async fn job_head_migration_backfills_connected_and_detached_jobs() {
         .unwrap();
     store.fork("connected", &connected_head).await.unwrap();
     store.fork("detached", &root).await.unwrap();
+    store.fork("finished", &root).await.unwrap();
     store
         .submit_job_with_id("job-connected", "connected", &root)
         .await
         .unwrap();
     store
         .submit_job_with_id("job-detached", "detached", &detached_base)
+        .await
+        .unwrap();
+    store
+        .submit_job_with_id("job-finished", "finished", &root)
+        .await
+        .unwrap();
+    store
+        .set_job_status("job-finished", JobStatus::Queued, JobStatus::Running)
+        .await
+        .unwrap();
+    store
+        .set_job_status("job-finished", JobStatus::Running, JobStatus::Finished)
+        .await
+        .unwrap();
+    store
+        .set_branch_head("finished", &root, &connected_head)
         .await
         .unwrap();
     drop(store);
@@ -52,4 +69,5 @@ async fn job_head_migration_backfills_connected_and_detached_jobs() {
         reopened.get_job("job-detached").await.unwrap().head,
         detached_base
     );
+    assert_eq!(reopened.get_job("job-finished").await.unwrap().head, root);
 }

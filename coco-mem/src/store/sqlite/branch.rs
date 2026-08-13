@@ -407,24 +407,6 @@ fn session_anchor_from_node(path: &Path, node: &Node) -> Result<crate::SessionAn
     }
 }
 
-async fn update_branch_head_after_session_write(
-    connection: &mut AsyncSqliteConnection,
-    path: &Path,
-    branch: &str,
-    expected_old_head: &str,
-    new_head: &str,
-) -> Result<()> {
-    let updated = update_branch_head(connection, path, branch, expected_old_head, new_head).await?;
-    ensure!(
-        updated == 1,
-        CorruptedStoreSnafu {
-            path: path.to_owned(),
-            message: format!("SQLite branch {branch:?} did not match expected head"),
-        }
-    );
-    Ok(())
-}
-
 async fn validate_session_state(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
@@ -1105,15 +1087,14 @@ impl SessionStore for SqliteStore {
                         nodes.push(new_node);
                     }
 
-                    update_branch_head_after_session_write(
+                    update_branch_head_checked_in_transaction(
                         connection,
                         &self.database_path,
                         name,
                         &expected_old_head,
                         &new_head,
                     )
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
+                    .await?;
                     Ok((new_head, nodes))
                 },
             )
@@ -1161,15 +1142,14 @@ impl SessionStore for SqliteStore {
                     persist_node_without_transaction(connection, &self.database_path, &node)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
-                    update_branch_head_after_session_write(
+                    update_branch_head_checked_in_transaction(
                         connection,
                         &self.database_path,
                         name,
                         &expected_old_head,
                         &node.id,
                     )
-                    .await
-                    .map_err(SqliteTransactionError::Operation)?;
+                    .await?;
                     Ok((node.id.clone(), node))
                 },
             )

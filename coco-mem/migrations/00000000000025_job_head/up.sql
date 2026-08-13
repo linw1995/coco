@@ -48,6 +48,7 @@ SELECT
     jobs.work_branch,
     jobs.base,
     CASE
+        WHEN jobs.status = 'finished' THEN jobs.base
         WHEN connected_jobs.connected = 1 THEN COALESCE(branches.head_id, jobs.base)
         ELSE jobs.base
     END,

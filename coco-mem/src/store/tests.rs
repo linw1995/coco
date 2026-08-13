@@ -1542,6 +1542,7 @@ where
     let old_child = store.get_node(&child_id).await.unwrap();
     let old_session = store.get_node(&session_id).await.unwrap();
     store.fork("main", &child_id).await.unwrap();
+    let job = store.submit_job("main", &root_id).await.unwrap();
 
     let new_head = store
         .rebase_session(
@@ -1572,6 +1573,7 @@ where
     assert_eq!(session.temperature, None);
     assert_eq!(ancestry[1].created_at, old_session.created_at);
     assert_eq!(ancestry[2].id, root_id);
+    assert_eq!(store.get_job(&job.job_id).await.unwrap().head, new_head);
 
     let Kind::Anchor(old_anchor) = &old_session.kind else {
         panic!("expected original session anchor");
@@ -1780,6 +1782,7 @@ where
         .await
         .unwrap();
     store.fork("main", &child_id).await.unwrap();
+    let job = store.submit_job("main", &root_id).await.unwrap();
 
     let new_head = store
         .handoff_session("main", &SessionAnchorPatch::default(), "handoff prompt")
@@ -1801,6 +1804,7 @@ where
     assert_eq!(ancestry[1].id, child_id);
     assert_eq!(ancestry[2].id, session_id);
     assert_eq!(ancestry[3].id, root_id);
+    assert_eq!(store.get_job(&job.job_id).await.unwrap().head, new_head);
 }
 
 async fn assert_handoff_session_requires_visible_session_anchor<F>()
