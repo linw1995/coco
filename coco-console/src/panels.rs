@@ -540,6 +540,7 @@ fn ParentRef(
                 class="node-detail-parent-link"
                 href=href
                 aria-label=aria_label
+                data-node-target=target
                 data-node-x=point.map(|point| point.x)
                 data-node-y=point.map(|point| point.y)
             >"Jump"</a>
@@ -2465,9 +2466,9 @@ mod tests {
             );
         }
         assert!(
-            detail.contains(
-                r##"href="#detail-parent-node" aria-label="Jump to Parent: parent-node" data-node-x="120" data-node-y="80""##
-            ),
+            detail.contains(r##"href="#detail-parent-node""##)
+                && detail.contains(r#"data-node-target="detail-parent-node""#)
+                && detail.contains(r#"data-node-x="120" data-node-y="80""#),
             "{detail}"
         );
         assert!(
@@ -2477,7 +2478,7 @@ mod tests {
         assert!(
             detail.contains(
                 r#"href="/?mode=all&amp;graph_focus_target=detail-merge-node&amp;graph_focus_x=240&amp;graph_focus_y=160#detail-merge-node""#
-            ),
+            ) && detail.contains(r#"data-node-target="detail-merge-node""#),
             "{detail}"
         );
         assert!(!detail.contains(r#"data-node-x="240""#), "{detail}");
