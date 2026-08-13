@@ -3223,19 +3223,25 @@ fn install_provider_context_rendered_listener(
 
 fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
     let document = graph.borrow().document.clone();
+    let detail_document = document.clone();
     let detail_graph = graph.clone();
     let detail_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
         let Some(link) = detail_link_from_event(&event) else {
             return;
         };
-        let Some(hash) = link.get_attribute("href") else {
-            return;
+        let navigation = match detail_link_navigation(&link, &detail_document) {
+            Ok(Some(navigation)) => navigation,
+            Ok(None) => return,
+            Err(error) => {
+                web_sys::console::error_1(&error);
+                return;
+            }
         };
 
         event.prevent_default();
         event.stop_propagation();
         close_graph_index_popover(&link);
-        if let Some(point) = graph_index_link_point(&link) {
+        if let Some(point) = navigation.point {
             update_viewport(detail_graph.clone(), |graph| {
                 if graph.auto_follow
                     && let Err(error) = graph.set_auto_follow(false)
@@ -3245,7 +3251,7 @@ fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), 
                 center_viewport_on_graph_point(graph, point);
             });
         }
-        select_detail_link(detail_graph.clone(), hash);
+        select_detail_link(detail_graph.clone(), navigation.hash);
     });
     document.add_event_listener_with_callback("click", detail_closure.as_ref().unchecked_ref())?;
     detail_closure.forget();
@@ -3275,7 +3281,47 @@ fn detail_link_from_event(event: &MouseEvent) -> Option<Element> {
         return None;
     }
     let target = event.target()?.dyn_into::<Element>().ok()?;
-    target.closest("a[href^=\"#detail-\"]").ok().flatten()
+    target
+        .closest("a[href^=\"#detail-\"], a.node-detail-parent-link[data-node-target]")
+        .ok()
+        .flatten()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DetailLinkNavigation {
+    hash: String,
+    point: Option<Point>,
+}
+
+fn detail_link_navigation(
+    link: &Element,
+    document: &Document,
+) -> Result<Option<DetailLinkNavigation>, JsValue> {
+    let Some(href) = link.get_attribute("href") else {
+        return Ok(None);
+    };
+    if href.starts_with("#detail-") {
+        return Ok(Some(DetailLinkNavigation {
+            hash: href,
+            point: graph_index_link_point(link),
+        }));
+    }
+    let Some(target) = link
+        .class_list()
+        .contains("node-detail-parent-link")
+        .then(|| link.get_attribute("data-node-target"))
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    Ok(
+        graph_focus_point_from_rendered_node(document, &target)?.map(|point| {
+            DetailLinkNavigation {
+                hash: format!("#{target}"),
+                point: Some(point),
+            }
+        }),
+    )
 }
 
 fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
@@ -5216,6 +5262,73 @@ mod tests {
         link.remove_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
             .expect_throw("detail link listener should be removed");
         assert_eq!(captured_hash.borrow().as_deref(), Some("#detail-aaaaaaaa"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_cross_mode_parent_link_uses_rendered_anchor_range_node() {
+        let fixture = GraphFixture::new();
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .upsert_graph_items(
+                    GraphViewportItems {
+                        nodes: vec![graph_node("expanded-parent", 320, 180)],
+                        edges: Vec::new(),
+                    },
+                    false,
+                )
+                .expect_throw("expanded parent should render");
+        }
+        let document = fixture.graph.borrow().document.clone();
+        let link = document
+            .create_element("a")
+            .expect_throw("parent link should be created");
+        link.set_class_name("node-detail-parent-link");
+        link.set_attribute(
+            "href",
+            "/?mode=all&graph_focus_target=detail-expanded-parent#detail-expanded-parent",
+        )
+        .expect_throw("cross-mode target should be set");
+        link.set_attribute("data-node-target", "detail-expanded-parent")
+            .expect_throw("parent node target should be set");
+        fixture
+            .root
+            .append_child(&link)
+            .expect_throw("parent link should be mounted");
+
+        let detected = Rc::new(Cell::new(false));
+        let closure_detected = detected.clone();
+        let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+            event.prevent_default();
+            closure_detected.set(detail_link_from_event(&event).is_some());
+        });
+        link.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+            .expect_throw("parent click listener should be installed");
+        link.dispatch_event(&mouse_event("click", 0, 0, 0, 0))
+            .expect_throw("parent click should dispatch");
+        link.remove_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+            .expect_throw("parent click listener should be removed");
+        assert!(detected.get());
+
+        assert_eq!(
+            detail_link_navigation(&link, &document)
+                .expect_throw("parent navigation should resolve"),
+            Some(DetailLinkNavigation {
+                hash: "#detail-expanded-parent".to_owned(),
+                point: Some(Point { x: 320, y: 180 }),
+            })
+        );
+
+        document
+            .query_selector(".node-link[data-node-target=\"detail-expanded-parent\"]")
+            .expect_throw("expanded parent query should succeed")
+            .expect_throw("expanded parent should exist")
+            .remove();
+        assert_eq!(
+            detail_link_navigation(&link, &document)
+                .expect_throw("cross-mode fallback should be preserved"),
+            None
+        );
     }
 
     #[wasm_bindgen_test]

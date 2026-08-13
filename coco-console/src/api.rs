@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use coco_types::Node;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,8 @@ pub enum NodeDetailResponse {
     Found {
         node: Box<Node>,
         #[serde(default)]
+        parent_graph_links: BTreeMap<String, GraphPointLink>,
+        #[serde(default)]
         markdown_documents: Vec<MarkdownDocument>,
         tool_use_input_links: Vec<ToolUseInputLink>,
         #[serde(default)]
@@ -27,6 +31,12 @@ pub enum NodeDetailResponse {
         #[serde(default)]
         tool_input_json_highlights: Vec<ToolInputJsonHighlight>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GraphPointLink {
+    pub point: Point,
+    pub local: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

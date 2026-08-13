@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -32,7 +32,7 @@ use super::publisher::ConsolePublisher;
 use super::render::{render_index_page, render_skills_page};
 use crate::Result;
 use crate::api::{
-    AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphViewportEdgeKind,
+    AnchorRangeNode, AnchorRangePath, AnchorRangeResponse, GraphPointLink, GraphViewportEdgeKind,
     NodeDetailResponse, Point as ApiPoint, ProviderContextBranch, ProviderContextItem,
     ProviderContextNode, ProviderContextResponse, ToolUseInputLink,
 };
@@ -66,7 +66,7 @@ struct AppState<S> {
 
 #[async_trait]
 trait PanelDataSource: Send + Sync {
-    async fn node_detail(&self, target: String) -> Result<NodeDetailResponse>;
+    async fn node_detail(&self, target: String, graph_mode: String) -> Result<NodeDetailResponse>;
 
     async fn anchor_range(
         &self,
@@ -104,8 +104,12 @@ impl PanelServerContext {
         }
     }
 
-    pub async fn node_detail(&self, target: String) -> Result<NodeDetailResponse> {
-        self.source.node_detail(target).await
+    pub async fn node_detail(
+        &self,
+        target: String,
+        graph_mode: String,
+    ) -> Result<NodeDetailResponse> {
+        self.source.node_detail(target, graph_mode).await
     }
 
     pub async fn anchor_range(
@@ -144,8 +148,8 @@ impl<S> PanelDataSource for AppState<S>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
-    async fn node_detail(&self, target: String) -> Result<NodeDetailResponse> {
-        load_node_detail(self, &target).await
+    async fn node_detail(&self, target: String, graph_mode: String) -> Result<NodeDetailResponse> {
+        load_node_detail(self, &target, view_mode_from_value(&graph_mode)).await
     }
 
     async fn anchor_range(
@@ -514,13 +518,17 @@ where
     let Some(target) = query.get("target") else {
         return json_response(&NodeDetailResponse::Default, "node detail");
     };
-    match load_node_detail(&state, target).await {
+    match load_node_detail(&state, target, view_mode_from_query(&query)).await {
         Ok(response) => json_response(&response, "node detail"),
         Err(error) => plain_error(error.to_string()),
     }
 }
 
-async fn load_node_detail<S>(state: &AppState<S>, target: &str) -> Result<NodeDetailResponse>
+async fn load_node_detail<S>(
+    state: &AppState<S>,
+    target: &str,
+    view_mode: ViewMode,
+) -> Result<NodeDetailResponse>
 where
     S: Store + Clone + Send + Sync + 'static,
 {
@@ -531,12 +539,15 @@ where
     };
     match state.store.get_node(node_id).await {
         Ok(node) => {
+            let parent_graph_links =
+                load_parent_graph_links(&state.web_graph, &node, view_mode).await?;
             let tool_use_input_links =
                 resolve_tool_use_input_links(&state.web_graph, &node).await?;
             let highlights = super::syntax_highlight::tool_input_syntax_highlights(&node);
             let markdown_documents = super::markdown::node_markdown_documents(&node);
             Ok(NodeDetailResponse::Found {
                 node: Box::new(node),
+                parent_graph_links,
                 markdown_documents,
                 tool_use_input_links,
                 tool_input_shell_highlights: highlights.shell,
@@ -548,6 +559,61 @@ where
         }),
         Err(source) => Err(source).context(StoreSnafu),
     }
+}
+
+async fn load_parent_graph_links(
+    web_graph: &WebGraphRuntime,
+    node: &Node,
+    view_mode: ViewMode,
+) -> Result<BTreeMap<String, GraphPointLink>> {
+    let mut parent_ids = BTreeSet::new();
+    if !node.parent.is_empty() {
+        parent_ids.insert(node.parent.clone());
+    }
+    if let Kind::Anchor(anchor) = &node.kind {
+        parent_ids.extend(
+            anchor
+                .merge_parents()
+                .iter()
+                .map(|parent| parent.node_id().to_owned()),
+        );
+    }
+    let parent_ids = parent_ids.into_iter().collect::<Vec<_>>();
+    let current_points = web_graph.node_points(view_mode, &parent_ids).await?;
+    let fallback_points = if view_mode == ViewMode::Anchors {
+        let missing_ids = parent_ids
+            .iter()
+            .filter(|node_id| !current_points.contains_key(*node_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        web_graph.node_points(ViewMode::All, &missing_ids).await?
+    } else {
+        BTreeMap::new()
+    };
+    Ok(parent_ids
+        .into_iter()
+        .filter_map(|node_id| {
+            current_points
+                .get(&node_id)
+                .map(|point| GraphPointLink {
+                    point: ApiPoint {
+                        x: point.x,
+                        y: point.y,
+                    },
+                    local: true,
+                })
+                .or_else(|| {
+                    fallback_points.get(&node_id).map(|point| GraphPointLink {
+                        point: ApiPoint {
+                            x: point.x,
+                            y: point.y,
+                        },
+                        local: false,
+                    })
+                })
+                .map(|link| (node_id, link))
+        })
+        .collect())
 }
 
 #[async_trait]
@@ -1709,7 +1775,7 @@ mod tests {
 
         let request = Request::builder()
             .uri(format!(
-                "/api/panels/node-detail?target={}",
+                "/api/panels/node-detail?target={}&graph_mode=all",
                 node_target_id(&node_id)
             ))
             .body(Body::empty())
@@ -1718,6 +1784,78 @@ mod tests {
         let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
         let detail: NodeDetailResponse = serde_json::from_slice(&detail_body).unwrap();
         assert!(matches!(detail, NodeDetailResponse::Found { node, .. } if node.id == node_id));
+    }
+
+    #[tokio::test]
+    async fn node_detail_parent_links_focus_visible_or_all_graph_nodes() {
+        let source = SqliteStore::open_temporary().await.unwrap();
+        let publisher = ConsolePublisher::new();
+        let store = ConsoleStore::new(source.clone(), publisher.clone());
+        let source_anchor = store
+            .append(NewNode {
+                parent: store.root_id(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    Vec::new(),
+                    PromptAnchor {
+                        prompt: "source".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let detail_parent = store
+            .append(NewNode {
+                parent: source_anchor.clone(),
+                role: Role::LLM,
+                metadata: None,
+                kind: Kind::Text("detail parent".to_owned()),
+            })
+            .await
+            .unwrap();
+        let target_anchor = store
+            .append(NewNode {
+                parent: detail_parent.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge(source_anchor.clone())],
+                    PromptAnchor {
+                        prompt: "target".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let web_graph = WebGraphRuntime::open(source.store_path(), publisher)
+            .await
+            .unwrap();
+        web_graph.catch_up().await.unwrap();
+        let state = AppState { store, web_graph };
+
+        let NodeDetailResponse::Found {
+            parent_graph_links, ..
+        } = load_node_detail(&state, &node_target_id(&target_anchor), ViewMode::Anchors)
+            .await
+            .unwrap()
+        else {
+            panic!("node detail should be found");
+        };
+        assert!(!parent_graph_links[&detail_parent].local);
+        assert!(parent_graph_links[&source_anchor].local);
+
+        let NodeDetailResponse::Found {
+            parent_graph_links, ..
+        } = load_node_detail(&state, &node_target_id(&target_anchor), ViewMode::All)
+            .await
+            .unwrap()
+        else {
+            panic!("node detail should be found");
+        };
+        assert!(parent_graph_links.values().all(|link| link.local));
     }
 
     #[tokio::test]
@@ -1823,7 +1961,7 @@ mod tests {
         let state = AppState { store, web_graph };
         state.web_graph.catch_up().await.unwrap();
 
-        let detail = load_node_detail(&state, &node_target_id(&write_id))
+        let detail = load_node_detail(&state, &node_target_id(&write_id), ViewMode::All)
             .await
             .unwrap();
         let NodeDetailResponse::Found {
@@ -1844,9 +1982,10 @@ mod tests {
             }]
         );
 
-        let linked_detail = load_node_detail(&state, &tool_use_input_links[0].target)
-            .await
-            .unwrap();
+        let linked_detail =
+            load_node_detail(&state, &tool_use_input_links[0].target, ViewMode::All)
+                .await
+                .unwrap();
         assert!(
             matches!(linked_detail, NodeDetailResponse::Found { node, .. } if node.id == exec_id)
         );

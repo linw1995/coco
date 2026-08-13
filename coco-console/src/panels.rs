@@ -11,11 +11,13 @@ use leptos::server_fn::codec::GetUrl;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
-    AnchorRangeResponse, CodeHighlightKind, CodeHighlightRange, GraphViewportEdgeKind,
-    JsonHighlightKind, JsonHighlightRange, MarkdownDocument, MarkdownNode, NodeDetailResponse,
-    ProviderContextBranch, ProviderContextItem, ProviderContextResponse, ShellHighlightKind,
-    ShellHighlightToken, ToolInputJsonHighlight, ToolInputShellHighlight, ToolUseInputLink,
+    AnchorRangeResponse, CodeHighlightKind, CodeHighlightRange, GraphPointLink,
+    GraphViewportEdgeKind, JsonHighlightKind, JsonHighlightRange, MarkdownDocument, MarkdownNode,
+    NodeDetailResponse, ProviderContextBranch, ProviderContextItem, ProviderContextResponse,
+    ShellHighlightKind, ShellHighlightToken, ToolInputJsonHighlight, ToolInputShellHighlight,
+    ToolUseInputLink,
 };
+use crate::graph_render::graph_point_href;
 
 #[cfg(target_arch = "wasm32")]
 mod client;
@@ -107,10 +109,13 @@ fn panel_detail_view(payload: PanelDetailPayload) -> AnyView {
 }
 
 #[server(prefix = "/api/panels", endpoint = "node-detail", input = GetUrl)]
-async fn load_node_detail(target: String) -> Result<NodeDetailResponse, ServerFnError> {
+async fn load_node_detail(
+    target: String,
+    graph_mode: String,
+) -> Result<NodeDetailResponse, ServerFnError> {
     let context = expect_context::<crate::host::PanelServerContext>();
     context
-        .node_detail(target)
+        .node_detail(target, graph_mode)
         .await
         .map_err(|error| ServerFnError::ServerError(error.to_string()))
 }
@@ -162,21 +167,22 @@ async fn load_provider_context_items(
 }
 
 #[island]
-pub fn NodeDetailPanel() -> impl IntoView {
-    view! { <NodeDetailPanelBody/> }
+pub fn NodeDetailPanel(graph_mode: String) -> impl IntoView {
+    view! { <NodeDetailPanelBody graph_mode/> }
 }
 
 #[component]
-fn NodeDetailPanelBody() -> impl IntoView {
+fn NodeDetailPanelBody(graph_mode: String) -> impl IntoView {
     let selection = use_panel_selection(PanelSelection::default());
     let graph_revision = use_graph_revision();
     let selected_target = Memo::new(move |_| selection.get().target);
     let detail = LocalResource::new(move || {
         graph_revision.track();
         let request = selected_target.get();
+        let graph_mode = graph_mode.clone();
         async move {
             let target = request?;
-            let response = load_node_detail(target.clone())
+            let response = load_node_detail(target.clone(), graph_mode)
                 .await
                 .map_err(|error| error.to_string());
             Some(LoadedPanel {
@@ -413,6 +419,7 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         }
         NodeDetailResponse::Found {
             node,
+            parent_graph_links,
             markdown_documents,
             tool_use_input_links,
             tool_input_shell_highlights,
@@ -420,6 +427,7 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         } => view! {
             <NodeDetail
                 node=*node
+                parent_graph_links
                 markdown_documents
                 tool_use_input_links
                 tool_input_shell_highlights
@@ -433,6 +441,7 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
 #[component]
 fn NodeDetail(
     node: Node,
+    #[prop(default = BTreeMap::new())] parent_graph_links: BTreeMap<String, GraphPointLink>,
     markdown_documents: Vec<MarkdownDocument>,
     tool_use_input_links: Vec<ToolUseInputLink>,
     tool_input_shell_highlights: Vec<ToolInputShellHighlight>,
@@ -482,15 +491,21 @@ fn NodeDetail(
                 {parent.map(|parent| view! {
                     <div class="node-detail-meta-wide">
                         <dt>"Parent"</dt>
-                        <ParentRef label="Parent".to_owned() node_id=parent/>
+                        <ParentRef
+                            label="Parent".to_owned()
+                            graph_link=parent_graph_links.get(&parent).copied()
+                            node_id=parent
+                        />
                     </div>
                 })}
-                {merge_parents.into_iter().map(|(kind, node_id)| view! {
+                {merge_parents.into_iter().map(|(kind, node_id)| {
+                    let graph_link = parent_graph_links.get(&node_id).copied();
+                    view! {
                     <div class="node-detail-meta-wide">
                         <dt>{format!("{kind} parent")}</dt>
-                        <ParentRef label=format!("{kind} parent") node_id/>
+                        <ParentRef label=format!("{kind} parent") node_id graph_link/>
                     </div>
-                }).collect::<Vec<_>>()}
+                }}).collect::<Vec<_>>()}
             </dl>
             <NodeDetailBody
                 kind=node.kind
@@ -504,15 +519,31 @@ fn NodeDetail(
 }
 
 #[component]
-fn ParentRef(label: String, node_id: String) -> impl IntoView {
-    let href = format!("#{NODE_TARGET_PREFIX}{node_id}");
+fn ParentRef(
+    label: String,
+    node_id: String,
+    #[prop(optional_no_strip)] graph_link: Option<GraphPointLink>,
+) -> impl IntoView {
+    let target = format!("{NODE_TARGET_PREFIX}{node_id}");
+    let href = graph_link.map_or_else(
+        || format!("#{target}"),
+        |link| graph_point_href(&target, link.point, link.local, "all"),
+    );
     let aria_label = format!("Jump to {label}: {node_id}");
     let title = node_id.clone();
+    let point = graph_link.filter(|link| link.local).map(|link| link.point);
 
     view! {
         <dd class="node-detail-parent-ref">
             <code title=title>{node_id}</code>
-            <a class="node-detail-parent-link" href=href aria-label=aria_label>"Jump"</a>
+            <a
+                class="node-detail-parent-link"
+                href=href
+                aria-label=aria_label
+                data-node-target=target
+                data-node-x=point.map(|point| point.x)
+                data-node-y=point.map(|point| point.y)
+            >"Jump"</a>
         </dd>
     }
 }
@@ -2136,6 +2167,7 @@ mod tests {
             request: "detail-node".to_owned(),
             response: Ok(NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text("response".to_owned()))),
+                parent_graph_links: BTreeMap::new(),
                 markdown_documents: Vec::new(),
                 tool_use_input_links: Vec::new(),
                 tool_input_shell_highlights: Vec::new(),
@@ -2175,7 +2207,7 @@ mod tests {
 
     #[test]
     fn panel_islands_render_independent_server_fallbacks() {
-        let node = view! { <NodeDetailPanel/> }.to_html();
+        let node = view! { <NodeDetailPanel graph_mode="all".to_owned()/> }.to_html();
         let provider = view! {
             <ProviderContextPanel graph_mode="all".to_owned() initial=None/>
         }
@@ -2233,6 +2265,7 @@ mod tests {
             node: Box::new(test_node(Kind::Text(
                 "<script>alert(1)</script>".to_owned(),
             ))),
+            parent_graph_links: BTreeMap::new(),
             markdown_documents: Vec::new(),
             tool_use_input_links: Vec::new(),
             tool_input_shell_highlights: Vec::new(),
@@ -2383,9 +2416,33 @@ mod tests {
                 attachments: Vec::new(),
             },
         )));
+        let parent_graph_links = BTreeMap::from([
+            (
+                "parent-node".to_owned(),
+                GraphPointLink {
+                    point: crate::api::Point { x: 120, y: 80 },
+                    local: true,
+                },
+            ),
+            (
+                "merge-node".to_owned(),
+                GraphPointLink {
+                    point: crate::api::Point { x: 240, y: 160 },
+                    local: false,
+                },
+            ),
+            (
+                "shadow-node".to_owned(),
+                GraphPointLink {
+                    point: crate::api::Point { x: 360, y: 240 },
+                    local: true,
+                },
+            ),
+        ]);
         let detail = view! {
             <NodeDetail
                 node
+                parent_graph_links
                 markdown_documents=Vec::new()
                 tool_use_input_links=Vec::new()
                 tool_input_shell_highlights=Vec::new()
@@ -2404,14 +2461,27 @@ mod tests {
             ("Shadow parent", "shadow-node"),
         ] {
             assert!(
-                detail.contains(&format!(r##"href="#detail-{node_id}""##)),
-                "{detail}"
-            );
-            assert!(
                 detail.contains(&format!(r#"aria-label="Jump to {label}: {node_id}""#)),
                 "{detail}"
             );
         }
+        assert!(
+            detail.contains(r##"href="#detail-parent-node""##)
+                && detail.contains(r#"data-node-target="detail-parent-node""#)
+                && detail.contains(r#"data-node-x="120" data-node-y="80""#),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(r##"href="#detail-shadow-node""##),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(
+                r#"href="/?mode=all&amp;graph_focus_target=detail-merge-node&amp;graph_focus_x=240&amp;graph_focus_y=160#detail-merge-node""#
+            ) && detail.contains(r#"data-node-target="detail-merge-node""#),
+            "{detail}"
+        );
+        assert!(!detail.contains(r#"data-node-x="240""#), "{detail}");
     }
 
     #[test]
@@ -2420,6 +2490,7 @@ mod tests {
         let node = view! {
             <NodeDetailContent response=NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text(source.to_owned()))),
+                parent_graph_links: BTreeMap::new(),
                 markdown_documents: vec![MarkdownDocument {
                     source: source.to_owned(),
                     blocks: vec![
@@ -2819,6 +2890,7 @@ mod tests {
                         input: serde_json::json!({"session_id": "exec-1"}),
                     },
                 ]))),
+                parent_graph_links: BTreeMap::new(),
                 markdown_documents: Vec::new(),
                 tool_use_input_links: vec![ToolUseInputLink {
                     tool_use_index: 1,
