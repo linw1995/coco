@@ -1721,16 +1721,22 @@ fn job_link_element(
             ("role", "listitem".to_owned()),
         ],
     )?;
-    let link = document.create_element("a")?;
     let all_view = graph_mode == "all";
-    let href = job_href(&job, all_view);
-    let (_, point) = job_focus(&job, all_view);
-    let head_href = job_destination_href(&job, all_view, JobDestination::Head);
-    let (_, head_point) = job_destination_focus(&job, JobDestination::Head);
-    let anchor_href = job_destination_href(&job, all_view, JobDestination::HeadAnchor);
-    let (_, anchor_point) = job_destination_focus(&job, JobDestination::HeadAnchor);
-    let head_label = format!("Jump job {} to head in All view", job.short_id);
-    let anchor_label = format!("Jump job {} to head anchor in Anchors view", job.short_id);
+    let primary_link = job_primary_link_element(document, &job, all_view)?;
+    item.append_child(&primary_link)?;
+    let actions = job_destination_actions_element(document, &job, all_view)?;
+    item.append_child(&actions)?;
+    Ok(item)
+}
+
+fn job_primary_link_element(
+    document: &Document,
+    job: &GraphJob,
+    all_view: bool,
+) -> Result<Element, JsValue> {
+    let link = document.create_element("a")?;
+    let href = job_href(job, all_view);
+    let (_, point) = job_focus(job, all_view);
     set_attributes(
         &link,
         [
@@ -1761,7 +1767,7 @@ fn job_link_element(
     let branch = document.create_element("span")?;
     branch.set_attribute("class", "job-branch")?;
     let branch_text = if job.branch == job.work_branch {
-        job.branch
+        job.branch.clone()
     } else {
         format!("{} → {}", job.branch, job.work_branch)
     };
@@ -1772,8 +1778,14 @@ fn job_link_element(
     current_head.set_text_content(Some(&format!("head {}", job.head_short_id)));
     summary.append_child(&current_head)?;
     link.append_child(&summary)?;
-    item.append_child(&link)?;
+    Ok(link)
+}
 
+fn job_destination_actions_element(
+    document: &Document,
+    job: &GraphJob,
+    all_view: bool,
+) -> Result<Element, JsValue> {
     let actions = document.create_element("nav")?;
     set_attributes(
         &actions,
@@ -1782,6 +1794,9 @@ fn job_link_element(
             ("aria-label", "Jump destination".to_owned()),
         ],
     )?;
+    let head_href = job_destination_href(job, all_view, JobDestination::Head);
+    let (_, head_point) = job_destination_focus(job, JobDestination::Head);
+    let head_label = format!("Jump job {} to head in All view", job.short_id);
     let head_button = job_destination_button_element(
         document,
         "job-destination-button job-destination-head",
@@ -1791,6 +1806,9 @@ fn job_link_element(
         head_point,
     )?;
     actions.append_child(&head_button)?;
+    let anchor_href = job_destination_href(job, all_view, JobDestination::HeadAnchor);
+    let (_, anchor_point) = job_destination_focus(job, JobDestination::HeadAnchor);
+    let anchor_label = format!("Jump job {} to head anchor in Anchors view", job.short_id);
     let anchor_button = job_destination_button_element(
         document,
         "job-destination-button job-destination-anchor",
@@ -1800,8 +1818,7 @@ fn job_link_element(
         anchor_point,
     )?;
     actions.append_child(&anchor_button)?;
-    item.append_child(&actions)?;
-    Ok(item)
+    Ok(actions)
 }
 
 fn job_destination_button_element(
