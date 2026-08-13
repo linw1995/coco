@@ -352,12 +352,7 @@ pub fn job_destination_focus(
     }
 }
 
-pub(crate) fn graph_point_href(
-    target: &str,
-    point: crate::api::Point,
-    local: bool,
-    mode: &str,
-) -> String {
+pub fn graph_point_href(target: &str, point: crate::api::Point, local: bool, mode: &str) -> String {
     if local {
         return format!("#{target}");
     }
