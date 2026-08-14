@@ -86,6 +86,7 @@ fn GraphPage(
     let stats = format!("{} / revision {}", mode.label(), revision);
     let graph_mode = mode.as_query_value().to_owned();
     let graph = GraphCanvasModel::new(mode == ViewMode::Anchors, mode == ViewMode::All, &viewport);
+    let node_detail_drawer_open = initial_provider_context.is_some();
     view! {
         <main
             id="console-root"
@@ -104,20 +105,71 @@ fn GraphPage(
                     <p class="stats">{stats}</p>
                 </section>
             </header>
-            <section class="content">
+            <section
+                class="content"
+                data-open-drawer=node_detail_drawer_open.then_some("node-detail")
+            >
                 <div class="graph-shell">
                     <div class="graph-surface"><GraphCanvas graph/></div>
                     <EmptyTimeScale/>
                 </div>
-                <section class="provider-context-panel">
+                <nav class="side-drawer-toolbar" aria-label="Inspector panels">
+                    <button
+                        type="button"
+                        data-drawer-open="provider-context"
+                        aria-controls="provider-context-drawer"
+                        aria-expanded="false"
+                    >
+                        "Context"
+                    </button>
+                    <button
+                        type="button"
+                        data-drawer-open="node-detail"
+                        aria-controls="node-detail-drawer"
+                        aria-expanded=node_detail_drawer_open.to_string()
+                    >
+                        "Detail"
+                    </button>
+                </nav>
+                <aside
+                    id="provider-context-drawer"
+                    class="side-drawer provider-context-panel"
+                    data-drawer="provider-context"
+                    aria-label="Provider Context"
+                    aria-hidden="true"
+                    inert=""
+                >
+                    <button
+                        type="button"
+                        class="side-drawer-close"
+                        data-drawer-close=""
+                        aria-label="Close Provider Context"
+                    >
+                        <span aria-hidden="true">"×"</span>
+                    </button>
                     <div class="provider-context-slot">
                         <ProviderContextPanel
                             graph_mode=graph_mode
                             initial=initial_provider_context
                         />
                     </div>
-                </section>
-                <aside class="side">
+                </aside>
+                <aside
+                    id="node-detail-drawer"
+                    class="side-drawer node-detail-panel"
+                    data-drawer="node-detail"
+                    aria-label="Node Detail"
+                    aria-hidden=(!node_detail_drawer_open).to_string()
+                    inert=(!node_detail_drawer_open).then_some("")
+                >
+                    <button
+                        type="button"
+                        class="side-drawer-close"
+                        data-drawer-close=""
+                        aria-label="Close Node Detail"
+                    >
+                        <span aria-hidden="true">"×"</span>
+                    </button>
                     <div id=NODE_DETAIL_PANEL_ID class="node-detail-slot">
                         <NodeDetailPanel graph_mode=mode.as_query_value().to_owned()/>
                     </div>
@@ -642,6 +694,11 @@ mod tests {
         assert!(!page.contains("<!--bc-"));
         assert_eq!(page.matches("<leptos-island").count(), 2);
         assert!(page.contains("graph-anchor-range"));
+        assert!(page.contains("class=\"side-drawer-toolbar\""));
+        assert!(page.contains("data-drawer=\"provider-context\""));
+        assert!(page.contains("data-drawer=\"node-detail\""));
+        assert_eq!(page.matches("data-drawer-close").count(), 2);
+        assert_eq!(page.matches("aria-expanded=\"false\"").count(), 2);
         assert_eq!(
             page.matches("Select a node to inspect its content.")
                 .count(),

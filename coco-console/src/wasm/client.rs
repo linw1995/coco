@@ -23,7 +23,6 @@ use crate::api::{
 };
 use crate::panels::{
     PROVIDER_CONTEXT_RENDERED_EVENT, PanelSelection, load_anchor_range, notify_graph_revision,
-    reveal_node_detail_on_mobile,
 };
 #[cfg(test)]
 use crate::truncate_label;
@@ -53,6 +52,29 @@ const MAX_ZOOM: f64 = 4.0;
 const MAX_SHORT_CANVAS_AUTO_ZOOM: f64 = 2.6;
 const TIME_SCALE_FOCUS_SIGMA: f64 = 6.4;
 const VERSION_REFRESH_RETRY_MS: i32 = 50;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SideDrawer {
+    ProviderContext,
+    NodeDetail,
+}
+
+impl SideDrawer {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ProviderContext => "provider-context",
+            Self::NodeDetail => "node-detail",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "provider-context" => Some(Self::ProviderContext),
+            "node-detail" => Some(Self::NodeDetail),
+            _ => None,
+        }
+    }
+}
 
 struct GraphItemsRefreshInput {
     window: Window,
@@ -170,6 +192,7 @@ fn redirect_legacy_detail_url() -> Result<bool, JsValue> {
 async fn run() -> Result<(), JsValue> {
     let graph = setup_graph()?;
     sync_initial_detail_url(&graph.borrow().window)?;
+    sync_side_drawer_with_selection(&graph.borrow().document, &graph.borrow().window)?;
     render_full_viewport(graph.clone()).await?;
     install_graph_events_or_log(graph.clone());
     focus_selected_node_in_graph(graph);
@@ -2676,8 +2699,9 @@ fn remap_expanded_viewport(
 }
 
 fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
-    let installers: [GraphListenerInstaller; 10] = [
+    let installers: [GraphListenerInstaller; 11] = [
         install_anchor_range_listener,
+        install_side_drawer_listener,
         install_detail_link_listener,
         install_follow_toggle_listener,
         install_mouse_pan_listener,
@@ -2692,6 +2716,125 @@ fn install_graph_listeners(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsVal
         install(graph.clone())?;
     }
     Ok(())
+}
+
+fn install_side_drawer_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
+    let document = graph.borrow().document.clone();
+    let click_document = document.clone();
+    let click_closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        let Some(target) = event
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+        else {
+            return;
+        };
+        if let Some(trigger) = target.closest("button[data-drawer-open]").ok().flatten() {
+            let Some(drawer) = trigger
+                .get_attribute("data-drawer-open")
+                .as_deref()
+                .and_then(SideDrawer::from_name)
+            else {
+                return;
+            };
+            event.prevent_default();
+            if let Err(error) = set_open_side_drawer(&click_document, Some(drawer)) {
+                web_sys::console::error_1(&error);
+            }
+            return;
+        }
+        if target
+            .closest("button[data-drawer-close]")
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return;
+        }
+        event.prevent_default();
+        if let Err(error) = close_side_drawer_and_focus_trigger(&click_document) {
+            web_sys::console::error_1(&error);
+        }
+    });
+    document.add_event_listener_with_callback("click", click_closure.as_ref().unchecked_ref())?;
+    click_closure.forget();
+
+    let keyboard_document = document.clone();
+    let keyboard_closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |event: KeyboardEvent| {
+        if event.key() != "Escape" || event.default_prevented() {
+            return;
+        }
+        let Ok(Some(_)) = open_side_drawer(&keyboard_document) else {
+            return;
+        };
+        event.prevent_default();
+        if let Err(error) = close_side_drawer_and_focus_trigger(&keyboard_document) {
+            web_sys::console::error_1(&error);
+        }
+    });
+    document
+        .add_event_listener_with_callback("keydown", keyboard_closure.as_ref().unchecked_ref())?;
+    keyboard_closure.forget();
+    Ok(())
+}
+
+fn open_side_drawer(document: &Document) -> Result<Option<SideDrawer>, JsValue> {
+    Ok(document
+        .query_selector(".content")?
+        .and_then(|content| content.get_attribute("data-open-drawer"))
+        .as_deref()
+        .and_then(SideDrawer::from_name))
+}
+
+fn set_open_side_drawer(document: &Document, selected: Option<SideDrawer>) -> Result<(), JsValue> {
+    let Some(content) = document.query_selector(".content")? else {
+        return Ok(());
+    };
+    if let Some(selected) = selected {
+        content.set_attribute("data-open-drawer", selected.name())?;
+    } else {
+        content.remove_attribute("data-open-drawer")?;
+    }
+    for drawer in [SideDrawer::ProviderContext, SideDrawer::NodeDetail] {
+        let expanded = selected == Some(drawer);
+        if let Some(panel) =
+            document.query_selector(&format!("[data-drawer=\"{}\"]", drawer.name()))?
+        {
+            panel.set_attribute("aria-hidden", if expanded { "false" } else { "true" })?;
+            if expanded {
+                panel.remove_attribute("inert")?;
+            } else {
+                panel.set_attribute("inert", "")?;
+            }
+        }
+        if let Some(trigger) =
+            document.query_selector(&format!("button[data-drawer-open=\"{}\"]", drawer.name()))?
+        {
+            trigger.set_attribute("aria-expanded", if expanded { "true" } else { "false" })?;
+        }
+    }
+    Ok(())
+}
+
+fn close_side_drawer_and_focus_trigger(document: &Document) -> Result<(), JsValue> {
+    let open = open_side_drawer(document)?;
+    set_open_side_drawer(document, None)?;
+    let Some(open) = open else {
+        return Ok(());
+    };
+    if let Some(trigger) =
+        document.query_selector(&format!("button[data-drawer-open=\"{}\"]", open.name()))?
+    {
+        trigger.unchecked_into::<web_sys::HtmlElement>().focus()?;
+    }
+    Ok(())
+}
+
+fn sync_side_drawer_with_selection(document: &Document, window: &Window) -> Result<(), JsValue> {
+    let selection = PanelSelection::from_hash(&window.location().hash()?);
+    set_open_side_drawer(
+        document,
+        selection.target.is_some().then_some(SideDrawer::NodeDetail),
+    )
 }
 
 fn install_anchor_range_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -3193,6 +3336,11 @@ fn install_hashchange_node_selection_listener(
         if let Err(error) = sync_detail_query(&event_window) {
             web_sys::console::error_1(&error);
         }
+        if let Err(error) =
+            sync_side_drawer_with_selection(&selection_graph.borrow().document, &event_window)
+        {
+            web_sys::console::error_1(&error);
+        }
         focus_selected_node_in_graph(selection_graph.clone());
     });
     selection_window.add_event_listener_with_callback(
@@ -3325,20 +3473,15 @@ fn detail_link_navigation(
 }
 
 fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
-    let window = {
+    let (window, document) = {
         let graph = graph.borrow();
-        graph.window.clone()
+        (graph.window.clone(), graph.document.clone())
     };
-    let reveals_current_detail = window
-        .location()
-        .hash()
-        .is_ok_and(|current_hash| same_detail_target(&current_hash, &hash));
-
+    if let Err(error) = set_open_side_drawer(&document, Some(SideDrawer::NodeDetail)) {
+        web_sys::console::error_1(&error);
+    }
     match update_detail_hash(&window, &hash) {
         Ok(changed) => {
-            if reveals_current_detail {
-                reveal_node_detail_on_mobile();
-            }
             if changed {
                 return;
             }
@@ -3350,12 +3493,6 @@ fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
     }
 
     focus_selected_node_in_graph(graph);
-}
-
-fn same_detail_target(current_hash: &str, next_hash: &str) -> bool {
-    let current = PanelSelection::from_hash(current_hash).target;
-    let next = PanelSelection::from_hash(next_hash).target;
-    current.is_some() && current == next
 }
 
 fn update_detail_hash(window: &Window, hash: &str) -> Result<bool, JsValue> {
@@ -4032,6 +4169,20 @@ mod tests {
                       </div>
                     </details>
                   </div>
+                  <section class="content">
+                    <nav class="side-drawer-toolbar">
+                      <button type="button" data-drawer-open="provider-context"
+                              aria-expanded="false">Context</button>
+                      <button type="button" data-drawer-open="node-detail"
+                              aria-expanded="false">Detail</button>
+                    </nav>
+                    <aside data-drawer="provider-context" aria-hidden="true" inert>
+                      <button type="button" data-drawer-close>Close</button>
+                    </aside>
+                    <aside data-drawer="node-detail" aria-hidden="true" inert>
+                      <button type="button" data-drawer-close>Close</button>
+                    </aside>
+                  </section>
                   <div class="graph-wrap" data-zoom="1">
                     <button class="follow-toggle" type="button" aria-pressed="false">Follow</button>
                     <svg class="graph">
@@ -5012,6 +5163,60 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn graph_items_side_drawers_switch_and_close_without_clearing_selection() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        let window = fixture.graph.borrow().window.clone();
+
+        set_open_side_drawer(&document, Some(SideDrawer::ProviderContext))
+            .expect_throw("provider context drawer should open");
+        assert_eq!(
+            open_side_drawer(&document).expect_throw("drawer state should resolve"),
+            Some(SideDrawer::ProviderContext)
+        );
+        let provider = query_required(&document, "[data-drawer=\"provider-context\"]")
+            .expect_throw("provider context drawer should exist");
+        let detail = query_required(&document, "[data-drawer=\"node-detail\"]")
+            .expect_throw("node detail drawer should exist");
+        assert_eq!(
+            provider.get_attribute("aria-hidden").as_deref(),
+            Some("false")
+        );
+        assert!(!provider.has_attribute("inert"));
+        assert_eq!(detail.get_attribute("aria-hidden").as_deref(), Some("true"));
+        assert!(detail.has_attribute("inert"));
+
+        window
+            .location()
+            .set_hash("detail-aaaaaaaa")
+            .expect_throw("selection hash should be set");
+        sync_side_drawer_with_selection(&document, &window)
+            .expect_throw("node selection should open detail drawer");
+        assert_eq!(
+            open_side_drawer(&document).expect_throw("drawer state should resolve"),
+            Some(SideDrawer::NodeDetail)
+        );
+
+        close_side_drawer_and_focus_trigger(&document)
+            .expect_throw("node detail drawer should close");
+        assert_eq!(
+            open_side_drawer(&document).expect_throw("drawer state should resolve"),
+            None
+        );
+        assert_eq!(
+            window.location().hash().expect_throw("hash should exist"),
+            "#detail-aaaaaaaa"
+        );
+        let active = document
+            .active_element()
+            .expect_throw("drawer trigger should receive focus");
+        assert_eq!(
+            active.get_attribute("data-drawer-open").as_deref(),
+            Some("node-detail")
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn graph_items_detail_navigation_uses_history_and_one_refresh_trigger() {
         let fixture = GraphFixture::new();
         let window = fixture.graph.borrow().window.clone();
@@ -5040,14 +5245,6 @@ mod tests {
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa"
         );
-        assert!(same_detail_target(
-            "#detail-aaaaaaaa",
-            "#detail-aaaaaaaa?context=detail-context"
-        ));
-        assert!(!same_detail_target(
-            "#detail-aaaaaaaa",
-            "#detail-bbbbbbbb?context=detail-context"
-        ));
         select_detail_link(
             fixture.graph.clone(),
             "#detail-aaaaaaaa?context=detail-context".to_owned(),
