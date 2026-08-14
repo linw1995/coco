@@ -21,7 +21,7 @@ const DATABASE_FILE_NAME: &str = "web-graph.sqlite3";
 const WRITE_BATCH_SIZE: usize = 64;
 const MAX_READ_BATCH_SIZE: usize = 128;
 // This version covers every source-derived projection stored alongside the layouts.
-pub const LAYOUT_VERSION: u32 = 8;
+pub const LAYOUT_VERSION: u32 = 9;
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("web-graph-migrations");
 
 mod database;
@@ -31,8 +31,9 @@ mod spatial;
 use database::{AsyncSqliteConnection, Database};
 use schema::{
     web_graph_edge_routes, web_graph_edges, web_graph_exec_sessions, web_graph_layouts,
-    web_graph_node_placements, web_graph_nodes, web_graph_provider_branch_history,
-    web_graph_provider_context_nodes, web_graph_state, web_graph_tool_uses,
+    web_graph_node_origins, web_graph_node_placements, web_graph_nodes,
+    web_graph_provider_branch_history, web_graph_provider_context_nodes, web_graph_state,
+    web_graph_tool_uses,
 };
 pub use spatial::{Viewport, ViewportCursor, ViewportPage};
 
@@ -75,6 +76,13 @@ pub struct ProjectedToolUse {
 pub struct ProjectedExecSessionResult {
     pub tool_result_id: String,
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeOriginProjection {
+    pub node_id: String,
+    pub branch_instance_id: String,
+    pub branch_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +540,45 @@ impl WebGraphStore {
             .map(|rows| rows.into_iter().collect())
     }
 
+    pub async fn node_origin_projections(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Option<GraphRead<HashMap<String, NodeOriginProjection>>>> {
+        use diesel_async::RunQueryDsl;
+
+        validate_read_batch_size(node_ids.len())?;
+        let path = self.path.clone();
+        let node_ids = node_ids.to_vec();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .transaction::<_, TransactionError, _>(async |connection| {
+                let Some(state) = load_state(connection).await? else {
+                    return Ok(None);
+                };
+                let origins = if node_ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    web_graph_node_origins::table
+                        .filter(web_graph_node_origins::node_id.eq_any(node_ids))
+                        .select(NodeOriginRow::as_select())
+                        .load::<NodeOriginRow>(connection)
+                        .await?
+                        .into_iter()
+                        .map(|row| {
+                            let projection = NodeOriginProjection::from(row);
+                            (projection.node_id.clone(), projection)
+                        })
+                        .collect()
+                };
+                Ok(Some(GraphRead {
+                    state,
+                    value: origins,
+                }))
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
     pub async fn provider_branch_heads(&self) -> Result<Option<GraphRead<ProviderBranchState>>> {
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
@@ -825,6 +872,52 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
+    pub async fn apply_node_origin_projection(
+        &self,
+        projection: Option<&NodeOriginProjection>,
+        node_id: &str,
+    ) -> Result<()> {
+        use diesel::upsert::excluded;
+        use diesel_async::RunQueryDsl;
+
+        let path = self.path.clone();
+        let projection = projection.cloned();
+        let node_id = node_id.to_owned();
+        let mut connection = self.database.acquire().await?;
+        connection
+            .immediate_transaction::<_, TransactionError, _>(async |connection| {
+                if let Some(projection) = projection {
+                    let row = NodeOriginRow {
+                        node_id: projection.node_id,
+                        branch_instance_id: projection.branch_instance_id,
+                        branch_name: projection.branch_name,
+                    };
+                    diesel::insert_into(web_graph_node_origins::table)
+                        .values(&row)
+                        .on_conflict(web_graph_node_origins::node_id)
+                        .do_update()
+                        .set((
+                            web_graph_node_origins::branch_instance_id
+                                .eq(excluded(web_graph_node_origins::branch_instance_id)),
+                            web_graph_node_origins::branch_name
+                                .eq(excluded(web_graph_node_origins::branch_name)),
+                        ))
+                        .execute(connection)
+                        .await?;
+                } else {
+                    diesel::delete(
+                        web_graph_node_origins::table
+                            .filter(web_graph_node_origins::node_id.eq(node_id)),
+                    )
+                    .execute(connection)
+                    .await?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.into_store_error(path))
+    }
+
     pub async fn replace(&self, graph: &Graph) -> Result<()> {
         let snapshot = graph.snapshot();
         let path = self.path.clone();
@@ -926,6 +1019,24 @@ struct StateRow {
 #[diesel(table_name = web_graph_nodes)]
 struct NodeRow {
     node_id: String,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
+#[diesel(table_name = web_graph_node_origins)]
+struct NodeOriginRow {
+    node_id: String,
+    branch_instance_id: String,
+    branch_name: String,
+}
+
+impl From<NodeOriginRow> for NodeOriginProjection {
+    fn from(row: NodeOriginRow) -> Self {
+        Self {
+            node_id: row.node_id,
+            branch_instance_id: row.branch_instance_id,
+            branch_name: row.branch_name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -2118,6 +2229,9 @@ async fn replace_snapshot(
         .execute(connection)
         .await?;
     diesel::delete(web_graph_edges::table)
+        .execute(connection)
+        .await?;
+    diesel::delete(web_graph_node_origins::table)
         .execute(connection)
         .await?;
     diesel::delete(web_graph_nodes::table)

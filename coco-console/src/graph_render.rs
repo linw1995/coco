@@ -31,6 +31,7 @@ struct RenderedNode {
     id: String,
     key: String,
     target: String,
+    href: String,
     node_id: String,
     x: i32,
     y: i32,
@@ -44,7 +45,7 @@ struct RenderedEdge {
     id: String,
     hit_target_id: String,
     key: String,
-    class: &'static str,
+    class: String,
     marker: &'static str,
     path: String,
     kind: &'static str,
@@ -87,10 +88,12 @@ impl GraphCanvasModel {
 
 impl RenderedNode {
     fn new(node: &GraphViewportNode) -> Self {
+        let target = node.node_target.clone();
         Self {
             id: render_element_id(&node.key),
             key: node.key.clone(),
-            target: node.node_target.clone(),
+            href: node.href.clone().unwrap_or_else(|| format!("#{target}")),
+            target,
             node_id: node.id.clone(),
             x: node.x,
             y: node.y,
@@ -104,12 +107,12 @@ impl RenderedNode {
 
 impl RenderedEdge {
     fn new(edge: &GraphViewportEdge) -> Self {
-        let (class, marker) = edge_style(edge.kind);
+        let (base_class, marker) = edge_style(edge.kind);
         Self {
             id: render_element_id(&edge.key),
             hit_target_id: edge_hit_target_id(&edge.key),
             key: edge.key.clone(),
-            class,
+            class: edge_class(edge, base_class),
             marker,
             path: bezier_path(edge.route),
             kind: edge.kind.key_part(),
@@ -443,7 +446,7 @@ fn graph_node_view(node: RenderedNode) -> AnyView {
             id=node.id
             data-render-key=node.key
             class="node-link"
-            href=format!("#{}", node.target)
+            href=node.href
             data-node-target=node.target
             data-node-id=node.node_id
             data-base-node-x=node.x
@@ -491,6 +494,12 @@ pub fn edge_hit_target_id(key: &str) -> String {
 
 pub fn node_group_class(node: &GraphViewportNode) -> String {
     let mut class = format!("node {}", css_token(&node.kind));
+    if let Some(origin) = node.origin.as_ref() {
+        class.push_str(&format!(
+            " origin origin-{}",
+            origin_style_index(&origin.branch_instance_id)
+        ));
+    }
     if !node.labels.is_empty() {
         class.push_str(" active");
     }
@@ -503,10 +512,39 @@ pub fn node_title_text(node: &GraphViewportNode) -> String {
     } else {
         format!(" [{}]", node.labels.join(", "))
     };
+    let origin = node.origin.as_ref().map_or_else(
+        || "unknown origin".to_owned(),
+        |origin| {
+            format!(
+                "origin {} ({})",
+                origin.branch_name,
+                truncate_label(&origin.branch_instance_id, 16)
+            )
+        },
+    );
     format!(
-        "{} · {}{}: {}",
-        node.short_id, node.kind, labels, node.summary
+        "{} · {}{} · {}: {}",
+        node.short_id, node.kind, labels, origin, node.summary
     )
+}
+
+fn edge_class(edge: &GraphViewportEdge, base: &str) -> String {
+    match (edge.kind, edge.origin.as_ref()) {
+        (GraphViewportEdgeKind::Primary, Some(origin)) => format!(
+            "{base} origin origin-{}",
+            origin_style_index(&origin.branch_instance_id)
+        ),
+        _ => base.to_owned(),
+    }
+}
+
+pub fn origin_style_index(instance_id: &str) -> u8 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in instance_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % 8) as u8
 }
 
 pub fn node_label(node: &GraphViewportNode) -> String {

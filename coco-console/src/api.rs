@@ -21,6 +21,8 @@ pub enum NodeDetailResponse {
     },
     Found {
         node: Box<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<GraphNodeOrigin>,
         #[serde(default)]
         parent_graph_links: BTreeMap<String, GraphPointLink>,
         #[serde(default)]
@@ -342,8 +344,18 @@ pub struct GraphViewportNode {
     pub kind: String,
     pub summary: String,
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<GraphNodeOrigin>,
     pub x: i32,
     pub y: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GraphNodeOrigin {
+    pub branch_instance_id: String,
+    pub branch_name: String,
 }
 
 impl GraphViewportNode {
@@ -396,6 +408,8 @@ pub struct GraphViewportEdge {
     pub kind: GraphViewportEdgeKind,
     pub source_id: String,
     pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<GraphNodeOrigin>,
     pub route: GraphBezierRoute,
 }
 
@@ -434,6 +448,8 @@ mod tests {
             kind: "text".to_owned(),
             summary: "first".to_owned(),
             labels: vec!["main".to_owned()],
+            href: None,
+            origin: None,
             x: 0,
             y: 0,
         };
@@ -442,6 +458,7 @@ mod tests {
             kind: GraphViewportEdgeKind::Primary,
             source_id: "1".to_owned(),
             target_id: "2".to_owned(),
+            origin: None,
             route: GraphBezierRoute {
                 source: Point { x: 0, y: 0 },
                 control_1: Point { x: 30, y: 0 },

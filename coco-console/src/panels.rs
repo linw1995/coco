@@ -399,6 +399,7 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         }
         NodeDetailResponse::Found {
             node,
+            origin,
             parent_graph_links,
             markdown_documents,
             tool_use_input_links,
@@ -407,6 +408,7 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
         } => view! {
             <NodeDetail
                 node=*node
+                origin
                 parent_graph_links
                 markdown_documents
                 tool_use_input_links
@@ -421,6 +423,7 @@ fn NodeDetailContent(response: NodeDetailResponse) -> AnyView {
 #[component]
 fn NodeDetail(
     node: Node,
+    #[prop(default = None)] origin: Option<crate::api::GraphNodeOrigin>,
     #[prop(default = BTreeMap::new())] parent_graph_links: BTreeMap<String, GraphPointLink>,
     markdown_documents: Vec<MarkdownDocument>,
     tool_use_input_links: Vec<ToolUseInputLink>,
@@ -468,6 +471,13 @@ fn NodeDetail(
                     <dd><code title=full_id>{short_id}</code></dd>
                 </div>
                 <div><dt>"Created"</dt><dd>{node.created_at.to_string()}</dd></div>
+                <div class="node-detail-meta-wide">
+                    <dt>"Origin"</dt>
+                    <dd>{origin.map_or_else(
+                        || "Unknown".to_owned(),
+                        |origin| format!("{} ({})", origin.branch_name, origin.branch_instance_id),
+                    )}</dd>
+                </div>
                 {parent.map(|parent| view! {
                     <div class="node-detail-meta-wide">
                         <dt>"Parent"</dt>
@@ -2201,6 +2211,10 @@ mod tests {
             node: Box::new(test_node(Kind::Text(
                 "<script>alert(1)</script>".to_owned(),
             ))),
+            origin: Some(crate::api::GraphNodeOrigin {
+                branch_instance_id: "branch-instance-day-1".to_owned(),
+                branch_name: "day".to_owned(),
+            }),
             parent_graph_links: BTreeMap::new(),
             markdown_documents: Vec::new(),
             tool_use_input_links: Vec::new(),
@@ -2225,6 +2239,8 @@ mod tests {
         let node_error = view! { <NodeDetailError error="node failed".to_owned()/> }.to_html();
         let provider_error =
             view! { <ProviderContextError error="provider failed".to_owned()/> }.to_html();
+
+        assert!(node.contains("day (branch-instance-day-1)"));
 
         assert!(node.contains("&lt;script&gt;"));
         assert!(!node.contains("<script>"));
@@ -2426,6 +2442,7 @@ mod tests {
         let node = view! {
             <NodeDetailContent response=NodeDetailResponse::Found {
                 node: Box::new(test_node(Kind::Text(source.to_owned()))),
+                origin: None,
                 parent_graph_links: BTreeMap::new(),
                 markdown_documents: vec![MarkdownDocument {
                     source: source.to_owned(),
@@ -2826,6 +2843,7 @@ mod tests {
                         input: serde_json::json!({"session_id": "exec-1"}),
                     },
                 ]))),
+                origin: None,
                 parent_graph_links: BTreeMap::new(),
                 markdown_documents: Vec::new(),
                 tool_use_input_links: vec![ToolUseInputLink {

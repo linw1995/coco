@@ -24,9 +24,9 @@ use super::web_graph_order::{
     stable_column_order,
 };
 use super::web_graph_store::{
-    Error as StoreError, ProjectedExecSessionResult, ProjectedToolUse, ProviderBranchProjection,
-    ProviderContextNodeProjection, ProviderContextSplit, StoredGraphState, ToolSessionProjection,
-    Viewport, WebGraphStore,
+    Error as StoreError, NodeOriginProjection, ProjectedExecSessionResult, ProjectedToolUse,
+    ProviderBranchProjection, ProviderContextNodeProjection, ProviderContextSplit,
+    StoredGraphState, ToolSessionProjection, Viewport, WebGraphStore,
 };
 use super::web_graph_view::{
     EndpointPortOffsets, EndpointPortSlots, GRAPH_NODE_RADIUS, GRAPH_PADDING, GRAPH_RANK_STEP,
@@ -37,9 +37,9 @@ use super::web_graph_view::{
 };
 use super::{ConsolePublisher, subscribe_job_changes, subscribe_source_changes};
 use crate::api::{
-    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphJobsResponse, GraphViewport,
-    GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode,
-    GraphViewportResponse, Point as ApiPoint,
+    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphJobsResponse, GraphNodeOrigin,
+    GraphViewport, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
+    GraphViewportNode, GraphViewportResponse, Point as ApiPoint,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::web_graph::{
@@ -90,6 +90,12 @@ struct EnsureResult {
 struct SourceProjectionResult {
     changed_source_nodes: u64,
     nodes_to_reflow: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectedBranchLabels {
+    labels: Vec<String>,
+    href: Option<String>,
 }
 
 enum ReflowStep {
@@ -889,7 +895,10 @@ impl WebGraphRuntime {
                 .incident_routes_at_revision(layout_kind(mode), &node_ids, state.revision)
                 .await?
             {
-                return Ok(routes.into_values().map(viewport_edge).collect());
+                return Ok(routes
+                    .into_values()
+                    .map(|route| viewport_edge(route, None))
+                    .collect());
             }
             tokio::task::yield_now().await;
         }
@@ -1055,6 +1064,14 @@ impl WebGraphRuntime {
             .into_iter()
             .map(|node| (node.id.clone(), node))
             .collect::<BTreeMap<_, _>>();
+        let source_records = self
+            .source
+            .graph_node_records_by_ids(&node_ids)
+            .await
+            .context(StoreSnafu)?
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
         let parent_ids = source_nodes
             .values()
             .filter(|node| !node.parent.is_empty())
@@ -1079,6 +1096,23 @@ impl WebGraphRuntime {
                     node_id: entry.node_id.clone(),
                 }
             })?;
+            let source_record = source_records.get(&entry.node_id).with_context(|| {
+                WebGraphSourceNodeMissingSnafu {
+                    node_id: entry.node_id.clone(),
+                }
+            })?;
+            let origin = source_record
+                .origin
+                .as_ref()
+                .map(|origin| NodeOriginProjection {
+                    node_id: source_record.id.clone(),
+                    branch_instance_id: origin.branch_instance_id.clone(),
+                    branch_name: origin.branch_name.clone(),
+                });
+            self.store
+                .apply_node_origin_projection(origin.as_ref(), &source_record.id)
+                .await
+                .context(WebGraphStoreSnafu)?;
             let projection = tool_session_projection(entry.row_id, source_node);
             self.store
                 .apply_tool_session_projection(&projection)
@@ -1234,6 +1268,18 @@ impl WebGraphRuntime {
         }
     }
 
+    pub async fn node_origin(&self, node_id: &str) -> crate::Result<Option<GraphNodeOrigin>> {
+        Ok(self
+            .source_node(node_id)
+            .await?
+            .origin
+            .as_ref()
+            .map(|origin| GraphNodeOrigin {
+                branch_instance_id: origin.branch_instance_id.clone(),
+                branch_name: origin.branch_name.clone(),
+            }))
+    }
+
     pub async fn rightmost_viewport(
         &self,
         mode: ViewMode,
@@ -1358,6 +1404,23 @@ impl WebGraphRuntime {
             }
         }
 
+        let revision = revision.context(WebGraphNotInitializedSnafu)?;
+        let origin_ids = placements
+            .iter()
+            .map(|placement| placement.node.to_string())
+            .chain(routes.iter().filter_map(|route| {
+                (route.edge.kind == EdgeKind::Primary).then(|| route.edge.target.to_string())
+            }))
+            .collect::<BTreeSet<_>>();
+        let Some(origins) = self
+            .origin_projections_at_revision(&origin_ids, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(labels) = self.branch_labels_at_revision(mode, revision).await? else {
+            return Ok(None);
+        };
         let mut nodes = Vec::with_capacity(placements.len());
         for chunk in placements.chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE) {
             let ids = chunk
@@ -1378,13 +1441,27 @@ impl WebGraphRuntime {
                         node_id: placement.node.to_string(),
                     }
                 })?;
-                nodes.push(viewport_node(node, placement.point));
+                let projected_labels = labels.get(&node.id).cloned().unwrap_or_default();
+                nodes.push(viewport_node(
+                    node,
+                    placement.point,
+                    projected_labels.labels,
+                    projected_labels.href,
+                    origins.get(&node.id),
+                ));
             }
             tokio::task::yield_now().await;
         }
-        let edges = routes.into_iter().map(viewport_edge).collect();
+        let edges = routes
+            .into_iter()
+            .map(|route| {
+                let origin = (route.edge.kind == EdgeKind::Primary)
+                    .then(|| origins.get(route.edge.target.as_str()))
+                    .flatten();
+                viewport_edge(route, origin)
+            })
+            .collect();
         let canvas = canvas.context(WebGraphNotInitializedSnafu)?;
-        let revision = revision.context(WebGraphNotInitializedSnafu)?;
         let Some(error_nodes) = self.error_nodes_once(revision).await? else {
             return Ok(None);
         };
@@ -1404,6 +1481,142 @@ impl WebGraphRuntime {
             nodes,
             edges,
         }))
+    }
+
+    async fn origin_projections_at_revision(
+        &self,
+        node_ids: &BTreeSet<String>,
+        revision: Revision,
+    ) -> crate::Result<Option<BTreeMap<String, NodeOriginProjection>>> {
+        let mut origins = BTreeMap::new();
+        for chunk in node_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE)
+        {
+            let read = self
+                .store
+                .node_origin_projections(chunk)
+                .await
+                .context(WebGraphStoreSnafu)?
+                .context(WebGraphNotInitializedSnafu)?;
+            if read.state.revision != revision {
+                return Ok(None);
+            }
+            origins.extend(read.value);
+        }
+        Ok(Some(origins))
+    }
+
+    async fn branch_labels_at_revision(
+        &self,
+        mode: ViewMode,
+        revision: Revision,
+    ) -> crate::Result<Option<BTreeMap<String, ProjectedBranchLabels>>> {
+        let read = self
+            .store
+            .provider_branch_heads()
+            .await
+            .context(WebGraphStoreSnafu)?
+            .context(WebGraphNotInitializedSnafu)?;
+        if read.state.revision != revision {
+            return Ok(None);
+        }
+        let heads = read
+            .value
+            .history_heads
+            .into_iter()
+            .filter_map(|(branch, head)| head.map(|head| (branch, head)))
+            .collect::<Vec<_>>();
+        let projected = if mode == ViewMode::All {
+            heads
+                .into_iter()
+                .map(|(branch, head)| (branch, head.clone(), head))
+                .collect::<Vec<_>>()
+        } else {
+            let head_ids = heads
+                .iter()
+                .map(|(_, head)| head.clone())
+                .collect::<BTreeSet<_>>();
+            let mut anchors = BTreeMap::new();
+            for chunk in head_ids
+                .into_iter()
+                .collect::<Vec<_>>()
+                .chunks(SOURCE_NODE_HYDRATION_BATCH_SIZE)
+            {
+                anchors.extend(
+                    self.source
+                        .graph_nearest_anchor_or_root_ids(chunk)
+                        .await
+                        .context(StoreSnafu)?,
+                );
+            }
+            heads
+                .into_iter()
+                .filter_map(|(branch, head)| {
+                    anchors
+                        .get(&head)
+                        .cloned()
+                        .map(|projected| (branch, projected, head))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut grouped = BTreeMap::<String, (Vec<String>, BTreeSet<String>)>::new();
+        for (branch, node_id, head_id) in projected {
+            let entry = grouped.entry(node_id).or_default();
+            entry.0.push(branch);
+            entry.1.insert(head_id);
+        }
+        for (labels, _) in grouped.values_mut() {
+            labels.sort();
+        }
+
+        let head_ids = grouped
+            .iter()
+            .filter_map(|(projected_id, (_, head_ids))| {
+                let head_id = head_ids.iter().next()?;
+                (mode == ViewMode::Anchors && head_ids.len() == 1 && head_id != projected_id)
+                    .then(|| head_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let head_node_ids = head_ids
+            .iter()
+            .map(|node_id| NodeId::new(node_id.clone()).context(WebGraphModelSnafu))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let Some(head_placements) = self
+            .placements_at_revision(LayoutKind::All, &head_node_ids, revision)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let head_points = head_placements
+            .into_iter()
+            .map(|placement| (placement.node.to_string(), placement.point))
+            .collect::<BTreeMap<_, _>>();
+
+        Ok(Some(
+            grouped
+                .into_iter()
+                .map(|(projected_id, (labels, head_ids))| {
+                    let href = head_ids
+                        .iter()
+                        .next()
+                        .filter(|head_id| head_ids.len() == 1 && *head_id != &projected_id)
+                        .and_then(|head_id| {
+                            head_points.get(head_id).map(|point| {
+                                crate::graph_render::graph_point_href(
+                                    &node_target_id(head_id),
+                                    api_point(*point),
+                                    false,
+                                    "all",
+                                )
+                            })
+                        });
+                    (projected_id, ProjectedBranchLabels { labels, href })
+                })
+                .collect(),
+        ))
     }
 
     async fn jobs_once(&self, revision: Revision) -> crate::Result<Option<GraphJobsResponse>> {
@@ -2614,7 +2827,13 @@ fn layout_name(kind: LayoutKind) -> &'static str {
     }
 }
 
-fn viewport_node(node: &Node, point: Point) -> GraphViewportNode {
+fn viewport_node(
+    node: &Node,
+    point: Point,
+    labels: Vec<String>,
+    href: Option<String>,
+    origin: Option<&NodeOriginProjection>,
+) -> GraphViewportNode {
     GraphViewportNode {
         key: node_key(&node.id),
         id: node.id.clone(),
@@ -2622,13 +2841,15 @@ fn viewport_node(node: &Node, point: Point) -> GraphViewportNode {
         short_id: shorten_id(&node.id),
         kind: graph_kind_name(node).to_owned(),
         summary: summarize_node(node),
-        labels: Vec::new(),
+        labels,
+        href,
+        origin: origin.map(api_origin),
         x: point.x,
         y: point.y,
     }
 }
 
-fn viewport_edge(route: RoutedEdge) -> GraphViewportEdge {
+fn viewport_edge(route: RoutedEdge, origin: Option<&NodeOriginProjection>) -> GraphViewportEdge {
     let kind = match route.edge.kind {
         EdgeKind::Primary => GraphViewportEdgeKind::Primary,
         EdgeKind::Merge => GraphViewportEdgeKind::Merge,
@@ -2639,7 +2860,15 @@ fn viewport_edge(route: RoutedEdge) -> GraphViewportEdge {
         kind,
         source_id: route.edge.source.to_string(),
         target_id: route.edge.target.to_string(),
+        origin: origin.map(api_origin),
         route: api_route(route.route),
+    }
+}
+
+fn api_origin(origin: &NodeOriginProjection) -> GraphNodeOrigin {
+    GraphNodeOrigin {
+        branch_instance_id: origin.branch_instance_id.clone(),
+        branch_name: origin.branch_name.clone(),
     }
 }
 
@@ -3729,10 +3958,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn viewport_keeps_origins_separate_from_current_shared_head_labels() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let day_anchor = writer
+            .fork_with_nodes(
+                "day",
+                &root,
+                vec![NewNodeContent {
+                    role: Role::System,
+                    metadata: None,
+                    kind: Kind::Anchor(Anchor::session(
+                        Vec::new(),
+                        SessionAnchor {
+                            role: SessionRole::Orchestrator,
+                            provider_profile: None,
+                            provider: Some("openai".to_owned()),
+                            model: "test-model".to_owned(),
+                            tools: Vec::new(),
+                            system_prompt: "day system prompt".to_owned(),
+                            prompt: "day".to_owned(),
+                            temperature: None,
+                            max_tokens: None,
+                            additional_params: None,
+                            enable_coco_shim: false,
+                            active_skill: None,
+                        },
+                    )),
+                }],
+            )
+            .await
+            .unwrap();
+        let day_history = writer
+            .append_on_branch(
+                "day",
+                NewNode {
+                    parent: day_anchor.clone(),
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("day history".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("day", &day_anchor, &day_history)
+            .await
+            .unwrap();
+        writer.fork("main", &day_history).await.unwrap();
+
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        let all = runtime
+            .viewport(ViewMode::All, complete_viewport())
+            .await
+            .unwrap();
+        let history_node = all
+            .nodes
+            .iter()
+            .find(|node| node.id == day_history)
+            .unwrap();
+        assert_eq!(history_node.labels, ["day", "main"]);
+        let first_instance = history_node
+            .origin
+            .as_ref()
+            .expect("branch-created node should have an origin")
+            .branch_instance_id
+            .clone();
+        assert_eq!(history_node.origin.as_ref().unwrap().branch_name, "day");
+        assert!(
+            all.nodes
+                .iter()
+                .find(|node| node.id == root)
+                .unwrap()
+                .origin
+                .is_none()
+        );
+        assert!(all.edges.iter().any(|edge| {
+            edge.kind == GraphViewportEdgeKind::Primary
+                && edge.target_id == day_history
+                && edge
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.branch_instance_id == first_instance)
+        }));
+
+        let anchors = runtime
+            .viewport(ViewMode::Anchors, complete_viewport())
+            .await
+            .unwrap();
+        let projected_head = anchors
+            .nodes
+            .iter()
+            .find(|node| node.id == day_anchor)
+            .unwrap();
+        assert_eq!(projected_head.labels, ["day", "main"]);
+        let projected_href = projected_head
+            .href
+            .as_deref()
+            .expect("projected labels should navigate to their actual shared head");
+        assert!(projected_href.starts_with(&format!(
+            "/?mode=all&graph_focus_target=detail-{day_history}&"
+        )));
+        assert!(projected_href.ends_with(&format!("#detail-{day_history}")));
+
+        writer.delete_branch("day").await.unwrap();
+        writer.fork("day", &root).await.unwrap();
+        let recreated = writer
+            .append_on_branch(
+                "day",
+                NewNode {
+                    parent: root,
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("recreated day".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("day", &writer.root_id(), &recreated)
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let all = runtime
+            .viewport(ViewMode::All, complete_viewport())
+            .await
+            .unwrap();
+        let historical = all
+            .nodes
+            .iter()
+            .find(|node| node.id == day_history)
+            .unwrap();
+        let recreated = all.nodes.iter().find(|node| node.id == recreated).unwrap();
+        assert_eq!(historical.labels, ["main"]);
+        assert_eq!(recreated.labels, ["day"]);
+        assert_eq!(historical.origin.as_ref().unwrap().branch_name, "day");
+        assert_eq!(recreated.origin.as_ref().unwrap().branch_name, "day");
+        assert_ne!(
+            historical.origin.as_ref().unwrap().branch_instance_id,
+            recreated.origin.as_ref().unwrap().branch_instance_id
+        );
+    }
+
+    #[tokio::test]
+    async fn v9_layout_rebuild_replays_historical_node_origins() {
+        const PREVIOUS_LAYOUT_VERSION: u32 = 8;
+
+        assert_eq!(LAYOUT_VERSION, 9);
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        writer.fork("day", &root).await.unwrap();
+        let day_node = writer
+            .append_on_branch(
+                "day",
+                NewNode {
+                    parent: root.clone(),
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("historical day".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("day", &root, &day_node)
+            .await
+            .unwrap();
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        let derived_path = runtime.store.path().to_owned();
+        drop(runtime);
+
+        let mut connection = SqliteConnection::establish(derived_path.to_str().unwrap()).unwrap();
+        connection
+            .batch_execute(&format!(
+                "DELETE FROM web_graph_node_origins; UPDATE web_graph_state SET layout_version = {PREVIOUS_LAYOUT_VERSION};"
+            ))
+            .unwrap();
+        drop(connection);
+
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.store.state().await.unwrap().unwrap().source_cursor,
+            None
+        );
+        runtime.catch_up().await.unwrap();
+        let viewport = runtime
+            .viewport(ViewMode::All, complete_viewport())
+            .await
+            .unwrap();
+        assert_eq!(
+            viewport
+                .nodes
+                .iter()
+                .find(|node| node.id == day_node)
+                .unwrap()
+                .origin
+                .as_ref()
+                .unwrap()
+                .branch_name,
+            "day"
+        );
+    }
+
+    #[tokio::test]
     async fn v7_layout_rebuild_connects_root_to_top_level_anchors() {
         const PREVIOUS_LAYOUT_VERSION: u32 = 7;
 
-        assert_eq!(LAYOUT_VERSION, 8);
+        assert_eq!(LAYOUT_VERSION, 9);
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let day = append_session_anchor(&writer, &root, "day").await;
@@ -3773,7 +4214,7 @@ mod tests {
     async fn v6_layout_rebuild_backfills_historical_provider_context() {
         const PREVIOUS_LAYOUT_VERSION: u32 = 6;
 
-        assert_eq!(LAYOUT_VERSION, 8);
+        assert_eq!(LAYOUT_VERSION, 9);
         let writer = SqliteStore::open_temporary().await.unwrap();
         let root = writer.root_id();
         let historical_session = append_session_anchor(&writer, &root, "historical").await;

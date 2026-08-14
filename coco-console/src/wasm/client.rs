@@ -1226,6 +1226,8 @@ impl VirtualGraph {
             kind: layout_node.node.kind.clone(),
             summary: layout_node.node.summary.clone(),
             labels: vec!["expanded".to_owned()],
+            href: None,
+            origin: None,
             x: layout_node.point.x,
             y: layout_node.point.y,
         };
@@ -1377,11 +1379,18 @@ impl VirtualGraph {
 
     fn edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
         let element = svg_element(&self.document, "path")?;
-        let (class, marker) = edge_style(edge.kind);
+        let (base_class, marker) = edge_style(edge.kind);
+        let class = match (edge.kind, edge.origin.as_ref()) {
+            (GraphViewportEdgeKind::Primary, Some(origin)) => format!(
+                "{base_class} origin origin-{}",
+                crate::graph_render::origin_style_index(&origin.branch_instance_id)
+            ),
+            _ => base_class.to_owned(),
+        };
         set_attributes(
             &element,
             [
-                ("class", class.to_string()),
+                ("class", class),
                 ("marker-end", marker.to_string()),
                 ("d", bezier_path(edge.route)),
             ],
@@ -2251,7 +2260,12 @@ fn set_node_link_attributes(
             ("id", render_element_id(&node.key)),
             ("data-render-key", node.key.clone()),
             ("class", node_link_class(is_new).to_owned()),
-            ("href", format!("#{}", node.node_target)),
+            (
+                "href",
+                node.href
+                    .clone()
+                    .unwrap_or_else(|| format!("#{}", node.node_target)),
+            ),
             ("data-node-target", node.node_target.clone()),
             ("data-node-id", node.id.clone()),
             ("data-base-node-x", node.x.to_string()),
@@ -6260,6 +6274,8 @@ mod tests {
             kind: "prompt".to_owned(),
             summary: format!("summary for {id}"),
             labels: Vec::new(),
+            href: None,
+            origin: None,
             x,
             y,
         }
