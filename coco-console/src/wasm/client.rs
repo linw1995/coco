@@ -4338,7 +4338,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_node_label_limits_heads_and_character_count() {
+    fn graph_items_node_label_lists_all_heads_and_limits_character_count() {
         let mut node = graph_node("aaaaaaaa", 56, 56);
         node.labels = vec![
             "abcdefghijklmnop".to_owned(),
@@ -4346,7 +4346,7 @@ mod tests {
             "third".to_owned(),
         ];
 
-        assert_eq!(node_label(&node), "aaaaaaaa abcdefghijk… · short · +1");
+        assert_eq!(node_label(&node), "aaaaaaaa abcdefghijk… · short · third");
         assert_eq!(truncate_label("abcdefghijkl", 12), "abcdefghijkl");
         assert_eq!(truncate_label("abcdefghijklm", 12), "abcdefghijk…");
         assert_eq!(truncate_label("anything", 0), "");
