@@ -9,11 +9,11 @@
 ## 2. Branch-Aware Node Creation
 
 - [x] 2.1 Add explicit store operations for detached append, branch-aware append, and atomic branch bootstrap while preserving existing detached behavior.
-- [ ] 2.2 Change session creation to bootstrap its branch instance, initial session anchor, live ref, and session state atomically.
+- [x] 2.2 Change session creation to bootstrap its branch instance, initial session anchor, live ref, and session state atomically.
 - [x] 2.3 Record origins for prompt job bases, optional session patches, and every node created by branch batch/head-update transactions.
-- [ ] 2.4 Propagate authoritative branch context through backend trace appenders, terminal response and failure persistence, retries, and recovery execution.
-- [ ] 2.5 Record origins for rebase, handoff, skill invocation, and skill-session creation paths.
-- [ ] 2.6 Add integration tests proving detached nodes remain unknown, fork and head movement do not rewrite origins, failed transactions leave no partial provenance, and all production branch-aware paths assign origins.
+- [x] 2.4 Propagate authoritative branch context through backend trace appenders, terminal response and failure persistence, retries, and recovery execution.
+- [x] 2.5 Record origins for rebase, handoff, skill invocation, and skill-session creation paths.
+- [x] 2.6 Add integration tests proving detached nodes remain unknown, fork and head movement do not rewrite origins, failed transactions leave no partial provenance, and all production branch-aware paths assign origins.
 
 ## 3. Console Projection and API
 

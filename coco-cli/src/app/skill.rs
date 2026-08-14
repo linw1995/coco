@@ -281,18 +281,21 @@ where
     let skill_name = command.name;
     let session_role = resolve_parent_session_role(store, &parent_tool_use_id).await?;
     let invocation_node_id = store
-        .append(NewNode {
-            parent: parent_tool_use_id.clone(),
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::skill_invocation(
-                vec![],
-                SkillInvocationAnchor {
-                    skill_name: skill_name.clone(),
-                    mode: mode.clone(),
-                },
-            )),
-        })
+        .append_on_branch(
+            &branch,
+            NewNode {
+                parent: parent_tool_use_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    vec![],
+                    SkillInvocationAnchor {
+                        skill_name: skill_name.clone(),
+                        mode: mode.clone(),
+                    },
+                )),
+            },
+        )
         .await
         .context(StoreSnafu)?;
     let workspace_root = std::env::current_dir().context(ResolveCurrentDirSnafu)?;
