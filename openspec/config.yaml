@@ -1,0 +1,25 @@
+schema: spec-driven
+
+context: |
+  CoCo is a Rust workspace. coco-mem is the authoritative SQLite persistence
+  layer and coco-console maintains a disposable derived web-graph projection.
+  Nodes are immutable DAG values; branch references are mutable and multiple
+  branch names may point to the same head. Keep Node identity independent from
+  branch provenance. Existing SQLite stores migrate forward on writable open,
+  while read-only consumers require the current schema. All code, comments,
+  specs, and externally visible text are English.
+
+rules:
+  proposal:
+    - State whether a change affects Node identity, current branch semantics, or stored data.
+    - Call out compatibility and migration behavior explicitly.
+  specs:
+    - Cover legacy stores, unknown provenance, deleted and recreated branch names, detached nodes, and multiple refs at one head.
+  design:
+    - Separate authoritative coco-mem data from disposable coco-console projections.
+    - Include migration, rollback boundary, failure atomicity, and performance considerations.
+  tasks:
+    - Include relevant unit tests and the repository acceptance command `prek -a`.
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
