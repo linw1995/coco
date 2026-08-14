@@ -564,10 +564,21 @@ body {
 }
 
 .content {
+  --node-detail-drawer-width: min(32rem, calc(100% - 6.5rem));
+  --provider-context-drawer-width: min(22rem, calc(100% - 6.5rem));
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(16rem, 20rem) minmax(26rem, 32rem);
+  grid-template-columns: minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
+  position: relative;
+}
+
+.content[data-open-drawer="provider-context"] {
+  --open-drawer-width: var(--provider-context-drawer-width);
+}
+
+.content[data-open-drawer="node-detail"] {
+  --open-drawer-width: var(--node-detail-drawer-width);
 }
 
 .graph-shell {
@@ -1185,18 +1196,97 @@ body {
   white-space: nowrap;
 }
 
-.provider-context-panel,
-.side {
-  background: rgba(8, 11, 18, 0.48);
+.side-drawer {
+  background: rgba(8, 11, 18, 0.97);
   border-left: 1px solid rgba(255, 255, 255, 0.08);
-  height: calc(100vh - 4.45rem);
+  bottom: 0;
+  box-shadow: -18px 0 44px rgba(0, 0, 0, 0.4);
+  height: 100%;
   min-height: 0;
   overflow: hidden;
-  padding: 1rem;
+  padding: 3rem 1rem 1rem;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  top: 0;
+  transform: translateX(100%);
+  transition: transform 180ms ease, visibility 180ms;
+  visibility: hidden;
+  z-index: 20;
 }
 
 .provider-context-panel {
-  display: block;
+  width: var(--provider-context-drawer-width);
+}
+
+.node-detail-panel {
+  width: var(--node-detail-drawer-width);
+}
+
+.content[data-open-drawer="provider-context"] [data-drawer="provider-context"],
+.content[data-open-drawer="node-detail"] [data-drawer="node-detail"] {
+  pointer-events: auto;
+  transform: translateX(0);
+  visibility: visible;
+}
+
+.side-drawer-toolbar {
+  display: grid;
+  gap: 0.45rem;
+  position: absolute;
+  right: 1rem;
+  top: 4rem;
+  transition: right 180ms ease;
+  z-index: 21;
+}
+
+.content[data-open-drawer] .side-drawer-toolbar {
+  right: calc(var(--open-drawer-width) + 0.75rem);
+}
+
+.side-drawer-toolbar button,
+.side-drawer-close {
+  align-items: center;
+  background: rgba(8, 11, 18, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 7px;
+  color: #bfdbfe;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 650;
+  justify-content: center;
+}
+
+.side-drawer-toolbar button {
+  min-height: 2rem;
+  padding: 0 0.68rem;
+}
+
+.side-drawer-toolbar button:hover,
+.side-drawer-toolbar button:focus-visible,
+.side-drawer-toolbar button[aria-expanded="true"],
+.side-drawer-close:hover,
+.side-drawer-close:focus-visible {
+  background: rgba(30, 64, 175, 0.4);
+  border-color: rgba(96, 165, 250, 0.68);
+  color: #eff6ff;
+  outline: none;
+}
+
+.side-drawer-close {
+  height: 2rem;
+  position: absolute;
+  right: 0.75rem;
+  top: 0.65rem;
+  width: 2rem;
+}
+
+.side-drawer-close span {
+  font-size: 1.2rem;
+  font-weight: 400;
+  line-height: 1;
 }
 
 .provider-context-slot {
@@ -1221,12 +1311,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
   display: none;
 }
 
-.side {
-  display: block;
-}
-
 .provider-context-section h2,
-.side h2,
 .node-details h2 {
   color: #dbeafe;
   font-size: 0.78rem;
@@ -2165,7 +2250,6 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 
   .content {
     grid-template-columns: 1fr;
-    overflow: visible;
   }
 
   .graph-shell {
@@ -2176,31 +2260,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
     touch-action: pan-y;
   }
 
-  .provider-context-panel,
-  .side {
-    border-left: 0;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    height: auto;
-    overflow: visible;
-  }
-
-  .provider-context-section {
-    height: auto;
-    max-height: min(42svh, 22rem);
-  }
-
-  .provider-context-slot > leptos-island,
-  .provider-context-slot .panel-content {
-    height: auto;
-  }
-
-  .node-details {
-    height: auto;
-    overflow: visible;
-    scroll-margin-block-start: 1rem;
-  }
-
-  .side {
+  .side-drawer {
     padding-bottom: calc(1rem + env(safe-area-inset-bottom));
   }
 
@@ -2210,6 +2270,13 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 
   .skill-metadata {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .side-drawer,
+  .side-drawer-toolbar {
+    transition: none;
   }
 }
 

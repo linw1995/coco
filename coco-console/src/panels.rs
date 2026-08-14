@@ -22,12 +22,11 @@ use crate::graph_render::graph_point_href;
 #[cfg(target_arch = "wasm32")]
 mod client;
 #[cfg(target_arch = "wasm32")]
-pub use client::{
-    PROVIDER_CONTEXT_RENDERED_EVENT, notify_graph_revision, reveal_node_detail_on_mobile,
-};
+pub use client::{PROVIDER_CONTEXT_RENDERED_EVENT, notify_graph_revision};
 
 const NODE_TARGET_PREFIX: &str = "detail-";
 const MAX_PROVIDER_CONTEXT_LOAD_RETRIES: u8 = 3;
+#[cfg(not(target_arch = "wasm32"))]
 pub const NODE_DETAIL_PANEL_ID: &str = "node-detail-panel";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -191,15 +190,6 @@ fn NodeDetailPanelBody(graph_mode: String) -> impl IntoView {
             })
         }
     });
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(move || {
-        let current = selected_target.get();
-        let loaded = detail.get().flatten();
-        if current_node_detail_is_loaded(current.as_deref(), loaded.as_ref()) {
-            reveal_node_detail_on_mobile();
-        }
-    });
-
     view! {
         <div class="panel-content">
             {move || node_detail_view(selected_target.get(), detail.get().flatten())}
@@ -353,16 +343,6 @@ fn use_graph_revision() -> RwSignal<u64> {
     #[cfg(target_arch = "wasm32")]
     client::subscribe_to_graph_revision(revision);
     revision
-}
-
-#[cfg(any(target_arch = "wasm32", test))]
-fn current_node_detail_is_loaded(
-    current: Option<&str>,
-    loaded: Option<&LoadedPanel<String, NodeDetailResponse>>,
-) -> bool {
-    current
-        .zip(loaded)
-        .is_some_and(|(current, loaded)| loaded.request == current)
 }
 
 fn node_detail_view(
@@ -2159,50 +2139,6 @@ mod tests {
                 targets: vec!["detail-first".to_owned()],
             })
         );
-    }
-
-    #[test]
-    fn current_node_detail_is_loaded_accepts_every_current_response() {
-        let found = LoadedPanel {
-            request: "detail-node".to_owned(),
-            response: Ok(NodeDetailResponse::Found {
-                node: Box::new(test_node(Kind::Text("response".to_owned()))),
-                parent_graph_links: BTreeMap::new(),
-                markdown_documents: Vec::new(),
-                tool_use_input_links: Vec::new(),
-                tool_input_shell_highlights: Vec::new(),
-                tool_input_json_highlights: Vec::new(),
-            }),
-        };
-        let missing = LoadedPanel {
-            request: "detail-node".to_owned(),
-            response: Ok(NodeDetailResponse::Missing {
-                target: "detail-node".to_owned(),
-            }),
-        };
-        let failed = LoadedPanel {
-            request: "detail-node".to_owned(),
-            response: Err("backend unavailable".to_owned()),
-        };
-
-        assert!(current_node_detail_is_loaded(
-            Some("detail-node"),
-            Some(&found)
-        ));
-        assert!(current_node_detail_is_loaded(
-            Some("detail-node"),
-            Some(&missing)
-        ));
-        assert!(current_node_detail_is_loaded(
-            Some("detail-node"),
-            Some(&failed)
-        ));
-        assert!(!current_node_detail_is_loaded(
-            Some("detail-other"),
-            Some(&found)
-        ));
-        assert!(!current_node_detail_is_loaded(None, Some(&found)));
-        assert!(!current_node_detail_is_loaded(Some("detail-node"), None));
     }
 
     #[test]
