@@ -4377,6 +4377,7 @@ mod tests {
                             kind: GraphViewportEdgeKind::Primary,
                             source_id: "source".to_owned(),
                             target_id: "target".to_owned(),
+                            origin: None,
                             route: GraphBezierRoute {
                                 source: Point { x: 120, y: 80 },
                                 control_1: Point { x: 150, y: 80 },
@@ -6306,6 +6307,7 @@ mod tests {
             kind,
             source_id: source_id.to_owned(),
             target_id: target_id.to_owned(),
+            origin: None,
             route,
         }
     }
