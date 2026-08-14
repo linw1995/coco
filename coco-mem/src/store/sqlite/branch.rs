@@ -20,7 +20,7 @@ use crate::error::{
     InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu, MissingSessionAnchorSnafu,
     ParentNotFoundSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
-use crate::schema::{branch_instances, branches, jobs, node_origins, sessions};
+use crate::schema::{branch_instances, branches, jobs, node_origins, nodes, sessions};
 use crate::store::{BranchAppendSessionState, BranchStore, SessionStore};
 use crate::{
     Anchor, AnchorPayload, Kind, NewNodeContent, Node, PauseReason, Role, SessionAnchorPatch,
@@ -1342,17 +1342,30 @@ impl SessionStore for SqliteStore {
                         };
                         let new_node =
                             Node::new(parent, node.role, node.metadata, kind, node.created_at);
+                        let node_existed = nodes::table
+                            .filter(nodes::id.eq(&new_node.id))
+                            .select(nodes::id)
+                            .first::<String>(connection)
+                            .await
+                            .optional()
+                            .context(QuerySqliteStoreSnafu {
+                                path: self.database_path.clone(),
+                            })
+                            .map_err(SqliteTransactionError::Operation)?
+                            .is_some();
                         upsert_node_without_transaction(connection, &self.database_path, &new_node)
                             .await
                             .map_err(SqliteTransactionError::Operation)?;
-                        persist_node_origin(
-                            connection,
-                            &self.database_path,
-                            &new_node.id,
-                            &branch_instance_id,
-                        )
-                        .await
-                        .map_err(SqliteTransactionError::Operation)?;
+                        if !node_existed {
+                            persist_node_origin(
+                                connection,
+                                &self.database_path,
+                                &new_node.id,
+                                &branch_instance_id,
+                            )
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        }
                         previous_new_id = Some(new_node.id.clone());
                         new_head = new_node.id.clone();
                         nodes.push(new_node);

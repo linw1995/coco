@@ -6,7 +6,7 @@ CREATE TABLE branch_instances (
 );
 
 CREATE INDEX branch_instances_name_idx
-ON branch_instances (name);
+ON branch_instances (name, created_at, instance_id);
 
 INSERT INTO branch_instances (instance_id, name, created_at, deleted_at)
 SELECT 'branch-legacy-' || lower(hex(randomblob(16))), name, NULL, NULL

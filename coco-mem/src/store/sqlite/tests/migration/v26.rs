@@ -49,7 +49,7 @@ async fn writable_open_adds_legacy_instances_without_inventing_node_origins() {
         )
         .await
         .unwrap();
-    store
+    let legacy_job = store
         .submit_job_with_id("legacy-job", "main", &root)
         .await
         .unwrap();
@@ -82,7 +82,7 @@ async fn writable_open_adds_legacy_instances_without_inventing_node_origins() {
             reason: PauseReason::Closed,
         }
     );
-    assert_eq!(reopened.get_job("legacy-job").await.unwrap().base, root);
+    assert_eq!(reopened.get_job("legacy-job").await.unwrap(), legacy_job);
     assert_eq!(reopened.get_node(&detached).await.unwrap().id, detached);
 
     let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
@@ -121,6 +121,61 @@ async fn writable_open_adds_legacy_instances_without_inventing_node_origins() {
         .unwrap()
         .count;
     assert_eq!(origins, 0);
+}
+
+#[tokio::test]
+async fn branch_aware_append_after_v25_migration_uses_the_legacy_instance() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let root = store.root_id();
+    store.fork("main", &root).await.unwrap();
+    drop(store);
+
+    let database_path = sqlite_database_path(&path);
+    let mut connection =
+        diesel::sqlite::SqliteConnection::establish(database_path.to_str().unwrap()).unwrap();
+    revert_store_migrations_to(&mut connection, 25);
+    drop(connection);
+
+    let store = SqliteStore::open(&path).await.unwrap();
+    let appended = store
+        .append_on_branch(
+            "main",
+            NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("after migration".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+    let branch = graph.graph_branches().await.unwrap().pop().unwrap();
+    let records = graph
+        .graph_node_records_by_ids(&[root, appended.clone()])
+        .await
+        .unwrap();
+    assert!(
+        records
+            .iter()
+            .find(|record| record.id != appended)
+            .unwrap()
+            .origin
+            .is_none()
+    );
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.id == appended)
+            .unwrap()
+            .origin
+            .as_ref()
+            .unwrap()
+            .branch_instance_id,
+        branch.instance_id
+    );
 }
 
 #[tokio::test]

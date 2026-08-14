@@ -1,3 +1,7 @@
+# Track Node Branch Origins
+
+<!-- markdownlint-disable MD013 -->
+
 ## Why
 
 The current graph can identify live branch heads, but it cannot reliably explain which branch execution created an older node after heads move, branches are deleted, or names are reused. This makes the built-in `day` branch indistinguishable from ordinary history in coco-console and makes the Console's observed head snapshots an unreliable provenance source.

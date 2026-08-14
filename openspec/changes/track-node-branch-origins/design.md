@@ -1,3 +1,7 @@
+# Track Node Branch Origins Design
+
+<!-- markdownlint-disable MD013 -->
+
 ## Context
 
 See `proposal.md` for motivation. coco-mem currently stores mutable branches as `name -> head_id`; Nodes contain immutable DAG content and do not carry branch context. Many high-level operations know their branch, but the low-level `NodeStore::append` API does not. Session creation also appends its first session anchor before creating the branch. coco-console reads current branch names and heads from coco-mem and maintains an observed branch-head history for provider-context consistency, but that derived history is neither complete nor authoritative provenance.
@@ -82,7 +86,7 @@ The existing detached append behavior remains valid and produces no `node_origin
 The implementation must cover these paths:
 
 | Creation path | Origin behavior |
-|---|---|
+| --- | --- |
 | Branch bootstrap and initial session anchor | New branch instance |
 | Prompt job base and optional session patch | Job branch instance |
 | Backend trace, terminal response, and failure nodes | Completion work-branch instance |
@@ -175,4 +179,3 @@ Console work remains bounded by changed nodes and the small current branch snaps
 7. Run relevant crate tests and `prek -a` before accepting implementation.
 
 Operational rollback before step 1 commits is a binary rollback. After the coco-mem migration commits, restore the pre-migration database backup or run the explicit down migration with acceptance of provenance loss before using an older binary.
-

@@ -7657,6 +7657,20 @@ mod tests {
         assert_eq!(recovered.anchor_id, prompt_anchor_id);
         let recovered_node = store.get_node(&recovered.response_node_id).await.unwrap();
         assert_eq!(recovered_node.parent, prompt_anchor_id);
+        let graph = SqliteGraphStore::open_read_only(store.store_path())
+            .await
+            .unwrap();
+        let branch = graph.graph_branches().await.unwrap().pop().unwrap();
+        assert!(
+            graph
+                .graph_node_records_by_ids(&[error_node_id, recovered.response_node_id])
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|record| record
+                    .origin
+                    .is_some_and(|origin| { origin.branch_instance_id == branch.instance_id }))
+        );
     }
 
     #[tokio::test]

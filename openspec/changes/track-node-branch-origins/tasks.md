@@ -1,3 +1,7 @@
+# Track Node Branch Origins Tasks
+
+<!-- markdownlint-disable MD013 -->
+
 ## 1. Authoritative Provenance Schema
 
 - [x] 1.1 Add the next coco-mem SQLite migration for `branch_instances`, `node_origins`, and live `branches.instance_id`, including a provenance-discarding down migration.
@@ -26,10 +30,10 @@
 
 ## 4. Compatibility and Performance Validation
 
-- [ ] 4.1 Verify writable upgrade from the previous coco-mem schema preserves Node IDs, branch heads, session states, jobs, and CLI-visible behavior while leaving legacy origins unknown.
-- [ ] 4.2 Verify current-schema read-only opens succeed, pure read-only opens of the previous schema retain existing failure behavior, and downgrade expectations are documented by tests.
-- [ ] 4.3 Verify storage growth is limited to one row per branch generation and at most one row per branch-originated node, with no writes on head-only movement.
-- [ ] 4.4 Run `cargo test -p coco-mem`.
-- [ ] 4.5 Run `cargo test -p coco-llm -p coco-core -p coco-cli`.
-- [ ] 4.6 Run `cargo test -p coco-console`.
-- [ ] 4.7 Run `prek -a` and resolve every reported issue.
+- [x] 4.1 Verify writable upgrade from the previous coco-mem schema preserves Node IDs, branch heads, session states, jobs, and CLI-visible behavior while leaving legacy origins unknown.
+- [x] 4.2 Verify current-schema read-only opens succeed, pure read-only opens of the previous schema retain existing failure behavior, and downgrade expectations are documented by tests.
+- [x] 4.3 Verify storage growth is limited to one row per branch generation and at most one row per branch-originated node, with no writes on head-only movement.
+- [x] 4.4 Run `cargo test -p coco-mem`.
+- [x] 4.5 Run `cargo test -p coco-llm -p coco-core -p coco-cli`.
+- [x] 4.6 Run `cargo test -p coco-console`.
+- [x] 4.7 Run `prek -a` and resolve every reported issue.

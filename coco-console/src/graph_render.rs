@@ -551,15 +551,11 @@ pub fn node_label(node: &GraphViewportNode) -> String {
     if node.labels.is_empty() {
         node.short_id.clone()
     } else {
-        let mut labels = node
+        let labels = node
             .labels
             .iter()
-            .take(2)
             .map(|label| truncate_label(label, 12))
             .collect::<Vec<_>>();
-        if node.labels.len() > labels.len() {
-            labels.push(format!("+{}", node.labels.len() - labels.len()));
-        }
         format!("{} {}", node.short_id, labels.join(" · "))
     }
 }

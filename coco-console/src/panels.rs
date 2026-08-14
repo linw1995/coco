@@ -2483,6 +2483,7 @@ mod tests {
         }
         .to_html();
 
+        assert!(node.contains("Unknown"), "{node}");
         assert!(node.contains(r#"class="markdown-body""#), "{node}");
         assert!(node.contains("<h1>Rendered"), "{node}");
         assert!(node.contains("<strong>safe"), "{node}");

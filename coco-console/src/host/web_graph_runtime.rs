@@ -1408,9 +1408,12 @@ impl WebGraphRuntime {
         let origin_ids = placements
             .iter()
             .map(|placement| placement.node.to_string())
-            .chain(routes.iter().filter_map(|route| {
-                (route.edge.kind == EdgeKind::Primary).then(|| route.edge.target.to_string())
-            }))
+            .chain(
+                routes
+                    .iter()
+                    .filter(|route| route.edge.kind == EdgeKind::Primary)
+                    .map(|route| route.edge.target.to_string()),
+            )
             .collect::<BTreeSet<_>>();
         let Some(origins) = self
             .origin_projections_at_revision(&origin_ids, revision)
@@ -4006,6 +4009,7 @@ mod tests {
             .await
             .unwrap();
         writer.fork("main", &day_history).await.unwrap();
+        writer.fork("release", &day_history).await.unwrap();
 
         let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
             .await
@@ -4020,7 +4024,7 @@ mod tests {
             .iter()
             .find(|node| node.id == day_history)
             .unwrap();
-        assert_eq!(history_node.labels, ["day", "main"]);
+        assert_eq!(history_node.labels, ["day", "main", "release"]);
         let first_instance = history_node
             .origin
             .as_ref()
@@ -4054,7 +4058,7 @@ mod tests {
             .iter()
             .find(|node| node.id == day_anchor)
             .unwrap();
-        assert_eq!(projected_head.labels, ["day", "main"]);
+        assert_eq!(projected_head.labels, ["day", "main", "release"]);
         let projected_href = projected_head
             .href
             .as_deref()
@@ -4094,7 +4098,7 @@ mod tests {
             .find(|node| node.id == day_history)
             .unwrap();
         let recreated = all.nodes.iter().find(|node| node.id == recreated).unwrap();
-        assert_eq!(historical.labels, ["main"]);
+        assert_eq!(historical.labels, ["main", "release"]);
         assert_eq!(recreated.labels, ["day"]);
         assert_eq!(historical.origin.as_ref().unwrap().branch_name, "day");
         assert_eq!(recreated.origin.as_ref().unwrap().branch_name, "day");
