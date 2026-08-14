@@ -402,6 +402,7 @@ struct VirtualGraph {
     resize_observer: Option<ResizeObserver>,
     anchor_range_selection: Option<AnchorRangeSelection>,
     anchor_range: Option<ExpandedAnchorRange>,
+    pending_selection_focus: Option<String>,
 }
 
 impl VirtualGraph {
@@ -450,6 +451,7 @@ impl VirtualGraph {
             resize_observer: None,
             anchor_range_selection: None,
             anchor_range: None,
+            pending_selection_focus: None,
         };
         graph.apply_follow_toggle_state()?;
         Ok(graph)
@@ -3358,7 +3360,7 @@ fn install_provider_context_rendered_listener(
     let context_graph = graph.clone();
     let context_window = graph.borrow().window.clone();
     let context_closure = Closure::<dyn FnMut()>::new(move || {
-        focus_selected_node_in_graph(context_graph.clone());
+        handle_provider_context_rendered(context_graph.clone());
     });
     context_window.add_event_listener_with_callback(
         PROVIDER_CONTEXT_RENDERED_EVENT,
@@ -3367,6 +3369,21 @@ fn install_provider_context_rendered_listener(
     context_closure.forget();
 
     Ok(())
+}
+
+fn handle_provider_context_rendered(graph: Rc<RefCell<VirtualGraph>>) {
+    let should_focus = {
+        let graph = graph.borrow();
+        graph.sync_selected_graph_node();
+        if let Err(error) = sync_selected_provider_context_node(&graph.window, &graph.document) {
+            web_sys::console::error_1(&error);
+        }
+        let selected_target = selected_node_target(&graph.window);
+        selected_target.is_some() && graph.pending_selection_focus == selected_target
+    };
+    if should_focus {
+        focus_selected_node_in_graph(graph);
+    }
 }
 
 fn install_detail_link_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -3655,7 +3672,7 @@ fn take_graph_focus_point(
 }
 
 fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
-    let point = {
+    let (selected_target, point) = {
         let graph = graph.borrow();
         graph.sync_selected_graph_node();
         if let Err(error) = sync_selected_provider_context_node(&graph.window, &graph.document) {
@@ -3673,14 +3690,16 @@ fn focus_selected_node_in_graph(graph: Rc<RefCell<VirtualGraph>>) {
                 None
             }
         };
-        match selected_graph_focus_point(&graph.window, &graph.document, transform) {
+        let point = match selected_graph_focus_point(&graph.window, &graph.document, transform) {
             Ok(point) => point.or(link_point),
             Err(error) => {
                 web_sys::console::error_1(&error);
                 link_point
             }
-        }
+        };
+        (selected_target, point)
     };
+    graph.borrow_mut().pending_selection_focus = selected_target.filter(|_| point.is_none());
     if let Some(point) = point {
         update_viewport(graph, |graph| {
             if graph.auto_follow
@@ -4259,6 +4278,32 @@ mod tests {
             let _ = sync_detail_query(&window);
             self.root.remove();
         }
+    }
+
+    fn append_provider_context_point(
+        fixture: &GraphFixture,
+        target: &str,
+        point: Point,
+    ) -> Element {
+        let document = fixture.graph.borrow().document.clone();
+        let context_point = document
+            .create_element("span")
+            .expect_throw("provider context point should be created");
+        context_point.set_class_name("provider-context-node-graph-point");
+        context_point
+            .set_attribute("data-node-target", target)
+            .expect_throw("provider context target should be set");
+        context_point
+            .set_attribute("data-node-x", &point.x.to_string())
+            .expect_throw("provider context x should be set");
+        context_point
+            .set_attribute("data-node-y", &point.y.to_string())
+            .expect_throw("provider context y should be set");
+        fixture
+            .root
+            .append_child(&context_point)
+            .expect_throw("provider context point should be mounted");
+        context_point
     }
 
     async fn expand_test_anchor_range(
@@ -5319,6 +5364,75 @@ mod tests {
 
         assert!(row.class_list().contains("selected"));
         assert_eq!(link.get_attribute("aria-current").as_deref(), Some("true"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_provider_context_refresh_preserves_the_viewport() {
+        let fixture = GraphFixture::new();
+        append_provider_context_point(&fixture, "detail-selected", Point { x: 320, y: 180 });
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .window
+                .location()
+                .set_hash("detail-selected")
+                .expect_throw("selection hash should be set");
+            graph.canvas = Some(GraphCanvas {
+                width: 640,
+                height: 360,
+            });
+            graph.viewport = ViewportState {
+                x: 24.0,
+                y: 36.0,
+                width: 200.0,
+                height: 100.0,
+                overscan: MIN_OVERSCAN,
+            };
+            graph.pending_selection_focus = None;
+        }
+        let viewport = fixture.graph.borrow().viewport;
+
+        handle_provider_context_rendered(fixture.graph.clone());
+
+        let current = fixture.graph.borrow().viewport;
+        assert_eq!(current.x, viewport.x);
+        assert_eq!(current.y, viewport.y);
+        assert_eq!(current.width, viewport.width);
+        assert_eq!(current.height, viewport.height);
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_provider_context_render_completes_pending_selection_focus() {
+        let fixture = GraphFixture::new();
+        append_provider_context_point(&fixture, "detail-selected", Point { x: 320, y: 180 });
+        {
+            let mut graph = fixture.graph.borrow_mut();
+            graph
+                .window
+                .location()
+                .set_hash("detail-selected")
+                .expect_throw("selection hash should be set");
+            graph.canvas = Some(GraphCanvas {
+                width: 640,
+                height: 360,
+            });
+            graph.viewport = ViewportState {
+                x: 24.0,
+                y: 36.0,
+                width: 200.0,
+                height: 100.0,
+                overscan: MIN_OVERSCAN,
+            };
+            graph.pending_selection_focus = Some("detail-selected".to_owned());
+            graph.patch_in_flight = true;
+        }
+
+        handle_provider_context_rendered(fixture.graph.clone());
+
+        let graph = fixture.graph.borrow();
+        assert_eq!(graph.pending_selection_focus, None);
+        assert_eq!(graph.viewport.x, 220.0);
+        assert_eq!(graph.viewport.y, 130.0);
     }
 
     #[wasm_bindgen_test]

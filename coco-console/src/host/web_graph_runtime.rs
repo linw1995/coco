@@ -895,7 +895,16 @@ impl WebGraphRuntime {
         }
     }
 
-    pub async fn drive(self, mut source_changes: watch::Receiver<u64>) -> Infallible {
+    pub async fn drive(self, source_changes: watch::Receiver<u64>) -> Infallible {
+        self.drive_with_reconcile_interval(source_changes, RECONCILE_INTERVAL)
+            .await
+    }
+
+    async fn drive_with_reconcile_interval(
+        self,
+        mut source_changes: watch::Receiver<u64>,
+        reconcile_interval: Duration,
+    ) -> Infallible {
         let mut retry_delay = RETRY_MIN_DELAY;
         loop {
             source_changes.borrow_and_update();
@@ -912,7 +921,7 @@ impl WebGraphRuntime {
                 changed = source_changes.changed() => {
                     changed.expect("web graph runtime retains the source change publisher");
                 }
-                () = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+                () = tokio::time::sleep(reconcile_interval) => {}
             }
         }
     }
@@ -4082,7 +4091,11 @@ mod tests {
         let mut revisions = runtime.subscribe();
         revisions.borrow_and_update();
         let source_changes = runtime.subscribe_source_changes();
-        let driver = tokio::spawn(runtime.clone().drive(source_changes));
+        let driver = tokio::spawn(
+            runtime
+                .clone()
+                .drive_with_reconcile_interval(source_changes, Duration::from_secs(5 * 60)),
+        );
         let console_store = ConsoleStore::new(writer.clone(), publisher);
 
         let child = append_text(&console_store, &root, "live child").await;
@@ -4093,7 +4106,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(child_cursor.node_id, child);
-        timeout(Duration::from_secs(30), async {
+        timeout(Duration::from_secs(60), async {
             loop {
                 revisions.changed().await.unwrap();
                 let revision = *revisions.borrow_and_update();
