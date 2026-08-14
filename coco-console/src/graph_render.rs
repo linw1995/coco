@@ -572,7 +572,7 @@ pub fn node_title_text(node: &GraphViewportNode) -> String {
     )
 }
 
-fn edge_class(edge: &GraphViewportEdge, base: &str) -> String {
+pub fn edge_class(edge: &GraphViewportEdge, base: &str) -> String {
     match (edge.kind, edge.origin.as_ref()) {
         (GraphViewportEdgeKind::Primary, Some(origin)) => format!(
             "{base} origin origin-{}",
