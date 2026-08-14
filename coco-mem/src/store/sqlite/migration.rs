@@ -14,7 +14,6 @@ use crate::error::{
 };
 
 mod v23;
-mod v25;
 mod v7;
 
 #[cfg(test)]
@@ -22,7 +21,7 @@ pub use v7::NODE_ITEM_ROWS_BACKFILL_META_KEY;
 #[cfg(test)]
 pub use v23::FS_MIGRATION_COMPLETE_META_KEY;
 
-pub const CURRENT_VERSION: i32 = v25::VERSION;
+pub const CURRENT_VERSION: i32 = 26;
 pub const STORE_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 const MIN_SUPPORTED_VERSION: i32 = 6;

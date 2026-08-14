@@ -60,7 +60,7 @@ async fn writable_open_backfills_job_heads_from_v24() {
     drop(connection);
 
     let reopened = SqliteStore::open(&path).await.unwrap();
-    assert_eq!(reopened.schema_version().await.unwrap(), 25);
+    assert_eq!(reopened.schema_version().await.unwrap(), 26);
     assert_eq!(
         reopened.get_job("job-connected").await.unwrap().head,
         connected_head

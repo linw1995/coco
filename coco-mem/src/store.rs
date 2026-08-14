@@ -10,8 +10,8 @@ mod tests;
 
 pub use sqlite::{
     GRAPH_READ_BATCH_SIZE, GraphBranchPage, GraphBranchPageCursor, GraphBranchRecord,
-    GraphChildPage, GraphChildPageCursor, GraphJobPage, GraphNodeCursor, GraphNodePage,
-    GraphNodeRecord, SqliteGraphStore, SqliteStore,
+    GraphChildPage, GraphChildPageCursor, GraphJobPage, GraphNodeCursor, GraphNodeOrigin,
+    GraphNodePage, GraphNodeRecord, SqliteGraphStore, SqliteStore,
 };
 
 use crate::{
@@ -79,6 +79,17 @@ pub trait NodeStore {
 pub trait BranchStore {
     /// Creates a branch from a node id or branch reference and returns its head id.
     async fn fork(&self, name: &str, from_ref: &str) -> StoreResult<String>;
+
+    /// Creates a branch and appends its initial nodes atomically.
+    async fn fork_with_nodes(
+        &self,
+        name: &str,
+        from_ref: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String>;
+
+    /// Appends one node with the immutable origin of the current branch instance.
+    async fn append_on_branch(&self, name: &str, node: NewNode) -> StoreResult<String>;
 
     /// Returns the current head node identifier for a branch.
     async fn get_branch_head(&self, name: &str) -> StoreResult<String>;

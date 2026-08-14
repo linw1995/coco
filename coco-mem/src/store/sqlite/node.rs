@@ -19,10 +19,10 @@ use crate::error::{
     ParseSqliteStoreValueSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu, StoreError,
 };
 use crate::schema::{
-    node_anchor_prompt_attachments, node_anchor_session_patch_tools, node_anchor_session_patches,
-    node_anchor_session_tools, node_anchor_sessions, node_anchor_skill_invocations,
-    node_anchor_skill_results, node_metadata, node_relations, node_tool_results, node_tool_uses,
-    nodes,
+    branch_instances, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
+    node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
+    node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_origins,
+    node_relations, node_tool_results, node_tool_uses, nodes,
 };
 use crate::store::NodeStore;
 use crate::{

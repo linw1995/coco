@@ -8,6 +8,7 @@ use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use snafu::prelude::*;
 
+use super::branch::{load_branch_instance_id, persist_node_origin};
 use super::node::{load_node_by_exact_id, persist_node_without_transaction, validate_new_node};
 use super::{
     AsyncSqliteConnection, GraphJobPage, SqliteStore, SqliteTransactionError, load_branch_head,
@@ -336,6 +337,9 @@ async fn append_prompt_job_base_in_transaction(
     let parent_id = load_branch_head(connection, path, branch)
         .await
         .map_err(SqliteTransactionError::Operation)?;
+    let branch_instance_id = load_branch_instance_id(connection, path, branch)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
     let prompt_parent_id = if let Some(patch) = session_patch {
         load_session_chain(connection, path, &parent_id)
             .await
@@ -351,6 +355,9 @@ async fn append_prompt_job_base_in_transaction(
             .await
             .map_err(SqliteTransactionError::Operation)?;
         persist_node_without_transaction(connection, path, &node)
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+        persist_node_origin(connection, path, &node.id, &branch_instance_id)
             .await
             .map_err(SqliteTransactionError::Operation)?;
         node.id
@@ -369,6 +376,9 @@ async fn append_prompt_job_base_in_transaction(
         .await
         .map_err(SqliteTransactionError::Operation)?;
     persist_node_without_transaction(connection, path, &node)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
+    persist_node_origin(connection, path, &node.id, &branch_instance_id)
         .await
         .map_err(SqliteTransactionError::Operation)?;
     Ok(node.id)

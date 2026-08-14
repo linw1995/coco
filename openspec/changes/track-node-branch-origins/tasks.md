@@ -1,16 +1,16 @@
 ## 1. Authoritative Provenance Schema
 
-- [ ] 1.1 Add the next coco-mem SQLite migration for `branch_instances`, `node_origins`, and live `branches.instance_id`, including a provenance-discarding down migration.
-- [ ] 1.2 Update Diesel schema and add focused storage types for branch instances and optional node origins without changing `Node` or its hash payload.
-- [ ] 1.3 Implement branch-instance creation, deletion retention, same-name recreation, and current branch reads that preserve multiple refs at one head.
-- [ ] 1.4 Implement transactional single-node and batch origin persistence with indexed, bounded graph-read joins.
-- [ ] 1.5 Add migration tests covering legacy active, attached, paused, shared-head, and same-name-after-delete data plus up/down schema behavior.
+- [x] 1.1 Add the next coco-mem SQLite migration for `branch_instances`, `node_origins`, and live `branches.instance_id`, including a provenance-discarding down migration.
+- [x] 1.2 Update Diesel schema and add focused storage types for branch instances and optional node origins without changing `Node` or its hash payload.
+- [x] 1.3 Implement branch-instance creation, deletion retention, same-name recreation, and current branch reads that preserve multiple refs at one head.
+- [x] 1.4 Implement transactional single-node and batch origin persistence with indexed, bounded graph-read joins.
+- [x] 1.5 Add migration tests covering legacy active, attached, paused, shared-head, and same-name-after-delete data plus up/down schema behavior.
 
 ## 2. Branch-Aware Node Creation
 
-- [ ] 2.1 Add explicit store operations for detached append, branch-aware append, and atomic branch bootstrap while preserving existing detached behavior.
+- [x] 2.1 Add explicit store operations for detached append, branch-aware append, and atomic branch bootstrap while preserving existing detached behavior.
 - [ ] 2.2 Change session creation to bootstrap its branch instance, initial session anchor, live ref, and session state atomically.
-- [ ] 2.3 Record origins for prompt job bases, optional session patches, and every node created by branch batch/head-update transactions.
+- [x] 2.3 Record origins for prompt job bases, optional session patches, and every node created by branch batch/head-update transactions.
 - [ ] 2.4 Propagate authoritative branch context through backend trace appenders, terminal response and failure persistence, retries, and recovery execution.
 - [ ] 2.5 Record origins for rebase, handoff, skill invocation, and skill-session creation paths.
 - [ ] 2.6 Add integration tests proving detached nodes remain unknown, fork and head movement do not rewrite origins, failed transactions leave no partial provenance, and all production branch-aware paths assign origins.

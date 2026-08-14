@@ -87,6 +87,19 @@ where
         self.notify_source_if_ok(self.inner.fork(name, from_ref).await)
     }
 
+    async fn fork_with_nodes(
+        &self,
+        name: &str,
+        from_ref: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> StoreResult<String> {
+        self.notify_source_if_ok(self.inner.fork_with_nodes(name, from_ref, nodes).await)
+    }
+
+    async fn append_on_branch(&self, name: &str, node: NewNode) -> StoreResult<String> {
+        self.notify_source_if_ok(self.inner.append_on_branch(name, node).await)
+    }
+
     async fn get_branch_head(&self, name: &str) -> StoreResult<String> {
         self.inner.get_branch_head(name).await
     }
