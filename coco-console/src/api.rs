@@ -344,12 +344,21 @@ pub struct GraphViewportNode {
     pub kind: String,
     pub summary: String,
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub head_links: Vec<GraphBranchHeadLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<GraphNodeOrigin>,
     pub x: i32,
     pub y: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GraphBranchHeadLink {
+    pub branch: String,
+    pub node_target: String,
+    pub href: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -448,6 +457,7 @@ mod tests {
             kind: "text".to_owned(),
             summary: "first".to_owned(),
             labels: vec!["main".to_owned()],
+            head_links: Vec::new(),
             href: None,
             origin: None,
             x: 0,

@@ -37,9 +37,10 @@ use super::web_graph_view::{
 };
 use super::{ConsolePublisher, subscribe_job_changes, subscribe_source_changes};
 use crate::api::{
-    GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob, GraphJobsResponse, GraphNodeOrigin,
-    GraphViewport, GraphViewportDiffResponse, GraphViewportEdge, GraphViewportEdgeKind,
-    GraphViewportNode, GraphViewportResponse, Point as ApiPoint,
+    GraphBezierRoute, GraphBranchHeadLink, GraphCanvas, GraphErrorNode, GraphJob,
+    GraphJobsResponse, GraphNodeOrigin, GraphViewport, GraphViewportDiffResponse,
+    GraphViewportEdge, GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse,
+    Point as ApiPoint,
 };
 use crate::host::api::{GraphViewportDiffRequest, GraphViewportRequest};
 use crate::web_graph::{
@@ -95,6 +96,7 @@ struct SourceProjectionResult {
 #[derive(Debug, Clone, Default)]
 struct ProjectedBranchLabels {
     labels: Vec<String>,
+    head_links: Vec<GraphBranchHeadLink>,
     href: Option<String>,
 }
 
@@ -1424,6 +1426,7 @@ impl WebGraphRuntime {
                     node,
                     placement.point,
                     projected_labels.labels,
+                    projected_labels.head_links,
                     projected_labels.href,
                     origins.get(&node.id),
                 ));
@@ -1540,22 +1543,23 @@ impl WebGraphRuntime {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut grouped = BTreeMap::<String, (Vec<String>, BTreeSet<String>)>::new();
+        let mut grouped = BTreeMap::<String, Vec<(String, String)>>::new();
         for (branch, node_id, head_id) in projected {
-            let entry = grouped.entry(node_id).or_default();
-            entry.0.push(branch);
-            entry.1.insert(head_id);
+            grouped.entry(node_id).or_default().push((branch, head_id));
         }
-        for (labels, _) in grouped.values_mut() {
-            labels.sort();
+        for branches in grouped.values_mut() {
+            branches.sort();
         }
 
         let head_ids = grouped
             .iter()
-            .filter_map(|(projected_id, (_, head_ids))| {
-                let head_id = head_ids.iter().next()?;
-                (mode == ViewMode::Anchors && head_ids.len() == 1 && head_id != projected_id)
-                    .then(|| head_id.clone())
+            .flat_map(|(projected_id, branches)| {
+                branches
+                    .iter()
+                    .filter(move |(_, head_id)| {
+                        mode == ViewMode::Anchors && head_id != projected_id
+                    })
+                    .map(|(_, head_id)| head_id.clone())
             })
             .collect::<BTreeSet<_>>();
         let head_node_ids = head_ids
@@ -1572,15 +1576,29 @@ impl WebGraphRuntime {
             .into_iter()
             .map(|placement| (placement.node.to_string(), placement.point))
             .collect::<BTreeMap<_, _>>();
+        if head_points.len() != head_ids.len() {
+            return Ok(None);
+        }
 
         Ok(Some(
             grouped
                 .into_iter()
-                .map(|(projected_id, (labels, head_ids))| {
-                    let href = head_ids
+                .map(|(projected_id, branches)| {
+                    let labels = branches
+                        .iter()
+                        .map(|(branch, _)| branch.clone())
+                        .collect::<Vec<_>>();
+                    let distinct_head_ids = branches
+                        .iter()
+                        .map(|(_, head_id)| head_id.clone())
+                        .collect::<BTreeSet<_>>();
+                    let href = distinct_head_ids
                         .iter()
                         .next()
-                        .filter(|head_id| head_ids.len() == 1 && *head_id != &projected_id)
+                        .filter(|head_id| {
+                            distinct_head_ids.len() == 1
+                                && head_id.as_str() != projected_id.as_str()
+                        })
                         .and_then(|head_id| {
                             head_points.get(head_id).map(|point| {
                                 crate::graph_render::graph_point_href(
@@ -1591,7 +1609,39 @@ impl WebGraphRuntime {
                                 )
                             })
                         });
-                    (projected_id, ProjectedBranchLabels { labels, href })
+                    let head_links = if mode == ViewMode::Anchors && distinct_head_ids.len() > 1 {
+                        branches
+                            .iter()
+                            .filter_map(|(branch, head_id)| {
+                                let node_target = node_target_id(head_id);
+                                let href = if head_id == &projected_id {
+                                    format!("#{node_target}")
+                                } else {
+                                    crate::graph_render::graph_point_href(
+                                        &node_target,
+                                        api_point(*head_points.get(head_id)?),
+                                        false,
+                                        "all",
+                                    )
+                                };
+                                Some(GraphBranchHeadLink {
+                                    branch: branch.clone(),
+                                    node_target,
+                                    href,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        projected_id,
+                        ProjectedBranchLabels {
+                            labels,
+                            head_links,
+                            href,
+                        },
+                    )
                 })
                 .collect(),
         ))
@@ -2814,6 +2864,7 @@ fn viewport_node(
     node: &Node,
     point: Point,
     labels: Vec<String>,
+    head_links: Vec<GraphBranchHeadLink>,
     href: Option<String>,
     origin: Option<&NodeOriginProjection>,
 ) -> GraphViewportNode {
@@ -2825,6 +2876,7 @@ fn viewport_node(
         kind: graph_kind_name(node).to_owned(),
         summary: summarize_node(node),
         labels,
+        head_links,
         href,
         origin: origin.map(api_origin),
         x: point.x,
@@ -4086,6 +4138,75 @@ mod tests {
             historical.origin.as_ref().unwrap().branch_instance_id,
             recreated.origin.as_ref().unwrap().branch_instance_id
         );
+    }
+
+    #[tokio::test]
+    async fn anchor_labels_link_to_each_distinct_hidden_branch_head() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let root = writer.root_id();
+        let anchor = append_session_anchor(&writer, &root, "main").await;
+        writer.fork("main", &anchor).await.unwrap();
+        let main_head = writer
+            .append_on_branch(
+                "main",
+                NewNode {
+                    parent: anchor.clone(),
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("main head".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("main", &anchor, &main_head)
+            .await
+            .unwrap();
+        writer.fork("recovery", &anchor).await.unwrap();
+        let recovery_head = writer
+            .append_on_branch(
+                "recovery",
+                NewNode {
+                    parent: anchor.clone(),
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("recovery head".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        writer
+            .set_branch_head("recovery", &anchor, &recovery_head)
+            .await
+            .unwrap();
+
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+        let anchors = runtime
+            .viewport(ViewMode::Anchors, complete_viewport())
+            .await
+            .unwrap();
+        let projected = anchors.nodes.iter().find(|node| node.id == anchor).unwrap();
+        let main_target = node_target_id(&main_head);
+        let recovery_target = node_target_id(&recovery_head);
+
+        assert_eq!(projected.labels, ["main", "recovery"]);
+        assert_eq!(
+            projected
+                .head_links
+                .iter()
+                .map(|link| (link.branch.as_str(), link.node_target.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("main", main_target.as_str()),
+                ("recovery", recovery_target.as_str()),
+            ]
+        );
+        assert!(projected.head_links.iter().all(|link| {
+            link.href.contains("mode=all") && link.href.contains("graph_focus_target=")
+        }));
     }
 
     #[tokio::test]

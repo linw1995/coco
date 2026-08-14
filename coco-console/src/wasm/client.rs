@@ -15,6 +15,8 @@ use super::refresh::{
     JobRefreshState, PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
     pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
+#[cfg(test)]
+use crate::api::GraphBranchHeadLink;
 use crate::api::{
     AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob,
     GraphJobsResponse, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -1226,6 +1228,7 @@ impl VirtualGraph {
             kind: layout_node.node.kind.clone(),
             summary: layout_node.node.summary.clone(),
             labels: vec!["expanded".to_owned()],
+            head_links: Vec::new(),
             href: None,
             origin: None,
             x: layout_node.point.x,
@@ -1407,11 +1410,13 @@ impl VirtualGraph {
             set_node_link_attributes(&link, &node, false)?;
             clear_children(&link);
             self.append_node_group_to_link(&link, &node)?;
+            self.replace_node_head_links(&node)?;
             self.rendered.nodes.insert(node.key, fingerprint);
             return Ok(());
         }
         let link = self.node_link_element(&node, is_new)?;
-        self.append_node(&node.key, &link, fingerprint)
+        self.append_node(&node.key, &link, fingerprint)?;
+        self.replace_node_head_links(&node)
     }
 
     fn node_link_element(
@@ -1548,8 +1553,60 @@ impl VirtualGraph {
         Ok(())
     }
 
+    fn replace_node_head_links(&self, node: &GraphViewportNode) -> Result<(), JsValue> {
+        if let Some(existing) = self
+            .document
+            .get_element_by_id(&crate::graph_render::node_head_links_id(&node.key))
+        {
+            existing.remove();
+        }
+        if node.head_links.is_empty() {
+            return Ok(());
+        }
+        let group = svg_element(&self.document, "g")?;
+        set_attributes(
+            &group,
+            [
+                ("id", crate::graph_render::node_head_links_id(&node.key)),
+                ("class", "node-branch-head-links".to_owned()),
+                ("transform", format!("translate({} {})", node.x, node.y)),
+            ],
+        )?;
+        for layout in crate::graph_render::branch_head_link_layouts(&node.head_links) {
+            let link = svg_element(&self.document, "a")?;
+            set_attributes(
+                &link,
+                [
+                    ("class", "node-branch-head-link".to_owned()),
+                    ("href", layout.href),
+                    ("data-node-target", layout.node_target),
+                ],
+            )?;
+            let label = svg_element(&self.document, "text")?;
+            set_attributes(
+                &label,
+                [
+                    ("class", "node-branch-head-label".to_owned()),
+                    ("x", layout.x.to_string()),
+                    ("y", "-27".to_owned()),
+                ],
+            )?;
+            label.set_text_content(Some(&layout.branch));
+            link.append_child(&label)?;
+            group.append_child(&link)?;
+        }
+        self.node_group.append_child(&group)?;
+        Ok(())
+    }
+
     fn remove_key(&mut self, key: &str) {
         if let Some(element) = self.document.get_element_by_id(&render_element_id(key)) {
+            element.remove();
+        }
+        if let Some(element) = self
+            .document
+            .get_element_by_id(&crate::graph_render::node_head_links_id(key))
+        {
             element.remove();
         }
         if let Some(element) = self.document.get_element_by_id(&edge_hit_target_id(key)) {
@@ -4352,6 +4409,52 @@ mod tests {
         assert_eq!(truncate_label("anything", 0), "");
     }
 
+    #[wasm_bindgen_test]
+    fn graph_items_distinct_hidden_heads_render_individual_branch_links() {
+        let fixture = GraphFixture::new();
+        let mut node = graph_node("anchor", 100, 80);
+        node.labels = vec!["main".to_owned(), "recovery".to_owned()];
+        node.head_links = vec![
+            GraphBranchHeadLink {
+                branch: "main".to_owned(),
+                node_target: "detail-main-head".to_owned(),
+                href: "/?mode=all#detail-main-head".to_owned(),
+            },
+            GraphBranchHeadLink {
+                branch: "recovery".to_owned(),
+                node_target: "detail-recovery-head".to_owned(),
+                href: "/?mode=all#detail-recovery-head".to_owned(),
+            },
+        ];
+
+        fixture
+            .graph
+            .borrow_mut()
+            .upsert_node(node, false)
+            .expect_throw("node with branch head links should render");
+        let links = fixture
+            .graph
+            .borrow()
+            .document
+            .query_selector_all(".node-branch-head-link")
+            .expect_throw("branch head links should be queryable");
+
+        assert_eq!(links.length(), 2);
+        let first = links
+            .item(0)
+            .expect_throw("main branch link should exist")
+            .dyn_into::<Element>()
+            .expect_throw("main branch link should be an element");
+        assert_eq!(
+            first.get_attribute("data-node-target").as_deref(),
+            Some("detail-main-head")
+        );
+        assert_eq!(
+            first.get_attribute("href").as_deref(),
+            Some("/?mode=all#detail-main-head")
+        );
+    }
+
     #[wasm_bindgen_test(async)]
     async fn graph_items_expand_anchor_details_inside_the_svg_graph() {
         let fixture = GraphFixture::new();
@@ -6275,6 +6378,7 @@ mod tests {
             kind: "prompt".to_owned(),
             summary: format!("summary for {id}"),
             labels: Vec::new(),
+            head_links: Vec::new(),
             href: None,
             origin: None,
             x,

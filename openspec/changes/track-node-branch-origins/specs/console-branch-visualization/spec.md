@@ -29,6 +29,13 @@ The graph SHALL render branch names as labels on their current head nodes rather
 - **THEN** its label is projected to the nearest visible anchor or root
 - **AND** navigation from the label can reach the actual head in All view
 
+#### Scenario: Distinct hidden heads share one visible anchor
+
+- **GIVEN** multiple branches have distinct non-anchor heads beneath the same visible anchor
+- **WHEN** the graph is rendered in Anchors view
+- **THEN** all branch labels are displayed on that single anchor node
+- **AND** each label navigates to its own actual head in All view
+
 ### Requirement: Node origins style historical paths
 
 The graph SHALL use persisted node origin information to style historical nodes and their incoming primary path segments without changing DAG topology.

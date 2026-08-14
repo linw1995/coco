@@ -23,7 +23,7 @@
 
 - [x] 3.1 Add a disposable web-graph migration and projection fields or tables for optional origin instance identity and historical branch name.
 - [x] 3.2 Extend bounded coco-mem graph reads and Console catch-up/rebuild to ingest origins without per-node source queries.
-- [x] 3.3 Project current branch refs onto actual heads in All view and nearest visible anchors or root in Anchors view, grouping shared-head labels deterministically.
+- [x] 3.3 Project current branch refs onto actual heads in All view and nearest visible anchors or root in Anchors view, grouping labels deterministically while preserving per-label navigation for distinct hidden heads.
 - [x] 3.4 Extend graph API payloads additively with optional origin details while retaining current Node and edge topology.
 - [x] 3.5 Render stable origin styles for nodes and primary-parent segments in SSR and WASM, retain merge/shadow semantics, and render unknown origins neutrally.
 - [x] 3.6 Add Console tests for day-origin history, deleted and recreated branch instances, shared heads, current refs differing from origin, legacy unknown nodes, incremental catch-up, and full projection rebuild parity.

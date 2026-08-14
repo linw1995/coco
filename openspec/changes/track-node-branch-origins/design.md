@@ -124,7 +124,7 @@ Current branch records include their instance IDs. Console groups them by visibl
 head_id -> sorted [branch ref]
 ```
 
-In All view, labels attach to the actual head. In Anchors view, non-anchor heads project to the nearest visible anchor or root while retaining navigation to the actual head in All view. Multiple refs at one actual or projected head become multiple labels on one rendered node.
+In All view, labels attach to the actual head. In Anchors view, non-anchor heads project to the nearest visible anchor or root while retaining per-label navigation to the actual head in All view. Multiple refs at one actual or projected head become multiple labels on one rendered node, including when distinct hidden heads share the same visible anchor.
 
 ### 5. Store origin in the disposable Console projection
 

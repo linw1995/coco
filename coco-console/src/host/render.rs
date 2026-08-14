@@ -618,6 +618,7 @@ mod tests {
                 kind: "text".to_owned(),
                 summary: "Latest node".to_owned(),
                 labels: vec!["main".to_owned()],
+                head_links: Vec::new(),
                 href: None,
                 origin: None,
                 x: 2300,

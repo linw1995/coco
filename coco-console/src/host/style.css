@@ -1090,6 +1090,23 @@ body {
   text-anchor: middle;
 }
 
+.node-branch-head-label {
+  fill: #bfdbfe;
+  font-size: 10px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: rgba(8, 11, 18, 0.92);
+  stroke-linejoin: round;
+  stroke-width: 4px;
+  text-anchor: middle;
+  text-decoration: underline;
+}
+
+.node-branch-head-link:hover .node-branch-head-label,
+.node-branch-head-link:focus .node-branch-head-label {
+  fill: #fef3c7;
+}
+
 .node-kind {
   fill: #9aa8bd;
   font-size: 9px;
