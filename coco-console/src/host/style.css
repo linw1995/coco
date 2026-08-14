@@ -579,6 +579,8 @@ body {
 }
 
 .graph-surface {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
   position: relative;
@@ -624,9 +626,9 @@ body {
   align-items: flex-start;
   display: flex;
   gap: 0.5rem;
-  position: absolute;
-  right: 1rem;
-  top: 1rem;
+  justify-content: flex-end;
+  padding: 1rem 1rem 0.5rem;
+  position: relative;
   z-index: 5;
 }
 
