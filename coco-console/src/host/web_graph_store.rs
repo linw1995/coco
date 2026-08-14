@@ -872,52 +872,6 @@ impl WebGraphStore {
             .map_err(|error| error.into_store_error(path))
     }
 
-    pub async fn apply_node_origin_projection(
-        &self,
-        projection: Option<&NodeOriginProjection>,
-        node_id: &str,
-    ) -> Result<()> {
-        use diesel::upsert::excluded;
-        use diesel_async::RunQueryDsl;
-
-        let path = self.path.clone();
-        let projection = projection.cloned();
-        let node_id = node_id.to_owned();
-        let mut connection = self.database.acquire().await?;
-        connection
-            .immediate_transaction::<_, TransactionError, _>(async |connection| {
-                if let Some(projection) = projection {
-                    let row = NodeOriginRow {
-                        node_id: projection.node_id,
-                        branch_instance_id: projection.branch_instance_id,
-                        branch_name: projection.branch_name,
-                    };
-                    diesel::insert_into(web_graph_node_origins::table)
-                        .values(&row)
-                        .on_conflict(web_graph_node_origins::node_id)
-                        .do_update()
-                        .set((
-                            web_graph_node_origins::branch_instance_id
-                                .eq(excluded(web_graph_node_origins::branch_instance_id)),
-                            web_graph_node_origins::branch_name
-                                .eq(excluded(web_graph_node_origins::branch_name)),
-                        ))
-                        .execute(connection)
-                        .await?;
-                } else {
-                    diesel::delete(
-                        web_graph_node_origins::table
-                            .filter(web_graph_node_origins::node_id.eq(node_id)),
-                    )
-                    .execute(connection)
-                    .await?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|error| error.into_store_error(path))
-    }
-
     pub async fn replace(&self, graph: &Graph) -> Result<()> {
         let snapshot = graph.snapshot();
         let path = self.path.clone();
@@ -957,7 +911,15 @@ impl WebGraphStore {
     }
 
     pub async fn apply_patch(&self, patch: Patch) -> Result<StoredGraphState> {
-        self.apply_patch_inner(patch, None).await
+        self.apply_patch_inner(patch, None, None).await
+    }
+
+    pub async fn apply_patch_with_node_origin(
+        &self,
+        patch: Patch,
+        origin: Option<NodeOriginProjection>,
+    ) -> Result<StoredGraphState> {
+        self.apply_patch_inner(patch, None, origin).await
     }
 
     pub async fn apply_patch_and_advance_source(
@@ -965,13 +927,15 @@ impl WebGraphStore {
         patch: Patch,
         source_cursor: GraphNodeCursor,
     ) -> Result<StoredGraphState> {
-        self.apply_patch_inner(patch, Some(source_cursor)).await
+        self.apply_patch_inner(patch, Some(source_cursor), None)
+            .await
     }
 
     async fn apply_patch_inner(
         &self,
         patch: Patch,
         source_cursor: Option<GraphNodeCursor>,
+        origin: Option<NodeOriginProjection>,
     ) -> Result<StoredGraphState> {
         let path = self.path.clone();
         let mut connection = self.database.acquire().await?;
@@ -986,9 +950,24 @@ impl WebGraphStore {
                 if let Some(source_cursor) = source_cursor.as_ref() {
                     validate_source_cursor_advance(&state, source_cursor, patch.source_version)?;
                 }
+                if let Some(origin) = origin.as_ref()
+                    && !patch
+                        .topology
+                        .add_nodes
+                        .iter()
+                        .any(|node| node.as_str() == origin.node_id.as_str())
+                {
+                    return Err(invalid_value(
+                        "web_graph_node_origins.node_id",
+                        &origin.node_id,
+                    ));
+                }
                 validate_patch_candidate(connection, &patch).await?;
                 let new_layout_edges = collect_new_layout_edges(connection, &patch).await?;
                 apply_patch_rows(connection, &patch, source_cursor.as_ref()).await?;
+                if let Some(origin) = origin.as_ref() {
+                    insert_node_origin_projection(connection, origin).await?;
+                }
                 validate_new_cycles(connection, &new_layout_edges).await?;
                 Ok(StoredGraphState {
                     format_version: state.format_version,
@@ -2910,6 +2889,32 @@ async fn apply_patch_rows(
             .await?
     };
     expect_row_count("advance_revision", 1, changed)
+}
+
+async fn insert_node_origin_projection(
+    connection: &mut AsyncSqliteConnection,
+    projection: &NodeOriginProjection,
+) -> std::result::Result<(), TransactionError> {
+    use diesel::upsert::excluded;
+    use diesel_async::RunQueryDsl;
+
+    let row = NodeOriginRow {
+        node_id: projection.node_id.clone(),
+        branch_instance_id: projection.branch_instance_id.clone(),
+        branch_name: projection.branch_name.clone(),
+    };
+    diesel::insert_into(web_graph_node_origins::table)
+        .values(&row)
+        .on_conflict(web_graph_node_origins::node_id)
+        .do_update()
+        .set((
+            web_graph_node_origins::branch_instance_id
+                .eq(excluded(web_graph_node_origins::branch_instance_id)),
+            web_graph_node_origins::branch_name.eq(excluded(web_graph_node_origins::branch_name)),
+        ))
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 async fn remove_layout_rows(
@@ -4960,6 +4965,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(node("a"), 0), (node("c"), 1), (node("d"), 0)]
         );
+    }
+
+    #[tokio::test]
+    async fn node_origin_is_committed_with_the_node_revision() {
+        let directory = TestDirectory::new();
+        let store = WebGraphStore::open(&directory.path).await.unwrap();
+        store.replace(&graph()).await.unwrap();
+        let origin = NodeOriginProjection {
+            node_id: "d".to_owned(),
+            branch_instance_id: "day-instance".to_owned(),
+            branch_name: "day".to_owned(),
+        };
+
+        let state = store
+            .apply_patch_with_node_origin(graph_patch(), Some(origin.clone()))
+            .await
+            .unwrap();
+        let read = store
+            .node_origin_projections(&["d".to_owned()])
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(read.state.revision, state.revision);
+        assert_eq!(read.value.get("d"), Some(&origin));
     }
 
     #[tokio::test]

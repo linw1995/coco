@@ -1064,14 +1064,6 @@ impl WebGraphRuntime {
             .into_iter()
             .map(|node| (node.id.clone(), node))
             .collect::<BTreeMap<_, _>>();
-        let source_records = self
-            .source
-            .graph_node_records_by_ids(&node_ids)
-            .await
-            .context(StoreSnafu)?
-            .into_iter()
-            .map(|node| (node.id.clone(), node))
-            .collect::<BTreeMap<_, _>>();
         let parent_ids = source_nodes
             .values()
             .filter(|node| !node.parent.is_empty())
@@ -1096,23 +1088,6 @@ impl WebGraphRuntime {
                     node_id: entry.node_id.clone(),
                 }
             })?;
-            let source_record = source_records.get(&entry.node_id).with_context(|| {
-                WebGraphSourceNodeMissingSnafu {
-                    node_id: entry.node_id.clone(),
-                }
-            })?;
-            let origin = source_record
-                .origin
-                .as_ref()
-                .map(|origin| NodeOriginProjection {
-                    node_id: source_record.id.clone(),
-                    branch_instance_id: origin.branch_instance_id.clone(),
-                    branch_name: origin.branch_name.clone(),
-                });
-            self.store
-                .apply_node_origin_projection(origin.as_ref(), &source_record.id)
-                .await
-                .context(WebGraphStoreSnafu)?;
             let projection = tool_session_projection(entry.row_id, source_node);
             self.store
                 .apply_tool_session_projection(&projection)
@@ -2416,7 +2391,12 @@ impl WebGraphRuntime {
                 tokio::task::yield_now().await;
                 continue;
             };
-            match self.store.apply_patch(patch).await {
+            let origin = node.origin.as_ref().map(|origin| NodeOriginProjection {
+                node_id: node.id.clone(),
+                branch_instance_id: origin.branch_instance_id.clone(),
+                branch_name: origin.branch_name.clone(),
+            });
+            match self.store.apply_patch_with_node_origin(patch, origin).await {
                 Ok(_) => return Ok(true),
                 Err(StoreError::InvalidGraph {
                     source: crate::web_graph::Error::RevisionMismatch { .. },
