@@ -1266,6 +1266,22 @@ body {
   right: var(--node-detail-drawer-width);
 }
 
+/* When both drawers auto-open on viewports narrower than their combined
+   width, stack them vertically instead of pushing the provider context panel
+   past the left edge of the content area. */
+@media (max-width: 54rem) {
+  .content[data-open-drawer~="provider-context"][data-open-drawer~="node-detail"] [data-drawer="provider-context"] {
+    bottom: auto;
+    height: 45%;
+    right: 0;
+  }
+
+  .content[data-open-drawer~="provider-context"][data-open-drawer~="node-detail"] [data-drawer="node-detail"] {
+    height: 55%;
+    top: auto;
+  }
+}
+
 .side-drawer-close {
   align-items: center;
   background: rgba(8, 11, 18, 0.9);

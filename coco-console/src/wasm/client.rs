@@ -2897,11 +2897,27 @@ fn close_side_drawer(document: &Document, drawer: SideDrawer) -> Result<(), JsVa
         .filter(|name| *name != drawer.name())
         .filter_map(SideDrawer::from_name)
         .collect::<Vec<_>>();
-    set_open_side_drawers(document, &remaining)
+    if remaining.len() == open.split_whitespace().count() {
+        return Ok(());
+    }
+    set_open_side_drawers(document, &remaining)?;
+    focus_graph_surface(document)
 }
 
 fn close_side_drawers(document: &Document) -> Result<(), JsValue> {
-    set_open_side_drawers(document, &[])
+    let was_open = open_side_drawers(document)?;
+    set_open_side_drawers(document, &[])?;
+    if was_open {
+        focus_graph_surface(document)?;
+    }
+    Ok(())
+}
+
+fn focus_graph_surface(document: &Document) -> Result<(), JsValue> {
+    if let Some(surface) = document.query_selector(".graph-wrap")? {
+        surface.unchecked_into::<web_sys::HtmlElement>().focus()?;
+    }
+    Ok(())
 }
 
 fn sync_side_drawer_with_selection(document: &Document, window: &Window) -> Result<(), JsValue> {
@@ -4276,7 +4292,7 @@ mod tests {
                       <button type="button" data-drawer-close>Close</button>
                     </aside>
                   </section>
-                  <div class="graph-wrap" data-zoom="1">
+                  <div class="graph-wrap" data-zoom="1" tabindex="0">
                     <button class="follow-toggle" type="button" aria-pressed="false">Follow</button>
                     <svg class="graph">
                       <rect class="graph-bg"></rect>
@@ -5428,6 +5444,10 @@ mod tests {
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa"
         );
+        let active = document
+            .active_element()
+            .expect_throw("focus should move to the graph surface");
+        assert!(active.class_list().contains("graph-wrap"));
     }
 
     #[wasm_bindgen_test]
