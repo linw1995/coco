@@ -86,7 +86,7 @@ fn GraphPage(
     let stats = format!("{} / revision {}", mode.label(), revision);
     let graph_mode = mode.as_query_value().to_owned();
     let graph = GraphCanvasModel::new(mode == ViewMode::Anchors, mode == ViewMode::All, &viewport);
-    let node_detail_drawer_open = initial_provider_context.is_some();
+    let drawers_open = initial_provider_context.is_some();
     view! {
         <main
             id="console-root"
@@ -107,37 +107,19 @@ fn GraphPage(
             </header>
             <section
                 class="content"
-                data-open-drawer=node_detail_drawer_open.then_some("node-detail")
+                data-open-drawer=drawers_open.then_some("provider-context node-detail")
             >
                 <div class="graph-shell">
                     <div class="graph-surface"><GraphCanvas graph/></div>
                     <EmptyTimeScale/>
                 </div>
-                <nav class="side-drawer-toolbar" aria-label="Inspector panels">
-                    <button
-                        type="button"
-                        data-drawer-open="provider-context"
-                        aria-controls="provider-context-drawer"
-                        aria-expanded="false"
-                    >
-                        "Context"
-                    </button>
-                    <button
-                        type="button"
-                        data-drawer-open="node-detail"
-                        aria-controls="node-detail-drawer"
-                        aria-expanded=node_detail_drawer_open.to_string()
-                    >
-                        "Detail"
-                    </button>
-                </nav>
                 <aside
                     id="provider-context-drawer"
                     class="side-drawer provider-context-panel"
                     data-drawer="provider-context"
                     aria-label="Provider Context"
-                    aria-hidden="true"
-                    inert=""
+                    aria-hidden=(!drawers_open).to_string()
+                    inert=(!drawers_open).then_some("")
                 >
                     <button
                         type="button"
@@ -159,8 +141,8 @@ fn GraphPage(
                     class="side-drawer node-detail-panel"
                     data-drawer="node-detail"
                     aria-label="Node Detail"
-                    aria-hidden=(!node_detail_drawer_open).to_string()
-                    inert=(!node_detail_drawer_open).then_some("")
+                    aria-hidden=(!drawers_open).to_string()
+                    inert=(!drawers_open).then_some("")
                 >
                     <button
                         type="button"
@@ -698,11 +680,15 @@ mod tests {
         assert!(!page.contains("<!--bc-"));
         assert_eq!(page.matches("<leptos-island").count(), 2);
         assert!(page.contains("graph-anchor-range"));
-        assert!(page.contains("class=\"side-drawer-toolbar\""));
+        assert!(!page.contains("side-drawer-toolbar"));
         assert!(page.contains("data-drawer=\"provider-context\""));
         assert!(page.contains("data-drawer=\"node-detail\""));
         assert_eq!(page.matches("data-drawer-close").count(), 2);
-        assert_eq!(page.matches("aria-expanded=\"false\"").count(), 2);
+        assert!(!page.contains("data-drawer-open=\"provider-context\""));
+        assert!(!page.contains("data-drawer-open=\"node-detail\""));
+        assert!(page.contains("aria-hidden=\"true\""));
+        assert!(page.contains("inert"));
+        assert_eq!(page.matches("aria-expanded=\"false\"").count(), 0);
         assert_eq!(
             page.matches("Select a node to inspect its content.")
                 .count(),
