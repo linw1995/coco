@@ -1262,8 +1262,59 @@ body {
   visibility: visible;
 }
 
-.content[data-open-drawer~="node-detail"] [data-drawer="provider-context"] {
-  right: var(--node-detail-drawer-width);
+/* Below the split-layout breakpoint the drawers overlay the graph; when the
+   node detail drawer is open, the provider context panel sits to its left. */
+@media (max-width: 1024px) {
+  .content[data-open-drawer~="node-detail"] [data-drawer="provider-context"] {
+    right: var(--node-detail-drawer-width);
+  }
+}
+
+/* On wide viewports the drawers share the row with the graph: the graph
+   column shrinks as the drawer columns open, so the panels never float over
+   the graph. */
+@media (min-width: 1025px) {
+  .content {
+    --node-detail-drawer-width: 32rem;
+    --provider-context-drawer-width: 22rem;
+    grid-template-columns: minmax(0, 1fr) 0 0;
+    transition: grid-template-columns 180ms ease;
+  }
+
+  .content[data-open-drawer~="provider-context"]:not([data-open-drawer~="node-detail"]) {
+    grid-template-columns: minmax(0, 1fr) var(--provider-context-drawer-width) 0;
+  }
+
+  .content[data-open-drawer~="node-detail"]:not([data-open-drawer~="provider-context"]) {
+    grid-template-columns: minmax(0, 1fr) 0 var(--node-detail-drawer-width);
+  }
+
+  .content[data-open-drawer~="provider-context"][data-open-drawer~="node-detail"] {
+    grid-template-columns: minmax(0, 1fr) var(--provider-context-drawer-width) var(--node-detail-drawer-width);
+  }
+
+  .graph-shell {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .side-drawer {
+    bottom: auto;
+    position: relative;
+    right: auto;
+    top: auto;
+    z-index: auto;
+  }
+
+  .provider-context-panel {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .node-detail-panel {
+    grid-column: 3;
+    grid-row: 1;
+  }
 }
 
 /* When both drawers auto-open on viewports narrower than their combined
@@ -2300,7 +2351,8 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .side-drawer {
+  .side-drawer,
+  .content {
     transition: none;
   }
 }
