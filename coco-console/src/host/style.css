@@ -1278,7 +1278,6 @@ body {
     --node-detail-drawer-width: 32rem;
     --provider-context-drawer-width: 22rem;
     grid-template-columns: minmax(0, 1fr) 0 0;
-    transition: grid-template-columns 180ms ease;
   }
 
   .content[data-open-drawer~="provider-context"]:not([data-open-drawer~="node-detail"]) {
@@ -2351,8 +2350,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .side-drawer,
-  .content {
+  .side-drawer {
     transition: none;
   }
 }
