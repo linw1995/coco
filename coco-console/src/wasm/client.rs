@@ -2855,19 +2855,26 @@ fn open_side_drawers(document: &Document) -> Result<bool, JsValue> {
         .is_some_and(|open| !open.trim().is_empty()))
 }
 
-fn set_open_side_drawers(document: &Document, open: &[SideDrawer]) -> Result<(), JsValue> {
+fn set_open_side_drawers(document: &Document, open: &[SideDrawer]) -> Result<bool, JsValue> {
     let Some(content) = document.query_selector(".content")? else {
-        return Ok(());
+        return Ok(false);
     };
-    if open.is_empty() {
-        content.remove_attribute("data-open-drawer")?;
+    let names = if open.is_empty() {
+        None
     } else {
-        let names = open
-            .iter()
-            .map(|drawer| drawer.name())
-            .collect::<Vec<_>>()
-            .join(" ");
-        content.set_attribute("data-open-drawer", &names)?;
+        Some(
+            open.iter()
+                .map(|drawer| drawer.name())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    };
+    if content.get_attribute("data-open-drawer") == names {
+        return Ok(false);
+    }
+    match names {
+        Some(names) => content.set_attribute("data-open-drawer", &names)?,
+        None => content.remove_attribute("data-open-drawer")?,
     }
     for drawer in [SideDrawer::ProviderContext, SideDrawer::NodeDetail] {
         let expanded = open.contains(&drawer);
@@ -2882,7 +2889,13 @@ fn set_open_side_drawers(document: &Document, open: &[SideDrawer]) -> Result<(),
             }
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+fn resize_viewport_for_open_drawers(graph: &Rc<RefCell<VirtualGraph>>, changed: bool) {
+    if changed {
+        graph.borrow_mut().resize_viewport();
+    }
 }
 
 fn close_side_drawer(document: &Document, drawer: SideDrawer) -> Result<(), JsValue> {
@@ -2920,7 +2933,7 @@ fn focus_graph_surface(document: &Document) -> Result<(), JsValue> {
     Ok(())
 }
 
-fn sync_side_drawer_with_selection(document: &Document, window: &Window) -> Result<(), JsValue> {
+fn sync_side_drawer_with_selection(document: &Document, window: &Window) -> Result<bool, JsValue> {
     let selection = PanelSelection::from_hash(&window.location().hash()?);
     if selection.target.is_some() {
         set_open_side_drawers(
@@ -3431,10 +3444,10 @@ fn install_hashchange_node_selection_listener(
         if let Err(error) = sync_detail_query(&event_window) {
             web_sys::console::error_1(&error);
         }
-        if let Err(error) =
-            sync_side_drawer_with_selection(&selection_graph.borrow().document, &event_window)
-        {
-            web_sys::console::error_1(&error);
+        let document = selection_graph.borrow().document.clone();
+        match sync_side_drawer_with_selection(&document, &event_window) {
+            Ok(changed) => resize_viewport_for_open_drawers(&selection_graph, changed),
+            Err(error) => web_sys::console::error_1(&error),
         }
         focus_selected_node_in_graph(selection_graph.clone());
     });
@@ -3587,11 +3600,12 @@ fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
         let graph = graph.borrow();
         (graph.window.clone(), graph.document.clone())
     };
-    if let Err(error) = set_open_side_drawers(
+    match set_open_side_drawers(
         &document,
         &[SideDrawer::ProviderContext, SideDrawer::NodeDetail],
     ) {
-        web_sys::console::error_1(&error);
+        Ok(changed) => resize_viewport_for_open_drawers(&graph, changed),
+        Err(error) => web_sys::console::error_1(&error),
     }
     match update_detail_hash(&window, &hash) {
         Ok(changed) => {
@@ -5448,6 +5462,56 @@ mod tests {
             .active_element()
             .expect_throw("focus should move to the graph surface");
         assert!(active.class_list().contains("graph-wrap"));
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_opening_drawers_resizes_viewport_before_centering() {
+        let fixture = GraphFixture::new();
+        let document = fixture.graph.borrow().document.clone();
+        let graph_wrap = fixture.graph.borrow().graph_wrap.clone();
+        graph_wrap
+            .set_attribute("style", "width: 320px")
+            .expect_throw("graph width should be set");
+
+        let changed = set_open_side_drawers(
+            &document,
+            &[SideDrawer::ProviderContext, SideDrawer::NodeDetail],
+        )
+        .expect_throw("drawers should open");
+        assert!(changed);
+        resize_viewport_for_open_drawers(&fixture.graph, changed);
+
+        assert_eq!(
+            fixture.graph.borrow().viewport.width,
+            graph_client_width(&graph_wrap)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_hashchange_sync_opens_drawers_without_holding_the_graph_borrow() {
+        let fixture = GraphFixture::new();
+        install_hashchange_node_selection_listener(fixture.graph.clone())
+            .expect_throw("hashchange listener should install");
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .location()
+            .set_hash("detail-aaaaaaaa")
+            .expect_throw("selection hash should be set");
+        window
+            .dispatch_event(
+                &web_sys::Event::new("hashchange").expect_throw("event should be created"),
+            )
+            .expect_throw("hashchange should dispatch");
+        // The handler must run to completion: drawers opened, the selection
+        // focus recorded, and no RefCell borrow panic while resizing.
+        assert!(
+            open_side_drawers(&fixture.graph.borrow().document)
+                .expect_throw("drawer state should resolve")
+        );
+        assert_eq!(
+            fixture.graph.borrow().pending_selection_focus.as_deref(),
+            Some("detail-aaaaaaaa")
+        );
     }
 
     #[wasm_bindgen_test]
