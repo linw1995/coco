@@ -2808,30 +2808,21 @@ fn install_side_drawer_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), 
         else {
             return;
         };
-        if let Some(trigger) = target.closest("button[data-drawer-open]").ok().flatten() {
-            let Some(drawer) = trigger
-                .get_attribute("data-drawer-open")
-                .as_deref()
-                .and_then(SideDrawer::from_name)
-            else {
-                return;
-            };
-            event.prevent_default();
-            if let Err(error) = set_open_side_drawer(&click_document, Some(drawer)) {
-                web_sys::console::error_1(&error);
-            }
+        let Some(button) = target.closest("button[data-drawer-close]").ok().flatten() else {
             return;
-        }
-        if target
-            .closest("button[data-drawer-close]")
+        };
+        let Some(drawer) = button
+            .closest("[data-drawer]")
             .ok()
             .flatten()
-            .is_none()
-        {
+            .and_then(|panel| panel.get_attribute("data-drawer"))
+            .as_deref()
+            .and_then(SideDrawer::from_name)
+        else {
             return;
-        }
+        };
         event.prevent_default();
-        if let Err(error) = close_side_drawer_and_focus_trigger(&click_document) {
+        if let Err(error) = close_side_drawer(&click_document, drawer) {
             web_sys::console::error_1(&error);
         }
     });
@@ -2843,11 +2834,11 @@ fn install_side_drawer_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), 
         if event.key() != "Escape" || event.default_prevented() {
             return;
         }
-        let Ok(Some(_)) = open_side_drawer(&keyboard_document) else {
+        if !matches!(open_side_drawers(&keyboard_document), Ok(true)) {
             return;
-        };
+        }
         event.prevent_default();
-        if let Err(error) = close_side_drawer_and_focus_trigger(&keyboard_document) {
+        if let Err(error) = close_side_drawers(&keyboard_document) {
             web_sys::console::error_1(&error);
         }
     });
@@ -2857,25 +2848,29 @@ fn install_side_drawer_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), 
     Ok(())
 }
 
-fn open_side_drawer(document: &Document) -> Result<Option<SideDrawer>, JsValue> {
+fn open_side_drawers(document: &Document) -> Result<bool, JsValue> {
     Ok(document
         .query_selector(".content")?
         .and_then(|content| content.get_attribute("data-open-drawer"))
-        .as_deref()
-        .and_then(SideDrawer::from_name))
+        .is_some_and(|open| !open.trim().is_empty()))
 }
 
-fn set_open_side_drawer(document: &Document, selected: Option<SideDrawer>) -> Result<(), JsValue> {
+fn set_open_side_drawers(document: &Document, open: &[SideDrawer]) -> Result<(), JsValue> {
     let Some(content) = document.query_selector(".content")? else {
         return Ok(());
     };
-    if let Some(selected) = selected {
-        content.set_attribute("data-open-drawer", selected.name())?;
-    } else {
+    if open.is_empty() {
         content.remove_attribute("data-open-drawer")?;
+    } else {
+        let names = open
+            .iter()
+            .map(|drawer| drawer.name())
+            .collect::<Vec<_>>()
+            .join(" ");
+        content.set_attribute("data-open-drawer", &names)?;
     }
     for drawer in [SideDrawer::ProviderContext, SideDrawer::NodeDetail] {
-        let expanded = selected == Some(drawer);
+        let expanded = open.contains(&drawer);
         if let Some(panel) =
             document.query_selector(&format!("[data-drawer=\"{}\"]", drawer.name()))?
         {
@@ -2886,35 +2881,55 @@ fn set_open_side_drawer(document: &Document, selected: Option<SideDrawer>) -> Re
                 panel.set_attribute("inert", "")?;
             }
         }
-        if let Some(trigger) =
-            document.query_selector(&format!("button[data-drawer-open=\"{}\"]", drawer.name()))?
-        {
-            trigger.set_attribute("aria-expanded", if expanded { "true" } else { "false" })?;
-        }
     }
     Ok(())
 }
 
-fn close_side_drawer_and_focus_trigger(document: &Document) -> Result<(), JsValue> {
-    let open = open_side_drawer(document)?;
-    set_open_side_drawer(document, None)?;
-    let Some(open) = open else {
+fn close_side_drawer(document: &Document, drawer: SideDrawer) -> Result<(), JsValue> {
+    let Some(content) = document.query_selector(".content")? else {
         return Ok(());
     };
-    if let Some(trigger) =
-        document.query_selector(&format!("button[data-drawer-open=\"{}\"]", open.name()))?
-    {
-        trigger.unchecked_into::<web_sys::HtmlElement>().focus()?;
+    let Some(open) = content.get_attribute("data-open-drawer") else {
+        return Ok(());
+    };
+    let remaining = open
+        .split_whitespace()
+        .filter(|name| *name != drawer.name())
+        .filter_map(SideDrawer::from_name)
+        .collect::<Vec<_>>();
+    if remaining.len() == open.split_whitespace().count() {
+        return Ok(());
+    }
+    set_open_side_drawers(document, &remaining)?;
+    focus_graph_surface(document)
+}
+
+fn close_side_drawers(document: &Document) -> Result<(), JsValue> {
+    let was_open = open_side_drawers(document)?;
+    set_open_side_drawers(document, &[])?;
+    if was_open {
+        focus_graph_surface(document)?;
+    }
+    Ok(())
+}
+
+fn focus_graph_surface(document: &Document) -> Result<(), JsValue> {
+    if let Some(surface) = document.query_selector(".graph-wrap")? {
+        surface.unchecked_into::<web_sys::HtmlElement>().focus()?;
     }
     Ok(())
 }
 
 fn sync_side_drawer_with_selection(document: &Document, window: &Window) -> Result<(), JsValue> {
     let selection = PanelSelection::from_hash(&window.location().hash()?);
-    set_open_side_drawer(
-        document,
-        selection.target.is_some().then_some(SideDrawer::NodeDetail),
-    )
+    if selection.target.is_some() {
+        set_open_side_drawers(
+            document,
+            &[SideDrawer::ProviderContext, SideDrawer::NodeDetail],
+        )
+    } else {
+        set_open_side_drawers(document, &[])
+    }
 }
 
 fn install_anchor_range_listener(graph: Rc<RefCell<VirtualGraph>>) -> Result<(), JsValue> {
@@ -3572,7 +3587,10 @@ fn select_detail_link(graph: Rc<RefCell<VirtualGraph>>, hash: String) {
         let graph = graph.borrow();
         (graph.window.clone(), graph.document.clone())
     };
-    if let Err(error) = set_open_side_drawer(&document, Some(SideDrawer::NodeDetail)) {
+    if let Err(error) = set_open_side_drawers(
+        &document,
+        &[SideDrawer::ProviderContext, SideDrawer::NodeDetail],
+    ) {
         web_sys::console::error_1(&error);
     }
     match update_detail_hash(&window, &hash) {
@@ -4267,12 +4285,6 @@ mod tests {
                     </details>
                   </div>
                   <section class="content">
-                    <nav class="side-drawer-toolbar">
-                      <button type="button" data-drawer-open="provider-context"
-                              aria-expanded="false">Context</button>
-                      <button type="button" data-drawer-open="node-detail"
-                              aria-expanded="false">Detail</button>
-                    </nav>
                     <aside data-drawer="provider-context" aria-hidden="true" inert>
                       <button type="button" data-drawer-close>Close</button>
                     </aside>
@@ -4280,7 +4292,7 @@ mod tests {
                       <button type="button" data-drawer-close>Close</button>
                     </aside>
                   </section>
-                  <div class="graph-wrap" data-zoom="1">
+                  <div class="graph-wrap" data-zoom="1" tabindex="0">
                     <button class="follow-toggle" type="button" aria-pressed="false">Follow</button>
                     <svg class="graph">
                       <rect class="graph-bg"></rect>
@@ -5380,17 +5392,17 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_side_drawers_switch_and_close_without_clearing_selection() {
+    fn graph_items_side_drawers_open_with_selection_and_close_without_clearing_selection() {
         let fixture = GraphFixture::new();
         let document = fixture.graph.borrow().document.clone();
         let window = fixture.graph.borrow().window.clone();
 
-        set_open_side_drawer(&document, Some(SideDrawer::ProviderContext))
-            .expect_throw("provider context drawer should open");
-        assert_eq!(
-            open_side_drawer(&document).expect_throw("drawer state should resolve"),
-            Some(SideDrawer::ProviderContext)
-        );
+        set_open_side_drawers(
+            &document,
+            &[SideDrawer::ProviderContext, SideDrawer::NodeDetail],
+        )
+        .expect_throw("drawers should open");
+        assert!(open_side_drawers(&document).expect_throw("drawer state should resolve"));
         let provider = query_required(&document, "[data-drawer=\"provider-context\"]")
             .expect_throw("provider context drawer should exist");
         let detail = query_required(&document, "[data-drawer=\"node-detail\"]")
@@ -5400,37 +5412,42 @@ mod tests {
             Some("false")
         );
         assert!(!provider.has_attribute("inert"));
+        assert_eq!(
+            detail.get_attribute("aria-hidden").as_deref(),
+            Some("false")
+        );
+        assert!(!detail.has_attribute("inert"));
+
+        close_side_drawer(&document, SideDrawer::NodeDetail)
+            .expect_throw("node detail drawer should close");
+        assert_eq!(
+            provider.get_attribute("aria-hidden").as_deref(),
+            Some("false")
+        );
         assert_eq!(detail.get_attribute("aria-hidden").as_deref(), Some("true"));
-        assert!(detail.has_attribute("inert"));
 
         window
             .location()
             .set_hash("detail-aaaaaaaa")
             .expect_throw("selection hash should be set");
         sync_side_drawer_with_selection(&document, &window)
-            .expect_throw("node selection should open detail drawer");
+            .expect_throw("node selection should open both drawers");
+        assert!(open_side_drawers(&document).expect_throw("drawer state should resolve"));
         assert_eq!(
-            open_side_drawer(&document).expect_throw("drawer state should resolve"),
-            Some(SideDrawer::NodeDetail)
+            detail.get_attribute("aria-hidden").as_deref(),
+            Some("false")
         );
 
-        close_side_drawer_and_focus_trigger(&document)
-            .expect_throw("node detail drawer should close");
-        assert_eq!(
-            open_side_drawer(&document).expect_throw("drawer state should resolve"),
-            None
-        );
+        close_side_drawers(&document).expect_throw("drawers should close");
+        assert!(!open_side_drawers(&document).expect_throw("drawer state should resolve"));
         assert_eq!(
             window.location().hash().expect_throw("hash should exist"),
             "#detail-aaaaaaaa"
         );
         let active = document
             .active_element()
-            .expect_throw("drawer trigger should receive focus");
-        assert_eq!(
-            active.get_attribute("data-drawer-open").as_deref(),
-            Some("node-detail")
-        );
+            .expect_throw("focus should move to the graph surface");
+        assert!(active.class_list().contains("graph-wrap"));
     }
 
     #[wasm_bindgen_test]

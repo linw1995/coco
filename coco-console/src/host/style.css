@@ -573,14 +573,6 @@ body {
   position: relative;
 }
 
-.content[data-open-drawer="provider-context"] {
-  --open-drawer-width: var(--provider-context-drawer-width);
-}
-
-.content[data-open-drawer="node-detail"] {
-  --open-drawer-width: var(--node-detail-drawer-width);
-}
-
 .graph-shell {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto auto;
@@ -1245,7 +1237,7 @@ body {
   right: 0;
   top: 0;
   transform: translateX(100%);
-  transition: transform 180ms ease, visibility 180ms;
+  transition: right 180ms ease, transform 180ms ease, visibility 180ms;
   visibility: hidden;
   z-index: 20;
 }
@@ -1258,28 +1250,38 @@ body {
   width: var(--node-detail-drawer-width);
 }
 
-.content[data-open-drawer="provider-context"] [data-drawer="provider-context"],
-.content[data-open-drawer="node-detail"] [data-drawer="node-detail"] {
+.content[data-open-drawer~="provider-context"] [data-drawer="provider-context"] {
   pointer-events: auto;
   transform: translateX(0);
   visibility: visible;
 }
 
-.side-drawer-toolbar {
-  display: grid;
-  gap: 0.45rem;
-  position: absolute;
-  right: 1rem;
-  top: 4rem;
-  transition: right 180ms ease;
-  z-index: 21;
+.content[data-open-drawer~="node-detail"] [data-drawer="node-detail"] {
+  pointer-events: auto;
+  transform: translateX(0);
+  visibility: visible;
 }
 
-.content[data-open-drawer] .side-drawer-toolbar {
-  right: calc(var(--open-drawer-width) + 0.75rem);
+.content[data-open-drawer~="node-detail"] [data-drawer="provider-context"] {
+  right: var(--node-detail-drawer-width);
 }
 
-.side-drawer-toolbar button,
+/* When both drawers auto-open on viewports narrower than their combined
+   width, stack them vertically instead of pushing the provider context panel
+   past the left edge of the content area. */
+@media (max-width: 54rem) {
+  .content[data-open-drawer~="provider-context"][data-open-drawer~="node-detail"] [data-drawer="provider-context"] {
+    bottom: auto;
+    height: 45%;
+    right: 0;
+  }
+
+  .content[data-open-drawer~="provider-context"][data-open-drawer~="node-detail"] [data-drawer="node-detail"] {
+    height: 55%;
+    top: auto;
+  }
+}
+
 .side-drawer-close {
   align-items: center;
   background: rgba(8, 11, 18, 0.9);
@@ -1291,31 +1293,20 @@ body {
   font: inherit;
   font-size: 0.72rem;
   font-weight: 650;
+  height: 2rem;
   justify-content: center;
+  position: absolute;
+  right: 0.75rem;
+  top: 0.65rem;
+  width: 2rem;
 }
 
-.side-drawer-toolbar button {
-  min-height: 2rem;
-  padding: 0 0.68rem;
-}
-
-.side-drawer-toolbar button:hover,
-.side-drawer-toolbar button:focus-visible,
-.side-drawer-toolbar button[aria-expanded="true"],
 .side-drawer-close:hover,
 .side-drawer-close:focus-visible {
   background: rgba(30, 64, 175, 0.4);
   border-color: rgba(96, 165, 250, 0.68);
   color: #eff6ff;
   outline: none;
-}
-
-.side-drawer-close {
-  height: 2rem;
-  position: absolute;
-  right: 0.75rem;
-  top: 0.65rem;
-  width: 2rem;
 }
 
 .side-drawer-close span {
@@ -2309,8 +2300,7 @@ leptos-island:has(> .panel-content) > .provider-context-default {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .side-drawer,
-  .side-drawer-toolbar {
+  .side-drawer {
     transition: none;
   }
 }
