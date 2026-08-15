@@ -3444,7 +3444,8 @@ fn install_hashchange_node_selection_listener(
         if let Err(error) = sync_detail_query(&event_window) {
             web_sys::console::error_1(&error);
         }
-        match sync_side_drawer_with_selection(&selection_graph.borrow().document, &event_window) {
+        let document = selection_graph.borrow().document.clone();
+        match sync_side_drawer_with_selection(&document, &event_window) {
             Ok(changed) => resize_viewport_for_open_drawers(&selection_graph, changed),
             Err(error) => web_sys::console::error_1(&error),
         }
@@ -5483,6 +5484,33 @@ mod tests {
         assert_eq!(
             fixture.graph.borrow().viewport.width,
             graph_client_width(&graph_wrap)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_hashchange_sync_opens_drawers_without_holding_the_graph_borrow() {
+        let fixture = GraphFixture::new();
+        install_hashchange_node_selection_listener(fixture.graph.clone())
+            .expect_throw("hashchange listener should install");
+        let window = fixture.graph.borrow().window.clone();
+        window
+            .location()
+            .set_hash("detail-aaaaaaaa")
+            .expect_throw("selection hash should be set");
+        window
+            .dispatch_event(
+                &web_sys::Event::new("hashchange").expect_throw("event should be created"),
+            )
+            .expect_throw("hashchange should dispatch");
+        // The handler must run to completion: drawers opened, the selection
+        // focus recorded, and no RefCell borrow panic while resizing.
+        assert!(
+            open_side_drawers(&fixture.graph.borrow().document)
+                .expect_throw("drawer state should resolve")
+        );
+        assert_eq!(
+            fixture.graph.borrow().pending_selection_focus.as_deref(),
+            Some("detail-aaaaaaaa")
         );
     }
 
