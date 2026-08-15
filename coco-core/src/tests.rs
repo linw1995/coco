@@ -9,7 +9,7 @@ use coco_llm::coco_mem::{
     Anchor, BackendMetadata, BranchStore, ExecutionMetadata, JobStatus, JobStore, Kind,
     MessageQueueStore, NewNode, NodeStore, PromptAnchor, ProviderMetadata, Role, SessionRole,
     SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillScript, SkillStore,
-    SkillVersionSpec, SqliteStore, ToolResult, ToolUse,
+    SkillVersionSpec, SqliteGraphStore, SqliteStore, ToolResult, ToolUse,
 };
 use coco_llm::{
     BACKEND_STEP_RETRY_LIMIT, BackendError, BackendEventPayload, BackendTurn, CompletionBackend,
@@ -56,21 +56,24 @@ fn failed_backend_responses(message: &str) -> Vec<std::result::Result<&'static s
 
 async fn append_skill_invocation_node<S>(store: &S, parent: &str, skill_name: &str) -> String
 where
-    S: NodeStore,
+    S: NodeStore + BranchStore,
 {
     store
-        .append(NewNode {
-            parent: parent.to_owned(),
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::skill_invocation(
-                vec![],
-                SkillInvocationAnchor {
-                    skill_name: skill_name.to_owned(),
-                    mode: SkillInvocationMode::InheritContext,
-                },
-            )),
-        })
+        .append_on_branch(
+            "main",
+            NewNode {
+                parent: parent.to_owned(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::skill_invocation(
+                    vec![],
+                    SkillInvocationAnchor {
+                        skill_name: skill_name.to_owned(),
+                        mode: SkillInvocationMode::InheritContext,
+                    },
+                )),
+            },
+        )
         .await
         .unwrap()
 }
@@ -325,18 +328,21 @@ async fn submit_prompt_job(
 ) -> coco_llm::coco_mem::Job {
     let parent = store.get_branch_head(branch).await.unwrap();
     let prompt_anchor_id = store
-        .append(NewNode {
-            parent,
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::prompt(
-                vec![],
-                PromptAnchor {
-                    prompt: prompt.to_owned(),
-                    attachments: vec![],
-                },
-            )),
-        })
+        .append_on_branch(
+            branch,
+            NewNode {
+                parent,
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: prompt.to_owned(),
+                        attachments: vec![],
+                    },
+                )),
+            },
+        )
         .await
         .unwrap();
     store.submit_job(branch, &prompt_anchor_id).await.unwrap()
@@ -1701,18 +1707,21 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         .unwrap();
     let caller_task = "Review the inherited task from the parent prompt.";
     let caller_prompt_id = store
-        .append(NewNode {
-            parent: base_session.anchor_id.clone(),
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::prompt(
-                vec![],
-                PromptAnchor {
-                    prompt: caller_task.to_owned(),
-                    attachments: vec![],
-                },
-            )),
-        })
+        .append_on_branch(
+            "main",
+            NewNode {
+                parent: base_session.anchor_id.clone(),
+                role: Role::System,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![],
+                    PromptAnchor {
+                        prompt: caller_task.to_owned(),
+                        attachments: vec![],
+                    },
+                )),
+            },
+        )
         .await
         .unwrap();
     let invocation_id = append_skill_invocation_node(&store, &caller_prompt_id, "fast-rust").await;
@@ -1784,6 +1793,40 @@ async fn llm_engine_executes_skill_and_cleans_up_child_branch() {
         &node.kind,
         Kind::Anchor(anchor) if anchor.as_prompt().is_some()
     )));
+
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let origin_records = graph
+        .graph_node_records_by_ids(&[
+            invocation_id.clone(),
+            child_session_anchor.0.id.clone(),
+            result.response_node_id.clone(),
+        ])
+        .await
+        .unwrap();
+    let invocation_origin = origin_records
+        .iter()
+        .find(|node| node.id == invocation_id)
+        .unwrap()
+        .origin
+        .as_ref()
+        .unwrap();
+    assert_eq!(invocation_origin.branch_name, "main");
+    let child_origins = origin_records
+        .iter()
+        .filter(|node| node.id != invocation_id)
+        .map(|node| node.origin.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        child_origins
+            .iter()
+            .all(|origin| origin.branch_name == child_branch && origin.branch_deleted_at.is_some())
+    );
+    assert_eq!(
+        child_origins[0].branch_instance_id,
+        child_origins[1].branch_instance_id
+    );
 
     let provider_contexts = provider_contexts.lock().await;
     assert_eq!(provider_contexts.len(), 1);

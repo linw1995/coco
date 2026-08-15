@@ -42,6 +42,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    web_graph_node_origins (node_id) {
+        node_id -> Text,
+        branch_instance_id -> Text,
+        branch_name -> Text,
+    }
+}
+
+diesel::table! {
     web_graph_node_placements (layout_kind, node_id) {
         layout_kind -> Text,
         node_id -> Text,
@@ -144,6 +152,7 @@ diesel::table! {
 diesel::joinable!(web_graph_edge_routes -> web_graph_layouts (layout_kind));
 diesel::joinable!(web_graph_node_placements -> web_graph_layouts (layout_kind));
 diesel::joinable!(web_graph_node_placements -> web_graph_nodes (node_id));
+diesel::joinable!(web_graph_node_origins -> web_graph_nodes (node_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     web_graph_edge_routes,
@@ -151,6 +160,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     web_graph_exec_sessions,
     web_graph_layouts,
     web_graph_node_placements,
+    web_graph_node_origins,
     web_graph_node_spatial_index,
     web_graph_node_spatial_items,
     web_graph_nodes,

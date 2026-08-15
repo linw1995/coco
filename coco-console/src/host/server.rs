@@ -545,8 +545,10 @@ where
                 resolve_tool_use_input_links(&state.web_graph, &node).await?;
             let highlights = super::syntax_highlight::tool_input_syntax_highlights(&node);
             let markdown_documents = super::markdown::node_markdown_documents(&node);
+            let origin = state.web_graph.node_origin(&node.id).await?;
             Ok(NodeDetailResponse::Found {
                 node: Box::new(node),
+                origin,
                 parent_graph_links,
                 markdown_documents,
                 tool_use_input_links,

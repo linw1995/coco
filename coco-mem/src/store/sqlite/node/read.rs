@@ -834,10 +834,30 @@ pub async fn load_graph_node_records_by_exact_ids(
         return Ok(Vec::new());
     }
     let rows = nodes::table
+        .left_join(node_origins::table.on(node_origins::node_id.eq(nodes::id)))
+        .left_join(
+            branch_instances::table.on(branch_instances::instance_id
+                .nullable()
+                .eq(node_origins::branch_instance_id.nullable())),
+        )
         .filter(nodes::id.eq_any(ids))
-        .select((nodes::id, nodes::parent_id, nodes::kind))
+        .select((
+            nodes::id,
+            nodes::parent_id,
+            nodes::kind,
+            node_origins::branch_instance_id.nullable(),
+            branch_instances::name.nullable(),
+            branch_instances::deleted_at.nullable(),
+        ))
         .order(nodes::id)
-        .load::<(String, String, String)>(connection)
+        .load::<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>(connection)
         .await
         .context(QuerySqliteStoreSnafu {
             path: path.to_owned(),
@@ -855,20 +875,37 @@ pub async fn load_graph_node_records_by_exact_ids(
     );
     let rows = rows
         .into_iter()
-        .map(|(id, parent, kind)| {
+        .map(|(id, parent, kind, instance_id, branch_name, deleted_at)| {
             let is_anchor = graph_node_kind_is_anchor(path, &id, &kind)?;
-            Ok((id, parent, is_anchor))
+            let origin = match (instance_id, branch_name) {
+                (Some(branch_instance_id), Some(branch_name)) => {
+                    Some(super::super::GraphNodeOrigin {
+                        branch_instance_id,
+                        branch_name,
+                        branch_deleted_at: deleted_at,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    return CorruptedStoreSnafu {
+                        path: path.to_owned(),
+                        message: format!("SQLite node {id:?} has an incomplete branch origin"),
+                    }
+                    .fail();
+                }
+            };
+            Ok((id, parent, is_anchor, origin))
         })
         .collect::<Result<Vec<_>>>()?;
     let anchor_ids = rows
         .iter()
-        .filter(|(_, _, is_anchor)| *is_anchor)
-        .map(|(id, _, _)| id.clone())
+        .filter(|(_, _, is_anchor, _)| *is_anchor)
+        .map(|(id, _, _, _)| id.clone())
         .collect::<Vec<_>>();
     let mut relations =
         load_node_relation_rows_for_ids(connection, path, Some(&anchor_ids)).await?;
     rows.into_iter()
-        .map(|(id, parent, is_anchor)| {
+        .map(|(id, parent, is_anchor, origin)| {
             let merge_parents = if is_anchor {
                 let relation_rows = relations.remove(&id).unwrap_or_default();
                 super::write::merge_parents_from_relation_rows(path, &id, &parent, &relation_rows)?
@@ -880,6 +917,7 @@ pub async fn load_graph_node_records_by_exact_ids(
                 parent,
                 is_anchor,
                 merge_parents,
+                origin,
             })
         })
         .collect()

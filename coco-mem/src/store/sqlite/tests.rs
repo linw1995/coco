@@ -5,20 +5,20 @@ use super::{
     NodeToolUseRow, SqliteGraphStore, SqliteStore,
 };
 use crate::schema::{
-    jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
+    branch_instances, jobs, node_anchor_prompt_attachments, node_anchor_session_patch_tools,
     node_anchor_session_patches, node_anchor_session_tools, node_anchor_sessions,
-    node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_relations,
-    node_tool_results, node_tool_uses, nodes, preset_version_tools, preset_versions, sessions,
-    skill_version_scripts, skill_versions,
+    node_anchor_skill_invocations, node_anchor_skill_results, node_metadata, node_origins,
+    node_relations, node_tool_results, node_tool_uses, nodes, preset_version_tools,
+    preset_versions, sessions, skill_version_scripts, skill_versions,
 };
 use crate::{
-    Anchor, BackendMetadata, BranchStore, GRAPH_READ_BATCH_SIZE, GraphBranchRecord,
-    GraphNodeCursor, Job, JobStatus, JobStore, Kind, MergeParent, MessageQueueStore, NewNode, Node,
-    NodeStore, PauseReason, Preset, PresetStore, PromptAnchor, PromptAttachment,
-    PromptImageAttachment, Role, SessionAnchor, SessionAnchorPatch, SessionRole, SessionState,
-    SessionStore, SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor,
-    SkillRuntimeContext, SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError,
-    Tool, ToolResult, ToolUse,
+    Anchor, BackendMetadata, BranchStore, GRAPH_READ_BATCH_SIZE, GraphNodeCursor, Job, JobStatus,
+    JobStore, Kind, MergeParent, MessageQueueStore, NewNode, NewNodeContent, Node, NodeStore,
+    PauseReason, Preset, PresetStore, PromptAnchor, PromptAttachment, PromptImageAttachment, Role,
+    SessionAnchor, SessionAnchorPatch, SessionRole, SessionState, SessionStore,
+    SkillInvocationAnchor, SkillInvocationMode, SkillResultAnchor, SkillRuntimeContext,
+    SkillScript, SkillStore, SkillUpdatePatch, SkillVersionSpec, StoreError, Tool, ToolResult,
+    ToolUse,
 };
 use diesel::connection::InstrumentationEvent;
 use diesel::prelude::*;
@@ -841,14 +841,12 @@ async fn graph_read_api_loads_branches_nodes_and_children_in_bounded_calls() {
     store.set_branch_head("main", &root, &child).await.unwrap();
     let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
 
-    assert_eq!(
-        graph.graph_branches().await.unwrap(),
-        vec![GraphBranchRecord {
-            name: "main".to_owned(),
-            head_id: child.clone(),
-            state: SessionState::Active,
-        }]
-    );
+    let branches = graph.graph_branches().await.unwrap();
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].name, "main");
+    assert!(branches[0].instance_id.starts_with("branch-"));
+    assert_eq!(branches[0].head_id, child);
+    assert_eq!(branches[0].state, SessionState::Active);
     let nodes = graph
         .graph_nodes_by_ids(&[root.clone(), child.clone()])
         .await
@@ -867,6 +865,237 @@ async fn graph_read_api_loads_branches_nodes_and_children_in_bounded_calls() {
             .unwrap()
             .get(&root),
         Some(&vec![child])
+    );
+}
+
+#[tokio::test]
+async fn branch_origins_are_immutable_across_head_moves_and_name_reuse() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let root = store.root_id();
+    let detached = store
+        .append(NewNode {
+            parent: root.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("detached".to_owned()),
+        })
+        .await
+        .unwrap();
+    store.fork("day", &root).await.unwrap();
+    let first_instance = SqliteGraphStore::open_read_only(&path)
+        .await
+        .unwrap()
+        .graph_branches()
+        .await
+        .unwrap()[0]
+        .instance_id
+        .clone();
+    let first = store
+        .append_on_branch(
+            "day",
+            NewNode {
+                parent: root.clone(),
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("first generation".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    store.set_branch_head("day", &root, &first).await.unwrap();
+    store.set_branch_head("day", &first, &root).await.unwrap();
+    store.delete_branch("day").await.unwrap();
+    store.fork("day", &root).await.unwrap();
+
+    let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+    let second_instance = graph.graph_branches().await.unwrap()[0].instance_id.clone();
+    assert_ne!(first_instance, second_instance);
+    let records = graph
+        .graph_node_records_by_ids(&[detached, first.clone()])
+        .await
+        .unwrap();
+    assert!(
+        records
+            .iter()
+            .find(|node| node.id != first)
+            .unwrap()
+            .origin
+            .is_none()
+    );
+    let first_origin = records
+        .iter()
+        .find(|node| node.id == first)
+        .unwrap()
+        .origin
+        .as_ref()
+        .unwrap();
+    assert_eq!(first_origin.branch_instance_id, first_instance);
+    assert_eq!(first_origin.branch_name, "day");
+    assert!(first_origin.branch_deleted_at.is_some());
+
+    let mut connection = store.connect().await.unwrap();
+    assert_eq!(
+        branch_instances::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        node_origins::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn atomic_branch_bootstrap_assigns_one_instance_to_every_initial_node() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("store");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let root = store.root_id();
+    let head = store
+        .fork_with_nodes(
+            "main",
+            &root,
+            vec![
+                NewNodeContent {
+                    role: Role::System,
+                    metadata: None,
+                    kind: Kind::Text("bootstrap".to_owned()),
+                },
+                NewNodeContent {
+                    role: Role::User,
+                    metadata: None,
+                    kind: Kind::Text("prompt".to_owned()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get_branch_head("main").await.unwrap(), head);
+
+    let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+    let branch = graph.graph_branches().await.unwrap().pop().unwrap();
+    let ancestry = store.ancestry(&head).await.unwrap();
+    let ids = ancestry
+        .iter()
+        .filter(|node| !node.is_root())
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    let origins = graph
+        .graph_node_records_by_ids(&ids)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|node| node.origin.unwrap().branch_instance_id)
+        .collect::<HashSet<_>>();
+    assert_eq!(origins, HashSet::from([branch.instance_id]));
+}
+
+#[tokio::test]
+async fn failed_branch_bootstrap_rolls_back_instance_session_nodes_and_origins() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let error = store
+        .fork_with_nodes(
+            "day",
+            &root,
+            vec![NewNodeContent {
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Anchor(Anchor::prompt(
+                    vec![MergeParent::merge("missing-node")],
+                    PromptAnchor {
+                        prompt: "invalid bootstrap".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                )),
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("missing-node"));
+
+    let mut connection = store.connect().await.unwrap();
+    assert_eq!(
+        branch_instances::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sessions::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        nodes::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        node_origins::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn failed_branch_batch_rolls_back_nodes_origins_and_head_movement() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    store.fork("day", &root).await.unwrap();
+
+    store
+        .append_nodes_and_set_branch_head_to(
+            "day",
+            &root,
+            &root,
+            "missing-head",
+            vec![NewNodeContent {
+                role: Role::User,
+                metadata: None,
+                kind: Kind::Text("rolled back".to_owned()),
+            }],
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(store.get_branch_head("day").await.unwrap(), root);
+    let mut connection = store.connect().await.unwrap();
+    assert_eq!(
+        nodes::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        node_origins::table
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .unwrap(),
+        0
     );
 }
 
@@ -2613,6 +2842,92 @@ async fn session_operations_persist_across_reopen() {
     );
     assert!(reopened.get_node(&rebased).await.is_ok());
     assert!(reopened.get_node(&handoff).await.is_ok());
+    let graph = SqliteGraphStore::open_read_only(&path).await.unwrap();
+    let branch = graph.graph_branches().await.unwrap().pop().unwrap();
+    assert!(
+        graph
+            .graph_node_records_by_ids(&[rebased, handoff])
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|record| record
+                .origin
+                .is_some_and(|origin| { origin.branch_instance_id == branch.instance_id }))
+    );
+}
+
+#[tokio::test]
+async fn no_op_rebase_does_not_backfill_origins_on_existing_nodes() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let session = store.append(session_anchor_node(&root)).await.unwrap();
+    let text = store
+        .append(NewNode {
+            parent: session.clone(),
+            role: Role::User,
+            metadata: None,
+            kind: Kind::Text("detached history".to_owned()),
+        })
+        .await
+        .unwrap();
+    store.fork("main", &text).await.unwrap();
+
+    let rebased = store
+        .rebase_session("main", &SessionAnchorPatch::default())
+        .await
+        .unwrap();
+
+    assert_eq!(rebased, text);
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    assert!(
+        graph
+            .graph_node_records_by_ids(&[session, rebased])
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|record| record.origin.is_none())
+    );
+}
+
+#[tokio::test]
+async fn prompt_job_base_and_session_patch_use_the_branch_instance_origin() {
+    let store = SqliteStore::open_temporary().await.unwrap();
+    let root = store.root_id();
+    let session = store.append(session_anchor_node(&root)).await.unwrap();
+    store.fork("main", &session).await.unwrap();
+    let job = store
+        .submit_job_with_id_and_prompt_base(
+            "job-origin",
+            "main",
+            PromptAnchor {
+                prompt: "job prompt".to_owned(),
+                attachments: Vec::new(),
+            },
+            Vec::new(),
+            Some(SessionAnchorPatch {
+                model: Some("gpt-5.5".to_owned()),
+                ..SessionAnchorPatch::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let patch = store.get_node(&job.base).await.unwrap().parent;
+    let graph = SqliteGraphStore::open_read_only(store.store_path())
+        .await
+        .unwrap();
+    let branch = graph.graph_branches().await.unwrap().pop().unwrap();
+    assert!(
+        graph
+            .graph_node_records_by_ids(&[patch, job.base])
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|record| record
+                .origin
+                .is_some_and(|origin| { origin.branch_instance_id == branch.instance_id }))
+    );
 }
 
 #[tokio::test]

@@ -3,8 +3,8 @@
 use leptos::prelude::*;
 
 use crate::api::{
-    GraphBezierRoute, GraphErrorNode, GraphJob, GraphViewportEdge, GraphViewportEdgeKind,
-    GraphViewportNode, GraphViewportResponse,
+    GraphBezierRoute, GraphBranchHeadLink, GraphErrorNode, GraphJob, GraphViewportEdge,
+    GraphViewportEdgeKind, GraphViewportNode, GraphViewportResponse,
 };
 
 pub const GRAPH_FOCUS_TARGET_QUERY: &str = "graph_focus_target";
@@ -31,20 +31,38 @@ struct RenderedNode {
     id: String,
     key: String,
     target: String,
+    href: String,
     node_id: String,
     x: i32,
     y: i32,
     class: String,
     title: String,
     label: String,
+    head_links: Vec<RenderedBranchHeadLink>,
     kind: String,
+}
+
+struct RenderedBranchHeadLink {
+    branch: String,
+    node_target: String,
+    href: String,
+    x: i32,
+    y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchHeadLinkLayout {
+    pub branch: String,
+    pub node_target: String,
+    pub href: String,
+    pub x: i32,
 }
 
 struct RenderedEdge {
     id: String,
     hit_target_id: String,
     key: String,
-    class: &'static str,
+    class: String,
     marker: &'static str,
     path: String,
     kind: &'static str,
@@ -87,16 +105,28 @@ impl GraphCanvasModel {
 
 impl RenderedNode {
     fn new(node: &GraphViewportNode) -> Self {
+        let target = node.node_target.clone();
         Self {
             id: render_element_id(&node.key),
             key: node.key.clone(),
-            target: node.node_target.clone(),
+            href: node.href.clone().unwrap_or_else(|| format!("#{target}")),
+            target,
             node_id: node.id.clone(),
             x: node.x,
             y: node.y,
             class: node_group_class(node),
             title: node_title_text(node),
             label: node_label(node),
+            head_links: branch_head_link_layouts(&node.head_links)
+                .into_iter()
+                .map(|link| RenderedBranchHeadLink {
+                    branch: link.branch,
+                    node_target: link.node_target,
+                    href: link.href,
+                    x: node.x + link.x,
+                    y: node.y - 27,
+                })
+                .collect(),
             kind: node.kind.clone(),
         }
     }
@@ -104,12 +134,12 @@ impl RenderedNode {
 
 impl RenderedEdge {
     fn new(edge: &GraphViewportEdge) -> Self {
-        let (class, marker) = edge_style(edge.kind);
+        let (base_class, marker) = edge_style(edge.kind);
         Self {
             id: render_element_id(&edge.key),
             hit_target_id: edge_hit_target_id(&edge.key),
             key: edge.key.clone(),
-            class,
+            class: edge_class(edge, base_class),
             marker,
             path: bezier_path(edge.route),
             kind: edge.kind.key_part(),
@@ -438,12 +468,28 @@ fn graph_edge_view(edge: RenderedEdge, render_hit_target: bool) -> AnyView {
 }
 
 fn graph_node_view(node: RenderedNode) -> AnyView {
+    let head_links_id = node_head_links_id(&node.key);
+    let head_links = (!node.head_links.is_empty()).then(|| {
+        view! {
+            <g id=head_links_id class="node-branch-head-links">
+                {node.head_links.into_iter().map(|link| view! {
+                    <a
+                        class="node-branch-head-link"
+                        href=link.href
+                        data-node-target=link.node_target
+                    >
+                        <text class="node-branch-head-label" x=link.x y=link.y>{link.branch}</text>
+                    </a>
+                }).collect_view()}
+            </g>
+        }
+    });
     view! {
         <a
             id=node.id
             data-render-key=node.key
             class="node-link"
-            href=format!("#{}", node.target)
+            href=node.href
             data-node-target=node.target
             data-node-id=node.node_id
             data-base-node-x=node.x
@@ -457,6 +503,7 @@ fn graph_node_view(node: RenderedNode) -> AnyView {
                 <text class="node-kind" y="44">{node.kind}</text>
             </g>
         </a>
+        {head_links}
     }
     .into_any()
 }
@@ -491,6 +538,12 @@ pub fn edge_hit_target_id(key: &str) -> String {
 
 pub fn node_group_class(node: &GraphViewportNode) -> String {
     let mut class = format!("node {}", css_token(&node.kind));
+    if let Some(origin) = node.origin.as_ref() {
+        class.push_str(&format!(
+            " origin origin-{}",
+            origin_style_index(&origin.branch_instance_id)
+        ));
+    }
     if !node.labels.is_empty() {
         class.push_str(" active");
     }
@@ -503,27 +556,91 @@ pub fn node_title_text(node: &GraphViewportNode) -> String {
     } else {
         format!(" [{}]", node.labels.join(", "))
     };
+    let origin = node.origin.as_ref().map_or_else(
+        || "unknown origin".to_owned(),
+        |origin| {
+            format!(
+                "origin {} ({})",
+                origin.branch_name,
+                truncate_label(&origin.branch_instance_id, 16)
+            )
+        },
+    );
     format!(
-        "{} · {}{}: {}",
-        node.short_id, node.kind, labels, node.summary
+        "{} · {}{} · {}: {}",
+        node.short_id, node.kind, labels, origin, node.summary
     )
 }
 
+pub fn edge_class(edge: &GraphViewportEdge, base: &str) -> String {
+    match (edge.kind, edge.origin.as_ref()) {
+        (GraphViewportEdgeKind::Primary, Some(origin)) => format!(
+            "{base} origin origin-{}",
+            origin_style_index(&origin.branch_instance_id)
+        ),
+        _ => base.to_owned(),
+    }
+}
+
+pub fn origin_style_index(instance_id: &str) -> u8 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in instance_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % 8) as u8
+}
+
 pub fn node_label(node: &GraphViewportNode) -> String {
-    if node.labels.is_empty() {
+    if node.labels.is_empty() || !node.head_links.is_empty() {
         node.short_id.clone()
     } else {
-        let mut labels = node
+        let labels = node
             .labels
             .iter()
-            .take(2)
             .map(|label| truncate_label(label, 12))
             .collect::<Vec<_>>();
-        if node.labels.len() > labels.len() {
-            labels.push(format!("+{}", node.labels.len() - labels.len()));
-        }
         format!("{} {}", node.short_id, labels.join(" · "))
     }
+}
+
+pub fn node_head_links_id(key: &str) -> String {
+    format!("{}-head-links", render_element_id(key))
+}
+
+pub fn branch_head_link_layouts(links: &[GraphBranchHeadLink]) -> Vec<BranchHeadLinkLayout> {
+    let labels = links
+        .iter()
+        .map(|link| truncate_label(&link.branch, 12))
+        .collect::<Vec<_>>();
+    let widths = labels
+        .iter()
+        .map(|label| {
+            i32::try_from(label.chars().count())
+                .unwrap_or(i32::MAX)
+                .saturating_mul(7)
+                .saturating_add(12)
+        })
+        .collect::<Vec<_>>();
+    let total_width = widths
+        .iter()
+        .fold(0_i32, |total, width| total.saturating_add(*width));
+    let mut cursor = -total_width / 2;
+    links
+        .iter()
+        .zip(labels)
+        .zip(widths)
+        .map(|((link, branch), width)| {
+            let x = cursor.saturating_add(width / 2);
+            cursor = cursor.saturating_add(width);
+            BranchHeadLinkLayout {
+                branch,
+                node_target: link.node_target.clone(),
+                href: link.href.clone(),
+                x,
+            }
+        })
+        .collect()
 }
 
 pub fn bezier_path(route: GraphBezierRoute) -> String {

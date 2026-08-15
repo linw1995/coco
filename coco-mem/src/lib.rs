@@ -12,7 +12,7 @@ pub use error::{StoreError, StoreResult};
 pub use store::{
     BranchAppendSessionState, BranchSessionStateUpdate, BranchStore, GRAPH_READ_BATCH_SIZE,
     GraphBranchPage, GraphBranchPageCursor, GraphBranchRecord, GraphChildPage,
-    GraphChildPageCursor, GraphNodeCursor, GraphNodePage, GraphNodeRecord, JobStore,
-    MessageQueueStore, NodeStore, PersistentStore, PresetStore, ProcessShareableStore,
+    GraphChildPageCursor, GraphNodeCursor, GraphNodeOrigin, GraphNodePage, GraphNodeRecord,
+    JobStore, MessageQueueStore, NodeStore, PersistentStore, PresetStore, ProcessShareableStore,
     SessionStore, SkillStore, SqliteGraphStore, SqliteStore, Store,
 };

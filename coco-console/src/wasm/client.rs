@@ -15,6 +15,8 @@ use super::refresh::{
     JobRefreshState, PendingViewportUpdate, VersionRefresh, ViewportFetch, next_viewport_fetch,
     pending_update_for_viewport_change, version_refresh_action, viewport_update_active,
 };
+#[cfg(test)]
+use crate::api::GraphBranchHeadLink;
 use crate::api::{
     AnchorRangePath, AnchorRangeResponse, GraphBezierRoute, GraphCanvas, GraphErrorNode, GraphJob,
     GraphJobsResponse, GraphViewport, GraphViewportDiffResponse, GraphViewportEdge,
@@ -32,8 +34,8 @@ use crate::viewport::{
 };
 use crate::{
     GRAPH_FOCUS_TARGET_QUERY, GRAPH_FOCUS_X_QUERY, GRAPH_FOCUS_Y_QUERY, JobDestination,
-    bezier_path, edge_hit_target_id, edge_hit_target_label, edge_kind_label, edge_style,
-    error_node_href, job_destination_focus, job_destination_href, job_focus, job_href,
+    bezier_path, edge_class, edge_hit_target_id, edge_hit_target_label, edge_kind_label,
+    edge_style, error_node_href, job_destination_focus, job_destination_href, job_focus, job_href,
     node_group_class, node_label, node_title_text, percent_encode, render_element_id,
 };
 
@@ -1084,6 +1086,13 @@ impl VirtualGraph {
             if let Some(group) = node.query_selector(".node")? {
                 group.set_attribute("transform", &format!("translate({x} {y})"))?;
             }
+            if let Some(key) = node.get_attribute("data-render-key")
+                && let Some(head_links) = self
+                    .document
+                    .get_element_by_id(&crate::graph_render::node_head_links_id(&key))
+            {
+                head_links.set_attribute("transform", &format!("translate({x} {y})"))?;
+            }
         }
 
         let edges = self
@@ -1226,6 +1235,9 @@ impl VirtualGraph {
             kind: layout_node.node.kind.clone(),
             summary: layout_node.node.summary.clone(),
             labels: vec!["expanded".to_owned()],
+            head_links: Vec::new(),
+            href: None,
+            origin: None,
             x: layout_node.point.x,
             y: layout_node.point.y,
         };
@@ -1306,13 +1318,13 @@ impl VirtualGraph {
             .document
             .get_element_by_id(&render_element_id(&edge.key))
             .map_or_else(|| self.edge_element(&edge), Ok)?;
-        let (class, marker) = edge_style(edge.kind);
+        let (base_class, marker) = edge_style(edge.kind);
         set_attributes(
             &element,
             [
                 ("id", render_element_id(&edge.key)),
                 ("data-render-key", edge.key.clone()),
-                ("class", class.to_owned()),
+                ("class", edge_class(&edge, base_class)),
                 ("marker-end", marker.to_owned()),
                 ("d", bezier_path(edge.route)),
                 ("data-source-x", edge.route.source.x.to_string()),
@@ -1377,11 +1389,18 @@ impl VirtualGraph {
 
     fn edge_element(&self, edge: &GraphViewportEdge) -> Result<Element, JsValue> {
         let element = svg_element(&self.document, "path")?;
-        let (class, marker) = edge_style(edge.kind);
+        let (base_class, marker) = edge_style(edge.kind);
+        let class = match (edge.kind, edge.origin.as_ref()) {
+            (GraphViewportEdgeKind::Primary, Some(origin)) => format!(
+                "{base_class} origin origin-{}",
+                crate::graph_render::origin_style_index(&origin.branch_instance_id)
+            ),
+            _ => base_class.to_owned(),
+        };
         set_attributes(
             &element,
             [
-                ("class", class.to_string()),
+                ("class", class),
                 ("marker-end", marker.to_string()),
                 ("d", bezier_path(edge.route)),
             ],
@@ -1398,11 +1417,13 @@ impl VirtualGraph {
             set_node_link_attributes(&link, &node, false)?;
             clear_children(&link);
             self.append_node_group_to_link(&link, &node)?;
+            self.replace_node_head_links(&node)?;
             self.rendered.nodes.insert(node.key, fingerprint);
             return Ok(());
         }
         let link = self.node_link_element(&node, is_new)?;
-        self.append_node(&node.key, &link, fingerprint)
+        self.append_node(&node.key, &link, fingerprint)?;
+        self.replace_node_head_links(&node)
     }
 
     fn node_link_element(
@@ -1539,8 +1560,60 @@ impl VirtualGraph {
         Ok(())
     }
 
+    fn replace_node_head_links(&self, node: &GraphViewportNode) -> Result<(), JsValue> {
+        if let Some(existing) = self
+            .document
+            .get_element_by_id(&crate::graph_render::node_head_links_id(&node.key))
+        {
+            existing.remove();
+        }
+        if node.head_links.is_empty() {
+            return Ok(());
+        }
+        let group = svg_element(&self.document, "g")?;
+        set_attributes(
+            &group,
+            [
+                ("id", crate::graph_render::node_head_links_id(&node.key)),
+                ("class", "node-branch-head-links".to_owned()),
+                ("transform", format!("translate({} {})", node.x, node.y)),
+            ],
+        )?;
+        for layout in crate::graph_render::branch_head_link_layouts(&node.head_links) {
+            let link = svg_element(&self.document, "a")?;
+            set_attributes(
+                &link,
+                [
+                    ("class", "node-branch-head-link".to_owned()),
+                    ("href", layout.href),
+                    ("data-node-target", layout.node_target),
+                ],
+            )?;
+            let label = svg_element(&self.document, "text")?;
+            set_attributes(
+                &label,
+                [
+                    ("class", "node-branch-head-label".to_owned()),
+                    ("x", layout.x.to_string()),
+                    ("y", "-27".to_owned()),
+                ],
+            )?;
+            label.set_text_content(Some(&layout.branch));
+            link.append_child(&label)?;
+            group.append_child(&link)?;
+        }
+        self.node_group.append_child(&group)?;
+        Ok(())
+    }
+
     fn remove_key(&mut self, key: &str) {
         if let Some(element) = self.document.get_element_by_id(&render_element_id(key)) {
+            element.remove();
+        }
+        if let Some(element) = self
+            .document
+            .get_element_by_id(&crate::graph_render::node_head_links_id(key))
+        {
             element.remove();
         }
         if let Some(element) = self.document.get_element_by_id(&edge_hit_target_id(key)) {
@@ -2251,7 +2324,12 @@ fn set_node_link_attributes(
             ("id", render_element_id(&node.key)),
             ("data-render-key", node.key.clone()),
             ("class", node_link_class(is_new).to_owned()),
-            ("href", format!("#{}", node.node_target)),
+            (
+                "href",
+                node.href
+                    .clone()
+                    .unwrap_or_else(|| format!("#{}", node.node_target)),
+            ),
             ("data-node-target", node.node_target.clone()),
             ("data-node-id", node.id.clone()),
             ("data-base-node-x", node.x.to_string()),
@@ -4324,7 +4402,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn graph_items_node_label_limits_heads_and_character_count() {
+    fn graph_items_node_label_lists_all_heads_and_limits_character_count() {
         let mut node = graph_node("aaaaaaaa", 56, 56);
         node.labels = vec![
             "abcdefghijklmnop".to_owned(),
@@ -4332,10 +4410,90 @@ mod tests {
             "third".to_owned(),
         ];
 
-        assert_eq!(node_label(&node), "aaaaaaaa abcdefghijk… · short · +1");
+        assert_eq!(node_label(&node), "aaaaaaaa abcdefghijk… · short · third");
         assert_eq!(truncate_label("abcdefghijkl", 12), "abcdefghijkl");
         assert_eq!(truncate_label("abcdefghijklm", 12), "abcdefghijk…");
         assert_eq!(truncate_label("anything", 0), "");
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_distinct_hidden_heads_render_individual_branch_links() {
+        let fixture = GraphFixture::new();
+        let mut node = graph_node("anchor", 100, 80);
+        node.labels = vec!["main".to_owned(), "recovery".to_owned()];
+        node.head_links = vec![
+            GraphBranchHeadLink {
+                branch: "main".to_owned(),
+                node_target: "detail-main-head".to_owned(),
+                href: "/?mode=all#detail-main-head".to_owned(),
+            },
+            GraphBranchHeadLink {
+                branch: "recovery".to_owned(),
+                node_target: "detail-recovery-head".to_owned(),
+                href: "/?mode=all#detail-recovery-head".to_owned(),
+            },
+        ];
+
+        fixture
+            .graph
+            .borrow_mut()
+            .upsert_node(node, false)
+            .expect_throw("node with branch head links should render");
+        let links = fixture
+            .graph
+            .borrow()
+            .document
+            .query_selector_all(".node-branch-head-link")
+            .expect_throw("branch head links should be queryable");
+
+        assert_eq!(links.length(), 2);
+        let first = links
+            .item(0)
+            .expect_throw("main branch link should exist")
+            .dyn_into::<Element>()
+            .expect_throw("main branch link should be an element");
+        assert_eq!(
+            first.get_attribute("data-node-target").as_deref(),
+            Some("detail-main-head")
+        );
+        assert_eq!(
+            first.get_attribute("href").as_deref(),
+            Some("/?mode=all#detail-main-head")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn graph_items_primary_edge_upsert_preserves_origin_class() {
+        let fixture = GraphFixture::new();
+        let mut edge = graph_edge(
+            GraphViewportEdgeKind::Primary,
+            "source",
+            "target",
+            route((120, 80), (150, 80), (168, 80), (188, 80)),
+        );
+        edge.origin = Some(crate::api::GraphNodeOrigin {
+            branch_instance_id: "branch-instance-day-1".to_owned(),
+            branch_name: "day".to_owned(),
+        });
+
+        fixture
+            .graph
+            .borrow_mut()
+            .upsert_edge(edge.clone())
+            .expect_throw("origin edge should render");
+        let element = fixture
+            .graph
+            .borrow()
+            .document
+            .get_element_by_id(&render_element_id(&edge.key))
+            .expect_throw("origin edge should exist");
+
+        assert!(element.class_list().contains("origin"));
+        assert!(
+            element
+                .get_attribute("class")
+                .is_some_and(|class| class.contains("origin-"))
+        );
     }
 
     #[wasm_bindgen_test(async)]
@@ -4363,6 +4521,7 @@ mod tests {
                             kind: GraphViewportEdgeKind::Primary,
                             source_id: "source".to_owned(),
                             target_id: "target".to_owned(),
+                            origin: None,
                             route: GraphBezierRoute {
                                 source: Point { x: 120, y: 80 },
                                 control_1: Point { x: 150, y: 80 },
@@ -4694,6 +4853,12 @@ mod tests {
         };
         {
             let mut graph = fixture.graph.borrow_mut();
+            let mut target = graph_node("target", 324, 80);
+            target.head_links = vec![GraphBranchHeadLink {
+                branch: "recovery".to_owned(),
+                node_target: "detail-hidden-target".to_owned(),
+                href: "/?mode=all#detail-hidden-target".to_owned(),
+            }];
             let canvas = GraphCanvas {
                 width: 560,
                 height: 280,
@@ -4706,7 +4871,7 @@ mod tests {
                         nodes: vec![
                             graph_node("source", 100, 80),
                             graph_node("middle", 212, 80),
-                            graph_node("target", 324, 80),
+                            target,
                         ],
                         edges: Vec::new(),
                     },
@@ -4751,6 +4916,13 @@ mod tests {
             .expect_throw("target anchor should remain rendered");
         assert_eq!(
             target.get_attribute("transform").as_deref(),
+            Some("translate(436 80)")
+        );
+        let target_head_links = document
+            .get_element_by_id(&crate::graph_render::node_head_links_id("node:target"))
+            .expect_throw("target branch head links should remain rendered");
+        assert_eq!(
+            target_head_links.get_attribute("transform").as_deref(),
             Some("translate(436 80)")
         );
     }
@@ -6260,6 +6432,9 @@ mod tests {
             kind: "prompt".to_owned(),
             summary: format!("summary for {id}"),
             labels: Vec::new(),
+            head_links: Vec::new(),
+            href: None,
+            origin: None,
             x,
             y,
         }
@@ -6290,6 +6465,7 @@ mod tests {
             kind,
             source_id: source_id.to_owned(),
             target_id: target_id.to_owned(),
+            origin: None,
             route,
         }
     }

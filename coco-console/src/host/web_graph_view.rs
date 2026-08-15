@@ -513,6 +513,9 @@ mod tests {
             kind: "text".to_owned(),
             summary: summary.to_owned(),
             labels: Vec::new(),
+            head_links: Vec::new(),
+            href: None,
+            origin: None,
             x: 0,
             y: 0,
         };

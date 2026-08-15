@@ -1,9 +1,26 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    branch_instances (instance_id) {
+        instance_id -> Text,
+        name -> Text,
+        created_at -> Nullable<Text>,
+        deleted_at -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     branches (name) {
         name -> Text,
         head_id -> Text,
+        instance_id -> Text,
+    }
+}
+
+diesel::table! {
+    node_origins (node_id) {
+        node_id -> Text,
+        branch_instance_id -> Text,
     }
 }
 
@@ -246,6 +263,9 @@ diesel::table! {
 }
 
 diesel::joinable!(branches -> nodes (head_id));
+diesel::joinable!(branches -> branch_instances (instance_id));
+diesel::joinable!(node_origins -> branch_instances (branch_instance_id));
+diesel::joinable!(node_origins -> nodes (node_id));
 diesel::joinable!(node_anchor_sessions -> nodes (node_id));
 diesel::joinable!(node_anchor_session_tools -> node_anchor_sessions (node_id));
 diesel::joinable!(node_anchor_skill_invocations -> nodes (node_id));
@@ -260,6 +280,7 @@ diesel::joinable!(sessions -> branches (branch_name));
 
 diesel::allow_tables_to_appear_in_same_query!(
     branches,
+    branch_instances,
     jobs,
     message_queue_items,
     node_anchor_prompt_attachments,
@@ -270,6 +291,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     node_anchor_skill_invocations,
     node_anchor_skill_results,
     node_metadata,
+    node_origins,
     node_relations,
     node_tool_results,
     node_tool_uses,

@@ -19,8 +19,16 @@ const GRAPH_CONNECTION_LIMIT: usize = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphBranchRecord {
     pub name: String,
+    pub instance_id: String,
     pub head_id: String,
     pub state: SessionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNodeOrigin {
+    pub branch_instance_id: String,
+    pub branch_name: String,
+    pub branch_deleted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +81,7 @@ pub struct GraphNodeRecord {
     pub parent: String,
     pub is_anchor: bool,
     pub merge_parents: Vec<MergeParent>,
+    pub origin: Option<GraphNodeOrigin>,
 }
 
 mod branch;

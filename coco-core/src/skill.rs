@@ -7,8 +7,8 @@ use std::sync::Weak;
 
 use async_trait::async_trait;
 use coco_llm::coco_mem::{
-    Anchor, BranchStore, Kind, NewNode, NodeStore, Role, SessionAnchor, SessionRole, SessionStore,
-    SkillRecord, SkillRuntimeContext, SkillScript, SkillStore,
+    Anchor, BranchStore, Kind, NewNodeContent, NodeStore, Role, SessionAnchor, SessionRole,
+    SessionStore, SkillRecord, SkillRuntimeContext, SkillScript, SkillStore,
 };
 use coco_llm::{
     ActiveSkillRuntimeContext, COCO_SKILL_PERSIST_DIR_ENV, COCO_SKILL_PERSIST_ROOT_ENV,
@@ -352,10 +352,13 @@ where
         let child_branch = temporary_skill_branch_name(&request.base_branch, &request.skill_name);
         ensure_skill_invocation_node(store, &request.parent_tool_use_id, &request.skill_name)
             .await?;
-        let child_session_anchor_id = append_skill_session_anchor(store, &request).await?;
-
+        let child_session = skill_session_anchor_content(store, &request).await?;
         store
-            .fork(&child_branch, &child_session_anchor_id)
+            .fork_with_nodes(
+                &child_branch,
+                &request.parent_tool_use_id,
+                vec![child_session],
+            )
             .await
             .map_err(|source| LlmError::Memory {
                 source: Box::new(source),
@@ -418,44 +421,38 @@ where
     })
 }
 
-async fn append_skill_session_anchor<S>(
+async fn skill_session_anchor_content<S>(
     store: &S,
     request: &SkillInvocationRequest,
-) -> std::result::Result<String, LlmError>
+) -> std::result::Result<NewNodeContent, LlmError>
 where
     S: NodeStore,
 {
     let inherited = resolve_parent_session_anchor(store, &request.parent_tool_use_id).await?;
-    store
-        .append(NewNode {
-            parent: request.parent_tool_use_id.clone(),
-            role: Role::System,
-            metadata: None,
-            kind: Kind::Anchor(Anchor::session(
-                vec![],
-                SessionAnchor {
-                    role: request.session_role,
-                    provider_profile: inherited.provider_profile,
-                    provider: inherited.provider,
-                    model: inherited.model,
-                    tools: inherited.tools,
-                    system_prompt: inherited.system_prompt,
-                    prompt: skill_execution_prompt(request),
-                    temperature: inherited.temperature,
-                    max_tokens: inherited.max_tokens,
-                    additional_params: inherited.additional_params,
-                    enable_coco_shim: request.enable_coco_shim,
-                    active_skill: Some(SkillRuntimeContext {
-                        name: request.skill_name.clone(),
-                        handoff: request.handoff.clone(),
-                    }),
-                },
-            )),
-        })
-        .await
-        .map_err(|source| LlmError::Memory {
-            source: Box::new(source),
-        })
+    Ok(NewNodeContent {
+        role: Role::System,
+        metadata: None,
+        kind: Kind::Anchor(Anchor::session(
+            vec![],
+            SessionAnchor {
+                role: request.session_role,
+                provider_profile: inherited.provider_profile,
+                provider: inherited.provider,
+                model: inherited.model,
+                tools: inherited.tools,
+                system_prompt: inherited.system_prompt,
+                prompt: skill_execution_prompt(request),
+                temperature: inherited.temperature,
+                max_tokens: inherited.max_tokens,
+                additional_params: inherited.additional_params,
+                enable_coco_shim: request.enable_coco_shim,
+                active_skill: Some(SkillRuntimeContext {
+                    name: request.skill_name.clone(),
+                    handoff: request.handoff.clone(),
+                }),
+            },
+        )),
+    })
 }
 
 async fn resolve_parent_session_anchor<S>(

@@ -462,6 +462,7 @@ struct ToolInvocationContext {
 #[derive(Debug)]
 struct StoreNodeAppender<S> {
     store: S,
+    branch: String,
     head_id: Mutex<String>,
 }
 
@@ -512,7 +513,7 @@ impl std::fmt::Debug for TraceNodeAppenderHandle {
 #[async_trait]
 impl<S> TraceNodeAppender for StoreNodeAppender<S>
 where
-    S: NodeStore + Send + Sync,
+    S: NodeStore + BranchStore + Send + Sync,
 {
     async fn head_id(&self) -> std::result::Result<String, BackendError> {
         Ok(self.head_id.lock().await.clone())
@@ -527,12 +528,15 @@ where
         let mut head_id = self.head_id.lock().await;
         let node_id = self
             .store
-            .append(NewNode {
-                parent: head_id.clone(),
-                role,
-                metadata,
-                kind,
-            })
+            .append_on_branch(
+                &self.branch,
+                NewNode {
+                    parent: head_id.clone(),
+                    role,
+                    metadata,
+                    kind,
+                },
+            )
             .await
             .map_err(|source| BackendError::failed(source.to_string()))?;
         *head_id = node_id.clone();
@@ -1512,32 +1516,31 @@ where
         let merge_parents = normalize_merge_parents(config.merge_parents, &root_id);
         let anchor_id = self
             .store
-            .append(NewNode {
-                parent: root_id,
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::session(
-                    merge_parents,
-                    SessionAnchor {
-                        role: config.role,
-                        provider_profile,
-                        provider,
-                        model: config.model,
-                        tools: config.tools,
-                        system_prompt: config.system_prompt,
-                        prompt: config.prompt,
-                        temperature: config.temperature,
-                        max_tokens: config.max_tokens,
-                        additional_params: config.additional_params,
-                        enable_coco_shim: config.enable_coco_shim,
-                        active_skill: None,
-                    },
-                )),
-            })
-            .await
-            .context(MemorySnafu)?;
-        self.store
-            .fork(&config.branch, &anchor_id)
+            .fork_with_nodes(
+                &config.branch,
+                &root_id,
+                vec![NewNodeContent {
+                    role: Role::System,
+                    metadata: None,
+                    kind: Kind::Anchor(Anchor::session(
+                        merge_parents,
+                        SessionAnchor {
+                            role: config.role,
+                            provider_profile,
+                            provider,
+                            model: config.model,
+                            tools: config.tools,
+                            system_prompt: config.system_prompt,
+                            prompt: config.prompt,
+                            temperature: config.temperature,
+                            max_tokens: config.max_tokens,
+                            additional_params: config.additional_params,
+                            enable_coco_shim: config.enable_coco_shim,
+                            active_skill: None,
+                        },
+                    )),
+                }],
+            )
             .await
             .context(MemorySnafu)?;
 
@@ -1742,6 +1745,7 @@ where
                 session_patch,
             } => {
                 self.append_prompt_anchor_to_parent_with_session_patch(
+                    &request.branch,
                     &reference_id,
                     text,
                     attachments,
@@ -1785,6 +1789,7 @@ where
         );
         let trace_node_appender = TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
             store: self.store.clone(),
+            branch: request.branch.clone(),
             head_id: Mutex::new(retry_from_node_id.clone()),
         }));
         let trace_node_store: Arc<TraceNodeStore> = Arc::new(self.store.clone());
@@ -2202,6 +2207,7 @@ where
             .await
             .context(MemorySnafu)?;
         self.append_prompt_anchor_to_parent_with_session_patch(
+            branch,
             &parent_id,
             prompt,
             attachments,
@@ -2214,10 +2220,11 @@ where
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore,
+    S: NodeStore + BranchStore,
 {
     async fn append_prompt_anchor_to_parent_with_session_patch(
         &self,
+        branch: &str,
         parent_id: &str,
         prompt: &str,
         attachments: &[PromptAttachment],
@@ -2228,28 +2235,38 @@ where
             Some(patch) => {
                 self.resolve_context(parent_id).await?;
                 self.store
-                    .append(NewNode {
-                        parent: parent_id.to_owned(),
-                        role: Role::System,
-                        metadata: None,
-                        kind: Kind::Anchor(Anchor::session_patch(vec![], patch.clone())),
-                    })
+                    .append_on_branch(
+                        branch,
+                        NewNode {
+                            parent: parent_id.to_owned(),
+                            role: Role::System,
+                            metadata: None,
+                            kind: Kind::Anchor(Anchor::session_patch(vec![], patch.clone())),
+                        },
+                    )
                     .await
                     .context(MemorySnafu)?
             }
             None => parent_id.to_owned(),
         };
-        self.append_prompt_anchor_to_parent(&prompt_parent_id, prompt, attachments, merge_parents)
-            .await
+        self.append_prompt_anchor_to_parent(
+            branch,
+            &prompt_parent_id,
+            prompt,
+            attachments,
+            merge_parents,
+        )
+        .await
     }
 }
 
 impl<B, S> LlmService<B, S>
 where
-    S: NodeStore,
+    S: NodeStore + BranchStore,
 {
     async fn append_prompt_anchor_to_parent(
         &self,
+        branch: &str,
         parent_id: &str,
         prompt: &str,
         attachments: &[PromptAttachment],
@@ -2267,18 +2284,21 @@ where
             }
         }
         self.store
-            .append(NewNode {
-                parent: parent_id.to_owned(),
-                role: Role::System,
-                metadata: None,
-                kind: Kind::Anchor(Anchor::prompt(
-                    normalized_parents,
-                    PromptAnchor {
-                        prompt: prompt.to_owned(),
-                        attachments: attachments.to_vec(),
-                    },
-                )),
-            })
+            .append_on_branch(
+                branch,
+                NewNode {
+                    parent: parent_id.to_owned(),
+                    role: Role::System,
+                    metadata: None,
+                    kind: Kind::Anchor(Anchor::prompt(
+                        normalized_parents,
+                        PromptAnchor {
+                            prompt: prompt.to_owned(),
+                            attachments: attachments.to_vec(),
+                        },
+                    )),
+                },
+            )
             .await
             .context(MemorySnafu)
     }
@@ -4784,7 +4804,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::Duration;
 
-    use coco_mem::{BranchStore, NodeStore, SessionStore, SqliteStore};
+    use coco_mem::{BranchStore, NodeStore, SessionStore, SqliteGraphStore, SqliteStore};
     use rig::completion::{
         CompletionError, CompletionModel, CompletionRequestBuilder, CompletionResponse,
         ToolDefinition,
@@ -6995,6 +7015,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_prompt_and_response_nodes_share_the_branch_instance_origin() {
+        let store = test_store().await;
+        let service = LlmService::new(
+            store.clone(),
+            FakeBackend::with_responses(&[("main", &[Ok("hello")])]),
+        );
+        service
+            .create_session(session_config("main"))
+            .await
+            .unwrap();
+        service
+            .prompt(prompt_request("main", "remember the branch"))
+            .await
+            .unwrap();
+
+        let graph = SqliteGraphStore::open_read_only(store.store_path())
+            .await
+            .unwrap();
+        let branch = graph.graph_branches().await.unwrap().pop().unwrap();
+        let ancestry = store.ancestry("main").await.unwrap();
+        let ids = ancestry
+            .into_iter()
+            .filter(|node| !node.is_root())
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let records = graph.graph_node_records_by_ids(&ids).await.unwrap();
+        assert!(!records.is_empty());
+        assert!(records.into_iter().all(|node| {
+            node.origin
+                .is_some_and(|origin| origin.branch_instance_id == branch.instance_id)
+        }));
+    }
+
+    #[tokio::test]
     async fn create_session_with_provider_profile_persists_only_profile_name() {
         let store = test_store().await;
         let backend = FakeBackend::with_responses(&[]);
@@ -7603,6 +7657,20 @@ mod tests {
         assert_eq!(recovered.anchor_id, prompt_anchor_id);
         let recovered_node = store.get_node(&recovered.response_node_id).await.unwrap();
         assert_eq!(recovered_node.parent, prompt_anchor_id);
+        let graph = SqliteGraphStore::open_read_only(store.store_path())
+            .await
+            .unwrap();
+        let branch = graph.graph_branches().await.unwrap().pop().unwrap();
+        assert!(
+            graph
+                .graph_node_records_by_ids(&[error_node_id, recovered.response_node_id])
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|record| record
+                    .origin
+                    .is_some_and(|origin| { origin.branch_instance_id == branch.instance_id }))
+        );
     }
 
     #[tokio::test]
@@ -8903,6 +8971,7 @@ mod tests {
     fn test_trace_appender(store: SqliteStore, head_id: &str) -> TraceNodeAppenderHandle {
         TraceNodeAppenderHandle::new(Arc::new(StoreNodeAppender {
             store,
+            branch: "main".to_owned(),
             head_id: Mutex::new(head_id.to_owned()),
         }))
     }

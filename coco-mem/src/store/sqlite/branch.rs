@@ -20,7 +20,7 @@ use crate::error::{
     InvalidAnchorSnafu, InvalidSessionHandoffPromptSnafu, MissingSessionAnchorSnafu,
     ParentNotFoundSnafu, QuerySqliteStoreSnafu, RefsNotConnectedSnafu, SessionStateMovedSnafu,
 };
-use crate::schema::{branches, jobs, sessions};
+use crate::schema::{branch_instances, branches, jobs, node_origins, nodes, sessions};
 use crate::store::{BranchAppendSessionState, BranchStore, SessionStore};
 use crate::{
     Anchor, AnchorPayload, Kind, NewNodeContent, Node, PauseReason, Role, SessionAnchorPatch,
@@ -47,6 +47,7 @@ pub struct SessionRow {
 struct GraphBranchRow {
     name: String,
     head_id: String,
+    instance_id: String,
     state: String,
     target_branch: Option<String>,
     base_head_id: Option<String>,
@@ -79,6 +80,7 @@ pub async fn load_graph_branch_records(
         .select((
             branches::name,
             branches::head_id,
+            branches::instance_id,
             sessions::state,
             sessions::target_branch,
             sessions::base_head_id,
@@ -123,6 +125,7 @@ pub async fn load_graph_branch_records(
             )?;
             Ok(GraphBranchRecord {
                 name,
+                instance_id: row.instance_id,
                 head_id: row.head_id,
                 state,
             })
@@ -252,10 +255,76 @@ async fn persist_branch(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     branch: &str,
+    instance_id: &str,
     head_id: &str,
 ) -> Result<()> {
     diesel::insert_into(branches::table)
-        .values((branches::name.eq(branch), branches::head_id.eq(head_id)))
+        .values((
+            branches::name.eq(branch),
+            branches::head_id.eq(head_id),
+            branches::instance_id.eq(instance_id),
+        ))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(())
+}
+
+async fn persist_branch_instance(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+) -> Result<String> {
+    let instance_id = format!("branch-{}", nanoid::nanoid!());
+    diesel::insert_into(branch_instances::table)
+        .values((
+            branch_instances::instance_id.eq(&instance_id),
+            branch_instances::name.eq(branch),
+            branch_instances::created_at.eq(Some(jiff::Timestamp::now().to_string())),
+            branch_instances::deleted_at.eq::<Option<String>>(None),
+        ))
+        .execute(connection)
+        .await
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?;
+    Ok(instance_id)
+}
+
+pub async fn load_branch_instance_id(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+) -> Result<String> {
+    branches::table
+        .filter(branches::name.eq(branch))
+        .select(branches::instance_id)
+        .get_result(connection)
+        .await
+        .optional()
+        .context(QuerySqliteStoreSnafu {
+            path: path.to_owned(),
+        })?
+        .context(BranchNotFoundSnafu {
+            name: branch.to_owned(),
+        })
+}
+
+pub async fn persist_node_origin(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    node_id: &str,
+    branch_instance_id: &str,
+) -> Result<()> {
+    diesel::insert_into(node_origins::table)
+        .values((
+            node_origins::node_id.eq(node_id),
+            node_origins::branch_instance_id.eq(branch_instance_id),
+        ))
+        .on_conflict(node_origins::node_id)
+        .do_nothing()
         .execute(connection)
         .await
         .context(QuerySqliteStoreSnafu {
@@ -287,13 +356,100 @@ async fn create_branch(
             let head_id = resolve_ref_id(connection, path, from_ref)
                 .await
                 .map_err(SqliteTransactionError::Operation)?;
-            persist_branch(connection, path, branch, &head_id)
+            let instance_id = persist_branch_instance(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_branch(connection, path, branch, &instance_id, &head_id)
                 .await
                 .map_err(SqliteTransactionError::Operation)?;
             persist_session_state(connection, path, branch, &SessionState::Active)
                 .await
                 .map_err(SqliteTransactionError::Operation)?;
             Ok(head_id)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn create_branch_with_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    from_ref: &str,
+    nodes: Vec<NewNodeContent>,
+) -> Result<String> {
+    connection
+        .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
+            if maybe_load_branch_head(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?
+                .is_some()
+            {
+                return Err(SqliteTransactionError::Operation(
+                    BranchExistsSnafu {
+                        name: branch.to_owned(),
+                    }
+                    .build(),
+                ));
+            }
+            let mut head_id = resolve_ref_id(connection, path, from_ref)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            let instance_id = persist_branch_instance(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            for content in nodes {
+                let node = Node::new(
+                    head_id,
+                    content.role,
+                    content.metadata,
+                    content.kind,
+                    jiff::Timestamp::now(),
+                );
+                validate_new_node(connection, path, &node)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                persist_node_without_transaction(connection, path, &node)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                persist_node_origin(connection, path, &node.id, &instance_id)
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
+                head_id = node.id;
+            }
+            persist_branch(connection, path, branch, &instance_id, &head_id)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_session_state(connection, path, branch, &SessionState::Active)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(head_id)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
+}
+
+async fn append_node_on_branch(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    branch: &str,
+    node: Node,
+) -> Result<String> {
+    connection
+        .immediate_transaction::<String, SqliteTransactionError, _>(async |connection| {
+            let instance_id = load_branch_instance_id(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            validate_new_node(connection, path, &node)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_node_without_transaction(connection, path, &node)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            persist_node_origin(connection, path, &node.id, &instance_id)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            Ok(node.id)
         })
         .await
         .map_err(|error| error.into_store_error(path))
@@ -708,6 +864,9 @@ async fn append_nodes_and_set_branch_head_in_transaction(
         .await
         .map_err(SqliteTransactionError::Operation)?;
 
+    let instance_id = load_branch_instance_id(connection, path, branch)
+        .await
+        .map_err(SqliteTransactionError::Operation)?;
     let mut head = parent.to_owned();
     for content in nodes {
         let node = Node::new(
@@ -721,6 +880,9 @@ async fn append_nodes_and_set_branch_head_in_transaction(
             .await
             .map_err(SqliteTransactionError::Operation)?;
         persist_node_without_transaction(connection, path, &node)
+            .await
+            .map_err(SqliteTransactionError::Operation)?;
+        persist_node_origin(connection, path, &node.id, &instance_id)
             .await
             .map_err(SqliteTransactionError::Operation)?;
         head = node.id;
@@ -783,8 +945,27 @@ async fn delete_branch_checked(
     path: &Path,
     branch: &str,
 ) -> Result<()> {
-    load_branch_head(connection, path, branch).await?;
-    delete_branch_record(connection, path, branch).await
+    connection
+        .immediate_transaction::<(), SqliteTransactionError, _>(async |connection| {
+            let instance_id = load_branch_instance_id(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)?;
+            diesel::update(
+                branch_instances::table.filter(branch_instances::instance_id.eq(instance_id)),
+            )
+            .set(branch_instances::deleted_at.eq(Some(jiff::Timestamp::now().to_string())))
+            .execute(connection)
+            .await
+            .context(QuerySqliteStoreSnafu {
+                path: path.to_owned(),
+            })
+            .map_err(SqliteTransactionError::Operation)?;
+            delete_branch_record(connection, path, branch)
+                .await
+                .map_err(SqliteTransactionError::Operation)
+        })
+        .await
+        .map_err(|error| error.into_store_error(path))
 }
 
 #[cfg(test)]
@@ -839,6 +1020,19 @@ async fn persist_session_nodes_and_branch_head_in_transaction(
 #[async_trait]
 impl BranchStore for SqliteGraphStore {
     async fn fork(&self, _name: &str, _from_ref: &str) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    async fn fork_with_nodes(
+        &self,
+        _name: &str,
+        _from_ref: &str,
+        _nodes: Vec<NewNodeContent>,
+    ) -> Result<String> {
+        self.ensure_read_only()
+    }
+
+    async fn append_on_branch(&self, _name: &str, _node: crate::NewNode) -> Result<String> {
         self.ensure_read_only()
     }
 
@@ -938,6 +1132,35 @@ impl BranchStore for SqliteStore {
         self.ensure_writable()?;
         let mut connection = self.connect().await?;
         create_branch(&mut connection, &self.database_path, name, from_ref).await
+    }
+
+    async fn fork_with_nodes(
+        &self,
+        name: &str,
+        from_ref: &str,
+        nodes: Vec<NewNodeContent>,
+    ) -> Result<String> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        create_branch_with_nodes(&mut connection, &self.database_path, name, from_ref, nodes).await
+    }
+
+    async fn append_on_branch(&self, name: &str, node: crate::NewNode) -> Result<String> {
+        self.ensure_writable()?;
+        let mut connection = self.connect().await?;
+        append_node_on_branch(
+            &mut connection,
+            &self.database_path,
+            name,
+            Node::new(
+                node.parent,
+                node.role,
+                node.metadata,
+                node.kind,
+                jiff::Timestamp::now(),
+            ),
+        )
+        .await
     }
 
     async fn get_branch_head(&self, name: &str) -> Result<String> {
@@ -1082,6 +1305,10 @@ impl SessionStore for SqliteStore {
                     let expected_old_head = load_branch_head(connection, &self.database_path, name)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
+                    let branch_instance_id =
+                        load_branch_instance_id(connection, &self.database_path, name)
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
                     let mut chain = load_session_chain(connection, &self.database_path, name)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
@@ -1115,9 +1342,30 @@ impl SessionStore for SqliteStore {
                         };
                         let new_node =
                             Node::new(parent, node.role, node.metadata, kind, node.created_at);
+                        let node_existed = nodes::table
+                            .filter(nodes::id.eq(&new_node.id))
+                            .select(nodes::id)
+                            .first::<String>(connection)
+                            .await
+                            .optional()
+                            .context(QuerySqliteStoreSnafu {
+                                path: self.database_path.clone(),
+                            })
+                            .map_err(SqliteTransactionError::Operation)?
+                            .is_some();
                         upsert_node_without_transaction(connection, &self.database_path, &new_node)
                             .await
                             .map_err(SqliteTransactionError::Operation)?;
+                        if !node_existed {
+                            persist_node_origin(
+                                connection,
+                                &self.database_path,
+                                &new_node.id,
+                                &branch_instance_id,
+                            )
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
+                        }
                         previous_new_id = Some(new_node.id.clone());
                         new_head = new_node.id.clone();
                         nodes.push(new_node);
@@ -1155,6 +1403,10 @@ impl SessionStore for SqliteStore {
                     let expected_old_head = load_branch_head(connection, &self.database_path, name)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
+                    let branch_instance_id =
+                        load_branch_instance_id(connection, &self.database_path, name)
+                            .await
+                            .map_err(SqliteTransactionError::Operation)?;
                     let chain = load_session_chain(connection, &self.database_path, name)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
@@ -1178,6 +1430,14 @@ impl SessionStore for SqliteStore {
                     persist_node_without_transaction(connection, &self.database_path, &node)
                         .await
                         .map_err(SqliteTransactionError::Operation)?;
+                    persist_node_origin(
+                        connection,
+                        &self.database_path,
+                        &node.id,
+                        &branch_instance_id,
+                    )
+                    .await
+                    .map_err(SqliteTransactionError::Operation)?;
                     update_branch_head_checked_in_transaction(
                         connection,
                         &self.database_path,

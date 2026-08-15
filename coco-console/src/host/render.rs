@@ -618,6 +618,9 @@ mod tests {
                 kind: "text".to_owned(),
                 summary: "Latest node".to_owned(),
                 labels: vec!["main".to_owned()],
+                head_links: Vec::new(),
+                href: None,
+                origin: None,
                 x: 2300,
                 y: 120,
             }],
@@ -626,6 +629,7 @@ mod tests {
                 kind: GraphViewportEdgeKind::Primary,
                 source_id: "previous".to_owned(),
                 target_id: "latest".to_owned(),
+                origin: None,
                 route: GraphBezierRoute {
                     source: Point { x: 2200, y: 120 },
                     control_1: Point { x: 2230, y: 120 },
