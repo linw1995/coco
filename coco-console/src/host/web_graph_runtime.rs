@@ -982,7 +982,9 @@ impl WebGraphRuntime {
                     .fail();
                 }
                 if cursor == &through {
-                    let synchronized = self.sync_provider_branch_history().await?;
+                    let Some(synchronized) = self.sync_provider_branch_history().await? else {
+                        continue;
+                    };
                     let current_revision = synchronized.revision.get();
                     self.publish_revision(current_revision);
                     if let Some(progress) = progress.as_mut() {
@@ -1158,7 +1160,7 @@ impl WebGraphRuntime {
         Ok(result)
     }
 
-    async fn sync_provider_branch_history(&self) -> crate::Result<StoredGraphState> {
+    async fn sync_provider_branch_history(&self) -> crate::Result<Option<StoredGraphState>> {
         loop {
             let stored = self
                 .store
@@ -1173,8 +1175,8 @@ impl WebGraphRuntime {
                 .await
                 .context(StoreSnafu)?;
             if stored.state.source_cursor != source_high_watermark {
-                tokio::task::yield_now().await;
-                continue;
+                // Only the outer catch-up loop can advance the source cursor.
+                return Ok(None);
             }
             let source_heads = source_branches
                 .iter()
@@ -1189,7 +1191,7 @@ impl WebGraphRuntime {
                 })
                 .collect::<BTreeMap<_, _>>();
             if history_heads == source_heads {
-                return Ok(stored.state);
+                return Ok(Some(stored.state));
             }
 
             let removed_branches = stored
@@ -1226,7 +1228,7 @@ impl WebGraphRuntime {
                 .await
                 .context(WebGraphStoreSnafu)?
             {
-                return Ok(state);
+                return Ok(Some(state));
             }
             tokio::task::yield_now().await;
         }
@@ -4614,6 +4616,30 @@ mod tests {
         assert_eq!(client_diff.added.nodes.len(), 1);
         assert!(client_diff.updated.nodes.is_empty());
         assert!(client_diff.removed.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn branch_history_sync_yields_to_source_catch_up() {
+        let writer = SqliteStore::open_temporary().await.unwrap();
+        let runtime = WebGraphRuntime::open(writer.store_path(), ConsolePublisher::new())
+            .await
+            .unwrap();
+        runtime.catch_up().await.unwrap();
+
+        let child = append_text(&writer, &writer.root_id(), "pending child").await;
+        let synchronized = timeout(
+            Duration::from_secs(5),
+            runtime.sync_provider_branch_history(),
+        )
+        .await
+        .expect("branch history synchronization must return when source catch-up is needed")
+        .unwrap();
+        assert!(synchronized.is_none());
+
+        runtime.catch_up().await.unwrap();
+        let state = runtime.store.state().await.unwrap().unwrap();
+        assert_eq!(state.source_cursor.unwrap().node_id, child);
+        assert_eq!(runtime.current_revision(), state.revision.get());
     }
 
     #[tokio::test(flavor = "multi_thread")]
