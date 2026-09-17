@@ -1,5 +1,8 @@
 use super::*;
 
+// Stay below SQLite's legacy 999-variable limit for every payload query.
+const NODE_READ_BATCH_SIZE: usize = 900;
+
 diesel::table! {
     #[sql_name = "nodes"]
     nodes_with_rowid (id) {
@@ -561,6 +564,23 @@ fn node_tool_result_slice<'a>(
 }
 
 pub(super) async fn node_rows_into_nodes(
+    connection: &mut AsyncSqliteConnection,
+    path: &Path,
+    rows: Vec<NodeRow>,
+) -> Result<Vec<Node>> {
+    let mut nodes = Vec::with_capacity(rows.len());
+    let mut rows = rows.into_iter();
+    loop {
+        let batch = rows.by_ref().take(NODE_READ_BATCH_SIZE).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        nodes.extend(node_batch_into_nodes(connection, path, batch).await?);
+    }
+    Ok(nodes)
+}
+
+async fn node_batch_into_nodes(
     connection: &mut AsyncSqliteConnection,
     path: &Path,
     rows: Vec<NodeRow>,

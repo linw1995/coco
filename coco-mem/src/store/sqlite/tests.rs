@@ -30,6 +30,7 @@ use std::time::Duration;
 use tokio::sync::{Barrier, oneshot};
 
 mod migration;
+mod node_batching;
 
 #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
 struct NodeRelationRow {
