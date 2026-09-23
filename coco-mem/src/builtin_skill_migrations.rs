@@ -68,7 +68,9 @@ pub const BUILTIN_SKILL_MIGRATIONS: &[BuiltinSkillMigration] = &[
             "6bf4094ad2dd2f9932cfc8d13a0f4a6b7adc9fe293e1ea6bc9f995d9c880a3f8",
             // Before session handoff required an explicit prompt.
             "dfc5ea6b5ef4c46ffb4c0c7d1fde59f1ebfe782eeb673a0987353047b72c7e3b",
+            // Before recovery could run on rotating branches.
             "91adf3f8b4e2fb11008b58db4d0c62c21b1b76cbe13b53a58e81fdeca1548b3b",
+            "148db37f8906289e8c2318ee787d2ede7b0ae2950368df3440f8d36574d551f0",
         ],
     },
     BuiltinSkillMigration {

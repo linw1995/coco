@@ -6453,6 +6453,8 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
     let states = store.list_session_states().await.unwrap();
     assert_eq!(states.get("main"), Some(&SessionState::Active));
     assert_eq!(states.get("day"), Some(&SessionState::Active));
+    assert_eq!(states.get("day-2"), Some(&SessionState::Active));
+    assert_eq!(states.get("day-3"), Some(&SessionState::Active));
 
     let head = store.get_branch_head("main").await.unwrap();
     let node = store.get_node(&head).await.unwrap();
@@ -6505,6 +6507,21 @@ async fn daemon_startup_creates_default_session_when_store_is_empty() {
             .collect::<Vec<_>>(),
         vec!["exec_command", "write_stdin", "search_skill"]
     );
+
+    for branch in ["day-2", "day-3"] {
+        let head = store.get_branch_head(branch).await.unwrap();
+        let node = store.get_node(&head).await.unwrap();
+        let Kind::Anchor(anchor) = node.kind else {
+            panic!("expected recovery session anchor");
+        };
+        let AnchorPayload::Session(session) = anchor.payload else {
+            panic!("expected recovery session anchor payload");
+        };
+        assert_eq!(session.provider_profile.as_deref(), Some("openai-codex"));
+        assert_eq!(session.model, "gpt-5.4");
+        assert_eq!(session.role, SessionRole::Orchestrator);
+        assert_eq!(session.tools.len(), 3);
+    }
 
     ensure_initial_session(&store, &llm, shared_test_provider_profiles())
         .await

@@ -1,9 +1,10 @@
 # CoCo Recovery
 
-Use this orchestrator skill from the built-in `day` branch after CoCo routes an
-LLM backend failure system event to it. The `day` branch is the recovery
-executor. The failed `work_branch` in the handoff is the target branch to inspect
-or repair, not the branch executing this skill.
+Use this orchestrator skill from the recovery branch selected by CoCo after it
+routes an LLM backend failure system event. The failed `work_branch` in the
+handoff is the target branch to inspect or repair, not the branch executing this
+skill. CoCo may retry the same original event on another recovery branch, so
+inspect persisted job state before repeating work with external effects.
 
 The handoff normally includes:
 
@@ -44,8 +45,8 @@ Rules:
 
 - Treat the event payload as authoritative. Do not guess missing job ids,
   branch names, or node ids.
-- Run from `day`. Do not create another recovery branch and do not treat
-  `work_branch` as the current execution branch.
+- Run from the selected recovery branch. Do not create another recovery branch
+  and do not treat `work_branch` as the current execution branch.
 - Inspect the job and relevant branches before acting. If the handoff does not
   identify a valid job or target branch, fail clearly instead of repairing the
   wrong job.
@@ -63,8 +64,8 @@ Rules:
   retry the original job. Then run `coco job status --json --job <job-id>` and
   verify that the original job is `finished` before declaring recovery success.
 - If the failed branch is not salvageable in place, rebuild the answer from
-  `day` using the graph state and available `coco` commands. Do not fork a
-  scratch branch.
+  the current recovery branch using the graph state and available `coco`
+  commands. Do not fork a scratch branch.
 - Keep the output shaped like a normal successful answer for the original job.
   Do not ask a supervisor to run follow-up commands.
 - If recovery succeeds, return the recovered result from the original job.

@@ -840,6 +840,36 @@ async fn llm_engine_join_job_waits_for_later_driver_notification() {
 }
 
 #[tokio::test]
+async fn llm_engine_join_job_observes_out_of_band_completion() {
+    let store = test_store().await;
+    let llm = test_llm(store.clone(), FakeBackend::with_responses(&[]));
+    llm.create_session(session_config("main")).await.unwrap();
+    let engine = ConversationEngine::new(llm);
+    let job = engine.submit_job("main", "hello", vec![]).await.unwrap();
+    let joiner = tokio::spawn({
+        let engine = engine.clone();
+        let job_id = job.job_id.clone();
+        async move { engine.join_job(&job_id).await }
+    });
+    sleep(Duration::from_millis(20)).await;
+    store
+        .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+        .await
+        .unwrap();
+    store
+        .set_job_status(&job.job_id, JobStatus::Running, JobStatus::Finished)
+        .await
+        .unwrap();
+
+    let joined = tokio::time::timeout(Duration::from_secs(3), joiner)
+        .await
+        .expect("joiner should poll externally updated job status")
+        .unwrap()
+        .unwrap();
+    assert_eq!(joined.status, JobStatus::Finished);
+}
+
+#[tokio::test]
 async fn llm_engine_join_job_observes_driver_from_another_engine_instance() {
     let store = test_store().await;
     let backend = BlockingBackend {
