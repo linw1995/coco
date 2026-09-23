@@ -10,6 +10,7 @@ use coco_llm::{
     SessionConfigPatch,
 };
 use futures::future::{BoxFuture, FutureExt, Shared};
+use futures::stream::StreamExt;
 use jiff::Timestamp;
 use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -24,6 +25,7 @@ pub type BranchLockGuard = coco_llm::BranchLockGuard;
 pub const SYSTEM_EVENT_QUEUE: &str = "system";
 const LLM_BACKEND_FAILURE_RECOVERY_REQUESTED: &str = "llm.backend_failure.recovery_requested";
 const SYSTEM_EVENT_VERSION: u64 = 1;
+const RESUME_JOB_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JobStatusSnapshot {
@@ -473,11 +475,17 @@ where
             .filter(|job| !matches!(job.status, JobStatus::Finished))
             .count();
         tracing::info!(incomplete_count, "resuming incomplete prompt jobs");
-        for (job_id, job) in jobs {
-            if matches!(job.status, JobStatus::Finished) {
-                continue;
-            }
-            self.drive_job(&job_id).await?;
+        let pending = jobs
+            .into_iter()
+            .filter(|(_, job)| !matches!(job.status, JobStatus::Finished))
+            .map(|(job_id, _)| job_id);
+        let results = futures::stream::iter(pending)
+            .map(|job_id| async move { self.drive_job(&job_id).await })
+            .buffer_unordered(RESUME_JOB_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for result in results {
+            result?;
         }
         Ok(())
     }
@@ -507,8 +515,13 @@ where
                 status = ?snapshot.status,
                 "waiting for prompt job status notification"
             );
-            if job_status.changed().await.is_err() {
-                return self.get_job(job_id).await;
+            tokio::select! {
+                changed = job_status.changed() => {
+                    if changed.is_err() {
+                        return self.get_job(job_id).await;
+                    }
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
     }

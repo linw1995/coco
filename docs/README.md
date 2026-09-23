@@ -10,3 +10,5 @@ Documentation for installing, configuring, and operating CoCo.
   image license material and retrieve the source bundle matching a GHCR tag.
 - [Credential Proxy](credential-proxy.md): expose API credentials through nono
   without exposing real keys to the sandbox.
+- [Backend Failure Recovery](recovery.md): inspect the three recovery branches
+  and the bounded retry cycle.

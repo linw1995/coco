@@ -53,6 +53,9 @@ use crate::{
 
 const DEFAULT_SESSION_BRANCH: &str = "main";
 const BUILTIN_DAY_BRANCH: &str = "day";
+const RECOVERY_BRANCHES: [&str; 3] = [BUILTIN_DAY_BRANCH, "day-2", "day-3"];
+// Prompt anchors persist across restarts, so the dispatcher can recover the original event.
+const RECOVERY_ATTEMPT_PREFIX: &str = "CoCo-Recovery-Attempt: ";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are CoCo. An AI copilot";
 const DAY_SYSTEM_PROMPT: &str = r#"You are CoCo Day, the built-in system event branch.
 
@@ -60,6 +63,11 @@ Your only job is to consume CoCo system events and turn them into concrete recov
 When you receive an LLM backend failure recovery event, inspect the event payload and run the `recovery` skill from this `day` branch through the injected `coco` command. The failed `work_branch` in the event is the target to inspect or repair, not the branch executing recovery. Do not create or select another recovery branch.
 
 Use the `compact` skill when a target branch has accumulated enough anchors or history that future recovery is likely to exceed context budget. Compact with session graph inspection and `coco session handoff`."#;
+const FALLBACK_RECOVERY_SYSTEM_PROMPT: &str = r#"You are a CoCo system event recovery branch.
+
+Handle the recovery event in the current prompt through the `recovery` skill. The event's work branch is the failed target, not the branch executing recovery. Inspect persisted state before retrying work and avoid repeating completed external actions. Do not create another recovery branch.
+
+Use the `compact` skill when a target branch has accumulated enough history to exceed its context budget."#;
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 const TELEGRAM_INBOUND_QUEUE: &str = "telegram.inbound";
 const PROMPT_JOB_QUEUE_IDLE_DELAY: Duration = Duration::from_secs(1);
@@ -182,31 +190,44 @@ where
         llm.create_session(config).await.context(LlmSnafu)?;
     }
 
-    ensure_builtin_day_session(shared_store, llm, provider_profiles).await?;
+    for (index, branch) in RECOVERY_BRANCHES.into_iter().enumerate() {
+        let system_prompt = if index == 0 {
+            DAY_SYSTEM_PROMPT
+        } else {
+            FALLBACK_RECOVERY_SYSTEM_PROMPT
+        };
+        ensure_builtin_recovery_session(
+            shared_store,
+            llm,
+            provider_profiles,
+            branch,
+            system_prompt,
+        )
+        .await?;
+    }
     Ok(())
 }
 
-async fn ensure_builtin_day_session<B, S>(
+async fn ensure_builtin_recovery_session<B, S>(
     shared_store: &S,
     llm: &Arc<LlmService<B, S>>,
     provider_profiles: &ProviderProfiles,
+    branch: &str,
+    system_prompt: &str,
 ) -> Result<()>
 where
     B: CompletionBackend + 'static,
     S: Store + Clone + Send + Sync + 'static,
 {
-    if builtin_day_session_is_valid(shared_store).await? {
+    if builtin_recovery_session_is_valid(shared_store, branch, system_prompt).await? {
         return Ok(());
     }
 
-    match shared_store.get_branch_head(BUILTIN_DAY_BRANCH).await {
+    match shared_store.get_branch_head(branch).await {
         Ok(_) => {
-            tracing::warn!(
-                branch = BUILTIN_DAY_BRANCH,
-                "replacing invalid builtin day session"
-            );
+            tracing::warn!(branch, "replacing invalid builtin recovery session");
             shared_store
-                .delete_branch(BUILTIN_DAY_BRANCH)
+                .delete_branch(branch)
                 .await
                 .context(StoreSnafu)?;
         }
@@ -214,10 +235,15 @@ where
         Err(source) => return Err(source).context(StoreSnafu),
     }
 
-    let config = match resolve_session_config(day_session_create_command(), provider_profiles) {
+    let config = match resolve_session_config(
+        recovery_session_create_command(branch, system_prompt),
+        provider_profiles,
+    ) {
         Ok(config) => config,
         Err(error) => {
-            let Some(config) = derive_day_session_config(shared_store).await? else {
+            let Some(config) =
+                derive_recovery_session_config(shared_store, branch, system_prompt).await?
+            else {
                 return Err(error);
             };
             config
@@ -227,19 +253,23 @@ where
         branch = %config.branch,
         max_tokens = config.max_tokens,
         tool_count = config.tools.len(),
-        "creating builtin day session"
+        "creating builtin recovery session"
     );
     llm.create_session(config).await.context(LlmSnafu)?;
     Ok(())
 }
 
-async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
-    let head = match store.get_branch_head(BUILTIN_DAY_BRANCH).await {
+async fn builtin_recovery_session_is_valid(
+    store: &impl Store,
+    branch: &str,
+    system_prompt: &str,
+) -> Result<bool> {
+    let head = match store.get_branch_head(branch).await {
         Ok(head) => head,
         Err(StoreError::BranchNotFound { .. }) => return Ok(false),
         Err(source) => return Err(source).context(StoreSnafu),
     };
-    match store.get_session_state(BUILTIN_DAY_BRANCH).await {
+    match store.get_session_state(branch).await {
         Ok(_) => {}
         Err(StoreError::BranchNotFound { .. }) => return Ok(false),
         Err(source) => return Err(source).context(StoreSnafu),
@@ -269,18 +299,22 @@ async fn builtin_day_session_is_valid(store: &impl Store) -> Result<bool> {
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
     Ok(session.role == SessionRole::Orchestrator
-        && session.system_prompt == DAY_SYSTEM_PROMPT
+        && session.system_prompt == system_prompt
         && session.enable_coco_shim
         && actual_tools == expected_tools)
 }
 
-async fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionConfig>> {
+async fn derive_recovery_session_config(
+    store: &impl Store,
+    recovery_branch: &str,
+    system_prompt: &str,
+) -> Result<Option<SessionConfig>> {
     let mut branches = store
         .list_session_states()
         .await
         .context(StoreSnafu)?
         .into_keys()
-        .filter(|branch| branch != BUILTIN_DAY_BRANCH)
+        .filter(|branch| branch != recovery_branch)
         .collect::<Vec<_>>();
     branches.sort();
     if let Some(index) = branches
@@ -310,13 +344,13 @@ async fn derive_day_session_config(store: &impl Store) -> Result<Option<SessionC
             .and_then(|provider| Provider::parse(provider).ok())
             .unwrap_or(Provider::OpenAi);
         return Ok(Some(SessionConfig {
-            branch: BUILTIN_DAY_BRANCH.to_owned(),
+            branch: recovery_branch.to_owned(),
             merge_parents: vec![],
             provider_profile: session_anchor.provider_profile,
             provider,
             model: session_anchor.model,
             role: SessionRole::Orchestrator,
-            system_prompt: DAY_SYSTEM_PROMPT.to_owned(),
+            system_prompt: system_prompt.to_owned(),
             prompt: String::new(),
             tools: default_builtin_day_tools(),
             temperature: session_anchor.temperature,
@@ -358,12 +392,12 @@ fn default_session_create_command() -> SessionCreateCommand {
     }
 }
 
-fn day_session_create_command() -> SessionCreateCommand {
+fn recovery_session_create_command(branch: &str, system_prompt: &str) -> SessionCreateCommand {
     SessionCreateCommand {
-        branch: BUILTIN_DAY_BRANCH.to_owned(),
+        branch: branch.to_owned(),
         role: CliSessionRole::Orchestrator,
         provider_profile: None,
-        system_prompt: DAY_SYSTEM_PROMPT.to_owned(),
+        system_prompt: system_prompt.to_owned(),
         prompt: String::new(),
         temperature: None,
         max_tokens: Some(DEFAULT_MAX_TOKENS),
@@ -694,7 +728,7 @@ struct SystemEventEnvelope {
     data: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LlmBackendFailureRecoveryRequested {
     #[serde(default)]
     dedupe_key: String,
@@ -707,6 +741,12 @@ struct LlmBackendFailureRecoveryRequested {
     error_node_id: String,
     retry_from_node_id: String,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryAttemptRecord {
+    attempt: usize,
+    event: LlmBackendFailureRecoveryRequested,
 }
 
 #[derive(Debug)]
@@ -781,14 +821,39 @@ impl<S> SystemEventMessageQueueWorker<S> {
     where
         S: Store,
     {
-        let route = route_system_event(&event);
-        match self.store.get_branch_head(route.branch).await {
+        let Some(attempt) = self.recovery_attempt_for_event(&event).await? else {
+            return Ok(true);
+        };
+        if attempt.attempt > 1
+            && self
+                .store
+                .get_job(&attempt.event.job_id)
+                .await
+                .context(StoreSnafu)?
+                .status
+                == JobStatus::Finished
+        {
+            self.finish_recovery_job(&event).await?;
+            return Ok(true);
+        }
+        if attempt.attempt > RECOVERY_BRANCHES.len() {
+            self.finish_recovery_job(&event).await?;
+            self.finish_job_if_running(&attempt.event.job_id).await?;
+            tracing::error!(
+                job_id = %attempt.event.job_id,
+                attempts = RECOVERY_BRANCHES.len(),
+                "recovery attempts exhausted"
+            );
+            return Ok(true);
+        }
+        let branch = RECOVERY_BRANCHES[attempt.attempt - 1];
+        match self.store.get_branch_head(branch).await {
             Ok(_) => {}
             Err(StoreError::BranchNotFound { .. }) => {
                 tracing::warn!(
                     message_id = %item.message_id,
                     queue = SYSTEM_EVENT_QUEUE,
-                    branch = route.branch,
+                    branch,
                     "kept system event because target branch is missing"
                 );
                 return Ok(false);
@@ -796,13 +861,14 @@ impl<S> SystemEventMessageQueueWorker<S> {
             Err(source) => return Err(source).context(StoreSnafu),
         }
 
-        let request = materialize_system_event_prompt_job(route, &event);
-        let dedupe_job_ids = system_event_prompt_job_dedupe_ids(&event);
+        self.finish_recovery_job(&event).await?;
+        let request = materialize_system_event_prompt_job(branch, &attempt);
+        let dedupe_job_ids = recovery_attempt_prompt_job_dedupe_ids(&attempt);
         if self.prompt_job_request_exists(&dedupe_job_ids).await? {
             tracing::debug!(
                 message_id = %item.message_id,
                 queue = SYSTEM_EVENT_QUEUE,
-                branch = route.branch,
+                branch,
                 job_id = %request.job_id,
                 "skipped duplicate system event prompt job"
             );
@@ -813,10 +879,98 @@ impl<S> SystemEventMessageQueueWorker<S> {
         tracing::info!(
             message_id = %item.message_id,
             queue = SYSTEM_EVENT_QUEUE,
-            branch = route.branch,
+            branch,
             "queued system event prompt job"
         );
         Ok(true)
+    }
+
+    async fn recovery_attempt_for_event(
+        &self,
+        event: &SystemEvent,
+    ) -> Result<Option<RecoveryAttemptRecord>>
+    where
+        S: Store,
+    {
+        let SystemEvent::LlmBackendFailureRecoveryRequested(failure) = event;
+        if !is_recovery_execution_branch(&failure.work_branch) {
+            return Ok(Some(RecoveryAttemptRecord {
+                attempt: 1,
+                event: failure.clone(),
+            }));
+        }
+
+        let node = self
+            .store
+            .get_node(&failure.base_node_id)
+            .await
+            .context(StoreSnafu)?;
+        let Kind::Anchor(Anchor {
+            payload: AnchorPayload::Prompt(prompt),
+            ..
+        }) = node.kind
+        else {
+            tracing::error!(job_id = %failure.job_id, "recovery job has no prompt anchor");
+            self.finish_job_if_running(&failure.job_id).await?;
+            return Ok(None);
+        };
+        let previous = parse_recovery_attempt(&prompt.prompt).or_else(|| {
+            if failure.work_branch == BUILTIN_DAY_BRANCH {
+                parse_legacy_recovery_event(&prompt.prompt)
+                    .map(|event| RecoveryAttemptRecord { attempt: 1, event })
+            } else {
+                None
+            }
+        });
+        let Some(previous) = previous else {
+            tracing::error!(job_id = %failure.job_id, "recovery job has no attempt marker");
+            self.finish_job_if_running(&failure.job_id).await?;
+            return Ok(None);
+        };
+        if previous
+            .attempt
+            .checked_sub(1)
+            .and_then(|index| RECOVERY_BRANCHES.get(index))
+            .is_none_or(|branch| !is_branch_or_descendant(&failure.work_branch, branch))
+        {
+            tracing::error!(
+                job_id = %failure.job_id,
+                attempt = previous.attempt,
+                branch = %failure.work_branch,
+                "recovery attempt marker does not match its branch"
+            );
+            self.finish_job_if_running(&failure.job_id).await?;
+            return Ok(None);
+        }
+        Ok(Some(RecoveryAttemptRecord {
+            attempt: previous.attempt + 1,
+            event: previous.event,
+        }))
+    }
+
+    async fn finish_recovery_job(&self, event: &SystemEvent) -> Result<()>
+    where
+        S: Store,
+    {
+        let SystemEvent::LlmBackendFailureRecoveryRequested(failure) = event;
+        if is_recovery_execution_branch(&failure.work_branch) {
+            self.finish_job_if_running(&failure.job_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_job_if_running(&self, job_id: &str) -> Result<()>
+    where
+        S: Store,
+    {
+        let job = self.store.get_job(job_id).await.context(StoreSnafu)?;
+        if job.status == JobStatus::Running {
+            self.store
+                .set_job_status(job_id, JobStatus::Running, JobStatus::Finished)
+                .await
+                .context(StoreSnafu)?;
+        }
+        Ok(())
     }
 
     async fn prompt_job_request_exists(&self, job_ids: &[String]) -> Result<bool>
@@ -1768,85 +1922,120 @@ fn decode_system_event_message(
     }
 }
 
-fn render_system_event_prompt(event: &SystemEvent) -> String {
-    match event {
-        SystemEvent::LlmBackendFailureRecoveryRequested(event) => format!(
-            "Handle this LLM backend failure recovery event.\n\n\
-             Run `coco skill run recovery --handoff ...` from the `day` branch and pass the event fields below as the handoff. \
-             Treat work branch {work_branch:?} as the failed target branch for job {job_id:?}, not as the branch executing recovery. \
-             Do not fork or create another recovery branch; recover the original task through `day` and produce a normal successful answer.\n\n\
-             Event fields:\n\
-             - job_id: {job_id}\n\
-             - root_branch: {root_branch}\n\
-             - work_branch: {work_branch}\n\
-             - failed_branch: {failed_branch}\n\
-             - base_node_id: {base_node_id}\n\
-             - execution_id: {execution_id}\n\
-             - error_node_id: {error_node_id}\n\
-             - retry_from_node_id: {retry_from_node_id}\n\
-             - message: {message}",
-            job_id = event.job_id,
-            root_branch = event.root_branch,
-            work_branch = event.work_branch,
-            failed_branch = event.failed_branch,
-            base_node_id = event.base_node_id,
-            execution_id = event.execution_id,
-            error_node_id = event.error_node_id,
-            retry_from_node_id = event.retry_from_node_id,
-            message = event.message,
-        ),
-    }
+fn render_recovery_prompt(branch: &str, attempt: &RecoveryAttemptRecord) -> String {
+    let event = &attempt.event;
+    let marker = serde_json::to_string(attempt).expect("recovery attempt should serialize");
+    format!(
+        "{RECOVERY_ATTEMPT_PREFIX}{marker}\n\n\
+         Handle this LLM backend failure recovery event (attempt {attempt_number} of {max_attempts}).\n\n\
+         Run `coco skill run recovery --handoff ...` from the `{branch}` branch and pass the event fields below as the handoff. \
+         Treat work branch {work_branch:?} as the failed target branch for job {job_id:?}, not as the branch executing recovery. \
+         Inspect the original job before repeating work. Do not create another recovery branch.\n\n\
+         Event fields:\n\
+         - job_id: {job_id}\n\
+         - root_branch: {root_branch}\n\
+         - work_branch: {work_branch}\n\
+         - failed_branch: {failed_branch}\n\
+         - base_node_id: {base_node_id}\n\
+         - execution_id: {execution_id}\n\
+         - error_node_id: {error_node_id}\n\
+         - retry_from_node_id: {retry_from_node_id}\n\
+         - message: {message}",
+        attempt_number = attempt.attempt,
+        max_attempts = RECOVERY_BRANCHES.len(),
+        job_id = event.job_id,
+        root_branch = event.root_branch,
+        work_branch = event.work_branch,
+        failed_branch = event.failed_branch,
+        base_node_id = event.base_node_id,
+        execution_id = event.execution_id,
+        error_node_id = event.error_node_id,
+        retry_from_node_id = event.retry_from_node_id,
+        message = event.message,
+    )
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SystemEventHandler {
-    Day,
+fn parse_recovery_attempt(prompt: &str) -> Option<RecoveryAttemptRecord> {
+    let first_line = prompt.lines().next()?;
+    serde_json::from_str(first_line.strip_prefix(RECOVERY_ATTEMPT_PREFIX)?).ok()
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SystemEventRoute {
-    branch: &'static str,
-    handler: SystemEventHandler,
+fn parse_legacy_recovery_event(prompt: &str) -> Option<LlmBackendFailureRecoveryRequested> {
+    let field = |name: &str| {
+        let prefix = format!("- {name}: ");
+        prompt
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+    };
+    let job_id = field("job_id")?;
+    let work_branch = field("work_branch")?;
+    let retry_from_node_id = field("retry_from_node_id")?;
+    Some(LlmBackendFailureRecoveryRequested {
+        dedupe_key: backend_failure_recovery_dedupe_key(&job_id, &work_branch, &retry_from_node_id),
+        job_id,
+        root_branch: field("root_branch")?,
+        failed_branch: field("failed_branch")?,
+        work_branch,
+        base_node_id: field("base_node_id")?,
+        execution_id: field("execution_id")?,
+        error_node_id: field("error_node_id")?,
+        retry_from_node_id,
+        message: field("message")?,
+    })
 }
 
-fn route_system_event(event: &SystemEvent) -> SystemEventRoute {
-    match event {
-        SystemEvent::LlmBackendFailureRecoveryRequested(_) => SystemEventRoute {
-            branch: BUILTIN_DAY_BRANCH,
-            handler: SystemEventHandler::Day,
-        },
-    }
+fn is_branch_or_descendant(branch: &str, root: &str) -> bool {
+    branch == root
+        || branch
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn is_recovery_execution_branch(branch: &str) -> bool {
+    RECOVERY_BRANCHES
+        .into_iter()
+        .any(|root| is_branch_or_descendant(branch, root))
 }
 
 fn materialize_system_event_prompt_job(
-    route: SystemEventRoute,
-    event: &SystemEvent,
+    branch: &str,
+    attempt: &RecoveryAttemptRecord,
 ) -> QueuedPromptRequest {
-    match route.handler {
-        SystemEventHandler::Day => QueuedPromptRequest {
-            job_id: stable_system_event_prompt_job_id(event),
-            branch: route.branch.to_owned(),
-            prompt: render_system_event_prompt(event),
-            merge_parents: vec![],
-            session_patch: None,
-        },
+    QueuedPromptRequest {
+        job_id: recovery_attempt_job_id(attempt),
+        branch: branch.to_owned(),
+        prompt: render_recovery_prompt(branch, attempt),
+        merge_parents: vec![],
+        session_patch: None,
     }
 }
 
+fn recovery_attempt_job_id(attempt: &RecoveryAttemptRecord) -> String {
+    if attempt.attempt == 1 {
+        return stable_prompt_job_id_from_dedupe_key(&attempt.event.dedupe_key);
+    }
+    stable_prompt_job_id_from_dedupe_key(&format!(
+        "{}:attempt:{}",
+        attempt.event.dedupe_key, attempt.attempt
+    ))
+}
+
+fn recovery_attempt_prompt_job_dedupe_ids(attempt: &RecoveryAttemptRecord) -> Vec<String> {
+    if attempt.attempt == 1 {
+        return vec![
+            recovery_attempt_job_id(attempt),
+            legacy_prompt_job_id_from_dedupe_key(&attempt.event.dedupe_key),
+        ];
+    }
+    vec![recovery_attempt_job_id(attempt)]
+}
+
+#[cfg(test)]
 fn stable_system_event_prompt_job_id(event: &SystemEvent) -> String {
     match event {
         SystemEvent::LlmBackendFailureRecoveryRequested(event) => {
             stable_prompt_job_id_from_dedupe_key(&event.dedupe_key)
         }
-    }
-}
-
-fn system_event_prompt_job_dedupe_ids(event: &SystemEvent) -> Vec<String> {
-    match event {
-        SystemEvent::LlmBackendFailureRecoveryRequested(event) => vec![
-            stable_prompt_job_id_from_dedupe_key(&event.dedupe_key),
-            legacy_prompt_job_id_from_dedupe_key(&event.dedupe_key),
-        ],
     }
 }
 
@@ -2171,8 +2360,8 @@ mod tests {
     };
     use coco_mem::{
         BackendMetadata, BranchStore, JobStatus, JobStore, Kind, MessageQueueStore, NewNode,
-        NodeStore, ProviderProfile, Role, SessionAnchorPatch, SessionRole, SessionStore,
-        SqliteStore,
+        NodeStore, PromptAnchor, ProviderProfile, Role, SessionAnchorPatch, SessionRole,
+        SessionStore, SqliteStore,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -3173,8 +3362,199 @@ mod tests {
         assert!(request.prompt.contains("retry-node"));
         assert!(request.prompt.contains("coco skill run recovery"));
         assert!(request.prompt.contains("from the `day` branch"));
-        assert!(request.prompt.contains("Do not fork"));
+        assert!(
+            request
+                .prompt
+                .contains("Do not create another recovery branch")
+        );
         assert!(!request.prompt.contains("active recovery branch"));
+    }
+
+    #[tokio::test]
+    async fn recovery_stops_after_three_branches() {
+        let store = test_store().await;
+        let llm = Arc::new(LlmService::new(
+            store.clone(),
+            BlockingOnceBackend::default(),
+        ));
+        for branch in ["main", "day", "day-2", "day-3"] {
+            llm.create_session(session_config(branch)).await.unwrap();
+        }
+        let root = store
+            .submit_job_with_id_and_prompt_base(
+                "job-root",
+                "main",
+                PromptAnchor {
+                    prompt: "original task".to_owned(),
+                    attachments: vec![],
+                },
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_job_status(&root.job_id, JobStatus::Queued, JobStatus::Running)
+            .await
+            .unwrap();
+
+        let worker = SystemEventMessageQueueWorker::new(store.clone());
+        let mut failed_job_id = root.job_id;
+        let mut failed_branch = "main".to_owned();
+        let mut failed_base = root.base;
+        for (index, branch) in ["day", "day-2", "day-3"].into_iter().enumerate() {
+            store
+                .enqueue_message(
+                    SYSTEM_EVENT_QUEUE,
+                    json!({
+                        "type": "llm.backend_failure.recovery_requested",
+                        "version": 1,
+                        "dedupe_key": format!("failure-{index}"),
+                        "data": {
+                            "job_id": failed_job_id,
+                            "root_branch": failed_branch,
+                            "work_branch": failed_branch,
+                            "failed_branch": failed_branch,
+                            "base_node_id": failed_base,
+                            "execution_id": format!("execution-{index}"),
+                            "error_node_id": format!("error-{index}"),
+                            "retry_from_node_id": format!("retry-{index}"),
+                            "message": "backend failed"
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(worker.drain_once().await.unwrap(), 1);
+            let queue = prompt_job_queue_for_branch(branch);
+            let requests = store.list_queue_messages(&queue).await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let request: QueuedPromptRequest =
+                serde_json::from_value(requests[0].payload.clone()).unwrap();
+            let marker = super::parse_recovery_attempt(&request.prompt).unwrap();
+            assert_eq!(marker.attempt, index + 1);
+            assert_eq!(marker.event.job_id, "job-root");
+            store.dequeue_message(&queue).await.unwrap().unwrap();
+
+            let job = store
+                .submit_job_with_id_and_prompt_base(
+                    &request.job_id,
+                    branch,
+                    PromptAnchor {
+                        prompt: request.prompt,
+                        attachments: vec![],
+                    },
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .set_job_status(&job.job_id, JobStatus::Queued, JobStatus::Running)
+                .await
+                .unwrap();
+            if index > 0 {
+                assert_eq!(
+                    store.get_job(&failed_job_id).await.unwrap().status,
+                    JobStatus::Finished
+                );
+            }
+            failed_job_id = job.job_id;
+            failed_branch = branch.to_owned();
+            failed_base = job.base;
+        }
+
+        store
+            .enqueue_message(
+                SYSTEM_EVENT_QUEUE,
+                json!({
+                    "type": "llm.backend_failure.recovery_requested",
+                    "version": 1,
+                    "dedupe_key": "failure-3",
+                    "data": {
+                        "job_id": failed_job_id,
+                        "root_branch": failed_branch,
+                        "work_branch": failed_branch,
+                        "failed_branch": failed_branch,
+                        "base_node_id": failed_base,
+                        "execution_id": "execution-3",
+                        "error_node_id": "error-3",
+                        "retry_from_node_id": "retry-3",
+                        "message": "backend failed"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(worker.drain_once().await.unwrap(), 1);
+        assert_eq!(
+            store.get_job("job-root").await.unwrap().status,
+            JobStatus::Finished
+        );
+        assert_eq!(
+            store.get_job(&failed_job_id).await.unwrap().status,
+            JobStatus::Finished
+        );
+        assert!(
+            store
+                .list_queue_messages(SYSTEM_EVENT_QUEUE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for branch in ["day", "day-2", "day-3"] {
+            assert!(
+                store
+                    .list_queue_messages(&prompt_job_queue_for_branch(branch))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_jobs_resume_across_branches_concurrently() {
+        let store = test_store().await;
+        let backend = BlockingOnceBackend::default();
+        let calls = backend.calls.clone();
+        let release_first = backend.release_first.clone();
+        let llm = Arc::new(LlmService::new(store.clone(), backend));
+        for branch in ["main", "day"] {
+            llm.create_session(session_config(branch)).await.unwrap();
+        }
+        let engine = ConversationEngine::new(llm);
+        let main = engine
+            .submit_job("main", "main task", vec![])
+            .await
+            .unwrap();
+        let day = engine.submit_job("day", "day task", vec![]).await.unwrap();
+
+        let resume = tokio::spawn(async move { super::resume_incomplete_jobs(&engine).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second branch should run while the first branch is blocked");
+        release_first.notify_one();
+        resume.await.unwrap().unwrap();
+        for job_id in [main.job_id, day.job_id] {
+            assert_eq!(
+                store.get_job(&job_id).await.unwrap().status,
+                JobStatus::Finished
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_day_prompt_retains_original_recovery_target() {
+        let prompt = "Event fields:\n- job_id: job-root\n- root_branch: main\n- work_branch: main\n- failed_branch: main\n- base_node_id: base\n- execution_id: execution\n- error_node_id: error\n- retry_from_node_id: retry\n- message: backend failed";
+        let event = super::parse_legacy_recovery_event(prompt).unwrap();
+        assert_eq!(event.job_id, "job-root");
+        assert_eq!(event.retry_from_node_id, "retry");
+        assert_eq!(event.dedupe_key, "llm.backend_failure:job-root:main:retry");
     }
 
     #[tokio::test]
@@ -3586,7 +3966,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = super::derive_day_session_config(&store)
+        let config = super::derive_recovery_session_config(&store, "day", super::DAY_SYSTEM_PROMPT)
             .await
             .unwrap()
             .expect("day config should be derived");
