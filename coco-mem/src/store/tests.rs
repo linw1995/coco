@@ -2509,7 +2509,7 @@ where
             .current()
             .unwrap()
             .body
-            .contains("Use this orchestrator skill from the built-in `day` branch")
+            .contains("Use this orchestrator skill from the recovery branch selected by CoCo")
     );
     assert!(
         recovery
